@@ -134,13 +134,13 @@ class EpisodeRecorder:
             self.thread.start()
             if not self.ready.wait(RECORDER_START_TIMEOUT_S):
                 raise TimeoutError("recording START timed out")
-            self.check_error()
-            self.is_recording = True
         except BaseException as exc:
             self.store_error(exc)
             if not isinstance(exc, Exception):
                 raise
-            self.check_error()
+        # writer 已登记的失败只向调用方传播，不作为第二次启动失败登记。
+        self.check_error()
+        self.is_recording = True
 
     def append(self, row, command=None, *, quality_issue=None) -> str | None:
         """质量拒绝返回原因，调用方立即结束本段；I/O 错误继续抛出。"""

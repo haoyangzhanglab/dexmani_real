@@ -69,8 +69,8 @@ def load_vr_transform(path: str | Path) -> np.ndarray:
     """从有效角度构造运行变换，历史标定报告不参与运行准入。"""
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     theta_deg = float(payload["theta_deg"])
-    if not -180 <= theta_deg <= 180:
-        raise ValueError("VR heading must be finite and within [-180, 180]")
+    if not np.isfinite(theta_deg):
+        raise ValueError("VR heading must be finite")
     # R_z(-theta) 将 VR FLU 前向映射到机器人基座 +X。
     theta = np.deg2rad(theta_deg)
     cosine, sine = np.cos(theta), np.sin(theta)

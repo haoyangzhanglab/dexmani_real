@@ -91,6 +91,7 @@ class TeleopLoop:
             self.runtime_state.request_emergency_stop()
         else:
             self.runtime_state.stop_signal.set()
+        self.pending_termination_reason = RunEndReason.FAILED.name.lower()
         self.termination_details.append(error_detail(stage, exc))
         self.audio.play("emergency")
 
@@ -100,10 +101,13 @@ class TeleopLoop:
         try:
             self.robot.stop()
         except BaseException as exc:
-            self.record_error("stop", exc)
+            if isinstance(exc, KeyboardInterrupt):
+                self.runtime_state.request_emergency_stop()
+            self.request_episode_end("stop_failed", run_end_reason=RunEndReason.FAILED)
             if failure is None:
                 failure = exc
             else:
+                self.record_error("stop", exc)
                 logger.exception("teleop stop also failed")
         self.controller.clear()
 
@@ -113,7 +117,9 @@ class TeleopLoop:
             try:
                 self.finish_recording()
             except BaseException as exc:
-                self.record_error("recording_cleanup", exc)
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
+                self.request_episode_end("recording_failed", run_end_reason=RunEndReason.FAILED)
                 failure = exc
         self.phase = TeleopPhase.IDLE
         self.cancel_epoch = None
@@ -152,7 +158,7 @@ class TeleopLoop:
     ):
         """先请求停止并保留结束意图，资源收尾由 run_episode 的边界执行。"""
         self.runtime_state.stop_signal.set()
-        if self.pending_termination_reason is None:
+        if self.pending_termination_reason is None or run_end_reason is RunEndReason.FAILED:
             self.pending_termination_reason = run_end_reason.name.lower()
             self.termination_details.append(dict(stage="termination", reason=reason))
             logger.info("本段结束：%s（%s）。", self.pending_termination_reason, reason)
@@ -216,10 +222,9 @@ class TeleopLoop:
                     tactile_reset_metadata=self.robot.hand.get_tactile_reset_metadata(),
                     tactile_hold_max_age_s=self.runtime.hand.feedback_max_age_s,
                 )
-                metadata.update(
-                    runtime_config_json=self.runtime_config_json,
-                    vr_to_robot_rotation=self.controller.rotation.as_matrix().tolist(),
-                )
+                metadata["vr_to_robot_rotation"] = self.controller.rotation.as_matrix().tolist()
+                if self.runtime_config_json is not None:
+                    metadata["runtime_config_json"] = self.runtime_config_json
                 if self.controller.hand_retargeter is not None:
                     metadata["hand_retargeting_calibration_json"] = json.dumps(
                         self.controller.hand_retargeter.calibration_metadata(), allow_nan=False,
@@ -528,7 +533,9 @@ class TeleopLoop:
                     break
                 self.run_control_tick()
         except BaseException as exc:
-            self.record_error("episode", exc)
+            # 主错误由会话边界报告；阻塞停止前仍须锁存中断并标记本段失败。
+            if isinstance(exc, KeyboardInterrupt):
+                self.runtime_state.request_emergency_stop()
             self.request_episode_end("episode_failed", run_end_reason=RunEndReason.FAILED)
             raise
         finally:

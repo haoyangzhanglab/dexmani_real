@@ -445,34 +445,68 @@ def test_owner_fault_and_late_close_error_are_reported(alive):
         arm.child_pipe.close()
 
 
-def test_repeated_close_does_not_renew_pending_owner_budget(monkeypatch):
-    clock = [10.0]
-    monkeypatch.setattr('dexmani_real.robot.xarm7.process.time.monotonic', lambda: clock[0])
+def test_each_close_waits_with_fixed_timeout_and_retains_pending_owner():
     arm = ArmProcess(ArmConfig(), runtime_state=SessionState())
     alive = [True]
     waits = []
     def join(timeout):
+        assert arm.io.stop.is_set() and arm.io.closing.is_set()
         waits.append(timeout)
-        clock[0] += timeout
-    arm.process = SimpleNamespace(pid=1, exitcode=0, is_alive=lambda: alive[0], join=join)
+    owner = arm.process = SimpleNamespace(pid=1, exitcode=None, is_alive=lambda: alive[0], join=join)
     try:
         with pytest.raises(TimeoutError, match='still active'):
             arm.close()
-        deadline = arm.close_deadline
-        clock[0] += 10
         with pytest.raises(TimeoutError, match='still active'):
             arm.close()
-        assert waits == [EXECUTOR_TIMEOUT_S, 0.0]
-        assert arm.close_deadline == deadline
+        assert waits == [EXECUTOR_TIMEOUT_S, EXECUTOR_TIMEOUT_S]
+        assert arm.process is owner
         assert not arm.is_closed and not arm.pipe.closed and not arm.child_pipe.closed
-        # 真正退出后仍可检查晚到错误并关闭端点，无需新的等待窗口。
+        # 真正退出后仍可检查晚到错误并关闭端点。
         alive[0] = False
+        owner.exitcode = 0
         arm.io.stopped.set()
         arm.close()
-        assert waits[-1] == 0.0 and arm.is_closed
+        assert waits[-1] == EXECUTOR_TIMEOUT_S and arm.is_closed
     finally:
         arm.pipe.close()
         arm.child_pipe.close()
+
+
+@pytest.mark.parametrize('field', ['fault', 'close_error'])
+def test_arm_close_reads_errors_first_reported_during_join(field):
+    from dexmani_real.robot.commands import RobotError
+    arm = ArmProcess(ArmConfig(), runtime_state=SessionState())
+    arm.io.stopped.set()
+    def join(timeout):
+        getattr(arm.io, field).value = b'late owner failure'
+    arm.process = SimpleNamespace(pid=1, exitcode=0, is_alive=lambda: False, join=join)
+    try:
+        for _ in range(2):
+            with pytest.raises(RobotError, match='late owner failure'):
+                arm.close()
+            assert arm.is_closed
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+def test_arm_join_interrupt_latches_before_pipe_cleanup():
+    state = SessionState()
+    arm = ArmProcess(ArmConfig(), runtime_state=state)
+    arm.io.stopped.set()
+    def join(timeout):
+        raise KeyboardInterrupt('join interrupted')
+    arm.process = SimpleNamespace(pid=1, exitcode=0, is_alive=lambda: False, join=join)
+    arm.pipe.close()
+    arm.child_pipe.close()
+    closed = []
+    def close_pipe():
+        assert state.estop_request and state.stop_signal.is_set()
+        closed.append(True)
+    arm.pipe = arm.child_pipe = SimpleNamespace(close=close_pipe)
+    with pytest.raises(KeyboardInterrupt, match='join interrupted'):
+        arm.close()
+    assert len(closed) == 2
 
 
 def test_cancelled_lifecycle_request_cannot_reuse_owner():

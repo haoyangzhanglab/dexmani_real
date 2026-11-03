@@ -23,6 +23,10 @@ def load_camera_extrinsics(serial: str, path: str | Path | None = None) -> np.nd
     if not isinstance(serial, str) or not serial.strip():
         raise ValueError("camera serial must be non-empty")
     cameras = _read_cameras(CAMERAS_PATH if path is None else Path(path))
+    return _parse_camera_extrinsics(cameras, serial)
+
+
+def _parse_camera_extrinsics(cameras: dict, serial: str) -> np.ndarray:
     return validate_rigid_transform(
         cameras[serial]["T_base_from_camera"], label=f"camera {serial} T_base_from_camera",
     )
@@ -32,9 +36,17 @@ def load_optional_camera_extrinsics(
     serial: str,
     path: str | Path | None = None,
 ) -> np.ndarray | None:
-    if path is None and not CAMERAS_PATH.exists():
+    """仅默认标定文件或 serial 缺失时省略外参；显式路径与坏条目仍报错。"""
+    if path is not None:
+        return load_camera_extrinsics(serial, path)
+    if not isinstance(serial, str) or not serial.strip():
+        raise ValueError("camera serial must be non-empty")
+    if not CAMERAS_PATH.exists():
         return None
-    return load_camera_extrinsics(serial, path)
+    cameras = _read_cameras(CAMERAS_PATH)
+    if serial not in cameras:
+        return None
+    return _parse_camera_extrinsics(cameras, serial)
 
 
 def save_camera_calibration(

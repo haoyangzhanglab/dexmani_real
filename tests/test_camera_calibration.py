@@ -14,6 +14,56 @@ from dexmani_real.utils.camera_calibrate.extrinsics import load_camera_extrinsic
 from dexmani_real.utils.camera_calibrate.hand_eye import solve_hand_eye
 
 
+@pytest.mark.parametrize('contents,error', [
+    (None, FileNotFoundError),
+    ('{}', KeyError),
+    ('{"other": {"T_base_from_camera": []}}', KeyError),
+])
+def test_optional_default_extrinsics_only_allow_missing_file_or_serial(monkeypatch, tmp_path, contents, error):
+    from dexmani_real.utils.camera_calibrate import extrinsics
+
+    path = tmp_path / 'cameras.json'
+    monkeypatch.setattr(extrinsics, 'CAMERAS_PATH', path)
+    if contents is not None:
+        path.write_text(contents)
+    assert extrinsics.load_optional_camera_extrinsics('actual-camera') is None
+    with pytest.raises(error):
+        extrinsics.load_camera_extrinsics('actual-camera')
+    # 显式选择同一文件时不能把缺失当作可选。
+    with pytest.raises(error):
+        extrinsics.load_optional_camera_extrinsics('actual-camera', path)
+
+
+@pytest.mark.parametrize('serial', ['', ' ', None])
+def test_optional_extrinsics_reject_invalid_serial(monkeypatch, tmp_path, serial):
+    from dexmani_real.utils.camera_calibrate import extrinsics
+
+    path = tmp_path / 'cameras.json'
+    path.write_text('{}')
+    monkeypatch.setattr(extrinsics, 'CAMERAS_PATH', path)
+    with pytest.raises(ValueError, match='serial must be non-empty'):
+        extrinsics.load_optional_camera_extrinsics(serial)
+
+
+@pytest.mark.parametrize('contents,error', [
+    ('{', json.JSONDecodeError),
+    ('[]', ValueError),
+    ('{"actual-camera": {}}', KeyError),
+    ('{"actual-camera": null}', TypeError),
+    ('{"actual-camera": {"T_base_from_camera": []}}', ValueError),
+    (json.dumps({'actual-camera': {'T_base_from_camera': np.zeros((4, 4)).tolist()}}), ValueError),
+])
+@pytest.mark.parametrize('explicit', [False, True])
+def test_optional_extrinsics_preserve_invalid_data_errors(monkeypatch, tmp_path, contents, error, explicit):
+    from dexmani_real.utils.camera_calibrate import extrinsics
+
+    path = tmp_path / 'cameras.json'
+    path.write_text(contents)
+    monkeypatch.setattr(extrinsics, 'CAMERAS_PATH', path)
+    with pytest.raises(error):
+        extrinsics.load_optional_camera_extrinsics('actual-camera', path if explicit else None)
+
+
 @pytest.fixture
 def poses():
     rng = np.random.default_rng(42)

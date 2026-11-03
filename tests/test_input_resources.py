@@ -9,6 +9,71 @@ from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.state import SessionState
 
 
+@pytest.fixture
+def resource_logs(monkeypatch, caplog):
+    import logging
+    monkeypatch.setattr(logging.getLogger('dexmani_real'), 'handlers', [])
+    monkeypatch.setattr(logging.getLogger('dexmani_real'), 'propagate', True)
+    return caplog
+
+
+@pytest.mark.parametrize('error_types', [
+    (OSError, None, None), (None, OSError, None), (None, None, OSError),
+    (KeyboardInterrupt, None, None), (OSError, KeyboardInterrupt, OSError),
+    (OSError, None, KeyboardInterrupt),
+])
+@pytest.mark.parametrize('alive', [False, True])
+def test_keyboard_stop_attempts_join_and_restore_after_failures(monkeypatch, resource_logs, error_types, alive):
+    from dexmani_real.runtime import keyboard as keyboard_module
+    state = SessionState()
+    keyboard = Keyboard(estop_callback=state.request_emergency_stop)
+    keyboard.active = True
+    keyboard.events.append('b')
+    keyboard.held_keys.add('w')
+    saved = keyboard.saved_termios = object()
+    errors = [kind('cleanup failed') if kind else None for kind in error_types]
+    calls = []
+    def action(index):
+        assert not keyboard.active and not keyboard.events and not keyboard.held_keys
+        if KeyboardInterrupt in error_types[:index]:
+            assert state.estop_request and state.stop_signal.is_set()
+        calls.append(index)
+        if errors[index] is not None:
+            raise errors[index]
+    def join(timeout):
+        assert timeout == keyboard_module.LISTENER_STOP_TIMEOUT_S
+        action(1)
+    def restore(value):
+        assert value is saved
+        action(2)
+    listener = keyboard.listener = SimpleNamespace(
+        ident=1, stop=lambda: action(0), join=join, is_alive=lambda: alive,
+    )
+    monkeypatch.setattr(keyboard_module, 'restore_terminal_echo', restore)
+    failures = [error for error in errors if error is not None]
+    with pytest.raises(type(failures[0])) as caught:
+        keyboard.stop()
+    assert caught.value is failures[0]
+    assert calls == [0, 1, 2]
+    assert keyboard.saved_termios is (saved if errors[2] else None)
+    assert keyboard.listener is listener
+    assert state.estop_request == (KeyboardInterrupt in error_types)
+    reported = [record.exc_info[1] for record in resource_logs.records if record.exc_info]
+    assert reported == failures[1:]
+    assert ('listener remains active' in resource_logs.text) == alive
+
+
+def test_keyboard_stop_without_started_listener_restores_terminal(monkeypatch):
+    keyboard = Keyboard()
+    keyboard.saved_termios = saved = object()
+    keyboard.listener = SimpleNamespace(ident=None, stop=lambda: None, is_alive=lambda: False,
+                                        join=lambda **kw: pytest.fail('unstarted listener join'))
+    restored = []
+    monkeypatch.setattr('dexmani_real.runtime.keyboard.restore_terminal_echo', restored.append)
+    keyboard.stop()
+    assert restored == [saved] and keyboard.saved_termios is None
+
+
 def test_busy_press_requires_release_and_new_press():
     keyboard = Keyboard()
     keyboard.active = True
@@ -123,6 +188,101 @@ def model_session():
     session.summary = {'termination_reason': None}
     session.save_results = lambda: None
     return session
+
+
+@pytest.mark.parametrize('prior_failure', [None, 'robot', 'recording', 'model'])
+@pytest.mark.parametrize('audio_error_type', [OSError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize('initial_reason', [None, 'startup_cancelled'])
+def test_policy_audio_cleanup_only_ordinary_errors_are_optional(
+    model_session, resource_logs, prior_failure, audio_error_type, initial_reason,
+):
+    session = model_session
+    session.summary['termination_reason'] = initial_reason
+    session.model = None
+    primary = OSError('primary failure')
+    audio_error = audio_error_type('audio close failed')
+    calls = []
+    def fail():
+        raise primary
+    if prior_failure == 'robot':
+        session.robot = SimpleNamespace(close=fail)
+    elif prior_failure == 'recording':
+        session.episode = SimpleNamespace(finish_recording=fail)
+    elif prior_failure == 'model':
+        future = Future()
+        future.set_exception(primary)
+        session.model = SimpleNamespace(close=lambda: future)
+    def close_audio():
+        calls.append('audio')
+        raise audio_error
+    def save_results():
+        if audio_error_type is KeyboardInterrupt:
+            assert session.runtime_state.estop_request
+        calls.append('results')
+    session.audio = SimpleNamespace(close=close_audio)
+    session.save_results = save_results
+    fatal_audio = audio_error_type is not OSError
+    assert session.close() == int(prior_failure is not None or fatal_audio)
+    assert calls == ['audio', 'results']
+    assert len(session.errors) == int(prior_failure is not None) + int(fatal_audio)
+    if prior_failure is not None:
+        assert session.errors[0]['message'] == 'primary failure'
+    reports = [record for record in resource_logs.records if record.exc_info and record.exc_info[1] is audio_error]
+    assert len(reports) == 1
+    assert reports[0].levelname == ('ERROR' if fatal_audio else 'WARNING')
+    assert session.runtime_state.estop_request == (audio_error_type is KeyboardInterrupt)
+    assert session.summary['termination_reason'] == (
+        'estop' if audio_error_type is KeyboardInterrupt
+        else 'failed' if prior_failure is not None or fatal_audio else initial_reason or 'quit'
+    )
+
+
+def test_policy_clean_close_preserves_startup_cancellation(model_session):
+    model_session.model = None
+    model_session.summary['termination_reason'] = 'startup_cancelled'
+    assert model_session.close() == 0
+    assert model_session.summary['termination_reason'] == 'startup_cancelled'
+
+
+@pytest.mark.parametrize('alive', [False, True])
+def test_audio_close_cancels_pending_and_reports_actual_thread_state(alive, resource_logs):
+    import threading
+    from dexmani_real.teleop.audio import AudioFeedback
+    audio = AudioFeedback.__new__(AudioFeedback)
+    audio.condition = threading.Condition()
+    audio.closed, audio.pending = False, object()
+    waits = []
+    def join(timeout):
+        assert audio.closed and audio.pending is None
+        waits.append(timeout)
+    worker = audio.worker = SimpleNamespace(join=join, is_alive=lambda: alive)
+    if alive:
+        with pytest.raises(TimeoutError, match='still active'):
+            audio.close()
+    else:
+        audio.close()
+    assert waits == [1.0] and audio.worker is worker
+    # 关闭错误交给运行入口报告，此处不重复 warning。
+    assert not resource_logs.records
+
+
+def test_audio_cancel_kills_and_reaps_player(monkeypatch):
+    import threading
+    from dexmani_real.teleop import audio as audio_module
+    audio = audio_module.AudioFeedback.__new__(audio_module.AudioFeedback)
+    audio.condition, audio.player, audio.closed = threading.Condition(), 'aplay', True
+    calls = []
+    player = SimpleNamespace(returncode=None)
+    player.poll = lambda: player.returncode
+    player.kill = lambda: calls.append('kill')
+    def communicate(timeout):
+        calls.append(('reap', timeout))
+        player.returncode = -signal.SIGKILL
+        return None, b''
+    player.communicate = communicate
+    monkeypatch.setattr(audio_module.subprocess, 'Popen', lambda *a, **kw: player)
+    audio.play_one('unused.wav')
+    assert calls == ['kill', ('reap', .5)] and player.returncode == -signal.SIGKILL
 
 
 @pytest.mark.parametrize('task_type,close_type', [
@@ -426,6 +586,53 @@ def test_sensor_cleanup_call_errors_are_reported(failed_call):
     assert workers.processes == ([] if failed_call == 'join' else [process])
 
 
+def test_sensor_shutdown_latches_later_interrupt_and_continues(resource_logs):
+    from dexmani_real.runtime.lifecycle import SensorWorkers
+    state = SessionState()
+    workers = SensorWorkers()
+    failure, interrupted = OSError('join failed'), KeyboardInterrupt('join interrupted')
+    def fail_join(**kw):
+        raise failure
+    def interrupt_join(**kw):
+        raise interrupted
+    calls = []
+    def final_join(**kw):
+        assert state.estop_request and state.stop_signal.is_set()
+        calls.append('last')
+    pending = SimpleNamespace(name='camera', pid=1, exitcode=None, join=fail_join)
+    exited = SimpleNamespace(name='vr', pid=2, exitcode=0, join=interrupt_join)
+    last = SimpleNamespace(name='other', pid=3, exitcode=0, join=final_join, is_alive=lambda: False)
+    workers.processes = [pending, exited, last]
+    with pytest.raises(OSError) as caught:
+        workers.shutdown(state)
+    assert caught.value is failure and calls == ['last']
+    assert workers.processes == [pending]
+    assert [record.exc_info[1] for record in resource_logs.records if record.exc_info] == [interrupted]
+
+
+def test_close_runtime_keeps_order_and_latches_interrupt_before_next_resource(resource_logs):
+    from dexmani_real.runtime.lifecycle import close_runtime
+    state = SessionState()
+    calls = []
+    failure, interrupted = OSError('robot failed'), KeyboardInterrupt('keyboard interrupted')
+    def close_robot():
+        assert state.stop_signal.is_set()
+        calls.append('robot')
+        raise failure
+    def stop_keyboard():
+        calls.append('keyboard')
+        raise interrupted
+    def shutdown_sensors(runtime_state):
+        assert runtime_state is state and state.estop_request
+        calls.append('sensors')
+    with pytest.raises(OSError) as caught:
+        close_runtime(state, SimpleNamespace(close=close_robot),
+                      keyboard=SimpleNamespace(stop=stop_keyboard),
+                      sensors=SimpleNamespace(shutdown=shutdown_sensors))
+    assert caught.value is failure and calls == ['robot', 'keyboard', 'sensors']
+    assert [record.exc_info[1] for record in resource_logs.records if record.exc_info] == [interrupted]
+
+
 @pytest.mark.parametrize('prior_result', ['session', 'stop', 'estop'])
 def test_sensor_recovery_preserves_policy_failure(prior_result):
     from dexmani_real.deployment.session import PolicySession
@@ -571,9 +778,13 @@ def test_poll_waits_for_fast_stop_and_returns_consistent_snapshot():
     ('vr', 's', 0), ('vr', 'c', 0), ('vr', 'd', 0), ('vr', 'q', 0), ('vr', 'esc', 1),
     ('connect', None, 1), ('running', 's', 1), ('cleanup', None, 1), ('idle', 'esc', 1),
     ('normal', None, 0), ('recorded', None, 0), ('no_quit', None, 1),
-    ('recording_cleanup', None, 1), ('audio_cleanup', None, 1),
+    ('recording_cleanup', None, 1), ('audio_cleanup', None, 0),
+    ('audio_interrupt', None, 1), ('audio_system_exit', None, 1),
+    ('running_audio_cleanup', None, 1), ('recording_audio_cleanup', None, 1),
 ])
-def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_code, published_camera):
+def test_teleop_startup_cancel_has_one_exit_path(
+    monkeypatch, tmp_path, stage, key, exit_code, published_camera, resource_logs,
+):
     import threading
 
     import numpy as np
@@ -582,6 +793,7 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
     from dexmani_real.robot.commands import OperationCancelled
     from dexmani_real.teleop import run
 
+    monkeypatch.setattr(run, 'configure_logging', lambda: None)
     keyboards, closed, sounds = [], [], []
     def start_keyboard(self):
         keyboards.append(self)
@@ -625,7 +837,9 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
     published_camera.is_running = SimpleNamespace(value=True)
     published_camera.vr_ring = SimpleNamespace(latest_sequence=1)
     monkeypatch.setattr(run, 'SensorChannels', lambda *a, **kw: published_camera)
-    monkeypatch.setattr('dexmani_real.ipc.sensors.load_optional_camera_extrinsics', lambda *a: None)
+    calibration = tmp_path / 'cameras.json'
+    calibration.write_text('{"other-camera": {}}')
+    monkeypatch.setattr('dexmani_real.utils.camera_calibrate.extrinsics.CAMERAS_PATH', calibration)
     monkeypatch.setattr(run, 'Robot', Robot)
     monkeypatch.setattr(run, 'load_vr_transform', lambda path: np.eye(3))
     monkeypatch.setattr(run.ActionMapper, 'for_mode', lambda *a, **kw: None)
@@ -633,12 +847,16 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
     monkeypatch.setattr(run, 'VRController', lambda *args: SimpleNamespace(hand_retargeter=None))
     def close_audio():
         closed.append('audio')
-        if stage == 'audio_cleanup':
+        if stage.endswith('audio_cleanup'):
             raise OSError('audio close failed')
+        if stage == 'audio_interrupt':
+            raise KeyboardInterrupt('audio interrupted')
+        if stage == 'audio_system_exit':
+            raise SystemExit('audio exited')
     monkeypatch.setattr(run, 'AudioFeedback', lambda: SimpleNamespace(play=sounds.append, close=close_audio))
     def finish_recording(self):
         closed.append('recording')
-        if stage == 'recording_cleanup':
+        if stage in {'recording_cleanup', 'recording_audio_cleanup'}:
             raise OSError('recording finish failed')
     monkeypatch.setattr(run.TeleopLoop, 'finish_recording', finish_recording)
     monkeypatch.setattr(run, 'initialize_hand', lambda *args, **kwargs: None)
@@ -648,14 +866,15 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
             self.keyboard.handle_key(key, True)
             run_loop_idle(self)
             return
-        if stage in {'normal', 'recorded', 'cleanup', 'recording_cleanup', 'audio_cleanup'}:
+        if stage in {'normal', 'recorded', 'cleanup', 'recording_cleanup', 'audio_cleanup',
+                     'audio_interrupt', 'audio_system_exit', 'recording_audio_cleanup'}:
             if stage == 'recorded':
                 assert self.camera_snapshot.serial == 'actual-camera'
             self.runtime_state.request_quit()
             return
         if stage == 'no_quit':
             return
-        if stage == 'running':
+        if stage in {'running', 'running_audio_cleanup'}:
             self.runtime_state.request_stop()  # 之前一段的正常 S 不能授权吞掉新故障。
             raise OperationCancelled('unexpected running interruption')
         pytest.fail('cancelled startup entered control')
@@ -663,12 +882,112 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
     result = run.run_teleop(RealConfig(), record=stage == 'recorded', episodes_dir='unused', max_duration_s=1,
                             runtime_config_json=None)
     assert result == exit_code
+    audio_reports = [record for record in resource_logs.records if 'teleop audio cleanup failed' in record.message]
+    if 'audio' in stage:
+        assert len(audio_reports) == 1
+        assert audio_reports[0].levelname == ('WARNING' if stage.endswith('audio_cleanup') else 'ERROR')
+        assert audio_reports[0].exc_info is not None
+    if stage == 'audio_interrupt':
+        assert keyboards[0].estop_callback.__self__.estop_request
     if stage in {'connect', 'running', 'cleanup'} or key == 'esc':
         assert 'emergency' in sounds
     assert 'robot' in closed and 'keyboard' in closed and 'audio' in closed
     assert closed.index('robot') < closed.index('recording') < closed.index('audio')
     if stage == 'vr':
         assert 'vr' in closed
+
+
+@pytest.mark.parametrize('case', [
+    'primary', 'primary_interrupt', 'primary_stop', 'primary_stop_interrupt',
+    'stop', 'finish_interrupt', 'runtime_interrupt',
+])
+def test_teleop_reports_primary_once_and_preserves_cleanup_failures(monkeypatch, resource_logs, case):
+    import numpy as np
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.teleop import run
+    from dexmani_real.teleop.loop import TeleopPhase
+
+    monkeypatch.setattr(run, 'configure_logging', lambda: None)
+    cause = ValueError('original cause')
+    context = ValueError('original context')
+    primary = KeyboardInterrupt('interrupted') if case == 'primary_interrupt' else OSError('failed')
+    cleanup = KeyboardInterrupt('interrupted') if case.endswith('interrupt') else OSError('failed')
+    loops, finishes, closed = [], [], []
+
+    class Robot:
+        def __init__(self, *a, runtime_state, **kw):
+            self.state = runtime_state
+        def connect(self):
+            pass
+        def check(self):
+            pass
+        def stop(self):
+            assert self.state.stop_signal.is_set()
+            if case == 'primary_interrupt':
+                assert self.state.estop_request
+            if case in {'primary_stop', 'primary_stop_interrupt', 'stop'}:
+                raise cleanup
+        def close(self):
+            closed.append('robot')
+            if case == 'runtime_interrupt':
+                raise cleanup
+            if case in {'primary_interrupt', 'primary_stop_interrupt', 'finish_interrupt'}:
+                assert self.state.estop_request
+
+    def stop_keyboard():
+        closed.append('keyboard')
+        if case.endswith('interrupt'):
+            assert loops[0].runtime_state.estop_request
+
+    monkeypatch.setattr(run, 'Robot', Robot)
+    monkeypatch.setattr(run, 'Keyboard', lambda **kw: SimpleNamespace(
+        bindings=kw['bindings'], start=lambda: None, stop=stop_keyboard, check_health=lambda: True,
+    ))
+    monkeypatch.setattr(run, 'SensorChannels', lambda *a, **kw: None)
+    monkeypatch.setattr(run, 'AudioFeedback', lambda: SimpleNamespace(play=lambda sound: None, close=lambda: None))
+    monkeypatch.setattr(run, 'load_vr_transform', lambda path: np.eye(3))
+    monkeypatch.setattr(run.ActionMapper, 'for_mode', lambda *a, **kw: None)
+    monkeypatch.setattr(run, 'build_hand_retargeter', lambda runtime: None)
+    monkeypatch.setattr(run, 'VRController', lambda *a: SimpleNamespace(clear=lambda: None))
+    monkeypatch.setattr(run, 'initialize_teleop', lambda *a, **kw: None)
+
+    def run_loop(self):
+        loops.append(self)
+        def start(epoch):
+            self.phase = TeleopPhase.ACTIVE
+            if case in {'stop', 'finish_interrupt'}:
+                self.request_episode_end('operator')
+        def fail_tick():
+            try:
+                raise context
+            except ValueError:
+                raise primary from cause
+        self.start_episode = start
+        self.service_episode = lambda timeout: case not in {'stop', 'finish_interrupt'}
+        self.run_control_tick = fail_tick
+        self.run_episode(self.runtime_state.cancel_epoch)
+
+    def finish(self):
+        finishes.append((self.pending_termination_reason, list(self.termination_details)))
+        if case == 'finish_interrupt' and len(finishes) == 1:
+            raise cleanup
+
+    monkeypatch.setattr(run.TeleopLoop, 'run', run_loop)
+    monkeypatch.setattr(run.TeleopLoop, 'finish_recording', finish)
+    assert run.run_teleop(RealConfig(), record=False, episodes_dir='unused', max_duration_s=1,
+                          runtime_config_json=None) == 1
+    details = [item for item in loops[0].termination_details if 'exception_type' in item]
+    expected = [cleanup] if case in {'stop', 'finish_interrupt'} else [primary]
+    if case in {'primary_stop', 'primary_stop_interrupt', 'runtime_interrupt'}:
+        expected.append(cleanup)
+    assert len(details) == len(expected)
+    reports = [record.exc_info[1] for record in resource_logs.records if record.exc_info]
+    assert len(reports) == len(expected)
+    assert all(sum(error is reported for reported in reports) == 1 for error in expected)
+    if primary in expected:
+        assert primary.__cause__ is cause and primary.__context__ is context
+    assert finishes[-1] == ('failed', loops[0].termination_details)
+    assert closed == ['robot', 'keyboard']
 
 
 def test_policy_does_not_treat_internal_stop_as_startup_cancel():
@@ -835,7 +1154,11 @@ def test_keyboard_events_keep_order_and_deduplicate_presses():
 
 
 @pytest.mark.parametrize('extrinsics', [False, True])
-def test_policy_camera_startup_uses_snapshot_interface(monkeypatch, tmp_path, published_camera, extrinsics):
+@pytest.mark.parametrize('record_raw', [False, True])
+@pytest.mark.parametrize('calibration_state', ['valid', 'missing_file', 'missing_serial'])
+def test_policy_camera_startup_uses_snapshot_interface(
+    monkeypatch, tmp_path, published_camera, extrinsics, record_raw, calibration_state,
+):
     import json
     import numpy as np
     from dexmani_real.config.real import RealConfig
@@ -843,15 +1166,18 @@ def test_policy_camera_startup_uses_snapshot_interface(monkeypatch, tmp_path, pu
     from dexmani_real.runtime.observation import ObservationNeeds
 
     calibration = tmp_path / 'camera.json'
-    calibration.write_text(json.dumps({'actual-camera': {'T_base_from_camera': np.eye(4).tolist()}}))
+    if calibration_state != 'missing_file':
+        serial = 'other-camera' if calibration_state == 'missing_serial' else 'actual-camera'
+        calibration.write_text(json.dumps({serial: {'T_base_from_camera': np.eye(4).tolist()}}))
+    monkeypatch.setattr('dexmani_real.utils.camera_calibrate.extrinsics.CAMERAS_PATH', calibration)
     session = deployment.PolicySession.__new__(deployment.PolicySession)
     session.runtime = RealConfig()
     session.runtime_state = SessionState()
     session.startup_cancel_epoch = session.runtime_state.cancel_epoch
     session.capture_needs = ObservationNeeds(camera_fields=('rgb',))
-    session.record_raw = False
+    session.record_raw = record_raw
     session.info = SimpleNamespace(observation_fields=('camera_extrinsic',) if extrinsics else ())
-    session.camera_calibration_path = calibration
+    session.camera_calibration_path = None
     configured, started = [], []
     session.observations = SimpleNamespace(camera_static=True, configure_camera=configured.append)
     session.check_startup = lambda: None
@@ -864,11 +1190,18 @@ def test_policy_camera_startup_uses_snapshot_interface(monkeypatch, tmp_path, pu
     session.process_context = SimpleNamespace(Process=lambda **kw: SimpleNamespace(**kw))
     session.run_config, session.output_dir = {}, tmp_path
     monkeypatch.setattr(deployment, 'initialize_hand', lambda *a, **kw: None)
+    if extrinsics and calibration_state != 'valid':
+        with pytest.raises(FileNotFoundError if calibration_state == 'missing_file' else KeyError):
+            session.start_devices()
+        assert started == ['camera'] and not configured
+        return
     session.start_devices()
     assert started == ['camera']
     assert configured == [session.camera_snapshot]
     assert session.run_config['effective_camera']['camera_serial'] == 'actual-camera'
-    assert (session.camera_snapshot.T_xarm_base_from_color is not None) == extrinsics
+    assert (session.camera_snapshot.T_xarm_base_from_color is not None) == (
+        calibration_state == 'valid' and (extrinsics or record_raw)
+    )
 
 
 @pytest.mark.parametrize('commands,selected', [

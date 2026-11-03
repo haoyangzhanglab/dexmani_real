@@ -42,7 +42,6 @@ class ArmProcess:
         self.pipe, self.child_pipe = self.ctx.Pipe()
         self.process: BaseProcess | None = None
         self.reply_pending = False
-        self.close_deadline: float | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -230,12 +229,10 @@ class ArmProcess:
     def close(self) -> None:
         self.request_stop()
         self.io.closing.set()
-        if self.close_deadline is None:
-            self.close_deadline = time.monotonic() + EXECUTOR_TIMEOUT_S
         errors: list[BaseException] = []
         if self.process is not None and self.process.pid is not None:
             try:
-                self.process.join(max(0.0, self.close_deadline - time.monotonic()))
+                self.process.join(EXECUTOR_TIMEOUT_S)
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()

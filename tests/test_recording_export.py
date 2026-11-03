@@ -290,25 +290,42 @@ def test_policy_export_still_rejects_invalid_numeric_rows(raw_episode, tmp_path,
     assert not target.exists()
 
 
-def test_writer_partial_start_failure_is_closed_and_retained(monkeypatch, tmp_path):
+@pytest.mark.parametrize('close_failure', [False, True])
+def test_writer_partial_start_failure_is_closed_and_retained(monkeypatch, tmp_path, caplog, close_failure):
+    import logging
+    monkeypatch.setattr(logging.getLogger('dexmani_real'), 'handlers', [])
+    monkeypatch.setattr(logging.getLogger('dexmani_real'), 'propagate', True)
     closed = []
+    cause = ValueError('invalid metadata')
+    failure = OSError('disk failed')
+    cleanup_failure = OSError('disk failed')
     class Writer:
         frame_count = 0
         def __init__(self, *args, **kwargs):
             pass
         def open(self, metadata):
-            raise OSError('disk failed')
+            raise failure from cause
         def close(self):
             closed.append(True)
+            if close_failure:
+                raise cleanup_failure
     monkeypatch.setattr(recording, 'RawWriter', Writer)
     recorder = recording.EpisodeRecorder(tmp_path, control_hz=16)
-    with pytest.raises(recording.RecordingError, match='disk failed'):
+    with pytest.raises(recording.RecordingError, match='disk failed') as caught:
         recorder.start(task_label='test', collection_source='teleop', metadata={})
+    assert caught.value.__cause__ is failure
+    assert failure.__cause__ is cause
     with pytest.raises(recording.RecordingError, match='disk failed'):
         recorder.finish(save=True, reason='failed')
     assert closed == [True]
     assert not recorder.writer_pending
     assert recorder.staging_path.is_dir()
+    assert recorder.result()['status'] == 'failed'
+    reports = [record for record in caplog.records if record.exc_info]
+    assert len(reports) == int(close_failure)
+    if close_failure:
+        assert reports[0].getMessage() == 'writer_close also failed'
+        assert reports[0].exc_info[1] is cleanup_failure
 
 
 @pytest.mark.parametrize('images', [1, 3])
@@ -721,6 +738,55 @@ def teleop_recording(tmp_path):
             recorder.finish(save=False, reason='test_cleanup')
 
 
+@pytest.mark.parametrize('runtime_config_json', [None, '{"collection": {"enabled": true}, "note": "实验"}'])
+def test_teleop_start_archives_optional_config_in_real_hdf5(monkeypatch, tmp_path, runtime_config_json):
+    import h5py
+    from scipy.spatial.transform import Rotation
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.data.raw import decode_camera_metadata
+    from dexmani_real.runtime.state import RunEndReason, SessionState
+    from dexmani_real.teleop import loop as teleop
+
+    metadata = raw_metadata()
+    del metadata['camera_T_xarm_base_from_color']
+    loop = teleop.TeleopLoop(
+        SessionState(), RealConfig(),
+        SimpleNamespace(prepare_streaming=lambda epoch: None, service_feedback=lambda: None,
+                        hand=SimpleNamespace(get_tactile_reset_metadata=lambda: {})),
+        task_label='test', sensors=SimpleNamespace(channels=None),
+        controller=SimpleNamespace(rotation=Rotation.identity(), hand_retargeter=None),
+        recording_dir=tmp_path, max_duration_s=60, runtime_config_json=runtime_config_json,
+        keyboard=None, audio=SimpleNamespace(play=lambda sound: None),
+        camera_snapshot=decode_camera_metadata(metadata),
+    )
+    frames = list(raw_frames())
+    monkeypatch.setattr(teleop, 'read_observation', lambda *a, **kw: frames[0][0])
+    monkeypatch.setattr(loop, 'preparation_interrupted', lambda: False)
+    monkeypatch.setattr(loop, 'admit_observation', lambda row: [])
+    monkeypatch.setattr(loop, 'recording_issue', lambda row: None)
+    monkeypatch.setattr(loop, 'try_begin', lambda row: None)
+    try:
+        loop.start_episode(loop.runtime_state.cancel_epoch)
+        recorder = loop.recorder
+        assert recorder.is_recording
+        for row, command in frames:
+            recorder.append(row, command)
+        loop.request_episode_end('stop', run_end_reason=RunEndReason.OPERATOR)
+        loop.finish_recording()
+        with h5py.File(recorder.published_path / 'data.h5', 'r') as data:
+            attrs = data['meta'].attrs
+            assert ('runtime_config_json' in attrs) == (runtime_config_json is not None)
+            if runtime_config_json is not None:
+                assert attrs['runtime_config_json'] == runtime_config_json
+            assert 'camera_T_xarm_base_from_color' not in attrs
+            np.testing.assert_array_equal(attrs['vr_to_robot_rotation'], np.eye(3))
+            assert attrs['termination_reason'] == 'operator'
+            assert data['depth'].shape[0] == len(frames)
+    finally:
+        if loop.recorder is not None:
+            loop.recorder.finish(save=False, reason='test_cleanup')
+
+
 @pytest.mark.parametrize('case', ['save', 'discard', 'empty', 'truncated', 'cancelled', 'estop'])
 def test_teleop_real_recording_finish_sounds(teleop_recording, case):
     from dexmani_real.data.raw import RawReader
@@ -774,12 +840,15 @@ def test_teleop_episode_error_propagates_before_prefix_publish(teleop_recording,
     assert caught.value is failure
     assert loop.phase is TeleopPhase.IDLE and loop.recorder is recorder
     assert recorder.published_path is None and recorder.writer_pending
+    assert not any('exception_type' in detail for detail in loop.termination_details)
+    # 模拟 run_teleop 的主错误登记边界，再执行会话录制收尾。
+    loop.record_error('session', caught.value)
     loop.finish_recording()
     assert loop.recorder is None and not recorder.writer_pending
     with RawReader(recorder.published_path) as reader:
         assert reader.num_frames == 3 and reader.meta['termination_reason'] == 'failed'
         validate_export_episode(reader)
-    assert any(detail.get('message') == 'mapping failed' for detail in loop.termination_details)
+    assert sum(detail.get('message') == 'mapping failed' for detail in loop.termination_details) == 1
     assert 'emergency' in sounds and 'save' not in sounds and 'discard' not in sounds
 
 
@@ -799,9 +868,10 @@ def test_teleop_stop_error_defers_prefix_publish(teleop_recording):
         loop.end_episode()
     assert caught.value is failure
     assert loop.recorder is recorder and recorder.writer_pending
+    loop.record_error('session', caught.value)
     loop.finish_recording()
     with RawReader(recorder.published_path) as reader:
-        assert reader.num_frames == 3
+        assert reader.num_frames == 3 and reader.meta['termination_reason'] == 'failed'
         validate_export_episode(reader)
     assert 'emergency' in sounds and 'save' not in sounds and 'discard' not in sounds
 
@@ -818,8 +888,9 @@ def test_teleop_writer_error_retains_staging(teleop_recording, monkeypatch):
         close()
         raise OSError('writer close failed')
     monkeypatch.setattr(recorder.writer, 'close', fail_close)
-    with pytest.raises(recording.RecordingError, match='writer close failed'):
+    with pytest.raises(recording.RecordingError, match='writer close failed') as caught:
         loop.end_episode()
+    loop.record_error('session', caught.value)
     assert loop.recorder is recorder and not recorder.writer_pending
     assert recorder.published_path is None and recorder.staging_path.is_dir()
     with pytest.raises(recording.RecordingError, match='writer close failed'):

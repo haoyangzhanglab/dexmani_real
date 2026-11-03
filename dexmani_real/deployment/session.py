@@ -269,16 +269,20 @@ class PolicySession:
         if self.audio is not None:
             try:
                 self.audio.close()
+            except Exception:
+                logger.warning("policy audio close failed", exc_info=True)
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
                 logger.exception("policy audio close failed")
                 self.errors.append(error_detail("audio_close", exc))
         failed = bool(self.errors or self.runtime_state.estop_request)
-        if self.summary["termination_reason"] is None:
-            self.summary["termination_reason"] = (
-                "estop" if self.runtime_state.estop_request else "failed" if failed else "quit"
-            )
+        if self.runtime_state.estop_request:
+            self.summary["termination_reason"] = "estop"
+        elif failed:
+            self.summary["termination_reason"] = "failed"
+        elif self.summary["termination_reason"] is None:
+            self.summary["termination_reason"] = "quit"
         self.summary["ended_utc"] = utc_now()
         try:
             self.save_results()

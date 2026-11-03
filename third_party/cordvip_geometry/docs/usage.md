@@ -56,7 +56,7 @@ python scripts/cordvip/track_object.py \
   --with-hand --output /tmp/cordvip/scene_001
 ```
 
-首帧冻结后人工确认候选，或省略 prompt 手画 mask。选择保存为 `initial_selections/<id>/`。复用时，`source_rgbd.npz` 中的 RGB、米制深度、内参、畸变模型与系数、时间戳、时钟和行号必须与实际首帧逐项精确相等。含路径的 `source_id` 仅作来源说明；Raw 搬迁后绑定数据相同即可直接复用已确认 mask，无须迁移选择文件。mask 文件仍须位于选择目录内，始终属于原始 RGB 网格，由 tracker 统一去畸变一次。
+首帧冻结后人工确认候选，或省略 prompt 手画 mask。选择保存为 `initial_selections/<id>/`。复用时，`source_rgbd.npz` 中的 RGB、米制深度、内参、畸变模型与系数必须与实际首帧逐项精确相等。`source_id`、时间戳、时钟和行号仅作来源说明，允许两个有效帧的这些信息不同；复用不改写已有选择文件及来源元数据。mask 文件仍须位于选择目录内，始终属于原始 RGB 网格，由 tracker 统一去畸变一次。
 
 多物体通过场景文件声明，路径相对 workspace：
 

@@ -51,7 +51,7 @@ def run_teleop(
     vr_transform_path=VR_TRANSFORM_PATH,
     camera_calibration_path=None,
 ) -> int:
-    """装配遥操作资源，运行并按原保存意图完成收尾。"""
+    """装配遥操作资源并收尾；runtime_config_json 为 None 时不归档配置属性。"""
     configure_logging()
     validate_robot_config(runtime)
     runtime.environment.validate()
@@ -205,6 +205,8 @@ def run_teleop(
         if audio is not None:
             try:
                 audio.close()
+            except Exception:
+                logger.warning("teleop audio cleanup failed", exc_info=True)
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     runtime_state.request_emergency_stop()

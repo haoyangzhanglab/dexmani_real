@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         max_duration_s=args.max_duration,
         runtime_config_json=runtime_config_json,
         task_name=args.task_name,
-        vr_transform_path=args.vr_transform or VR_TRANSFORM_PATH,
+        vr_transform_path=VR_TRANSFORM_PATH if args.vr_transform is None else args.vr_transform,
         camera_calibration_path=args.camera_calibration,
     )
 

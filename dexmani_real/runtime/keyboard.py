@@ -7,7 +7,6 @@ import sys
 import termios
 import threading
 from collections import deque
-from collections.abc import Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -162,31 +161,38 @@ class Keyboard:
             self.events.clear()
             self.held_keys.clear()
             self.condition.notify_all()
-        saved = self.saved_termios
-
-        def restore():
-            restore_terminal_echo(saved)
-            self.saved_termios = None
         failure = None
-        steps: list[Callable[[], None]] = []
-        if self.listener is not None:
-            steps.append(self.listener.stop)
-            if self.listener.ident is not None:
-                steps.append(lambda: self.listener.join(timeout=LISTENER_STOP_TIMEOUT_S))
-        steps.append(restore)
-        for step in steps:
+        try:
+            if self.listener is not None:
+                try:
+                    self.listener.stop()
+                except BaseException as exc:
+                    failure = exc
+                    if isinstance(exc, KeyboardInterrupt) and self.estop_callback is not None:
+                        self.estop_callback()
+                finally:
+                    try:
+                        if self.listener.ident is not None:
+                            self.listener.join(timeout=LISTENER_STOP_TIMEOUT_S)
+                    except BaseException as exc:
+                        if isinstance(exc, KeyboardInterrupt) and self.estop_callback is not None:
+                            self.estop_callback()
+                        if failure is None:
+                            failure = exc
+                        else:
+                            logger.exception("keyboard listener join also failed")
+        finally:
             try:
-                step()
+                restore_terminal_echo(self.saved_termios)
             except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt) and self.estop_callback is not None:
+                    self.estop_callback()
                 if failure is None:
                     failure = exc
                 else:
-                    logger.exception("additional keyboard shutdown failure")
-                if isinstance(exc, KeyboardInterrupt) and self.estop_callback is not None:
-                    try:
-                        self.estop_callback()
-                    except BaseException:
-                        logger.exception("keyboard shutdown emergency callback failed")
+                    logger.exception("keyboard terminal restore also failed")
+            else:
+                self.saved_termios = None
         if self.listener is not None and self.listener.is_alive():
             pending = TimeoutError("keyboard listener remains active after join")
             if failure is None:

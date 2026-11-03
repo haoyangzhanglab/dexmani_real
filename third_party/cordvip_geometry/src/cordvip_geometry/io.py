@@ -103,7 +103,7 @@ def write_confirmed_selection(
 
 
 def load_initial_selection(directory, frame):
-    """按 RGB-D、几何、行与时钟精确复用已确认 mask；source_id 仅作来源说明。"""
+    """按 RGB-D 与相机几何复用已确认 mask；来源标识、行号和时钟仅作说明。"""
     import numpy as np
 
     from .rgbd import load_frame
@@ -126,9 +126,6 @@ def load_initial_selection(directory, frame):
         "K",
         "distortion_model",
         "distortion_coeffs",
-        "timestamp_ns",
-        "clock",
-        "row_index",
     ):
         if not np.array_equal(getattr(saved, key), getattr(frame, key)):
             raise ValueError(

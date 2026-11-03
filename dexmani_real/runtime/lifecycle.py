@@ -67,14 +67,14 @@ class SensorWorkers:
                 if process.pid is None:
                     continue
                 process.join(timeout=max(0.0, deadline - time.monotonic()))
-                escalation = "graceful"
+                terminated = killed = False
                 if process.is_alive():
-                    escalation = "terminate"
                     process.terminate()
+                    terminated = True
                     process.join(timeout=WORKER_STOP_TIMEOUT_S)
                 if process.is_alive():
-                    escalation = "kill"
                     process.kill()
+                    killed = True
                     process.join(timeout=WORKER_STOP_TIMEOUT_S)
                 exitcode = process.exitcode
                 if exitcode is None:
@@ -83,28 +83,16 @@ class SensorWorkers:
                     continue
                 # 升级 kill 后，退出仍可能由先前尝试的 SIGTERM 引起。
                 if not (
-                    escalation != "graceful" and exitcode == -signal.SIGTERM
-                    or escalation == "kill" and exitcode == -signal.SIGKILL
+                    terminated and exitcode == -signal.SIGTERM
+                    or killed and exitcode == -signal.SIGKILL
                 ):
-                    raise RuntimeError(f"worker {process.name}: exitcode={exitcode}, {escalation}")
-                logger.warning(
-                    "worker %s stopped: exitcode=%s escalation=%s",
-                    process.name,
-                    exitcode,
-                    escalation,
-                )
+                    raise RuntimeError(f"worker {process.name}: exitcode={exitcode}")
+                logger.warning("worker %s terminated during shutdown: exitcode=%s", process.name, exitcode)
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     runtime_state.request_emergency_stop()
                 errors.append((process.name, exc))
-                try:
-                    pending = process.pid is not None and process.exitcode is None
-                except BaseException as status_error:
-                    if isinstance(status_error, KeyboardInterrupt):
-                        runtime_state.request_emergency_stop()
-                    errors.append((process.name, status_error))
-                    pending = True
-                if pending:
+                if process.pid is not None and process.exitcode is None:
                     unresolved.append(process)
         self.processes = unresolved
         if errors:

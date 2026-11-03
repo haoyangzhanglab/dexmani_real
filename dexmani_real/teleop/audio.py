@@ -58,7 +58,7 @@ class AudioFeedback:
         if self.worker is not None:
             self.worker.join(timeout=1.0)
             if self.worker.is_alive():
-                logger.warning("Audio worker still exiting after 1s")
+                raise TimeoutError("Audio worker still active after 1s; thread handle retained")
 
     def run(self):
         while True:
