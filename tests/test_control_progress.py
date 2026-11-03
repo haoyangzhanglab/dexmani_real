@@ -25,7 +25,7 @@ def make_rollout(monkeypatch, *, mode='sync', history=1):
                       observations=SimpleNamespace(project=lambda row: row),
                       control_needs=ObservationNeeds(), record_needs=ObservationNeeds(),
                       sensors=None, action_mapper=None,
-                      model=SimpleNamespace(poll=lambda: None, predict=lambda *a, **kw: None),
+                      model=SimpleNamespace(future=None, poll=lambda: None, predict=lambda *a, **kw: None),
                       max_running_s=None, index=1, output_dir='/tmp', record_raw=False,
                       audio=SimpleNamespace(play=lambda sound: None), keyboard=None)
     rollout.started_ns = rollout.next_step_ns = clock[0]
@@ -43,7 +43,7 @@ def make_rollout(monkeypatch, *, mode='sync', history=1):
 
 def test_slow_sync_mapping_submits_and_advances(monkeypatch):
     rollout, clock, sends = make_rollout(monkeypatch)
-    rollout.query = Prediction(0, None, np.zeros((4, 19)))
+    rollout.sync_actions = np.zeros((4, 19))
 
     def map_slow(action, row):
         clock[0] += 63_000_000
@@ -54,7 +54,7 @@ def test_slow_sync_mapping_submits_and_advances(monkeypatch):
         clock[0] = max(clock[0], rollout.next_step_ns)
         rollout.step()
     assert len(sends) == 4
-    assert rollout.last_slot == 3
+    assert rollout.sync_cursor == 4
     assert np.diff(sends).tolist() == [63_000_000] * 3
 
 
@@ -101,7 +101,7 @@ def test_fault_closes_robot_before_slow_resources(monkeypatch):
     order = []
     rollout.runtime_state.quit_requested = False
     rollout.runtime_state.estop_request = False
-    rollout.runtime_state.revoke_motion = lambda **kw: kw['reason']
+    rollout.runtime_state.revoke_motion = lambda **kw: None
     rollout.robot.stop = lambda: order.append('stop')
     rollout.robot.close = lambda: order.append('robot_close')
     rollout.prepare = lambda poll: (_ for _ in ()).throw(ValueError('prepare failed'))
@@ -145,7 +145,7 @@ def test_stop_failure_survives_successful_close(monkeypatch):
     order = []
     rollout.runtime_state.quit_requested = False
     rollout.runtime_state.estop_request = False
-    rollout.runtime_state.revoke_motion = lambda **kw: kw['reason']
+    rollout.runtime_state.revoke_motion = lambda **kw: None
     def failed_stop():
         order.append('stop')
         raise RuntimeError('stop failed')
@@ -168,7 +168,7 @@ def test_archive_source_loss_freezes_recording_while_control_continues(monkeypat
     rollout.recorder.is_recording = True
     rollout.record_needs = ObservationNeeds(camera_fields=('rgb', 'depth'))
     rollout.sensors = SimpleNamespace(check=lambda **kwargs: available[0] or loss != "worker_exit")
-    rollout.query = Prediction(0, None, np.zeros((4, 19)))
+    rollout.sync_actions = np.zeros((4, 19))
     observe = rollout.read_observation
     available = [True]
     def read():
@@ -188,35 +188,12 @@ def test_archive_source_loss_freezes_recording_while_control_continues(monkeypat
         clock[0] = max(clock[0], rollout.next_step_ns)
         rollout.step()
     assert len(sends) == 3
-    assert rollout.recorder.submitted_frames == 1
+    assert rollout.recorder.queue.qsize() == 1
     assert rollout.recorder.recording_truncated_reason == {
         'missing': 'camera_source_unavailable_or_unmatched', 'stale': 'camera_source_stale',
         'worker_exit': 'recording_camera_exited',
     }[loss]
     assert rollout.recorder.finish_request is None
-
-
-@pytest.mark.parametrize('stop_fails', [False, True])
-def test_replay_propagates_primary_failure_and_retains_stop_failure(monkeypatch, stop_fails):
-    from dexmani_real.replay import joint_replay
-    from dexmani_real.runtime.state import SessionState
-    monkeypatch.setattr(joint_replay.ActionMapper, 'for_mode', lambda *a, **kw: None)
-    primary = ValueError('device feedback failed')
-    cleanup = OSError('stop failed')
-    def stop():
-        if stop_fails:
-            raise cleanup
-    replay = joint_replay.JointReplay(SessionState(), RealConfig(), None,
-                                      robot=SimpleNamespace(stop=stop))
-    def admit(trajectory):
-        raise primary
-    replay.admit_replay = admit
-    trajectory = type('Trajectory', (), {'fps': 16, '__len__': lambda self: 2})()
-    with pytest.raises(ValueError) as caught:
-        replay.run(trajectory, cancel_epoch=1, hand_start_duration_s=0)
-    assert caught.value is primary
-    assert replay.result.errors == ([primary, cleanup] if stop_fails else [primary])
-    assert len(replay.result.replay_data['arm_qpos']) == 0
 
 
 @pytest.mark.parametrize('mapping_ns', [63_000_000, 200_000_000])
@@ -277,7 +254,7 @@ def test_teleop_slow_tick_commits_then_quits_through_episode_cleanup(monkeypatch
                        keyboard=keyboard, audio=SimpleNamespace(play=lambda sound: None))
     keyboard.allow_start()
     keyboard.handle_key('b', True)
-    loop.handle_commands(keyboard.poll(timeout=0))
+    loop.handle_commands(keyboard.poll(state, timeout=0)[0])
     assert order == ['send', 'commit', 'stop', 'close', 'clear']
     assert state.quit_requested and loop.phase is TeleopPhase.IDLE
 
@@ -302,7 +279,7 @@ def test_teleop_final_mapping_failure_freezes_before_invalid_action_row(monkeypa
         rejection_reason='no feasible target', arm_qpos=None))
     loop.execute_control_step(row)
     assert ended == ['target_unavailable: no feasible target']
-    assert loop.recorder.submitted_frames == 1
+    assert loop.recorder.queue.qsize() == 1
     assert loop.recorder.recording_truncated_reason == 'recording_no_command'
     assert loop.recorder.queue.qsize() == 1 and loop.recorder.finish_request is None
 
@@ -326,3 +303,105 @@ def test_close_interrupt_latches_emergency_before_waiting_for_writer(monkeypatch
         rollout.run(poll_operator=lambda: None)
     assert cleanup == ['writer', 'model']
     assert rollout.result.errors[0]['stage'] == 'robot_close'
+
+
+@pytest.mark.parametrize('prediction_ns,mapping_ns', [(600_000_000, 0), (100_000_000, 63_000_000)])
+def test_async_zero_progress_keeps_first_absolute_budget(monkeypatch, prediction_ns, mapping_ns):
+    from concurrent.futures import Future
+    rollout, clock, sends = make_rollout(monkeypatch, mode='async')
+    rollout.runtime_state.revoke_motion = lambda: None
+    rollout.policy_info.future_steps = 8
+    rollout.policy_info.control_action_dim = 19
+    deadline = rollout.wait_deadline_ns
+    pending = [None, None]
+    def predict(*args, **kwargs):
+        pending[:] = [Future(), clock[0] + prediction_ns]
+    def poll():
+        if pending[0] is None or clock[0] < pending[1]:
+            return None
+        future = pending[0]
+        pending[0] = None
+        future.set_result(np.zeros((8, 19)))
+        return future
+    def mapping(*args):
+        clock[0] += mapping_ns
+        return RobotCommand(np.zeros(7)), None
+    rollout.model.predict, rollout.model.poll = predict, poll
+    rollout.map_command = mapping
+    with pytest.raises(TimeoutError, match='budget expired'):
+        for _ in range(4000):
+            rollout.step()
+            clock[0] += 1_000_000
+    assert not sends
+    assert rollout.wait_deadline_ns == deadline
+    assert clock[0] <= deadline + mapping_ns + 1_000_000
+
+
+def test_target_lease_bounds_progress_even_with_plan(monkeypatch):
+    rollout, clock, _ = make_rollout(monkeypatch, mode='async')
+    rollout.wait_deadline_ns = None
+    rollout.target_expires_ns = clock[0]
+    assert rollout.expired_budget() == (clock[0], 'wait')
+    rollout.run_deadline_ns = clock[0]
+    assert rollout.expired_budget() == (clock[0], 'duration')
+
+
+@pytest.mark.parametrize('control_camera', [False, True])
+def test_frozen_recorder_stops_archive_only_reads(monkeypatch, control_camera):
+    rollout, _, _ = make_rollout(monkeypatch)
+    control = ObservationNeeds(camera_fields=('rgb',) if control_camera else ())
+    rollout.control_needs = control
+    rollout.capture_needs = control.union(ObservationNeeds(camera_fields=('rgb', 'depth'), required_tactile=('dense',)))
+    rollout.recorder = SimpleNamespace(is_recording=True)
+    rollout.sensors = SimpleNamespace(channels=None)
+    row, _ = rollout.read_observation()
+    needs = []
+    def read(*args, **kwargs):
+        needs.append(kwargs['needs'])
+        return row
+    monkeypatch.setattr('dexmani_real.deployment.rollout.read_observation', read)
+    monkeypatch.setattr('dexmani_real.deployment.rollout.check_observation', lambda *a, **kw: [])
+    Rollout.read_observation(rollout)
+    rollout.recorder.is_recording = False
+    Rollout.read_observation(rollout)
+    assert needs == [rollout.capture_needs, control]
+
+
+@pytest.mark.parametrize('model_fails', [False, True])
+def test_duration_and_owner_lease_stop_together_preserve_faults(monkeypatch, model_fails):
+    from concurrent.futures import Future
+
+    from dexmani_real.runtime.state import SafetyState, SessionState
+
+    rollout, clock, sends = make_rollout(monkeypatch, mode='async')
+    rollout.runtime_state = state = SessionState(safety_state=SafetyState.RUNNING)
+    rollout.cancel_epoch = state.cancel_epoch
+    state.stop_signal.set()  # owner 已观察到目标租期到期。
+    rollout.robot.check = lambda: None
+    rollout.robot.stop = lambda: None
+    rollout.run_deadline_ns = rollout.target_expires_ns = clock[0]
+    if model_fails:
+        done = Future()
+        done.set_exception(ValueError('model computation failed'))
+        rollout.model.poll = lambda: done
+        with pytest.raises(ValueError, match='model computation failed'):
+            rollout.step()
+    else:
+        rollout.step()
+        assert rollout.result.termination_reason == 'duration_complete'
+    assert not sends
+
+
+def test_operator_cancel_at_duration_still_uses_current_input(monkeypatch):
+    from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.runtime.state import SafetyState, SessionState
+
+    rollout, clock, _ = make_rollout(monkeypatch)
+    rollout.runtime_state = state = SessionState(safety_state=SafetyState.RUNNING)
+    rollout.cancel_epoch = state.cancel_epoch
+    rollout.robot.check = lambda: None
+    rollout.run_deadline_ns = clock[0]
+    state.request_stop()
+    with pytest.raises(OperationCancelled):
+        rollout.step()
+    assert not rollout.finished  # run 的操作者轮询消费终止输入后确定当前段原因。

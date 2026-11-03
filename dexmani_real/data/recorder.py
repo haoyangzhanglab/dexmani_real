@@ -28,7 +28,6 @@ class RecordingError(RuntimeError):
 class _FinishRequest:
     reason: str
     details: tuple[dict, ...]
-    technical_status: str
     recording_truncated_reason: str | None
 
 
@@ -48,7 +47,6 @@ class EpisodeRecorder:
         self.finish_request = None
         self.staging_path: Path | None = None
         self.published_path: Path | None = None
-        self.submitted_frames = 0
         self.writer = None
 
     @property
@@ -62,15 +60,14 @@ class EpisodeRecorder:
     def store_error(self, error, *, stage="recording_cleanup"):
         if self.error is None:
             self.error = error
-        elif error is not self.error:
+        else:
             logger.error("%s also failed", stage, exc_info=(type(error), error, error.__traceback__))
 
     def check_error(self):
         if self.error is not None:
             if not isinstance(self.error, RecordingError):
                 failure = RecordingError(f"Recording failed: {type(self.error).__name__}: {self.error}")
-                failure.__cause__ = self.error
-                self.error = failure
+                raise failure from self.error
             raise self.error
 
     def result(self):
@@ -165,16 +162,15 @@ class EpisodeRecorder:
         except Full:
             self.freeze("recording_queue_full")
             return
-        self.submitted_frames += 1
 
-    def finish(self, *, save, reason, details=None, technical_status="failed"):
+    def finish(self, *, save, reason, details=None):
         """关闭后由监督方发布；首次 finish 建立唯一收尾预算。"""
         if self.finish_request is not None:
             self.check_error()
             return self.published_path
         self.is_recording = False
         self.finish_request = request = _FinishRequest(
-            reason, tuple(dict(item) for item in (details or ())), technical_status,
+            reason, tuple(dict(item) for item in (details or ())),
             self.recording_truncated_reason,
         )
         # START 只报错；外层先停止设备，再由首次 finish 建立等待预算。
@@ -196,7 +192,7 @@ class EpisodeRecorder:
         if self.staging_path is None:
             return None
         try:
-            if save and self.submitted_frames > 0:
+            if save and self.written_frames > 0:
                 destination = self.staging_path.with_name(self.staging_path.name.removeprefix(".tmp_"))
                 publish(self.staging_path, destination)
                 self.published_path, self.staging_path = destination, None
@@ -208,7 +204,7 @@ class EpisodeRecorder:
             else:
                 shutil.rmtree(self.staging_path)
                 self.staging_path = None
-                if self.submitted_frames == 0:
+                if self.written_frames == 0:
                     logger.info("未录到数据，本段未发布。")
         except BaseException as exc:
             self.store_error(exc)
@@ -238,7 +234,6 @@ class EpisodeRecorder:
                     writer.finish(
                         finish.reason,
                         finish.details,
-                        technical_status=finish.technical_status,
                         recording_truncated_reason=finish.recording_truncated_reason,
                     )
                 else:

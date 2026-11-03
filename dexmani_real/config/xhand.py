@@ -90,7 +90,7 @@ class HandConfig:
             value = getattr(self, name)
             if type(value) is not int or value < minimum:
                 raise ValueError(f"hand {name} must be an integer >= {minimum}")
-        self.validate_home_pose()
+        self.validate_limits()
         if len(self.kp) != HAND_DOF or any(
             type(value) is not int or value <= 0 for value in self.kp
         ):
@@ -101,17 +101,11 @@ class HandConfig:
             raise ValueError(
                 "hand tor_max must contain twelve integers in [0, 400] (Mode 3 output scale)"
             )
-        for name in (
-            "feedback_max_age_s",
-            "home_timeout_s",
-            "home_tolerance_deg",
-        ):
-            value = getattr(self, name)
-            if not isfinite(value) or value <= 0:
-                raise ValueError(f"hand {name} must be finite and positive")
+        if not isfinite(self.feedback_max_age_s) or self.feedback_max_age_s <= 0:
+            raise ValueError("hand feedback_max_age_s must be finite and positive")
 
-    def validate_home_pose(self) -> None:
-        """手部禁用时仍须验证规划使用的固定姿态。"""
+    def validate_limits(self) -> None:
+        """实验范围必须包含在硬件额定范围内。"""
         bounds = np.asarray((self.qpos_min_rad, self.qpos_max_rad), dtype=np.float64)
         if bounds.shape != (2, HAND_DOF) or not np.isfinite(bounds).all():
             raise ValueError("hand command limits must each contain 12 finite values")
@@ -120,4 +114,13 @@ class HandConfig:
             raise ValueError("hand command limits must have lower < upper")
         if np.any(lower < XHAND_RATED_QPOS_MIN_RAD) or np.any(upper > XHAND_RATED_QPOS_MAX_RAD):
             raise ValueError("hand command limits exceed the rated device envelope")
-        validate_hand_target(np.deg2rad(self.home_qpos_deg), lower, upper)
+
+    def validate_home_pose(self) -> None:
+        self.validate_limits()
+        validate_hand_target(np.deg2rad(self.home_qpos_deg), self.qpos_min_rad, self.qpos_max_rad)
+
+    def validate_home(self) -> None:
+        self.validate_home_pose()
+        for value in (self.home_timeout_s, self.home_tolerance_deg):
+            if not isfinite(value) or value <= 0:
+                raise ValueError("hand HOME timeout and tolerance must be finite and positive")

@@ -142,7 +142,6 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
         mean_control_period_ns=mean_period,
         max_control_interval_ns=int(np.diff(control).max()) if frames > 1 else None,
         termination_reason=reader.meta.get("termination_reason"),
-        technical_status=reader.meta.get("technical_status"),
         recording_truncated_reason=reader.meta.get("recording_truncated_reason"),
     )
 
@@ -150,11 +149,11 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
     """枚举所有 episode 目录，损坏文件由读取边界直接报错。"""
     requested_path = Path(input_root).expanduser()
-    require_published_raw(requested_path)
     root = requested_path.resolve()
     if not root.is_dir():
         raise NotADirectoryError(root)
     if (root / "data.h5").is_file():
+        require_published_raw(requested_path)
         return (root,)
     episodes = tuple(
         sorted(

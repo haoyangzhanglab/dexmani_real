@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""通过键盘控制 xArm7/XHand，支持回零与点动。"""
+"""通过键盘控制 xArm7/XHand；--no-hand 仅连接机械臂。"""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 from dexmani_real.config.real import load_config
@@ -14,9 +15,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--config", type=Path, default=None, help="Trusted Python experiment file exporting CONFIG: RealConfig"
     )
+    parser.add_argument("--no-hand", action="store_true", help="不连接灵巧手，仅控制机械臂")
     args = parser.parse_args(argv)
 
     runtime = load_config(args.config)
+    if args.no_hand:
+        runtime = replace(runtime, hand=replace(runtime.hand, enabled=False))
 
     from dexmani_real.teleop.keyboard import KeyboardTeleop
     return KeyboardTeleop(runtime).run()

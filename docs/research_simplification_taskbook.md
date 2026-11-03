@@ -4,7 +4,7 @@
 >
 > 整理日期：2026-11-03。审查及撰写时的最新代码：[`0e1a37b40aa1b5dafbe66a604dbd3e65c5424265`](https://github.com/haoyangzhanglab/dexmani_real/commit/0e1a37b40aa1b5dafbe66a604dbd3e65c5424265)。本文汇总该提交之后的两轮审查：整体验收与继续减法、replay 专项审查。
 >
-> 本文替换上一版任务书，作为下一阶段唯一执行依据。上一阶段任务及实施记录保留在 [Git 历史版本](https://github.com/haoyangzhanglab/dexmani_real/blob/0e1a37b40aa1b5dafbe66a604dbd3e65c5424265/docs/research_simplification_taskbook.md)。旧文中 replay 的严格时间槽、发布状态门禁、审计产物和回放后 HOME 会话要求均撤销；旧勾选不代表本轮已经完成。以下实现任务全部从未完成开始。
+> 本文替换上一版任务书，作为下一阶段唯一执行依据。上一阶段任务及实施记录保留在 [Git 历史版本](https://github.com/haoyangzhanglab/dexmani_real/blob/0e1a37b40aa1b5dafbe66a604dbd3e65c5424265/docs/research_simplification_taskbook.md)。旧文中 replay 的严格时间槽、发布状态门禁、审计产物和回放后 HOME 会话要求均撤销；旧勾选不代表本轮已经完成。以下清单已按第二阶段实际实施更新，验证范围见第 8 节。
 
 ## 1. 目标、取舍与范围
 
@@ -90,12 +90,12 @@
 
 主要文件：`deployment/rollout.py`，相关回归见 V01–V03。
 
-- [ ] 保留启动时建立的首发绝对期限，包含已有 history 积累预算；在第一条 `robot.send_action` 正常返回前，不因 submit、新计划、预测完成或过时结果重新预测而更新/清除它。
-- [ ] 删除 `step()` 接受 `new_plan` 就清 `wait_deadline_ns` 的行为。候选通过映射、计划变得非空、Future 完成都不算设备提交成功。
-- [ ] `submit()` 不得覆盖尚未耗尽的无提交预算。需要建立新的预测等待期限时，只能在新的实际进展边界后建立一次，并受已有目标 `expires_ns` 限制；同一无提交阶段只可沿用或缩短。
-- [ ] 成功发送后记录新目标期限，并结束旧等待阶段。将已有 `target_expires_ns` 也纳入主循环的停止预算选择，使“有计划却反复丢弃候选”也有界；不要只依赖下一次无计划 submit 才检查旧目标期限。
-- [ ] 预算检查覆盖模型结果消费、映射之后和实际发送之前；不得让超时后的重提预测绕过预算。复用现有期限字段和 `budget_limit/expired_budget`，不加 watchdog 线程、新计数器或故障状态机。
-- [ ] 保持 async 裁掉过时动作、RTC 严格交接、Future 原错误传播、duration 同时到期优先级和已有目标租期。首发失败应明确结束并收尾，不在无时长上限时永久“忙而不发”。
+- [x] 保留启动时建立的首发绝对期限，包含已有 history 积累预算；在第一条 `robot.send_action` 正常返回前，不因 submit、新计划、预测完成或过时结果重新预测而更新/清除它。
+- [x] 删除 `step()` 接受 `new_plan` 就清 `wait_deadline_ns` 的行为。候选通过映射、计划变得非空、Future 完成都不算设备提交成功。
+- [x] `submit()` 不得覆盖尚未耗尽的无提交预算。需要建立新的预测等待期限时，只能在新的实际进展边界后建立一次，并受已有目标 `expires_ns` 限制；同一无提交阶段只可沿用或缩短。
+- [x] 成功发送后记录新目标期限，并结束旧等待阶段。将已有 `target_expires_ns` 也纳入主循环的停止预算选择，使“有计划却反复丢弃候选”也有界；不要只依赖下一次无计划 submit 才检查旧目标期限。
+- [x] 预算检查覆盖模型结果消费、映射之后和实际发送之前；不得让超时后的重提预测绕过预算。复用现有期限字段和 `budget_limit/expired_budget`，不加 watchdog 线程、新计数器或故障状态机。
+- [x] 保持 async 裁掉过时动作、RTC 严格交接、Future 原错误传播、duration 同时到期优先级和已有目标租期。首发失败应明确结束并收尾，不在无时长上限时永久“忙而不发”。
 
 实现判断标准不是“预测很活跃”，而是有成功目标提交，或在既定预算内带真实原因退出。
 
@@ -105,21 +105,21 @@
 
 **启动取消：**
 
-- [ ] 在启动流程开始、键盘开始接收取消之前捕获一次本地取消值；贯穿资源准备、connect、camera/pointcloud/VR 就绪、手部初始化、模型 load/warmup 等真正的长等待。不要在 S/C/D 之后重新捕获新值，把被取消的启动当成新的启动。
-- [ ] `check_startup`、`wait_model`、各 `may_start` 使用同一取消上下文；取消值改变或 quit/emergency 即离开等待。`requests_allow_motion()` 仅检查 quit/emergency，不能单独充当完整启动取消判断。
-- [ ] 每次等待完成、进入下一阶段前再检查取消，避免取消与 ready/Future 完成同时出现时继续启动。设备/worker 的真实故障照常报告，不被普通取消覆盖。
-- [ ] 不用“stop 为真就一律取消启动”替代上述修复：内部 prepare/HOME 本来会置 stop，这与用户取消不同。内部停止不递增用户取消计数。
-- [ ] 取消停止的是编排和后续操作，不声称能强杀已运行的模型线程/native 调用。保留真实 Future/进程供现有有界收尾；不继续 warmup、不创建下一段 recorder、不取得运动授权。
+- [x] 在启动流程开始、键盘开始接收取消之前捕获一次本地取消值；贯穿资源准备、connect、camera/pointcloud/VR 就绪、手部初始化、模型 load/warmup 等真正的长等待。不要在 S/C/D 之后重新捕获新值，把被取消的启动当成新的启动。
+- [x] `check_startup`、`wait_model`、各 `may_start` 使用同一取消上下文；取消值改变或 quit/emergency 即离开等待。`requests_allow_motion()` 仅检查 quit/emergency，不能单独充当完整启动取消判断。
+- [x] 每次等待完成、进入下一阶段前再检查取消，避免取消与 ready/Future 完成同时出现时继续启动。设备/worker 的真实故障照常报告，不被普通取消覆盖。
+- [x] 不用“stop 为真就一律取消启动”替代上述修复：内部 prepare/HOME 本来会置 stop，这与用户取消不同。内部停止不递增用户取消计数。
+- [x] 取消停止的是编排和后续操作，不声称能强杀已运行的模型线程/native 调用。保留真实 Future/进程供现有有界收尾；不继续 warmup、不创建下一段 recorder、不取得运动授权。
 
 **结束意图：**
 
-- [ ] 删除 `SessionState.run_ended_reason` 及开始操作时清它的逻辑；删除 `revoke_motion` 上仅用于回取旧原因的 `reason`、`expected_cancel_epoch` 参数及返回值。停止动作与结果归因分开。
-- [ ] 这里删除的是 `revoke_motion` 的原因协议，**不是** prepare/resume/HOME 等长操作需要的 `cancel_epoch` 比较。共享 stop/emergency、quit 请求和必要的小交互状态继续保留。
-- [ ] 键盘回调只在既有短临界区设置取消/退出/急停事实并入队；主线程解释已接纳终止事件，把结束原因写入现有当前操作结果。`RunEndReason` 若仍简化结果表达可保留，不能再成为全局镜像。
-- [ ] 删除 teleop `operator_pending` 和“回调已快停但还没入队”的等待协议。回调与入队已在同一 Condition 内，主线程取得该锁后可取得一致的输入快照。
-- [ ] 取已接纳终止事件及用于判别的 stop 快照时使用同一短输入临界区，锁外处理事件和 I/O。不能先无锁 poll、再读取一个后来改变的 stop，就断言是无操作者事件的执行器停止。临界区之后的新事件留给下一次处理，快停信号已即时生效。
-- [ ] 保持现有顺序：冻结保存决定前消费已接纳终止输入；D→Q 仍丢弃，冻结后的 D 不追溯修改已决定的保存；quit/emergency 独立保留。不要为了移除一个全局字段增设另一套 stop_reason / pending_reason / generation。
-- [ ] busy 接纳、held keys、停止与退出响应、jog 的 S/D 方向键语义保持正确；锁序继续 Condition → 本地状态锁，不反向嵌套。
+- [x] 删除 `SessionState.run_ended_reason` 及开始操作时清它的逻辑；删除 `revoke_motion` 上仅用于回取旧原因的 `reason`、`expected_cancel_epoch` 参数及返回值。停止动作与结果归因分开。
+- [x] 这里删除的是 `revoke_motion` 的原因协议，**不是** prepare/resume/HOME 等长操作需要的 `cancel_epoch` 比较。共享 stop/emergency、quit 请求和必要的小交互状态继续保留。
+- [x] 键盘回调只在既有短临界区设置取消/退出/急停事实并入队；主线程解释已接纳终止事件，把结束原因写入现有当前操作结果。`RunEndReason` 若仍简化结果表达可保留，不能再成为全局镜像。
+- [x] 删除 teleop `operator_pending` 和“回调已快停但还没入队”的等待协议。回调与入队已在同一 Condition 内，主线程取得该锁后可取得一致的输入快照。
+- [x] 取已接纳终止事件及用于判别的 stop 快照时使用同一短输入临界区，锁外处理事件和 I/O。不能先无锁 poll、再读取一个后来改变的 stop，就断言是无操作者事件的执行器停止。临界区之后的新事件留给下一次处理，快停信号已即时生效。
+- [x] 保持现有顺序：冻结保存决定前消费已接纳终止输入；D→Q 仍丢弃，冻结后的 D 不追溯修改已决定的保存；quit/emergency 独立保留。不要为了移除一个全局字段增设另一套 stop_reason / pending_reason / generation。
+- [x] busy 接纳、held keys、停止与退出响应、jog 的 S/D 方向键语义保持正确；锁序继续 Condition → 本地状态锁，不反向嵌套。
 
 ### T3. 把 replay 收敛为一次顺序 demo 播放
 
@@ -137,23 +137,23 @@
 | `meta.joint_units`、arm/hand joint names | rad 和当前设备顺序；一次检查，不猜单位、不重排、不迁移。 |
 | 当前 arm / hand 配置范围 | 一次向量化检查整段目标，不合范围在连接设备前失败；不裁剪、不 wrap 到另一分支。 |
 
-- [ ] 用短小的 h5py reader 一次读出上述数组和属性，关闭文件后再连接设备。允许 float32 / float64 等可转成实数目标的正常数值 dtype，不要求与 Raw writer 完全一致；复数、字符串、非有限值不被静默转换成合法动作。
-- [ ] 不依赖 `RawReader` 的完整模态/时间契约；不要求 `timing/rows`、历史首行 `arm_qpos/hand_qpos`、task label、历史时钟声明、RGB-D、触觉、完成状态或回放审计字段。动作字段本身定义绝对关节目标，不再证明历史 SDK 是否执行成功。
-- [ ] replay 移除 `require_published_raw` 和路径前缀门禁。显式路径下的文件能正常读取且目标有效即可，包括用户明确指定的 `.tmp_*` 目录；不自动发现临时目录，不读写并修复坏文件，不发布/重命名数据。正在写入、锁冲突和损坏文件按实际 I/O 错误失败，不加入重试或实时追读。
-- [ ] NaN 行、空序列、错列数、缺必要属性仍报错；不自动筛行、插值、补零或回退到实测关节位置。允许不完整的存档模态不等于允许不完整的目标序列。
-- [ ] 注意当前 `Robot.validate_command` 的 hand 检查使用额定硬件范围，未必覆盖更窄的 `HandConfig.qpos_min_rad/qpos_max_rad`。因此保留此处一次整段配置范围检查；不能删掉 mapper 后误以为公共 hand 校验覆盖了全部实验限位。无需为此扩展全仓命令接口。
+- [x] 用短小的 h5py reader 一次读出上述数组和属性，关闭文件后再连接设备。允许 float32 / float64 等可转成实数目标的正常数值 dtype，不要求与 Raw writer 完全一致；复数、字符串、非有限值不被静默转换成合法动作。
+- [x] 不依赖 `RawReader` 的完整模态/时间契约；不要求 `timing/rows`、历史首行 `arm_qpos/hand_qpos`、task label、历史时钟声明、RGB-D、触觉、完成状态或回放审计字段。动作字段本身定义绝对关节目标，不再证明历史 SDK 是否执行成功。
+- [x] replay 移除 `require_published_raw` 和路径前缀门禁。显式路径下的文件能正常读取且目标有效即可，包括用户明确指定的 `.tmp_*` 目录；不自动发现临时目录，不读写并修复坏文件，不发布/重命名数据。正在写入、锁冲突和损坏文件按实际 I/O 错误失败，不加入重试或实时追读。
+- [x] NaN 行、空序列、错列数、缺必要属性仍报错；不自动筛行、插值、补零或回退到实测关节位置。允许不完整的存档模态不等于允许不完整的目标序列。
+- [x] 注意当前 `Robot.validate_command` 的 hand 检查使用额定硬件范围，未必覆盖更窄的 `HandConfig.qpos_min_rad/qpos_max_rad`。因此保留此处一次整段配置范围检查；不能删掉 mapper 后误以为公共 hand 校验覆盖了全部实验限位。无需为此扩展全仓命令接口。
 
 #### T3.2 顺序、节拍与起点
 
-- [ ] 一次连接和公共 streaming prepare 后读取当前 arm/hand 新鲜反馈，只与**第一行目标**比较。沿用一个粗阈值：任一关节绝对差大于 10° 则报错并关闭，提示实验者先就位；不自动规划到第一帧。
-- [ ] 删除 `prepare_hand`、历史实测起点、手部 ramp、三帧到位、arm 漂移重复检查及 `--hand-start-duration`。开始播放时的第一行目标就是第一条 demo 目标。
-- [ ] 直接 `RobotCommand(arm_targets[i], hand_targets[i])` → `robot.send_action(..., expires_ns=now + COMMAND_LEASE_NS)`。不调用 replay 的 `ActionMapper`、IK、`MotionConstraints`、`project_*` 或 `wrap_nearest_equivalent`。公共设备校验和 arm Ruckig 执行仍在。
-- [ ] **删除 replay 在线几何/碰撞预检是本方案的明确取舍。** replay 不需要 Pinocchio、hpp-fcl、碰撞 mesh、桌面标定或 HOME planner 才能加载/播放关节目标；不把任意新场景、任意人工轨迹宣称为已验证可执行。teleop / policy / HOME 的几何检查保持。
-- [ ] 每一行开始时记 `iteration_start`，服务反馈和用户终止，提交该行；只等待 `max(0, period - elapsed)`。下一行从新的实际时刻开始；无绝对原点、slot deadline、累计 lateness、missed slot、补发或丢行策略。
-- [ ] 等待沿用短周期服务：继续检查设备/键盘健康并采集所需手反馈，不用一整段不可中断 sleep。保留一个普通小等待函数即可；已有公共 owner 负责 arm 反馈，replay 不再逐行构造全模态 Observation。
-- [ ] 成功提交后才增加显示用的 `sent_count`。公共 arm 邮箱仍是 latest-value；有序提交不等于每行都获得 SDK 回执或物理到位，不为 replay 改成 FIFO/ack 协议。
-- [ ] 最后一行正常提交后，以**固定 0.5 s 可中断留驻替代最后一行的普通周期等待**，然后关闭。不附加另一轮完整周期，不续租，不做收敛证明或三帧到位。目标租期/反馈故障照常打断；这段留驻不保证到位。无需新增尾帧参数。
-- [ ] 输入很慢或 native 调用阻塞以致公共目标租期到期，仍按公共执行规则停止；不为任意低频录制新增保活线程、自动重发或无限租期。
+- [x] 一次连接和公共 streaming prepare 后读取当前 arm/hand 新鲜反馈，只与**第一行目标**比较。沿用一个粗阈值：任一关节绝对差大于 10° 则报错并关闭，提示实验者先就位；不自动规划到第一帧。
+- [x] 删除 `prepare_hand`、历史实测起点、手部 ramp、三帧到位、arm 漂移重复检查及 `--hand-start-duration`。开始播放时的第一行目标就是第一条 demo 目标。
+- [x] 直接 `RobotCommand(arm_targets[i], hand_targets[i])` → `robot.send_action(..., expires_ns=now + COMMAND_LEASE_NS)`。不调用 replay 的 `ActionMapper`、IK、`MotionConstraints`、`project_*` 或 `wrap_nearest_equivalent`。公共设备校验和 arm Ruckig 执行仍在。
+- [x] **删除 replay 在线几何/碰撞预检是本方案的明确取舍。** replay 不需要 Pinocchio、hpp-fcl、碰撞 mesh、桌面标定或 HOME planner 才能加载/播放关节目标；不把任意新场景、任意人工轨迹宣称为已验证可执行。teleop / policy / HOME 的几何检查保持。
+- [x] 每一行开始时记 `iteration_start`，服务反馈和用户终止，提交该行；只等待 `max(0, period - elapsed)`。下一行从新的实际时刻开始；无绝对原点、slot deadline、累计 lateness、missed slot、补发或丢行策略。
+- [x] 等待沿用短周期服务：继续检查设备/键盘健康并采集所需手反馈，不用一整段不可中断 sleep。保留一个普通小等待函数即可；已有公共 owner 负责 arm 反馈，replay 不再逐行构造全模态 Observation。
+- [x] 成功提交后才增加显示用的 `sent_count`。公共 arm 邮箱仍是 latest-value；有序提交不等于每行都获得 SDK 回执或物理到位，不为 replay 改成 FIFO/ack 协议。
+- [x] 最后一行正常提交后，以**固定 0.5 s 可中断留驻替代最后一行的普通周期等待**，然后关闭。不附加另一轮完整周期，不续租，不做收敛证明或三帧到位。目标租期/反馈故障照常打断；这段留驻不保证到位。无需新增尾帧参数。
+- [x] 输入很慢或 native 调用阻塞以致公共目标租期到期，仍按公共执行规则停止；不为任意低频录制新增保活线程、自动重发或无限租期。
 
 节拍行为示意（省略公共设备生命周期和异常处理，非新增调度框架）：
 
@@ -170,31 +170,31 @@ for i in range(len(arm_targets)):
 
 #### T3.3 单次流程、退出和错误
 
-- [ ] 流程只剩：读取并校验 → 创建键盘/设备 → 连接与 prepare → 粗起点检查 → 顺序发送 → 短留驻 → 唯一 `finally` 公共收尾。
-- [ ] S/Q 均停止本次播放并退出，不进入“已停止但仍在等待”的会话；Esc/Ctrl+C 使用公共 emergency 路径并非零退出。取消在连接、准备、行间等待和尾帧留驻期间都有效。
-- [ ] 正常播完、操作者 S/Q 且关闭成功，CLI 返回 0；坏输入、起点拒绝、无操作者输入的设备停止/租期失效、SDK/反馈/关闭失败，CLI 非零。不能把所有 `OperationCancelled` 都吞成用户正常停止；设备故障与用户取消同时出现仍报告故障。
-- [ ] 删除 `ReplayStatus`、`ReplayResult`、`ReplayBuffer`、`save_replay_data`、提交候选/实测/时间戳审计数组、`session_result.json`、`replay_data.npz` 和结果去重代码。正常返回、明确的用户停止、真实异常已足够表达流程；不要换成另一套结果 envelope。
-- [ ] 删除 `output_dir`、`DEFAULT_OUTPUT_DIR`、`--output`、目录必须为空的校验和所有强制输出。控制台打印总行数、已提交行数、耗时和必要停止原因即可；同一命令可重复运行。旧产物留在原地。
-- [ ] 删除 `wait_for_home`、H 交互、`home_results`、回放中的 HOME planner 和相应取消分支。正常播放结束自动 close 并退出。
-- [ ] 复用 `close_runtime` 的停止/关闭与真实句柄处理；不叠加内外两层 replay 结果分类和重复 stop-finally。全部已创建资源在连接失败等部分启动路径也能被关闭。
-- [ ] 若运行主错与关闭错误同时存在，保留主错，记录关闭错误 traceback；只有关闭失败时也必须非零。错误不被最终普通 return 覆盖，不为去重存异常对象身份或添加错误注册器。
+- [x] 流程只剩：读取并校验 → 创建键盘/设备 → 连接与 prepare → 粗起点检查 → 顺序发送 → 短留驻 → 唯一 `finally` 公共收尾。
+- [x] S/Q 均停止本次播放并退出，不进入“已停止但仍在等待”的会话；Esc/Ctrl+C 使用公共 emergency 路径并非零退出。取消在连接、准备、行间等待和尾帧留驻期间都有效。
+- [x] 正常播完、操作者 S/Q 且关闭成功，CLI 返回 0；坏输入、起点拒绝、无操作者输入的设备停止/租期失效、SDK/反馈/关闭失败，CLI 非零。不能把所有 `OperationCancelled` 都吞成用户正常停止；设备故障与用户取消同时出现仍报告故障。
+- [x] 删除 `ReplayStatus`、`ReplayResult`、`ReplayBuffer`、`save_replay_data`、提交候选/实测/时间戳审计数组、`session_result.json`、`replay_data.npz` 和结果去重代码。正常返回、明确的用户停止、真实异常已足够表达流程；不要换成另一套结果 envelope。
+- [x] 删除 `output_dir`、`DEFAULT_OUTPUT_DIR`、`--output`、目录必须为空的校验和所有强制输出。控制台打印总行数、已提交行数、耗时和必要停止原因即可；同一命令可重复运行。旧产物留在原地。
+- [x] 删除 `wait_for_home`、H 交互、`home_results`、回放中的 HOME planner 和相应取消分支。正常播放结束自动 close 并退出。
+- [x] 复用 `close_runtime` 的停止/关闭与真实句柄处理；不叠加内外两层 replay 结果分类和重复 stop-finally。全部已创建资源在连接失败等部分启动路径也能被关闭。
+- [x] 若运行主错与关闭错误同时存在，保留主错，记录关闭错误 traceback；只有关闭失败时也必须非零。错误不被最终普通 return 覆盖，不为去重存异常对象身份或添加错误注册器。
 
 #### T3.4 模块和依赖
 
-- [ ] 将实际 runner 放入现有 `replay/run.py`，CLI 保持薄。reader 可与 runner 同文件，或仅在可读性明显更好时保留 `trajectory.py`；删除已无职责的 `joint_replay.py` 及无用导出。不为“单文件”把公共设备逻辑复制进去。
-- [ ] replay 的 preflight 只验证实际使用的 arm/hand 配置、反馈服务与发送频率；移除该入口对 environment/workspace/HOME 的附加验证。若公共 `validate_robot_config` 混合设备和场景校验，可把场景检查移到实际使用它的现有入口，同时更新所有调用方；不增加多种可选校验模式。
-- [ ] 核实传递导入，确保 replay 的帮助、reader 和假设备播放路径不加载碰撞/IK/相机/视频依赖；不要只删构造调用却留下顶层重依赖。其他功能仍用的依赖和文件不能全仓删除。
+- [x] 将实际 runner 放入现有 `replay/run.py`，CLI 保持薄。reader 可与 runner 同文件，或仅在可读性明显更好时保留 `trajectory.py`；删除已无职责的 `joint_replay.py` 及无用导出。不为“单文件”把公共设备逻辑复制进去。
+- [x] replay 的 preflight 只验证实际使用的 arm/hand 配置、反馈服务与发送频率；移除该入口对 environment/workspace/HOME 的附加验证。若公共 `validate_robot_config` 混合设备和场景校验，可把场景检查移到实际使用它的现有入口，同时更新所有调用方；不增加多种可选校验模式。
+- [x] 核实传递导入，确保 replay 的帮助、reader 和假设备播放路径不加载碰撞/IK/相机/视频依赖；不要只删构造调用却留下顶层重依赖。其他功能仍用的依赖和文件不能全仓删除。
 
 ### T4. sync 脱离 async / RTC 时间窗口算法
 
 主要文件：`deployment/rollout.py`、`deployment/schedule.py` 和配置校验/调用方。
 
-- [ ] sync 的真实状态只需当前动作数组、已执行游标、一个在途模型任务、下一次采样/执行时点，以及 T1 的公共等待/时长限制。直接表达“积累观测 → 预测 → 顺序执行 A 行 → 下一次预测”。
-- [ ] sync 不再创建伪造的观测 slot/handoff slot，不调用 `handoff_plan`、`prefetch_handoff`、`plan_rejection` 来表达顺序游标；`schedule.py` 只服务实际需要时间窗口的 async / RTC，清理各函数的 sync 特判。
-- [ ] 可以在现有 Rollout 中保留短小 mode 分支/方法；不为三种模式创建继承树、可插拔调度器或三个拥有独立生命周期的 Executor。观测、映射、公共发送、录制及收尾仍复用。
-- [ ] 模型等待期间不重复把同一行塞入 history；保持实际采样间隔的 history 断档规则、第一预测 reset RNG、预热恢复 RNG、A/P 配置语义及公共来源新鲜度检查。
-- [ ] 映射耗时 63 ms 而周期 62.5 ms 时，sync 仍发送有效动作并推进游标；不因名义 tick 过期丢弃，也不再额外睡完整周期或突发补发。发送失败不前进。
-- [ ] async 仍可以使用旧预测有效尾部；RTC 的前缀和交接检查不移除。本任务不以删模式来换取简单。
+- [x] sync 的真实状态只需当前动作数组、已执行游标、一个在途模型任务、下一次采样/执行时点，以及 T1 的公共等待/时长限制。直接表达“积累观测 → 预测 → 顺序执行 A 行 → 下一次预测”。
+- [x] sync 不再创建伪造的观测 slot/handoff slot，不调用 `handoff_plan`、`prefetch_handoff`、`plan_rejection` 来表达顺序游标；`schedule.py` 只服务实际需要时间窗口的 async / RTC，清理各函数的 sync 特判。
+- [x] 可以在现有 Rollout 中保留短小 mode 分支/方法；不为三种模式创建继承树、可插拔调度器或三个拥有独立生命周期的 Executor。观测、映射、公共发送、录制及收尾仍复用。
+- [x] 模型等待期间不重复把同一行塞入 history；保持实际采样间隔的 history 断档规则、第一预测 reset RNG、预热恢复 RNG、A/P 配置语义及公共来源新鲜度检查。
+- [x] 映射耗时 63 ms 而周期 62.5 ms 时，sync 仍发送有效动作并推进游标；不因名义 tick 过期丢弃，也不再额外睡完整周期或突发补发。发送失败不前进。
+- [x] async 仍可以使用旧预测有效尾部；RTC 的前缀和交接检查不移除。本任务不以删模式来换取简单。
 
 ### T5. 数据与错误链的局部减法
 
@@ -202,33 +202,33 @@ for i in range(len(arm_targets)):
 
 **录制和采样：**
 
-- [ ] 删除 `submitted_frames` 及递增/断言；writer 已结束且无错误后，用 `written_frames > 0` 判断可发布非空数据。writer 未完成或 I/O 失败时不得拿当前计数提前发布。
-- [ ] 保留 writer 的真实 frame_count、queue/freeze/finish 唤醒、首个错误、真实线程句柄和有界关闭。`is_recording=False` 不等于 writer 已退出。
-- [ ] 控制循环在 recorder 确实接收时读 control/record 并集；无录制或已冻结时读 control 所需字段。冻结后的下一轮不再复制仅供存档的 RGB-D/触觉，不停止控制必需来源，不清空其最新有效缓存。
-- [ ] 不为减少这次复制而添加动态 worker 重启、重新录制或按字段管理资源的框架。冻结保持不可逆；同一 episode 不因存档来源恢复而续录。
+- [x] 删除 `submitted_frames` 及递增/断言；writer 已结束且无错误后，用 `written_frames > 0` 判断可发布非空数据。writer 未完成或 I/O 失败时不得拿当前计数提前发布。
+- [x] 保留 writer 的真实 frame_count、queue/freeze/finish 唤醒、首个错误、真实线程句柄和有界关闭。`is_recording=False` 不等于 writer 已退出。
+- [x] 控制循环在 recorder 确实接收时读 control/record 并集；无录制或已冻结时读 control 所需字段。冻结后的下一轮不再复制仅供存档的 RGB-D/触觉，不停止控制必需来源，不清空其最新有效缓存。
+- [x] 不为减少这次复制而添加动态 worker 重启、重新录制或按字段管理资源的框架。冻结保持不可逆；同一 episode 不因存档来源恢复而续录。
 
 **数据事实：**
 
-- [ ] 删除 `technical_status` 的 Raw 初值/finish 参数、`_FinishRequest` 字段、控制层传参、Canonical quality 复制、文档和测试。不要改名为另一个等价成功标签。
-- [ ] 保留 `termination_reason`、错误详情、`recording_truncated_reason`、实际行数以及 recorder 的 published/failed/pending 结果。运行尾部失败不反向否定已正常发布的有效前缀。
-- [ ] RawReader 继续支持诊断指定 staging；Canonical 导出仍检查发布边界与完整数据。将 `require_published_raw` 收窄到请求 episode basename 与解析后 episode basename：真正 `.tmp_episode` 及其别名仍拒绝，普通 `.tmp_workspace/episode_good` 允许。不遍历祖先，不维护路径 provenance 或符号链接安全框架。
-- [ ] replay 不调用上述导出发布门禁。该分离是不同用途的明确约定，不是新增 strict/relaxed 模式。
-- [ ] Canonical 的固定模态、单位/形状、RGB 数量、来源时间与触觉年龄、相邻 control 间隔 ±25% 和观测不跨下次 control 等现有约束保持；`dt` 仍为名义周期。只删除已列出的冗余状态，不借 replay 放宽删去训练数据契约。
-- [ ] 保留“失败 Raw staging 不自动删除；可再生的导出 staging 失败只清本次目录”的行为。
+- [x] 删除 `technical_status` 的 Raw 初值/finish 参数、`_FinishRequest` 字段、控制层传参、Canonical quality 复制、文档和测试。不要改名为另一个等价成功标签。
+- [x] 保留 `termination_reason`、错误详情、`recording_truncated_reason`、实际行数以及 recorder 的 published/failed/pending 结果。运行尾部失败不反向否定已正常发布的有效前缀。
+- [x] RawReader 继续支持诊断指定 staging；Canonical 导出仍检查发布边界与完整数据。将 `require_published_raw` 收窄到请求 episode basename 与解析后 episode basename：真正 `.tmp_episode` 及其别名仍拒绝，普通 `.tmp_workspace/episode_good` 允许。不遍历祖先，不维护路径 provenance 或符号链接安全框架。
+- [x] replay 不调用上述导出发布门禁。该分离是不同用途的明确约定，不是新增 strict/relaxed 模式。
+- [x] Canonical 的固定模态、单位/形状、RGB 数量、来源时间与触觉年龄、相邻 control 间隔 ±25% 和观测不跨下次 control 等现有约束保持；`dt` 仍为名义周期。只删除已列出的冗余状态，不借 replay 放宽删去训练数据契约。
+- [x] 保留“失败 Raw staging 不自动删除；可再生的导出 staging 失败只清本次目录”的行为。
 
 **错误：**
 
-- [ ] `ArmProcess` 直接读取 owner fault/close_error 信息并抛出正常异常；移除 `_fault_error`、`_close_error`、`.args` 改写和 `reported_fault/reported_close_error` 身份去重快照。
-- [ ] owner 真正异步产生的故障通道、stop/disconnect 失败信息、join 后晚到错误和异常退出检查保留。这里删的是父进程重复包装和去重状态，不是故障本身。
-- [ ] 允许运行和收尾重复报告同一 owner 错误；不要求一个异常在整个系统只出现一次。已退出但失败与仍活着的 pending 继续按真实句柄区分，不用错误是否已打印推断资源是否结束。
-- [ ] 清理受影响代码里只为此维持的异常身份比较和帮助函数；保留必要的主错变量、异步 writer error 和“主错不能被次级收尾错误覆盖”的普通 try/finally。不要把所有错误处理一概删除。
+- [x] `ArmProcess` 直接读取 owner fault/close_error 信息并抛出正常异常；移除 `_fault_error`、`_close_error`、`.args` 改写和 `reported_fault/reported_close_error` 身份去重快照。
+- [x] owner 真正异步产生的故障通道、stop/disconnect 失败信息、join 后晚到错误和异常退出检查保留。这里删的是父进程重复包装和去重状态，不是故障本身。
+- [x] 允许运行和收尾重复报告同一 owner 错误；不要求一个异常在整个系统只出现一次。已退出但失败与仍活着的 pending 继续按真实句柄区分，不用错误是否已打印推断资源是否结束。
+- [x] 清理受影响代码里只为此维持的异常身份比较和帮助函数；保留必要的主错变量、异步 writer error 和“主错不能被次级收尾错误覆盖”的普通 try/finally。不要把所有错误处理一概删除。
 
 ### T6. 文档、测试和入口一次改完整
 
-- [ ] 更新 README 的 replay 命令、键位、输出目录、数据条件、时间语义、几何依赖和 HOME 使用说明；删除所有“严格 replay 槽位”“回放结束按 H/Q”“必写 NPZ/JSON”的现行约定。
-- [ ] 更新 CLI help、受影响模块 docstring、当前数据读写与配置调用方；无需给已删参数加 deprecation 周期。历史版本无需改写。
-- [ ] 改写因需求主动改变而失效的测试：特别是 replay staging 拒绝、精确 dtype、旧审计结果、旧 `technical_status` 和 `submitted_frames` 断言。保留这些测试原本覆盖的真实错误/资源边界，不以删除整组回归规避问题。
-- [ ] 按第 5 节完成行为验证，再审查实际 diff。不要用“搜索不到旧类名”“AST 可解析”代替运行行为验证，也不要为了填满清单新增与实现一一对应的测试。
+- [x] 更新 README 的 replay 命令、键位、输出目录、数据条件、时间语义、几何依赖和 HOME 使用说明；删除所有“严格 replay 槽位”“回放结束按 H/Q”“必写 NPZ/JSON”的现行约定。
+- [x] 更新 CLI help、受影响模块 docstring、当前数据读写与配置调用方；无需给已删参数加 deprecation 周期。历史版本无需改写。
+- [x] 改写因需求主动改变而失效的测试：特别是 replay staging 拒绝、精确 dtype、旧审计结果、旧 `technical_status` 和 `submitted_frames` 断言。保留这些测试原本覆盖的真实错误/资源边界，不以删除整组回归规避问题。
+- [x] 按第 5 节完成行为验证，再审查实际 diff。不要用“搜索不到旧类名”“AST 可解析”代替运行行为验证，也不要为了填满清单新增与实现一一对应的测试。
 
 ## 5. 验收场景
 
@@ -263,12 +263,12 @@ for i in range(len(arm_targets)):
 
 推荐顺序：T1 修复预算 → T2 修复启动取消并收拢结束意图 → T3 完整重写 replay → T4 简化 sync → T5 局部数据/错误减法 → T6 同步文档并完成回归。每个机制连同实际调用方一次改完整；阶段之间可以有清晰提交，不并存新旧实现。
 
-- [ ] R01–R16 均有明确落地结果；没有把任务改成再次提出方案或仅写 TODO。
-- [ ] 核心结构变少：replay 没有独立会话/审计/严格网格，sync 没有伪时间窗口，全局终止原因和错误身份台账消失，数据事实不重复存储。
-- [ ] 真实边界仍可解释：文件一次检查、设备副作用边界检查、来源新鲜度、目标租期和实际 pending 各自解决不同问题。
-- [ ] 文档、CLI、当前数据生产/消费和测试一致；没有兼容层、空壳旧类、无用参数、备用严格模式或换名机制。
-- [ ] 检查现有工作区并保留他人修改；不改用户实验数据，不做无关目录搬迁，不添加没有实际用途的依赖。
-- [ ] 完成后在本文末尾补实际实施记录：修改项、删除项、行为测试及结果、未执行项、与本文不同的必要调整及源码依据。只勾选实际完成项，不复制历史通过数量。
+- [x] R01–R16 均有明确落地结果；没有把任务改成再次提出方案或仅写 TODO。
+- [x] 核心结构变少：replay 没有独立会话/审计/严格网格，sync 没有伪时间窗口，全局终止原因和错误身份台账消失，数据事实不重复存储。
+- [x] 真实边界仍可解释：文件一次检查、设备副作用边界检查、来源新鲜度、目标租期和实际 pending 各自解决不同问题。
+- [x] 文档、CLI、当前数据生产/消费和测试一致；没有兼容层、空壳旧类、无用参数、备用严格模式或换名机制。
+- [x] 检查现有工作区并保留他人修改；不改用户实验数据，不做无关目录搬迁，不添加没有实际用途的依赖。
+- [x] 完成后在本文末尾补实际实施记录：修改项、删除项、行为测试及结果、未执行项、与本文不同的必要调整及源码依据。只勾选实际完成项，不复制历史通过数量。
 
 若实施时 HEAD 已前进，先比较本基线与当前代码，已修复的问题不重复实现。合理的局部实现选择可以自行决定；只有真实新调用关系或需求冲突才调整方案并解释，不以假想未来需求恢复复杂度。
 
@@ -281,3 +281,72 @@ for i in range(len(arm_targets)):
 | [ManiUniCon 回放工具](https://github.com/Universal-Control/ManiUniCon/blob/85c6f2e32ecf9f2bed62d202b058c39623444686/tools/replay_record_data.py#L84) | 单用途工具按用途读取数据的组织方式。 | 该工具主要服务 Meshcat 可视化，不作为真机关节回放的停止/执行依据；传感 replay 同样不是设备执行器。 |
 
 参考代码提供结构借鉴，不替代 dexmani_real 实际入口、设备协议和上述行为测试。
+
+
+## 8. 第二阶段实施记录（2026-11-03）
+
+实施起点为 `7cea1dacec438bdfaa328c42a3f5ce92351b7e19`；与审查基线相比只有任务书变化。保留工作区原有键盘点动 `--no-hand` 实现及对应 README 内容。未改动实验数据、checkpoint、标定或旧回放目录。
+
+### 已实施
+
+- T1：首发等待预算不再被 submit 重建或被新计划清空。主循环同时检查等待、已有目标租期和 duration；同刻优先 duration。慢预测和慢映射零提交均在原预算内失败。
+- T2：启动 epoch 在键盘启用前捕获，贯穿传感器、load/warmup、手初始化和准入；ready/Future 完成后再检查。`arm` 接收该 epoch。删除全局结束原因和撤权原因协议；当前操作解释终止输入。`Keyboard.poll` 在同一 Condition 内返回事件及 stop 快照，移除 operator_pending。
+- T3：最小 h5py reader 独立于 RawReader；直接逐行发送绝对目标，使用本轮剩余周期及末行 0.5 s 留驻。删除 joint_replay 模块、映射/几何入口、历史起点 ramp、绝对槽位、审计管线、输出目录和 HOME 会话。CLI 仅保留 episode/--config；S/Q 正常结束，急停及真实故障非零。唯一 finally 使用公共 close_runtime。
+- T4：sync 使用动作数组、游标及 PolicyWorker 已有 Future，schedule 只处理 async/RTC。结果到达可立即执行，等待帧不重复进入 history，提交成功才推进游标。
+- T5：删除提交计数、technical_status 全链及异常身份去重。writer 确认退出且无错后按 written_frames 发布非空前缀；冻结后只读取控制字段。导出门禁只检查两个 episode basename。
+- T6：调用方、CLI、README 和测试同步更新；保留旧测试对应的资源、来源时效、停止恢复、HOME 和 Canonical 边界。
+
+### 源码依据与局部调整
+
+- `ArmController.operation → wait_settled` 和 `tick` 实际使用 `homing.convergence_rad/velocity_convergence_rad_s`。这些名称下的停稳阈值仍属于公共 streaming 设备保障，保留校验。仅 HOME 使用的目标、超时和速度校验移到 HOME 使用边界；Policy 起点检查仍提前验证其 HOME 配置。
+- `Robot.validate_command` 的 hand 上下界来自额定硬件常量；reader 另外整段检查当前配置范围，没有删去该保障，也没有改变公共命令接口或裁剪文件目标。
+- `XHandFeedback.snapshot` 直接返回只读缓存。冻结后的减法集中在观测字段选择，不新增触觉缓存状态、动态 worker 重启或按字段资源管理。
+- 保留独立的短 trajectory reader 和现有 runner，删除无职责的 joint_replay。reader 和 fake 播放不要求 Pinocchio/hpp-fcl/视频依赖。
+
+### 实际验证
+
+使用 `/usr/bin/python3`，测试依赖安装在 `/tmp/dexmani-test-deps`；未修改项目依赖声明。系统最初缺 pytest/Ruff/SciPy/av，且系统 Zarr 为 3.x，临时测试目录补齐项目要求的 Zarr 2.18.7、NumPy 1.26.4、Ruckig 0.17.3 等依赖。Ruckig 首次构建因上游 scikit-build-core 参数不兼容失败，使用 `/tmp` 构建约束 `scikit-build-core<0.10` 后成功。
+
+执行：
+
+```bash
+PYTHONPATH=/tmp/dexmani-test-deps:$PWD PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -B -m pytest -p no:cacheprovider -q tests
+PYTHONPATH=/tmp/dexmani-test-deps:$PWD python3 -B -m ruff check --no-cache --select F dexmani_real scripts tests
+PYTHONPATH=/tmp/dexmani-test-deps:$PWD python3 -B scripts/replay_episode.py --help
+git diff --check
+```
+
+首轮结果：125 项测试通过；Ruff F 检查、CLI help 和 diff 空白检查通过。没有在仓库生成 pytest/ruff/mypy 缓存。
+
+行为证据包括：
+
+- 慢预测 600 ms、慢映射 63 ms 的 async 零提交预算；旧目标期限和 duration 同刻优先；sync 63 ms 映射推进游标、history 抖动与 RTC 错过交接。
+- S/C/D/Q/Esc 中断模型等待、ready/完成与取消同刻、Condition 内暂停快停回调与输入快照、保存冻结和 busy 长按；真实 Future 的 None、任务 TimeoutError 和未完成状态。
+- 真实最小 float32 HDF5、显式 `.tmp_demo`、坏数值/形状/类型/单位/顺序/手部配置范围；通过真实 Robot.send_action/close 接口的假 driver 顺序播放。
+- 300 行每行 63 ms 全部提交，用时 19.4 s（含尾帧留驻）；快速发送用时 19.1875 s；原目标数组逐行不变。相同 runner 和 CLI 重复运行，不生成审计文件。
+- connect/prepare/行间/尾帧阶段 S/Q/Esc，起点拒绝、反馈失效、无输入 stop、租期耗尽、主错及关闭错并存；所有已创建资源均尝试关闭。
+- 实际 writer 线程队列满后的 17 行有效前缀、零行不发布、写入错误和 join 超时保留句柄；冻结后观测字段缩减、导出 basename/别名门禁、真实 HDF5/视频与 Zarr 发布和失败清理。
+- owner 原故障和 join 后晚到关闭错误、进程仍活着与已退出的区分；停止/清邮箱/prepare 恢复、共享快照和 HOME 回归。
+
+### 验证限制
+
+所有设备均为假设备，未连接机器人，未宣称真机验收。真实 checkpoint/GPU load、warmup 和 SDK/native 阻塞的实机行为未执行；本轮验证其编排取消、Future 归属和错误传播。10° 起点阈值、0.5 s 留驻体验、实际运动跟随及停止延迟仍由实验者验收。软件等待期限不能强制终止已经进入的 native 调用。
+
+
+### 全链路审查与对齐记录
+
+在第二阶段工作区上继续沿入口、设备与数据调用链审查，直接修复以下遗漏：
+
+- teleop 的 VR/骨长标定启动取消统一抛出 `OperationCancelled`，删除 bool 成功/取消双轨返回。启动 S/C/D/Q 走同一正常关闭出口，Esc 非零；Policy 与 teleop 只用原始 epoch、quit/emergency 识别用户取消，内部 stop 不再冒充用户请求。
+- owner 因目标租期置 stop 与 duration 同刻到期时，先检查真实模型结果和既有预算，保留 duration_complete；模型错误及用户终止仍独立保留。
+- replay 在连接前后检查无操作者输入的 stop，禁止 prepare 清除它后继续运行；收尾阶段收到 Esc 也非零退出。reader/runner/CLI 统一类型与 `control_hz` 命名，helper 显式接收设备，避免把部分启动句柄的 Optional 状态带入播放主体。
+- `ArmProcess.close` 对同一 owner 只建立一次绝对 join 期限；重复调用使用剩余时间，仍活着的进程保留 Pipe 和真实 pending，真正退出后才关闭端点。删除停止确认对错误通道的重复读取。
+- 批量导出临时工作根目录只负责发现数据，识别实际 episode 后才执行 basename 发布门禁；每个 episode 及其别名继续校验。真实 Zarr 回归从 `.tmp_workspace/` 批量入口执行。
+- 配置/HOME 回归确认未使用 HOME 的 streaming 不依赖 HOME 目标或超时，公共停稳阈值及禁用手部时规划使用的固定姿态仍检查；清除单字段反射循环、多余原因别名、未使用 NONE 和过时注释。相关生产链未发现 SHA-256、格式版本或兼容迁移机制，无需新增替代方案。
+- README 的取消、关闭、批量导出说明与实现对齐，修正实施记录的重复节号；保留原有 `--no-hand` 行为。
+
+最终验证：完整离线业务套件 **150 项通过**；Ruff F 检查、四个受影响 CLI 的 `--help`、`git diff --check` 通过。所有业务设备均为 fake，覆盖公共 Robot.send_action/close、真实小 HDF5、视频、Zarr、线程和 Future。新增用例包括关闭期间急停、关闭超时保留句柄、重复 owner close 不续期、启动取消入口退出码、租期与 duration 同刻及模型错误、创建设备前拒绝坏目标和批量临时目录。
+
+对 22 个受影响源码执行常规 mypy：通过。工具位于 `/tmp/dexmani-review-tools`，使用 `--no-site-packages --follow-imports=silent --ignore-missing-imports --explicit-package-bases`，缓存位于 `/tmp/dexmani-review-mypy`；此检查不覆盖未标注方法体及第三方库类型。另执行 `--check-untyped-defs` 扩展检查并与 HEAD 的同一组源码对照：当前 Raw/PolicySession 仍有 36 项既有生命周期 Optional 标注报告，基线为 38 项，未出现新的错误消息；因此不将扩展检查称为通过，也没有用额外空值检查或 ignore 掩盖它们。新增 replay 与控制分支的类型收窄问题已修复。
+
+最终源码副本在 `/tmp` 成功构建 wheel，核对包含当前 replay 两个模块且不包含已删 joint_replay；构建、工具安装及全部缓存均留在 `/tmp`。未连接真机、加载实际 checkpoint 或执行 GPU 推理，真机验证限制继续适用。

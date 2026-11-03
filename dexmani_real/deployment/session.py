@@ -63,6 +63,7 @@ class PolicySession:
         self.record_needs = record_needs
         self.capture_needs = self.control_needs.union(record_needs)
         self.runtime_state = SessionState()
+        self.startup_cancel_epoch = self.runtime_state.cancel_epoch
         self.sensors = self.robot = self.keyboard = self.model = None
         self.audio = None
         self.episode = None
@@ -98,8 +99,8 @@ class PolicySession:
                 if self.robot is not None:
                     self.robot.check()
                 if not (
-                    self.runtime_state.stop_signal.is_set() or self.runtime_state.quit_requested
-                    or self.runtime_state.estop_request
+                    self.runtime_state.cancel_epoch != self.startup_cancel_epoch
+                    or self.runtime_state.quit_requested or self.runtime_state.estop_request
                 ):
                     raise
                 self.runtime_state.request_quit()
@@ -114,7 +115,7 @@ class PolicySession:
         except Exception as exc:
             failure = exc
             self.runtime_state.stop_signal.set()
-            self.runtime_state.revoke_motion(reason=RunEndReason.FAILED)
+            self.runtime_state.revoke_motion()
             logger.exception("policy session failed")
         finally:
             exit_code = self.close(failure=failure)
@@ -141,6 +142,8 @@ class PolicySession:
             },
         )
         self.keyboard.start()
+        if not self.startup_allowed():
+            raise OperationCancelled("startup cancelled before model load")
         self.model = PolicyWorker(
             lambda: load_policy(self.info, device=self.device, seed=self.seed),
             build_observation=self.observations.build,
@@ -175,7 +178,9 @@ class PolicySession:
 
     def start_devices(self):
         needs = self.capture_needs
+        self.check_startup()
         self.robot.connect()
+        self.check_startup()
         if needs.camera_worker or self.observations.camera_static:
             self.sensors.start(
                 self.process_context.Process(
@@ -185,7 +190,7 @@ class PolicySession:
                 ),
                 ring=self.sensors.channels.camera_ring,
                 timeout_s=CAMERA_READY_TIMEOUT_S,
-                may_start=lambda: self.keyboard.check_health() and self.runtime_state.requests_allow_motion(),
+                may_start=self.startup_allowed,
             )
             needs_extrinsics = needs.point_cloud or "camera_extrinsic" in self.info.observation_fields
             self.camera_snapshot = snapshot_camera_parameters(
@@ -218,15 +223,15 @@ class PolicySession:
                 ),
                 ring=self.sensors.channels.pointcloud_ring,
                 timeout_s=POINTCLOUD_READY_TIMEOUT_S,
-                may_start=lambda: self.keyboard.check_health() and self.runtime_state.requests_allow_motion(),
+                may_start=self.startup_allowed,
             )
         if self.observations.camera_static and not needs.camera_worker:
             self.sensors.shutdown(self.runtime_state)
             self.sensors.channels = None
-        self.robot.check()
-        startup_cancel_epoch = self.runtime_state.arm()
+        self.check_startup()
+        self.runtime_state.arm(cancel_epoch=self.startup_cancel_epoch)
         initialize_hand(
-            self.runtime_state, self.robot, cancel_epoch=startup_cancel_epoch,
+            self.runtime_state, self.robot, cancel_epoch=self.startup_cancel_epoch,
             required_tactile=needs.required_tactile,
             cancel_requested=self.home_abort_requested,
         )
@@ -311,9 +316,13 @@ class PolicySession:
             logger.warning("Cleanup remains pending; retained resources may outlive this wait")
         return int(not successful)
 
+    def startup_allowed(self):
+        return (self.keyboard.check_health() and self.runtime_state.requests_allow_motion()
+                and self.runtime_state.cancel_epoch == self.startup_cancel_epoch)
+
     def check_startup(self):
         self.robot.service_feedback()
-        if not self.runtime_state.requests_allow_motion():
+        if not self.startup_allowed():
             raise OperationCancelled("startup cancelled")
 
     def wait_model(self, deadline):
@@ -325,6 +334,7 @@ class PolicySession:
             future = self.model.poll()
             if future is not None:
                 future.result()
+                self.check_startup()
                 return
             time.sleep(min(0.005, remaining))
 
@@ -344,12 +354,13 @@ class PolicySession:
                 rtc_guidance_cap=self.runtime.execution.rtc_guidance_cap,
                 rtc_delay=self.runtime.execution.prefetch_steps,
             )
+        self.check_startup()
         self.model.warmup(rows, samples=1, **kwargs)
         self.wait_model(time.monotonic() + MODEL_STARTUP_TIMEOUT_S)
 
     def poll_operator(self, *, allow_tactile_reset: bool = False) -> int | None:
         return self.handle_command_batch(
-            self.keyboard.poll(timeout=0),
+            self.keyboard.poll(self.runtime_state, timeout=0)[0],
             allow_tactile_reset=allow_tactile_reset,
         )
 
@@ -357,6 +368,10 @@ class PolicySession:
         keys = {event.key for event in signals}
         if "d" in keys and self.episode is not None:
             self.episode.discard_requested = True
+        if self.episode is not None and keys.intersection({"s", "c", "d", "q", "esc"}):
+            reason = (RunEndReason.ESTOP if "esc" in keys else
+                      RunEndReason.QUIT if "q" in keys else RunEndReason.OPERATOR)
+            self.episode.stop("operator input", run_end_reason=reason)
         if "esc" in keys:
             self.runtime_state.request_emergency_stop()
             return None

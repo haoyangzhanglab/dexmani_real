@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from dexmani_real.config.xarm7 import ArmConfig
+from dexmani_real.config.xarm7 import EXECUTOR_TIMEOUT_S, ArmConfig
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.robot.xarm7.process import ArmProcess
 from dexmani_real.robot.xarm7.protocol import (
@@ -239,3 +239,56 @@ def test_recovery_reports_owner_fault_even_when_operator_also_cancelled():
     finally:
         process.pipe.close()
         process.child_pipe.close()
+
+
+@pytest.mark.parametrize('alive', [False, True])
+def test_owner_fault_and_late_close_error_are_reported(alive):
+    from dexmani_real.robot.commands import RobotError
+    state = SessionState()
+    arm = ArmProcess(ArmConfig(), runtime_state=state)
+    arm.io.fault.value = b'original SDK fault'
+    arm.io.stopped.set()
+    def join(timeout):
+        arm.io.close_error.value = b'late disconnect failure'
+    arm.process = SimpleNamespace(pid=1, exitcode=None if alive else 0,
+                                  is_alive=lambda: alive, join=join)
+    try:
+        with pytest.raises(RobotError, match='original SDK fault'):
+            arm.check_error()
+        with pytest.raises(RobotError, match='original SDK fault'):
+            arm.close()
+        assert arm.is_closed == (not alive)
+        assert arm._read_close_error().args == ('late disconnect failure',)
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+def test_repeated_close_does_not_renew_pending_owner_budget(monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr('dexmani_real.robot.xarm7.process.time.monotonic', lambda: clock[0])
+    arm = ArmProcess(ArmConfig(), runtime_state=SessionState())
+    alive = [True]
+    waits = []
+    def join(timeout):
+        waits.append(timeout)
+        clock[0] += timeout
+    arm.process = SimpleNamespace(pid=1, exitcode=0, is_alive=lambda: alive[0], join=join)
+    try:
+        with pytest.raises(TimeoutError, match='still active'):
+            arm.close()
+        deadline = arm.close_deadline
+        clock[0] += 10
+        with pytest.raises(TimeoutError, match='still active'):
+            arm.close()
+        assert waits == [EXECUTOR_TIMEOUT_S, 0.0]
+        assert arm.close_deadline == deadline
+        assert not arm.is_closed and not arm.pipe.closed and not arm.child_pipe.closed
+        # 真正退出后仍可检查晚到错误并关闭端点，无需新的等待窗口。
+        alive[0] = False
+        arm.io.stopped.set()
+        arm.close()
+        assert waits[-1] == 0.0 and arm.is_closed
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()

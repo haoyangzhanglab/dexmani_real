@@ -1,108 +1,32 @@
 #!/usr/bin/env python3
-"""在真机上按标称节拍回放完整 Raw 关节目标，并保存回放结果。"""
+"""顺序播放绝对关节 demo；S/Q 停止退出，Esc 急停。"""
 
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
+import logging
 
 from dexmani_real.config.real import load_config
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Submit complete Raw targets at their nominal frequency on the xArm7 and XHand. "
-            "Recorded timing need not be regular; completion means all targets were submitted, "
-            "not that historical physical motion was reproduced."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python scripts/replay_episode.py episodes/<task_name>/<episode_dir>
-  python scripts/replay_episode.py episodes/<task_name>/<episode_dir> --config ~/dexmani_config.py
-  python scripts/replay_episode.py episodes/<task_name>/<episode_dir> --output replay_results/my_replay/
-
-Controls:
-  Q     clean exit (save partial results)
-  H     planned robot return-home, then wait for Q to exit (post-replay prompt)
-  S     stop current motion
-  ESC   emergency stop
-        """,
-    )
-    parser.add_argument(
-        "episode",
-        type=str,
-        help=(
-            "Published Raw episode directory (episodes/<task_name>/episode_*) "
-            "with complete finite submission-attempt targets; prior capture failure does not disqualify valid data."
-        ),
-    )
-    parser.add_argument(
-        "--config", type=str, default=None, help="Trusted Python experiment file exporting CONFIG: RealConfig"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="Missing or empty directory for replay samples and control result.",
-    )
-    parser.add_argument(
-        "--hand-start-duration",
-        type=float,
-        default=0.5,
-        help=(
-            "Seconds to ramp XHand to the first recorded measured posture before replay (default: 0.5). "
-            "Only small start differences are allowed; 0 skips the ramp. Startup preserves the current hand posture."
-        ),
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("episode", help="包含绝对关节目标 data.h5 的目录")
+    parser.add_argument("--config", help="导出 CONFIG 的可信 Python 配置")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    from dexmani_real.replay.run import run_replay
+    from dexmani_real.utils.log import configure_logging
 
-    from dexmani_real.replay.joint_replay import ReplayStatus
-    from dexmani_real.replay.run import (
-        DEFAULT_OUTPUT_DIR,
-        run_replay,
-    )
-    from dexmani_real.replay.trajectory import load_trajectory
-
-    trajectory = load_trajectory(args.episode)
-
-    runtime = load_config(path=args.config)
-
-    print(f"Trajectory: {trajectory.episode_path}")
-    print(
-        f"  Frames: {len(trajectory)}  Nominal FPS: {trajectory.fps:.1f}  "
-        f"Nominal duration: {len(trajectory) / trajectory.fps:.1f}s"
-    )
-    print(f"  Task: {trajectory.task_label}")
-    print(f"  Acc: {runtime.arm.max_joint_acceleration_deg_per_s2:.0f}°/s²")
-    print(f"  Joint speed: {runtime.arm.max_joint_velocity_deg_per_s:.0f}°/s")
-
-    if args.output is None:
-        episode_name = Path(trajectory.episode_path).name
-        output_dir = str(Path(DEFAULT_OUTPUT_DIR) / f"{episode_name}_replay")
-    else:
-        output_dir = args.output
-    print(f"Output: {output_dir}")
-
-    outcome = run_replay(
-        trajectory,
-        runtime,
-        output_dir=output_dir,
-        hand_start_duration_s=args.hand_start_duration,
-    )
-
-    if not outcome.successful:
-        print(f"Replay stopped: {outcome.status.value}: {outcome.reason}")
+    configure_logging()
+    try:
+        run_replay(args.episode, load_config(args.config))
+    except (Exception, KeyboardInterrupt):
+        logging.getLogger(__name__).exception("Replay failed")
         return 1
-    if outcome.status is ReplayStatus.COMPLETED:
-        print("Replay completed.")
-    else:
-        print("Replay exited cleanly; partial results were retained.")
     return 0
 
 

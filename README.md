@@ -44,16 +44,18 @@ python scripts/run_policy.py --print-config
 
 ## 常用实验路径
 
-将 TASK、EPISODE、EXPERIMENT 替换为任务、已发布 episode 和保存的 Policy 实验路径。
+将 TASK、EPISODE、EXPERIMENT 替换为任务、episode 目录和保存的 Policy 实验路径。训练导出要求已发布 episode。
 
 ```bash
 python scripts/collect_teleop.py TASK
 python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr
 python scripts/run_policy.py EXPERIMENT --checkpoint latest --num-episodes 5
-python scripts/replay_episode.py episodes/TASK/EPISODE --output replay_results/run_001
+python scripts/replay_episode.py episodes/TASK/EPISODE
 python scripts/visualize_episode.py episodes/TASK/EPISODE
 python scripts/keyboard_teleop.py
 ```
+
+键盘点动仅连接机械臂时，使用 `python scripts/keyboard_teleop.py --no-hand`；可与 `--config` 一起使用，覆盖配置中的 `hand.enabled`。禁用手部后，碰撞检查仍使用 `hand.home_qpos_deg` 指定的固定手姿态。
 
 Episode 可视化默认按实测 `arm_qpos`、`hand_qpos` 通过 FK 重建手部表面点云；在 3D 区域切换到 `Hand Point Cloud` 可查看手部点云、指尖和 EEF 锚点，`xArm-base` 显示相机点云及指尖、EEF 锚点。两者共用基座坐标系和时间轴。手部点数由 `CONFIG.hand_pointcloud.num_points` 指定；`--no-point-cloud` 只关闭相机点云，手部重建不依赖相机外参。
 
@@ -61,7 +63,7 @@ VR 遥操作与策略会话：B 空闲时开始新段；S/C 停止并保存；D 
 
 音效使用系统 `aplay` 或 `paplay` 播放提示，普通播放或关闭失败仅 warning，不影响实验结果和退出码。一个后台线程播放，待播槽只保留最新提示；允许合并、漏播和延迟，不保证 FIFO 或急停音效抢占。退出取消待播及尾音，不等待排空。提示音不能证明机器人已停止、物理到位或任务成功。
 
-物理回放使用 S 停止、H 回零、Q 退出；收尾期间的 H 被拒绝，完成后须重新按下。键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出；S/D 在该入口仍是方向键。启动及 HOME 后先完成伺服准备，再进入 RUNNING/hold。松键或 IK/约束拒绝时制动并 hold；有效候选不会只因名义 tick 已过而丢弃。busy 期间仍维护按键释放，长按启动键不会穿过收尾自动启动。
+物理回放使用 S/Q 停止并退出、Esc/Ctrl+C 急停并非零退出，收尾期间的急停同样生效；正常播完自动关闭。需要 HOME 时使用已有遥操作或键盘点动入口。键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出；S/D 在该入口仍是方向键。启动及 HOME 后先完成伺服准备，再进入 RUNNING/hold。松键或 IK/约束拒绝时制动并 hold；有效候选不会只因名义 tick 已过而丢弃。busy 期间仍维护按键释放，长按启动键不会穿过收尾自动启动。
 
 传感进程在尝试 start 前登记归属，启动后中断仍由统一收尾回收；明确无 PID 的对象不 join，无法确认退出的句柄继续保留并报告。Policy 按实际受管进程检查健康，静态参数相机关闭后不再参与检查。
 
@@ -69,7 +71,9 @@ VR 遥操作与策略会话：B 空闲时开始新段；S/C 停止并保存；D 
 
 策略周期、数值 recipe、输入模态和动作窗口从 checkpoint 恢复，不改变录制的完整多模态 schema。sync 等待预测后顺序执行动作；async 按时间锚点裁掉过期动作，可继续旧计划的有效尾部；RTC 固定策略动作前缀并严格交接，错过承诺槽即结束。记预测长度为 P、`action_steps` 为 A、`prefetch_steps` 为 d：sync 要求 `1 <= A <= P`；async 要求 `1 <= d <= A <= P` 且 `d < P`；RTC 另要求 `A+d <= P`，guidance cap 须显式为有限非负值。EEF 前缀相同不保证未来 IK 分支相同。多帧 history 按实际入窗 control 时间判断，间隔超过 1.5dt 后清空重积累，窗口完整前不提交新预测；单帧模式不变。首预测 reset RNG，预热后恢复 RNG；预热重复引用同一观测行时，手部几何只计算一次；sync 的预测等待不得超过已有目标期限。运行时长期限与预测等待期限独立保存，选择更早者；恰好相等时按正常时长完成归因，真实错误和已发生的操作者停止仍按原规则处理。
 
-每段结束先停止设备，再同步完成录制和模型回收；已知退出、急停或致命失败时，先 close 机器人再等待慢资源。writer 有自己的有界收尾预算，同一未完成模型任务跨 episode/session 收尾共用一次绝对期限。writer 正常关闭后按冻结的保存意图发布，失败 Raw staging 保留，零行不发布。运行失败与容器发布状态独立；后续模型或 close 失败不会反向否定已发布数据。线程、进程和 Future 的超时不代表已退出，仍保留句柄并报告 pending。
+策略首发等待包含 history 积累预算；连续无成功提交期间，预测完成、接受计划、重提预测和映射都不续期。已有目标租期参与预算选择；owner 已因租期停止而 duration 同刻到期时，仍按 duration 结束，模型错误和操作者取消分别保留。启动取消值在键盘启用前捕获，贯穿传感器、模型 load/warmup 和最终准入；启动期间 S/C/D/Q 取消后正常关闭退出，内部 prepare/HOME 的 stop 不算用户取消。
+
+每段结束先停止设备，再同步完成录制和模型回收；已知退出、急停或致命失败时，先 close 机器人再等待慢资源。writer 有自己的有界收尾预算，同一未完成模型任务跨 episode/session 收尾共用一次绝对期限；同一 arm owner 的重复 close 也只使用首次关闭预算的剩余时间。writer 正常关闭后按冻结的保存意图发布，失败 Raw staging 保留，零行不发布。运行失败与容器发布状态独立；后续模型或 close 失败不会反向否定已发布数据。线程、进程和 Future 的超时不代表已退出，仍保留句柄并报告 pending。
 
 Policy Raw 直接使用结果的 episode 编号（如 `episode_002`），准备取消后允许编号空洞；既有数据不重命名。
 
@@ -79,19 +83,21 @@ Policy Raw 直接使用结果的 episode 编号（如 `episode_002`），准备�
 
 任务标签须为非空、非全空白字符串，不含 ASCII 控制字符 0–31 或 DEL 127，录制与导出共用此规则且不改写输入；策略任务名在创建会话目录前也按此规则接纳。遥操作 TASK 同时用于目录，另外禁止路径分隔符、以点开头的目录名及首尾空白；这些目录限制不适用于一般自然语言标签。
 
-Raw 使用 `data.h5` + `rgb.mp4`，默认在 `episodes/TASK/`；训练导出到 `datasets/TASK.zarr`，策略和回放产物位于 `rollouts/`、`replay_results/`。RawReader 和 `visualize_episode.py --info` 允许诊断显式 `.tmp_*` 路径；导出和物理回放检查请求路径及解析后路径，拒绝未发布目录及其符号链接。诊断不会发布或改名数据。
+Raw 使用 `data.h5` + `rgb.mp4`，默认在 `episodes/TASK/`；训练导出到 `datasets/TASK.zarr`，策略产物位于 `rollouts/`；回放只打印提交数和耗时，不生成审计文件或输出目录，可重复执行同一命令。RawReader 和 `visualize_episode.py --info` 允许诊断显式 `.tmp_*` 路径；导出只检查请求 episode 和解析后 episode 的 basename，拒绝实际 `.tmp_episode` 及其别名，允许普通 `.tmp_workspace` 祖先及用作批量输入的临时工作目录。回放接受显式指定的临时目录，文件锁冲突、损坏或目标无效仍报错。诊断不会发布或改名数据。
 
 Raw 将实测 state 与提交尝试 action 分开保存。组合命令按设备顺序提交，部分失败保持原故障并停止；送入 arm mailbox 只代表目标发布，不保证每个目标进入 SDK 或物理到位。手部 warm start、阻尼和滤波参考由控制线程在提交正常返回后更新；同一 VR 帧每个控制 tick 仍运行手映射和速度限制。dt 使用本次计算时刻减上次实际提交参考时刻，未实际提交的候选不推进参考或时间。SDK 调用正常返回也不证明手部物理执行。
 
 Canonical 保留 [固定 13 模态](dexmani_real/data/export.py)、原单位和 dtype、EEF 9D 与 EEF action 21D。示教导出目前只支持 teleop Raw。sync Policy Raw 的同行 action 是本次提交尝试，不代表由同行观测推理得到。正常保存、可导出和可物理回放是不同条件。相机外参 `camera_T_xarm_base_from_color` 从 color optical 坐标变换到 xArm base，平移单位为米。
 
-`timing/rows` 使用主机单调时钟，单位 ns，缺失值为 -1；`control_ns` 是采样起点，`observation_ns` 是快照完成时刻。臂、手、触觉和相机保留各自来源时间，缓存读取不刷新年龄；相机来源为首次主机接收时间，不等于曝光时刻。同行数据不代表硬件同步。按 control_needs 与 record_needs 的并集 capture_needs 采样，分别裁决控制和录制。请求录制而启动失败时不开始运动；运行中存档专用来源失效或队列满会冻结有效前缀，记录 recording_truncated_reason 并警告，控制输入仍有效时运动继续。teleop 末次映射失败、未形成提交命令时也冻结此前前缀，避免末行 NaN action 使有效示教无法导出。冻结不启动后台收尾，不恢复录制，不补造来源数据；停止运动后统一保存或丢弃。真实 writer I/O 或设备通信错误仍终止会话。仅录制截断且控制与关闭正常时，CLI 可正常退出，但必须报告截断原因、路径及行数。
+`timing/rows` 使用主机单调时钟，单位 ns，缺失值为 -1；`control_ns` 是采样起点，`observation_ns` 是快照完成时刻。臂、手、触觉和相机保留各自来源时间，缓存读取不刷新年龄；相机来源为首次主机接收时间，不等于曝光时刻。同行数据不代表硬件同步。录制接纳期间按 control_needs 与 record_needs 的并集采样；无录制或冻结后的下一轮只读取控制字段，来源缓存不清空，worker 不动态重启。请求录制而启动失败时不开始运动；运行中存档专用来源失效或队列满会冻结有效前缀，记录 recording_truncated_reason 并警告，控制输入仍有效时运动继续。teleop 末次映射失败、未形成提交命令时也冻结此前前缀，避免末行 NaN action 使有效示教无法导出。冻结不启动后台收尾，不恢复录制，不补造来源数据；停止运动后统一保存或丢弃。真实 writer I/O 或设备通信错误仍终止会话。仅录制截断且控制与关闭正常时，CLI 可正常退出，但必须报告截断原因、路径及行数。
 
-teleop/jog/sync 从每轮开始计时，只等待剩余周期；慢计算降低实际频率，不补发积压 tick，sync 只在提交后推进动作游标。async 保留时间锚点，RTC 保留严格前缀与交接承诺。Canonical 只接纳已发布且结构、数值和必要时序有效的 teleop Raw，不按历史 technical_status 拒绝数据。相邻 control 间隔保持名义 dt 的 ±25%，观测不得早于本次 control 或跨越下次 control；来源时钟及触觉年龄约束仍保留。删除平均周期 ±5% 和 readout 小于名义周期的门禁。因此名义 62.5 ms、实际稳定 66 ms 可以导出，125 ms 断档仍拒绝。单行仅警告，无法验证采样周期。episode_quality 保存平均周期、最大间隔、最大 readout、网格漂移、运行结束和录制截断信息。dt 是名义周期，严格时序实验应使用 Raw 时间戳；不重采样或改写 dt。
+teleop/jog/sync/replay 从每轮开始计时，只等待剩余周期；慢计算降低实际频率，不补发积压 tick，sync 只在提交后推进动作游标。async 保留时间锚点，RTC 保留严格前缀与交接承诺。Canonical 只接纳已发布且结构、数值和必要时序有效的 teleop Raw。相邻 control 间隔保持名义 dt 的 ±25%，观测不得早于本次 control 或跨越下次 control；来源时钟及触觉年龄约束仍保留。名义 62.5 ms、实际稳定 66 ms 可以导出，125 ms 断档仍拒绝。单行仅警告，无法验证采样周期。episode_quality 保存平均周期、最大间隔、最大 readout、网格漂移、运行结束和录制截断信息。dt 是名义周期，严格时序实验应使用 Raw 时间戳；不重采样或改写 dt。
 
 导出先验证元数据、结构、dtype、计数和时间规则；六个原始数值 dataset 随转换逐块各读取一次，整块有限值检查通过后才进入几何计算，转换结果仍检查有限值。前置验证成功不代表全部数值已通过；坏数值可能在转换开始后甚至末块才发现，整段及整批拒绝语义不变。保留 RGB 逐帧解码和流式写入，成功时导出全部帧，不截断、切分、插值、补帧或重采样。批量遇到不合格 episode 明确失败，错误标明 episode、原因及适用的行索引；可通过 `--exclude EPISODE` 排除整段后重试，不自动跳过或改写 Raw。全部完成后才原子发布 Canonical；准入或转换失败关闭资源并删除本次新建的 Canonical staging，清理失败另行记录且不覆盖原错；不删除源 Raw 或既有目标。
 
-物理回放要求已发布、合法非空有限目标和首行实测起点；含无命令 NaN 行的 Policy Raw 会被拒绝，不筛行或补值。回放保留提交前槽位检查、设备授权和目标租期；send_action 成功返回稍晚允许继续，例如 62.5 ms 槽内开始、63 ms 返回且下一槽仍有效时继续。下一行仍沿原时间轴，错过下一完整槽即停止，不跳行补发或重置原点；设备异常、撤权和租期拒绝仍直接失败。提交起止时间保留实测值，成功返回不证明物理到位。
+物理回放只要求 `data.h5` 中非空有限的 `action_arm_joint_target (N,7)`、`action_hand_joint_target (N,12)`，以及 `meta` 的 `control_hz`、`joint_units=rad` 和当前设备顺序的 JSON joint names。接受实数数值 dtype；不要求 timing、历史实测起点、RGB-D、触觉或完成标签。连接前一次校验整段当前 arm/hand 配置范围；当前手部配置可窄于公共额定硬件范围，不能省略文件校验。坏行不筛除、不补值、不裁剪。
+
+回放只比较新鲜反馈与第一行目标，任一关节差大于 10° 即拒绝并关闭，实验者须先就位。直接提交原始绝对目标，不执行 mapper、IK 或在线几何/碰撞检查，不加载 mesh、桌面标定或 HOME planner。实验者须确认同一机器人的布置适合该 demo。每行从实际开始计时，只等剩余周期；300 行每次耗时 63 ms 可全部顺序提交，慢了就变慢。末行成功后固定可中断留驻 0.5 s，替代普通周期等待，不续租或证明到位。公共反馈年龄、2 s 目标租期、stop/emergency、SDK 和关闭失败仍有效；无操作者输入的执行器停止非零退出。arm 邮箱仍是 latest-value，有序提交不代表每行都得到 SDK 回执或物理执行。
 
 每次新导出生成独立 `source_id`，原样搬迁保留 ID，供人工归档和实验说明。它不是内容 hash，不保证 split/resume 使用同一数据；配套 Policy 训练恢复允许显式更换数据路径，并按其当前实现检查实际模型/数据兼容项。旧数据和 checkpoint 不自动改写。Canonical 保存影响数值结果的处理配方与完整 URDF；实验应记录 source_id、导出 Real SHA、训练 Policy SHA 及手模板来源。修改处理算法或模板后重新导出，已有未知来源须如实保留。
 
@@ -115,9 +121,9 @@ arm HOME 使用配置 arm.homing.timeout_s（默认 60 秒）的一次绝对期�
 
 `StaticCollisionBox` 由基座坐标系中心 `center_xyz_m` 和沿基座 X/Y/Z 轴的完整边长 `size_xyz_m` 定义，单位均为米，范围为 `center_xyz_m ± size_xyz_m / 2`。盒体固定轴对齐，按配置顺序命名为 `obstacle_0`、`obstacle_1` 等。标定桌面名为 `table`，按平面法向计算姿态，支持倾斜桌面。
 
-遥操作、键盘点动、策略会话和物理回放首次使用 arm HOME 才加载桌面标定并构造 planner，会话内复用。未使用 HOME 的运行、启动手部 HOME、触觉初始化和单纯 RGB-D 录制不依赖桌面标定；实际启用点云去桌面时仍须在该 worker 启动前加载，之后 HOME 复用同一平面。未使用的有效平面元数据保持未加载，实际使用后记录系数和路径。
+遥操作、键盘点动、策略会话首次使用 arm HOME 才加载桌面标定并构造 planner，会话内复用。未使用 HOME 的运行、启动手部 HOME、触觉初始化和单纯 RGB-D 录制不依赖桌面标定；实际启用点云去桌面时仍须在该 worker 启动前加载，之后 HOME 复用同一平面。未使用的有效平面元数据保持未加载，实际使用后记录系数和路径。
 
-缺失/无效 HOME 标定或专用配置、干净的几何路径拒绝仅结束本次 HOME，保持停止并允许调整后重试；手部可能已完成回位，不能据此认定整机完全没动。已完成回放后的单次 HOME 拒绝记录在 `home_results`，不改变原回放完成结果。设备、超时、停止或清理失败仍按错误结束，不自动换直线或跳过检查。
+缺失/无效 HOME 标定或专用配置、干净的几何路径拒绝仅结束本次 HOME，保持停止并允许调整后重试；手部可能已完成回位，不能据此认定整机完全没动。设备、超时、停止或清理失败仍按错误结束，不自动换直线或跳过检查。
 
 HOME 净间隙仍为机器人几何到桌面的最小距离减去 `table.soft_clearance_m`。起始姿态在软间隙内时仍允许按既有规则退出，退出后不能重新进入，目标必须满足净间隙要求。`environment.table_plane_path` 是 HOME 和点云共用的标定来源；点云 `remove_table` 仍独立可选，去桌面不会执行机器人碰撞检查。在线端点控制不装配桌面碰撞模型。workspace、米/deg/rad 和物理高度/间隙保持明确。
 

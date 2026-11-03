@@ -11,8 +11,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from dexmani_real.runtime.state import RunEndReason
-
 logger = logging.getLogger(__name__)
 
 LISTENER_START_TIMEOUT_S = 2.0
@@ -105,7 +103,6 @@ class Keyboard:
             with state.motion_lock:
                 if not state.requests_allow_motion():
                     return None
-                state.run_ended_reason = RunEndReason.NONE
                 return state.cancel_epoch
 
     def callbacks(self, keyboard):
@@ -205,7 +202,8 @@ class Keyboard:
         if failure is not None:
             raise failure
 
-    def poll(self, timeout=0.05) -> list[KeyEvent]:
+    def poll(self, state, timeout=0.05):
+        """事件与 stop 在同一输入临界区取快照；调用方在锁外处理。"""
         if self.active and not self.check_health():
             timeout = 0
         with self.condition:
@@ -213,7 +211,7 @@ class Keyboard:
                 self.condition.wait_for(lambda: self.events or not self.active, timeout)
             events = list(self.events)
             self.events.clear()
-            return events
+            return events, state.stop_signal.is_set()
 
     def check_health(self):
         healthy = bool(self.active and self.listener is not None and self.listener.is_alive())

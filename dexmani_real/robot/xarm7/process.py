@@ -42,8 +42,7 @@ class ArmProcess:
         self.pipe, self.child_pipe = self.ctx.Pipe()
         self.process: BaseProcess | None = None
         self.reply_pending = False
-        self._fault_error: RobotError | None = None
-        self._close_error: RobotError | None = None
+        self.close_deadline: float | None = None
 
     @property
     def is_connected(self):
@@ -107,7 +106,7 @@ class ArmProcess:
             raise
 
     def _read_fault(self):
-        # owner 的首个故障不会被清除；父进程复用同一异常，保留原始 cause。
+        # owner 的首个故障不会被清除；每次检查直接报告当前事实。
         issue = self.fault
         if (not issue and self.process is not None and self.process.pid is not None
                 and not self.process.is_alive()):
@@ -115,19 +114,11 @@ class ArmProcess:
                 issue = f"arm owner exited: {self.process.exitcode}"
             elif not self.io.stopped.is_set():
                 issue = "arm owner exited without confirming stop"
-        if issue and self._fault_error is None:
-            self._fault_error = RobotError(f"xArm controller fault: {issue}")
-        return self._fault_error
+        return RobotError(f"xArm controller fault: {issue}") if issue else None
 
     def _read_close_error(self):
         message = self.io.close_error.value.decode(errors="replace")
-        # disconnect 会追加详情；更新已有异常，避免再附加一份已报告的停止错误。
-        if message:
-            if self._close_error is None:
-                self._close_error = RobotError(message)
-            else:
-                self._close_error.args = (message,)
-        return self._close_error
+        return RobotError(message) if message else None
 
     def check_error(self):
         error = self._read_fault() or self._read_close_error()
@@ -273,29 +264,26 @@ class ArmProcess:
         if self.process is not None and self.process.is_alive():
             if not self.io.stopped.wait(max(0, deadline - time.monotonic())):
                 raise TimeoutError("arm stop unresolved; SDK acceptance not confirmed")
-        error = self._read_close_error()
-        if error is not None:
-            raise error
         self.check_error()
 
     def close(self) -> None:
         self.request_stop()
         self.io.closing.set()
+        if self.close_deadline is None:
+            self.close_deadline = time.monotonic() + EXECUTOR_TIMEOUT_S
         errors: list[BaseException] = []
-        reported_fault = self._fault_error
-        reported_close_error = str(self._close_error) if self._close_error is not None else None
         if self.process is not None and self.process.pid is not None:
             try:
-                self.process.join(EXECUTOR_TIMEOUT_S)
+                self.process.join(max(0.0, self.close_deadline - time.monotonic()))
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
                 errors.append(exc)
-        # join 后保留晚到故障；已上报的运行故障不再冒充一次关闭失败。
+        # join 后重新读取故障，包含关闭期间晚到的错误。
         fault, close_error = self._read_fault(), self._read_close_error()
-        if fault is not None and fault is not reported_fault:
+        if fault is not None:
             errors.insert(0, fault)
-        if close_error is not None and str(close_error) != reported_close_error:
+        if close_error is not None:
             errors.append(close_error)
         alive = self.process is not None and self.process.is_alive()
         if alive:

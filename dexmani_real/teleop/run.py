@@ -61,6 +61,7 @@ def run_teleop(
     if "/" in task_name or "\\" in task_name:
         raise ValueError("task_name must be one safe directory component")
     validate_robot_config(runtime)
+    runtime.environment.validate()
     validate_control_rate(runtime, runtime.teleop.control_hz)
     runtime.teleop.validate()
     runtime.vr.validate()
@@ -90,6 +91,7 @@ def run_teleop(
     )
     ctx = mp.get_context("spawn")
     runtime_state = SessionState()
+    startup_cancel_epoch = runtime_state.cancel_epoch
     channels = SensorChannels(
         ctx,
         camera=runtime.camera if record else None,
@@ -150,7 +152,8 @@ def run_teleop(
                 ),
                 ring=sensors.channels.camera_ring,
                 timeout_s=CAMERA_READY_TIMEOUT_S,
-                may_start=lambda: keyboard.check_health() and runtime_state.requests_allow_motion(),
+                may_start=lambda: keyboard.check_health() and runtime_state.requests_allow_motion()
+                    and runtime_state.cancel_epoch == startup_cancel_epoch,
             )
             loop.camera_snapshot = snapshot_camera_parameters(
                 channels,
@@ -158,12 +161,14 @@ def run_teleop(
                 camera_calibration_path,
             )
         robot.check()
-        startup_cancel_epoch = runtime_state.arm()
-        if initialize_teleop(
+        if runtime_state.cancel_epoch != startup_cancel_epoch:
+            raise OperationCancelled("teleop startup cancelled")
+        runtime_state.arm(cancel_epoch=startup_cancel_epoch)
+        initialize_teleop(
             loop, ctx.Process(name="vr", target=run_vr, args=(channels, runtime.vr)),
             cancel_epoch=startup_cancel_epoch,
-        ):
-            loop.run()
+        )
+        loop.run()
         robot.check()
         clean = bool(runtime_state.quit_requested)
     except KeyboardInterrupt as exc:
@@ -174,8 +179,8 @@ def run_teleop(
             if robot is not None:
                 robot.check()
             if not (
-                runtime_state.stop_signal.is_set() or runtime_state.quit_requested
-                or runtime_state.estop_request
+                runtime_state.cancel_epoch != startup_cancel_epoch
+                or runtime_state.quit_requested or runtime_state.estop_request
             ):
                 raise
         except Exception as failure:
@@ -194,14 +199,12 @@ def run_teleop(
         try:
             if loop is not None:
                 loop.close()
-        except KeyboardInterrupt as exc:
+        except KeyboardInterrupt:
             runtime_state.request_emergency_stop()
-            if exc is not primary_failure:
-                logger.exception("teleop capture cleanup interrupted")
+            logger.exception("teleop capture cleanup interrupted")
         except Exception as exc:
             runtime_state.stop_signal.set()
-            if exc is not primary_failure:
-                logger.exception("teleop capture cleanup failed")
+            logger.exception("teleop capture cleanup failed")
             primary_failure = primary_failure or exc
         finally:
             try:
@@ -209,8 +212,7 @@ def run_teleop(
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     runtime_state.request_emergency_stop()
-                if exc is not primary_failure:
-                    logger.exception("teleop runtime cleanup failed")
+                logger.exception("teleop runtime cleanup failed")
             else:
                 shutdown_clean = True
             finally:
@@ -227,7 +229,10 @@ def run_teleop(
     )
 
 
-def initialize_teleop(loop, vr_process, *, cancel_epoch) -> bool:
+def initialize_teleop(loop, vr_process, *, cancel_epoch) -> None:
+    loop.robot.check()
+    if loop.runtime_state.cancel_epoch != cancel_epoch:
+        raise OperationCancelled("teleop startup cancelled")
     # 自动复位前，键盘停止回调已经生效。
     initialize_hand(
         loop.runtime_state,
@@ -237,28 +242,30 @@ def initialize_teleop(loop, vr_process, *, cancel_epoch) -> bool:
         cancel_requested=loop.poll_blocking_commands,
     )
     if loop.poll_blocking_commands():
-        return False
+        raise OperationCancelled("teleop startup cancelled")
     loop.sensors.start(
         vr_process,
         ring=loop.sensors.channels.vr_ring,
-        may_start=lambda: loop.keyboard.check_health() and loop.runtime_state.requests_allow_motion(),
+        may_start=lambda: loop.keyboard.check_health() and loop.runtime_state.requests_allow_motion()
+            and loop.runtime_state.cancel_epoch == cancel_epoch,
     )
     deadline = time.monotonic() + VR_READY_TIMEOUT_S
     while True:
-        if loop.poll_blocking_commands():
-            return False
+        if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
+            raise OperationCancelled("teleop startup cancelled")
         loop.robot.service_idle()
         if loop.sensors.channels.vr_ring.latest_sequence > 0:
             if loop.poll_blocking_commands():
-                return False
+                raise OperationCancelled("teleop startup cancelled")
             if not loop.sensors.check():
                 raise RuntimeError("VR worker exited during startup")
             break
         time.sleep(0.05)
         if time.monotonic() >= deadline:
             raise RuntimeError("VR failed to become ready before the startup timeout")
-    if not calibrate_hand(loop):
-        return False
+    calibrate_hand(loop, cancel_epoch)
+    if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
+        raise OperationCancelled("teleop startup cancelled")
     loop.runtime_state.revoke_motion()
     print(
         "就绪：B 空闲时开始新段 | S/C 保存结束本段 | D 丢弃本段 | "
@@ -266,14 +273,13 @@ def initialize_teleop(loop, vr_process, *, cancel_epoch) -> bool:
         "T 空闲时复位触觉。",
         flush=True,
     )
-    return True
 
 
-def calibrate_hand(loop):
+def calibrate_hand(loop, cancel_epoch) -> None:
     """只消费新鲜、来源时间递增的 VR 帧；重复读取缓存不计作标定样本。"""
     retargeter = loop.controller.hand_retargeter
     if retargeter is None:
-        return True
+        return
     from dexmani_real.teleop.retargeting.landmarks import (
         hand_lengths,
         prepare_landmarks,
@@ -286,9 +292,8 @@ def calibrate_hand(loop):
     last_source_ns = 0
     last_error = "no fresh hand frames"
     while len(measurements) < config.calibration_samples:
-        if loop.poll_blocking_commands():
-            loop.runtime_state.request_quit()
-            return False
+        if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
+            raise OperationCancelled("hand calibration cancelled")
         loop.robot.service_idle()
         if time.monotonic() >= deadline:
             raise RuntimeError(
@@ -310,9 +315,10 @@ def calibrate_hand(loop):
                 else:
                     measurements.append(measurement)
         time.sleep(0.005)
+    if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
+        raise OperationCancelled("hand calibration cancelled")
     retargeter.calibrate(measurements)
     logger.info("Hand morphology calibrated from %s distinct frames", len(measurements))
-    return True
 
 
 def build_hand_retargeter(runtime):

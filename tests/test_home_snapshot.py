@@ -132,3 +132,40 @@ def test_pointcloud_worker_does_not_reprocess_cached_camera_frame(monkeypatch):
     assert processed == [100, 200]
     assert [(row['source_camera_sequence'], row['timestamp_ns']) for row in published] == [(1, 100), (2, 200)]
     assert [int(row['rgb'][0]) for row in published] == [100, 200]
+
+
+@pytest.mark.parametrize('part', ['arm_target', 'arm_timeout', 'hand_target', 'hand_timeout'])
+def test_unused_home_config_does_not_gate_streaming_but_home_rejects(part):
+    from dexmani_real.config.control import HomeConfigurationError
+    from dexmani_real.runtime.home import home_hand
+    from dexmani_real.runtime.preflight import validate_robot_config
+    runtime = RealConfig()
+    if part == 'arm_target':
+        runtime = replace(runtime, arm=replace(runtime.arm, home_qpos=(float('nan'),) * 7))
+    elif part == 'arm_timeout':
+        runtime = replace(runtime, arm=replace(runtime.arm, homing=replace(runtime.arm.homing, timeout_s=0)))
+    elif part == 'hand_target':
+        runtime = replace(runtime, hand=replace(runtime.hand, home_qpos_deg=(float('nan'),) * 12))
+    else:
+        runtime = replace(runtime, hand=replace(runtime.hand, home_timeout_s=0))
+    validate_robot_config(runtime)
+    state = SessionState(safety_state=SafetyState.ARMED)
+    robot = SimpleNamespace(arm_config=runtime.arm, hand_config=runtime.hand)
+    # invalid HOME 必须在请求规划或发送任何目标前失败。
+    with pytest.raises(HomeConfigurationError):
+        if part.startswith('arm'):
+            home_robot(state, robot, lambda: pytest.fail('invalid HOME reached planner'),
+                       cancel_epoch=state.cancel_epoch, cancel_requested=lambda: False)
+        else:
+            home_hand(state, robot, cancel_epoch=state.cancel_epoch, cancel_requested=lambda: False)
+
+
+def test_streaming_keeps_standstill_thresholds_and_disabled_hand_geometry_checks():
+    from dexmani_real.runtime.preflight import validate_robot_config
+    runtime = RealConfig()
+    bad_arm = replace(runtime.arm, homing=replace(runtime.arm.homing, velocity_convergence_rad_s=0))
+    with pytest.raises(ValueError, match='standstill'):
+        validate_robot_config(replace(runtime, arm=bad_arm))
+    fixed_hand = replace(runtime.hand, enabled=False, home_qpos_deg=(float('nan'),) * 12)
+    with pytest.raises(ValueError, match='finite'):
+        validate_robot_config(replace(runtime, hand=fixed_hand))

@@ -28,7 +28,6 @@ from dexmani_real.deployment.schedule import (
     handoff_plan,
     plan_rejection,
     prefetch_handoff,
-    window_end,
 )
 from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
@@ -94,6 +93,8 @@ class Rollout:
         self.cancel_epoch = cancel_epoch
         self.history: deque[PolicyObservationRow] = deque(maxlen=policy_info.n_obs_steps)
         self.last_history_timestamp_ns = None
+        self.sync_actions = None
+        self.sync_cursor = 0
         self.plan: ActionChunk | None = None
         self.query: Prediction | None = None
         self.preparation_issue = None
@@ -119,18 +120,19 @@ class Rollout:
         return "; ".join(issues) if issues else None
 
     def read_observation(self):
-        row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
+        needs = (self.capture_needs if self.recorder is not None and self.recorder.is_recording
+                 else self.control_needs)
+        row = read_observation(self.sensors.channels, self.robot, needs=needs)
         issues = check_observation(row, self.runtime, self.control_needs)
         return row, "control_input_" + issues[0] if issues else None
 
     def budget_limit(self):
-        if self.wait_deadline_ns is not None and (
-            self.run_deadline_ns is None or self.wait_deadline_ns < self.run_deadline_ns
-        ):
-            return self.wait_deadline_ns, "wait"
-        if self.run_deadline_ns is not None:
-            return self.run_deadline_ns, "duration"
-        return None
+        limits = [(deadline, reason) for deadline, reason in (
+            (self.run_deadline_ns, "duration"),
+            (self.wait_deadline_ns, "wait"),
+            (self.target_expires_ns, "wait"),
+        ) if deadline is not None]
+        return min(limits, key=lambda item: item[0]) if limits else None
 
     def expired_budget(self):
         limit = self.budget_limit()
@@ -140,18 +142,15 @@ class Rollout:
         if self.finished:
             return
         ended_ns = time.monotonic_ns()
-        reason = self.runtime_state.revoke_motion(
-            reason=run_end_reason,
-            expected_cancel_epoch=self.cancel_epoch,
-        )
+        self.runtime_state.revoke_motion()
         self.result.duration_s = (ended_ns - self.started_ns) / 1e9 if self.started_ns else 0.0
         self.result.termination_reason = (
-            reason.name.lower() if self.started_ns
+            run_end_reason.name.lower() if self.started_ns
             else "preparation_failed" if self.preparation_issue or errors else "start_cancelled"
         )
         self.result.termination_details = detail if not errors else None
         self.result.errors.extend(errors)
-        self.plan = self.query = None
+        self.plan = self.query = self.sync_actions = None
         self.history.clear()
         self.previous_arm = self.wait_deadline_ns = self.run_deadline_ns = None
         self.robot.stop()
@@ -171,7 +170,6 @@ class Rollout:
                     save=save, reason=result.termination_reason,
                     details=result.errors + ([dict(stage="termination", reason=result.termination_details)]
                                              if result.termination_details is not None else []),
-                    technical_status="normal" if result.normal_termination else "failed",
                 )
             finally:
                 result.raw = self.recorder.result()
@@ -199,6 +197,7 @@ class Rollout:
             except OperationCancelled as exc:
                 # 取消不能掩盖同时发生的设备或 worker 故障。
                 self.robot.check()
+                poll_operator()
                 self.stop(str(exc))
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
@@ -242,10 +241,9 @@ class Rollout:
                 except BaseException as exc:
                     if isinstance(exc, KeyboardInterrupt):
                         self.runtime_state.request_emergency_stop()
-                    if exc is not failure:
-                        self.result.errors.append(error_detail(stage, exc))
-                        if failure is not None:
-                            logger.exception("episode %s also failed", stage)
+                    self.result.errors.append(error_detail(stage, exc))
+                    if failure is not None:
+                        logger.exception("episode %s also failed", stage)
                     self.audio.play("emergency")
                     if failure is None:
                         failure = exc
@@ -299,13 +297,11 @@ class Rollout:
         logger.info("Policy preparing")
         poll_operator()
         if not self.preparation_valid():
-            self.stop("cancelled before preparation")
-            return
+            raise OperationCancelled("cancelled before preparation")
         self.robot.prepare_streaming(self.cancel_epoch)
         poll_operator()
         if not self.preparation_valid():
-            self.stop("cancelled during streaming preparation")
-            return
+            raise OperationCancelled("cancelled during streaming preparation")
         if self.record_raw:
             self.recorder = EpisodeRecorder(self.output_dir, control_hz=1 / self.policy_info.control_dt_s)
             metadata = snapshot_recording_metadata(
@@ -319,8 +315,7 @@ class Rollout:
             )
         poll_operator()
         if not self.preparation_valid():
-            self.stop("cancelled during recorder start")
-            return
+            raise OperationCancelled("cancelled during recorder start")
         # 设备准备和 writer 启动后重新取得最终快照。
         row = self.start_observation()
         if row is None:
@@ -332,8 +327,7 @@ class Rollout:
         started_ns = self.runtime_state.begin_motion(cancel_epoch=self.cancel_epoch)
         if started_ns is None:
             self.robot.check()
-            self.stop("final admission declined")
-            return
+            raise OperationCancelled("final admission declined")
         self.started_ns = started_ns
         self.next_step_ns = self.started_ns
         self.wait_deadline_ns = (
@@ -354,15 +348,20 @@ class Rollout:
             expected = (self.policy_info.future_steps, self.policy_info.control_action_dim)
             if actions.shape != expected or not np.isfinite(actions).all():
                 raise ValueError(f"policy prediction requires finite shape {expected}")
-            # 预测任务与 query 成对创建，结束前由当前 rollout 独占回收。
-            cast(Prediction, self.query).result = actions
+            # 当前 rollout 独占消费预测结果；只有时间窗口模式需要 query 锚点。
+            if self.execution.mode == "sync":
+                self.sync_actions = actions
+                self.sync_cursor = 0
+            else:
+                cast(Prediction, self.query).result = actions
+            return True
 
     def submit(self, slot, *, handoff_slot=None, prefix=None):
         # 不能用新等待窗口续期已经耗尽的 bootstrap/预测预算。
         if self.expired_budget() is not None:
             return "prediction_budget_exhausted"
         submitted_ns = time.monotonic_ns()
-        if self.plan is None:
+        if self.plan is None and self.wait_deadline_ns is None:
             limits = [submitted_ns + PREDICTION_WAIT_TIMEOUT_NS]
             if self.target_expires_ns is not None:
                 limits.append(self.target_expires_ns)
@@ -376,7 +375,8 @@ class Rollout:
             return "prediction_budget_exhausted"
         self.model.predict(rows, reset_episode=self.first_prediction, **kwargs)
         self.first_prediction = False
-        self.query = Prediction(slot, handoff_slot)
+        if self.execution.mode != "sync":
+            self.query = Prediction(slot, handoff_slot)
         return None
 
     def map_command(self, action, row):
@@ -426,39 +426,39 @@ class Rollout:
         try:
             if self.finished:
                 return
-            if not self.runtime_state.can_move(cancel_epoch=self.cancel_epoch):
+            motion_allowed = self.runtime_state.can_move(cancel_epoch=self.cancel_epoch)
+            if not motion_allowed:
                 self.robot.check()
-                self.stop("owner_authority_revoked")
-                return
-            self.poll_model()
+                if (self.runtime_state.cancel_epoch != self.cancel_epoch
+                        or not self.runtime_state.requests_allow_motion()):
+                    raise OperationCancelled("owner_authority_revoked")
+            prediction_ready = self.poll_model()
             if self.recorder is not None:
                 self.recorder.check_error()
             if (limit := self.expired_budget()) is not None:
                 self.stop_budget(limit)
                 return
+            if not motion_allowed:
+                raise OperationCancelled("owner_authority_revoked")
 
             now = time.monotonic_ns()
             synchronous = self.execution.mode == "sync"
-            waiting_query = self.query if synchronous and self.plan is None else None
-            if waiting_query is not None and waiting_query.result is not None:
-                # 结果到达时读取执行快照，给予一个完整提交机会；不再进入模型 history。
-                slot = self.last_slot + 1
+            waiting_sync = synchronous and self.model.future is not None
+            if synchronous:
+                if now < self.next_step_ns and not prediction_ready:
+                    return
                 self.next_step_ns = now + self.dt_ns
-                skipped = 0
             else:
                 slot, self.next_step_ns, skipped = control_slot(
                     now_ns=now, next_step_ns=self.next_step_ns, last_slot=self.last_slot,
-                    dt_ns=self.dt_ns, synchronous=synchronous,
+                    dt_ns=self.dt_ns,
                 )
                 if slot is None:
                     return
-            if synchronous:
-                self.next_step_ns = now + self.dt_ns
-            self.result.skipped_slots += skipped
-            if skipped and self.execution.mode == "rtc" and self.plan is not None:
-                self.stop(f"missed_slot: expected={self.last_slot + 1}, actual={slot}")
-                return
-            if not synchronous:
+                self.result.skipped_slots += skipped
+                if skipped and self.execution.mode == "rtc" and self.plan is not None:
+                    self.stop(f"missed_slot: expected={self.last_slot + 1}, actual={slot}")
+                    return
                 self.last_slot = slot
             row, issue = self.read_observation()
             if not sources_available(row, self.control_needs):
@@ -467,10 +467,10 @@ class Rollout:
             if issue is not None:
                 self.stop(issue)
                 return
-            if waiting_query is not None and waiting_query.result is None:
+            if waiting_sync:
                 # 当前输入持续裁决；等待行是评估事实，不重复插入模型历史。
                 return
-            if waiting_query is None:
+            if not (synchronous and prediction_ready):
                 if self.policy_info.n_obs_steps > 1:
                     # sync 等待预测时不追加样本；只比较真正进入 history 的采样时刻。
                     # 半周期余量容忍小幅抖动，明确漏槽则直接重建连续窗口。
@@ -483,38 +483,49 @@ class Rollout:
                     self.last_history_timestamp_ns = row.control_timestamp_ns
                 self.history.append(self.observations.project(row))
 
-            new_plan, issue = handoff_plan(self.query, slot=slot, mode=self.execution.mode)
-            if issue == "handoff_prediction_exhausted" and self.execution.mode == "async":
-                self.query = None
-                if self.plan is not None and plan_rejection(
-                    self.plan, slot, self.execution.mode, self.execution.action_steps,
-                ) is not None:
-                    self.plan = None
-                issue = None
-            if issue is not None:
-                self.stop_rejection(issue)
-                return
-            if new_plan is not None:
-                if self.execution.mode == "rtc":
-                    new_plan.actions = self.action_mapper.normalize_policy_actions(
-                        new_plan.actions, self.policy_info.action_mode,
-                    )
-                self.plan, self.query = new_plan, None
-                self.wait_deadline_ns = None
-            if self.plan is None:
-                if len(self.history) == self.policy_info.n_obs_steps and self.query is None:
-                    issue = self.submit(slot)
-                    if issue is not None:
-                        self.stop_rejection(issue)
-                return
+            if synchronous:
+                actions = self.sync_actions
+                if actions is None:
+                    if len(self.history) == self.policy_info.n_obs_steps:
+                        issue = self.submit(None)
+                        if issue is not None:
+                            self.stop_rejection(issue)
+                    return
+                action_count = min(len(actions), self.execution.action_steps)
+                action = actions[self.sync_cursor]
+            else:
+                new_plan, issue = handoff_plan(self.query, slot=slot, mode=self.execution.mode)
+                if issue == "handoff_prediction_exhausted" and self.execution.mode == "async":
+                    self.query = None
+                    if self.plan is not None and plan_rejection(
+                        self.plan, slot, self.execution.mode, self.execution.action_steps,
+                    ) is not None:
+                        self.plan = None
+                    issue = None
+                if issue is not None:
+                    self.stop_rejection(issue)
+                    return
+                if new_plan is not None:
+                    if self.execution.mode == "rtc":
+                        new_plan.actions = self.action_mapper.normalize_policy_actions(
+                            new_plan.actions, self.policy_info.action_mode,
+                        )
+                    self.plan, self.query = new_plan, None
+                if self.plan is None:
+                    if len(self.history) == self.policy_info.n_obs_steps and self.query is None:
+                        issue = self.submit(slot)
+                        if issue is not None:
+                            self.stop_rejection(issue)
+                    return
 
-            issue = plan_rejection(self.plan, slot, self.execution.mode, self.execution.action_steps)
-            if issue is None:
-                issue = self.submit_prefetch(self.plan, slot)
-            if issue is not None:
-                self.stop_rejection(issue)
-                return
-            command, issue = self.map_command(self.plan.actions[slot - self.plan.anchor_slot], row)
+                issue = plan_rejection(self.plan, slot, self.execution.mode, self.execution.action_steps)
+                if issue is None:
+                    issue = self.submit_prefetch(self.plan, slot)
+                if issue is not None:
+                    self.stop_rejection(issue)
+                    return
+                action = self.plan.actions[slot - self.plan.anchor_slot]
+            command, issue = self.map_command(action, row)
             if issue is not None:
                 self.stop_rejection(issue)
                 return
@@ -542,20 +553,14 @@ class Rollout:
             self.target_expires_ns = expires_ns
             self.wait_deadline_ns = None
             if synchronous:
-                self.last_slot = slot
-                if slot + 1 == window_end(self.plan, self.execution.action_steps):
-                    self.plan = None
+                self.sync_cursor += 1
+                if self.sync_cursor == action_count:
+                    self.sync_actions = None
         finally:
             # 每个真实采样与至多一次提交尝试只记一行；部分失败不改写为成功。
             primary_error = sys.exc_info()[1]
             if primary_error is not None:
-                self.runtime_state.revoke_motion(
-                    reason=(
-                        RunEndReason.CANCELLED
-                        if isinstance(primary_error, OperationCancelled) else RunEndReason.FAILED
-                    ),
-                    expected_cancel_epoch=self.cancel_epoch,
-                )
+                self.runtime_state.revoke_motion()
             if row is not None and self.recorder is not None:
                 try:
                     self.recorder.append(row, attempted_command, quality_issue=self.recording_issue(row))

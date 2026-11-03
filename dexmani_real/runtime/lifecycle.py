@@ -4,7 +4,7 @@ import logging
 import time
 
 from dexmani_real.robot.commands import OperationCancelled
-from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
+from dexmani_real.runtime.state import SafetyState, SessionState
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,8 @@ class SensorWorkers:
                 if not allowed:
                     raise OperationCancelled(f"{process.name} startup cancelled")
                 if sequence > 0:
+                    if not may_start():
+                        raise OperationCancelled(f"{process.name} startup cancelled")
                     return
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
             raise RuntimeError(f"{process.name} failed to become ready")
@@ -111,9 +113,7 @@ def close_runtime(runtime_state: SessionState, robot=None, *, sensors=None, keyb
     runtime_state.stop_signal.set()
     errors = []
     for stage, close in (
-        ("revoke_motion", lambda: runtime_state.revoke_motion(
-            SafetyState.DISARMED, reason=RunEndReason.CANCELLED,
-        )),
+        ("revoke_motion", lambda: runtime_state.revoke_motion(SafetyState.DISARMED)),
         ("robot_close", robot.close if robot is not None else None),
         ("keyboard_stop", keyboard.stop if keyboard is not None else None),
         ("sensor_shutdown", (lambda: sensors.shutdown(runtime_state)) if sensors is not None else None),

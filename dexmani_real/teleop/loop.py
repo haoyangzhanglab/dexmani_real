@@ -101,12 +101,11 @@ class TeleopLoop:
         try:
             self.robot.stop()
         except BaseException as exc:
-            if exc is not primary_failure:
-                self.record_error("stop", exc)
-                if failure is None:
-                    failure = exc
-                else:
-                    logger.exception("teleop stop also failed")
+            self.record_error("stop", exc)
+            if failure is None:
+                failure = exc
+            else:
+                logger.exception("teleop stop also failed")
         if failure is not None or self.runtime_state.quit_requested or self.runtime_state.estop_request:
             try:
                 self.robot.close()
@@ -121,12 +120,11 @@ class TeleopLoop:
         try:
             self.finish_recording()
         except BaseException as exc:
-            if exc is not failure:
-                self.record_error("recording_cleanup", exc)
-                if failure is None:
-                    failure = exc
-                else:
-                    logger.exception("teleop recording cleanup also failed")
+            self.record_error("recording_cleanup", exc)
+            if failure is None:
+                failure = exc
+            else:
+                logger.exception("teleop recording cleanup also failed")
         self.phase = TeleopPhase.IDLE
         self.cancel_epoch = None
         if failure is not None and primary_failure is None:
@@ -145,10 +143,6 @@ class TeleopLoop:
             save=save,
             reason=reason,
             details=self.termination_details,
-            technical_status=(
-                "normal" if not self.capture_failed and reason in {"operator", "quit", "duration_complete"}
-                else "failed"
-            ),
         )
         # finish 失败时保留 recorder，让会话收尾继续持有未释放的 writer。
         self.recorder = None
@@ -169,32 +163,22 @@ class TeleopLoop:
     ):
         """先撤权并保留结束意图，资源收尾由 run_episode 的边界执行。"""
         self.capture_failed |= failed
-        reason_code = self.runtime_state.revoke_motion(
-            reason=run_end_reason, expected_cancel_epoch=self.cancel_epoch,
-        )
+        self.runtime_state.revoke_motion()
         if self.pending_termination_reason is None:
-            self.pending_termination_reason = reason_code.name.lower()
+            self.pending_termination_reason = run_end_reason.name.lower()
             self.termination_details.append(dict(stage="termination", reason=reason))
             logger.info("本段结束：%s（%s）。", self.pending_termination_reason, reason)
 
     def poll_blocking_commands(self):
         self.robot.check()
-        commands = self.keyboard.poll(timeout=0)
+        commands = self.keyboard.poll(self.runtime_state, timeout=0)[0]
         terminal = tuple(
             event for event in commands
             if event.key in ("esc", "q", "s", "c", "d")
         )
         if terminal:
             self.handle_commands(terminal)
-        return (
-            bool(terminal) or not self.runtime_state.requests_allow_motion()
-            # 快停止回调可能已撤权，但按键还未入队。
-            or (
-                self.phase in (TeleopPhase.PREPARING, TeleopPhase.ACTIVE)
-                and self.runtime_state.stop_signal.is_set()
-                and self.runtime_state.cancel_epoch != self.cancel_epoch
-            )
-        )
+        return bool(terminal) or not self.runtime_state.requests_allow_motion()
 
     def preparation_valid(self):
         return self.runtime_state.can_move(
@@ -214,7 +198,7 @@ class TeleopLoop:
         if self.preparation_valid():
             return False
         if self.runtime_state.stop_signal.is_set():
-            return True  # 停止回调已撤权，按键随后给出保存/丢弃意图。
+            return True
         self.request_episode_end("preparation_revoked")
         return True
 
@@ -347,7 +331,7 @@ class TeleopLoop:
                 ):
                     logger.info("忽略已被停止指令撤销的 HOME。")
                     return False
-                self.runtime_state.revoke_motion(reason=RunEndReason.OPERATOR)
+                self.runtime_state.revoke_motion()
                 expected_cancel_epoch = self.runtime_state.cancel_epoch
             if not self.poll_blocking_commands():
                 logger.info("正在回初始位…")
@@ -457,9 +441,7 @@ class TeleopLoop:
         finally:
             primary_error = sys.exc_info()[1]
             if primary_error is not None:
-                self.runtime_state.revoke_motion(
-                    reason=RunEndReason.FAILED, expected_cancel_epoch=cancel_epoch,
-                )
+                self.runtime_state.revoke_motion()
             if self.recorder is not None:
                 try:
                     # 示教行要求真实提交尝试；末次映射失败不能写 NaN 否定此前前缀。
@@ -489,7 +471,7 @@ class TeleopLoop:
 
     def run_control_tick(self):
         if self.runtime_state.stop_signal.is_set():
-            return  # 等待已经撤权、尚未入队的停止按键。
+            return  # 下一次输入快照负责归因；设备边界已停止。
         if (
             self.recorder is not None
             and time.monotonic_ns() >= cast(int, self.capture_deadline_ns)
@@ -502,7 +484,9 @@ class TeleopLoop:
         if self.next_tick_ns is not None and now_ns < self.next_tick_ns:
             return
         self.next_tick_ns = now_ns + self.control_dt_ns
-        row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
+        needs = (self.capture_needs if self.recorder is not None and self.recorder.is_recording
+                 else self.control_needs)
+        row = read_observation(self.sensors.channels, self.robot, needs=needs)
         if not sources_available(row, self.control_needs):
             return
         issues = self.admit_observation(row)
@@ -534,18 +518,11 @@ class TeleopLoop:
             self.recorder.check_error()
         if self.phase is TeleopPhase.ACTIVE and self.next_tick_ns is not None:
             timeout = min(timeout, max(0.0, (self.next_tick_ns - time.monotonic_ns()) / 1e9))
-        self.handle_commands(self.keyboard.poll(timeout=timeout))
-        if (
-            self.phase is TeleopPhase.ACTIVE and self.pending_termination_reason is None
-            and self.runtime_state.stop_signal.is_set()
-        ):
-            # owner 的普通租期到期也会置 stop；不能只等永远不会出现的键盘事件。
-            with self.runtime_state.motion_lock:
-                operator_pending = (
-                    self.runtime_state.run_ended_reason in (RunEndReason.OPERATOR, RunEndReason.QUIT)
-                )
-            if not operator_pending:
-                self.request_episode_end("executor_stopped")
+        events, stopped = self.keyboard.poll(timeout=timeout, state=self.runtime_state)
+        self.handle_commands(events)
+        if self.phase is TeleopPhase.ACTIVE and self.pending_termination_reason is None and stopped:
+            self.request_episode_end("executor_stopped")
+
         return (
             self.pending_termination_reason is None
             and not self.runtime_state.quit_requested
@@ -581,4 +558,4 @@ class TeleopLoop:
             if self.runtime_state.estop_request:
                 break
             self.keyboard.allow_start()
-            self.handle_commands(self.keyboard.poll(timeout=0.005))
+            self.handle_commands(self.keyboard.poll(self.runtime_state, timeout=0.005)[0])

@@ -74,17 +74,15 @@ class ArmConfig:
 
     def validate(self) -> None:
         joint_values = np.asarray(
-            (self.home_qpos, self.joint_limit_lower, self.joint_limit_upper), dtype=np.float64,
+            (self.joint_limit_lower, self.joint_limit_upper), dtype=np.float64,
         )
-        if joint_values.shape != (3, ARM_DOF):
-            raise ValueError(f"arm home and joint limits must each have {ARM_DOF} elements")
-        home, lower, upper = joint_values
+        if joint_values.shape != (2, ARM_DOF):
+            raise ValueError(f"arm joint limits must each have {ARM_DOF} elements")
+        lower, upper = joint_values
         if not np.isfinite(joint_values).all() or np.any(lower >= upper):
-            raise ValueError("arm home and joint limits must be finite and ordered")
+            raise ValueError("arm joint limits must be finite and ordered")
         if np.any(lower < XARM7_HARD_LOWER) or np.any(upper > XARM7_HARD_UPPER):
             raise ValueError("operational arm limits must be inside mechanical limits")
-        if np.any(home < lower) or np.any(home > upper):
-            raise ValueError("home_qpos must be within joint limits")
         if not isinstance(self.ip, str) or not self.ip.strip():
             raise ValueError("arm ip must be non-empty")
         if type(self.collision_sensitivity) is not int or not 0 <= self.collision_sensitivity <= 5:
@@ -100,7 +98,9 @@ class ArmConfig:
                 raise ValueError(f"arm {name} must be finite and positive")
         if 1 / self.feedback_hz >= self.feedback_max_age_s:
             raise ValueError("feedback period must fit freshness budget")
-        self.homing.validate()
+        for value in (self.homing.convergence_rad, self.homing.velocity_convergence_rad_s):
+            if not isfinite(value) or value <= 0:
+                raise ValueError("arm standstill thresholds must be finite and positive")
         speed = self.max_joint_velocity_rad_per_s
         if not isfinite(speed) or not 0.0001 <= speed <= pi:
             raise ValueError("max_joint_velocity_deg_per_s must convert to [0.0001, π] rad/s")
@@ -115,3 +115,11 @@ class ArmConfig:
         cog = np.asarray(self.tcp_load_cog_mm, dtype=np.float64)
         if cog.shape != (3,) or not np.isfinite(cog).all():
             raise ValueError("tcp_load_cog_mm must be a finite (3,) vector")
+
+    def validate_home(self) -> None:
+        self.homing.validate()
+        home = np.asarray(self.home_qpos, dtype=np.float64)
+        if home.shape != (ARM_DOF,) or not np.isfinite(home).all():
+            raise ValueError("arm home_qpos must contain seven finite values")
+        if np.any(home < self.joint_limit_lower) or np.any(home > self.joint_limit_upper):
+            raise ValueError("home_qpos must be within joint limits")

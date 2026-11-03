@@ -236,7 +236,6 @@ class RawWriter:
         self.meta = data.create_group("meta")
         self.meta.attrs.update(metadata)
         self.meta.attrs.update(
-            technical_status="failed",
             termination_reason="recording_incomplete",
             control_hz=self.control_hz,
             timestamp_source="host_monotonic_ns",
@@ -317,7 +316,7 @@ class RawWriter:
         self.row_times[self.frame_count : end] = self.timing_rows[:count]
         self.frame_count = end
 
-    def finish(self, reason, details, *, technical_status, recording_truncated_reason=None):
+    def finish(self, reason, details, *, recording_truncated_reason=None):
         self.flush()
         if recording_truncated_reason is not None:
             self.meta.attrs["recording_truncated_reason"] = recording_truncated_reason
@@ -326,10 +325,7 @@ class RawWriter:
             self.meta.create_dataset(
                 "termination_details", data=json.dumps(details, allow_nan=False)
             )
-        self.meta.attrs.update(
-            termination_reason=reason,
-            technical_status=technical_status,
-        )
+        self.meta.attrs["termination_reason"] = reason
 
     def close(self):
         errors = []
@@ -351,8 +347,8 @@ class RawWriter:
 def require_published_raw(path):
     requested = Path(path).expanduser()
     resolved = requested.resolve()
-    if any(part.startswith(".tmp_") for candidate in (requested, resolved) for part in candidate.parts):
-        raise ValueError(f"unpublished Raw cannot be exported or replayed: {requested}")
+    if any(candidate.name.startswith(".tmp_") for candidate in (requested, resolved)):
+        raise ValueError(f"unpublished Raw cannot be exported: {requested}")
 
 
 class RawReader:

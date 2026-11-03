@@ -77,7 +77,7 @@ def test_model_cleanup_deadline_is_not_restarted(monkeypatch):
 
 
 def test_busy_admission_and_cancellation_preserve_operator_intent():
-    from dexmani_real.runtime.state import RunEndReason, SafetyState
+    from dexmani_real.runtime.state import SafetyState
     state = SessionState(safety_state=SafetyState.ARMED)
     keyboard = Keyboard(bindings={'s': state.request_stop})
     keyboard.active = True
@@ -89,7 +89,7 @@ def test_busy_admission_and_cancellation_preserve_operator_intent():
     state.stop_signal.clear()
     assert state.begin_motion(cancel_epoch=epoch) is not None
     keyboard.handle_key('s', True)
-    assert state.run_ended_reason == RunEndReason.OPERATOR
+    assert [event.key for event in keyboard.events] == ["s"]
     assert state.cancel_epoch != epoch
 
 
@@ -189,3 +189,189 @@ def test_policy_ignores_unbound_keys_before_start_admission(keys):
         assert epoch is None
         # 无关按键不能消耗接纳，随后 B 仍可开始。
         assert session.handle_command_batch([KeyEvent('b')]) == session.runtime_state.cancel_epoch
+
+
+@pytest.mark.parametrize('key', ['s', 'c', 'd', 'q', 'esc'])
+def test_policy_startup_cancel_does_not_wait_for_model(monkeypatch, key):
+    from dexmani_real.deployment.session import PolicySession
+    from dexmani_real.robot.commands import OperationCancelled
+    session = PolicySession.__new__(PolicySession)
+    session.runtime_state = state = SessionState()
+    session.startup_cancel_epoch = state.cancel_epoch
+    session.robot = SimpleNamespace(service_feedback=lambda: None)
+    session.keyboard = Keyboard(estop_callback=state.request_emergency_stop,
+                                bindings={k: state.request_stop for k in ('s', 'c', 'd')})
+    session.keyboard.bindings['q'] = state.request_quit
+    session.keyboard.active = True
+    session.keyboard.listener = SimpleNamespace(is_alive=lambda: True)
+    task = Future()
+    session.model = SimpleNamespace(poll=lambda: None, future=task)
+    now = [0.0]
+    monkeypatch.setattr('time.monotonic', lambda: now[0])
+    def sleep(seconds):
+        now[0] += seconds
+        if now[0] >= .01:
+            session.keyboard.handle_key(key, True)
+    monkeypatch.setattr('time.sleep', sleep)
+    with pytest.raises(OperationCancelled):
+        session.wait_model(10)
+    assert now[0] == .01
+    assert session.model.future is task and not task.done()
+
+
+@pytest.mark.parametrize('failure', [False, True])
+def test_sensor_ready_and_cancel_together_never_admits(failure):
+    from dexmani_real.runtime.lifecycle import SensorWorkers
+    from dexmani_real.robot.commands import OperationCancelled
+    state = SessionState()
+    epoch = state.cancel_epoch
+    class Ring:
+        @property
+        def latest_sequence(self):
+            state.request_stop()
+            return 1
+    process = SimpleNamespace(name='camera', start=lambda: None,
+                              is_alive=lambda: not failure, exitcode=1)
+    workers = SensorWorkers(required_names=('camera',))
+    with pytest.raises(RuntimeError if failure else OperationCancelled):
+        workers.start(process, ring=Ring(), timeout_s=1,
+                      may_start=lambda: state.cancel_epoch == epoch)
+    assert workers.processes == [process]
+
+
+def test_model_completion_and_cancel_together_rechecks_admission():
+    from dexmani_real.deployment.session import PolicySession
+    from dexmani_real.robot.commands import OperationCancelled
+    session = PolicySession.__new__(PolicySession)
+    session.runtime_state = state = SessionState()
+    session.startup_cancel_epoch = state.cancel_epoch
+    session.keyboard = SimpleNamespace(check_health=lambda: True)
+    session.robot = SimpleNamespace(service_feedback=lambda: None)
+    done = Future()
+    done.set_result(None)
+    def poll():
+        state.request_stop()
+        return done
+    session.model = SimpleNamespace(poll=poll)
+    import time
+    with pytest.raises(OperationCancelled):
+        session.wait_model(time.monotonic() + 1)
+
+
+def test_poll_waits_for_fast_stop_and_returns_consistent_snapshot():
+    import threading
+    state = SessionState()
+    entered, release = threading.Event(), threading.Event()
+    def stop():
+        state.request_stop()
+        entered.set()
+        assert release.wait(2)
+    keyboard = Keyboard(bindings={'s': stop})
+    keyboard.active = True
+    keyboard.listener = SimpleNamespace(is_alive=lambda: True)
+    callback = threading.Thread(target=keyboard.handle_key, args=('s', True))
+    snapshots = []
+    reader = threading.Thread(target=lambda: snapshots.append(keyboard.poll(state, timeout=0)))
+    callback.start()
+    try:
+        assert entered.wait(2)
+        reader.start()
+        assert snapshots == []
+    finally:
+        release.set()
+        callback.join(2)
+        reader.join(2)
+    events, stopped = snapshots[0]
+    assert [event.key for event in events] == ['s'] and stopped
+
+
+@pytest.mark.parametrize('stage,key,exit_code', [
+    ('vr', 's', 0), ('vr', 'c', 0), ('vr', 'd', 0), ('vr', 'q', 0), ('vr', 'esc', 1),
+    ('connect', None, 1),
+])
+def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_code):
+    import threading
+
+    import numpy as np
+
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.teleop import run
+
+    keyboards, closed = [], []
+    def start_keyboard(self):
+        keyboards.append(self)
+        self.active = True
+        self.listener = SimpleNamespace(is_alive=lambda: True)
+    monkeypatch.setattr(Keyboard, 'start', start_keyboard)
+    monkeypatch.setattr(Keyboard, 'stop', lambda self: closed.append('keyboard'))
+
+    class Process:
+        pid = None
+        exitcode = None
+        def __init__(self, *, name, **kwargs):
+            self.name = name
+        def start(self):
+            self.pid = 1
+            if stage == 'vr':
+                keyboards[0].handle_key(key, True)
+        def is_alive(self):
+            return self.pid is not None and self.exitcode is None
+        def join(self, **kwargs):
+            self.exitcode = 0
+            closed.append('vr')
+
+    class Robot:
+        def __init__(self, arm, hand, *, runtime_state, **kwargs):
+            self.state = runtime_state
+        def connect(self):
+            if stage == 'connect':
+                self.state.stop_signal.set()
+                raise OperationCancelled('device stopped without operator input')
+        def check(self):
+            pass
+        def close(self):
+            closed.append('robot')
+
+    monkeypatch.setattr(run.mp, 'get_context', lambda kind: SimpleNamespace(Process=Process, Event=threading.Event))
+    monkeypatch.setattr(run, 'SensorChannels', lambda *a, **kw: SimpleNamespace(
+        is_running=SimpleNamespace(value=True), vr_ring=SimpleNamespace(latest_sequence=1)))
+    monkeypatch.setattr(run, 'Robot', Robot)
+    monkeypatch.setattr(run, 'load_vr_transform', lambda path: np.eye(3))
+    monkeypatch.setattr(run.ActionMapper, 'for_mode', lambda *a, **kw: None)
+    monkeypatch.setattr(run, 'build_hand_retargeter', lambda runtime: None)
+    monkeypatch.setattr(run, 'VRController', lambda *args: SimpleNamespace(hand_retargeter=None))
+    monkeypatch.setattr(run, 'AudioFeedback', lambda: SimpleNamespace(play=lambda sound: None,
+                                                                   close=lambda: closed.append('audio')))
+    monkeypatch.setattr(run, 'initialize_hand', lambda *args, **kwargs: None)
+    monkeypatch.setattr(run.TeleopLoop, 'run', lambda self: pytest.fail('cancelled startup entered control'))
+    result = run.run_teleop(RealConfig(), record=False, episodes_dir='unused', max_duration_s=1,
+                            runtime_config_json=None)
+    assert result == exit_code
+    assert 'robot' in closed and 'keyboard' in closed and 'audio' in closed
+    if stage == 'vr':
+        assert 'vr' in closed
+
+
+def test_policy_does_not_treat_internal_stop_as_startup_cancel():
+    from dexmani_real.deployment.session import PolicySession
+    from dexmani_real.robot.commands import OperationCancelled
+
+    session = PolicySession.__new__(PolicySession)
+    session.runtime_state = state = SessionState()
+    session.startup_cancel_epoch = state.cancel_epoch
+    session.info = SimpleNamespace(checkpoint_path=SimpleNamespace(name='fake'), weights='test',
+                                   inference_steps=1, control_dt_s=.0625)
+    session.runtime = SimpleNamespace(execution=SimpleNamespace(mode='sync', action_steps=1))
+    session.save_results = lambda **kwargs: None
+    session.robot = SimpleNamespace(check=lambda: None)
+    session.summary = {}
+    failures = []
+    def prepare():
+        state.revoke_motion()
+        raise OperationCancelled('device preparation unexpectedly stopped')
+    session.prepare_resources = prepare
+    session.close = lambda **kwargs: failures.append(kwargs['failure']) or 1
+    assert session.run() == 1
+    assert isinstance(failures[0], OperationCancelled)
+    assert not state.quit_requested

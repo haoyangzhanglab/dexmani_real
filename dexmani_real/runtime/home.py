@@ -57,6 +57,10 @@ def _home_motion(state, robot):
 
 def home_robot(state, robot, get_planner, *, cancel_epoch, cancel_requested):
     """父进程取消上下文贯穿回零；cancel_requested 同时服务故障与操作者输入。"""
+    try:
+        robot.arm_config.validate_home()
+    except (ValueError, TypeError) as exc:
+        raise HomeConfigurationError(f"arm HOME configuration: {exc}") from exc
     home_hand(state, robot, cancel_epoch=cancel_epoch, cancel_requested=cancel_requested)
     if cancel_requested() or not state.can_move(
         cancel_epoch=cancel_epoch, required_safety_state=SafetyState.ARMED,
@@ -150,6 +154,10 @@ def home_hand(state, robot, *, cancel_epoch, cancel_requested):
         return
     if state.safety_state != SafetyState.ARMED:
         raise OperationCancelled("hand home requires ARMED")
+    try:
+        hand.validate_home()
+    except (ValueError, TypeError) as exc:
+        raise HomeConfigurationError(f"hand HOME configuration: {exc}") from exc
     target = np.deg2rad(hand.home_qpos_deg)
     deadline = time.monotonic_ns() + int(hand.home_timeout_s * 1e9)
     tolerance = np.deg2rad(hand.home_tolerance_deg)

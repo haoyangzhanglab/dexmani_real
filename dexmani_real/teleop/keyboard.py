@@ -17,7 +17,7 @@ from dexmani_real.runtime.preflight import (
     jog_bounds,
     validate_robot_config,
 )
-from dexmani_real.runtime.state import RunEndReason, SessionState
+from dexmani_real.runtime.state import SessionState
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import sampling_clock_ns
 
@@ -31,6 +31,7 @@ class KeyboardTeleop:
     def run(self):
         configure_logging()
         validate_robot_config(self.runtime)
+        self.runtime.environment.validate()
         self.home_planner = None
         self.bounds = jog_bounds(self.runtime)
         self.runtime_state = SessionState()
@@ -59,9 +60,7 @@ class KeyboardTeleop:
             raise
         except Exception:
             self.runtime_state.stop_signal.set()
-            self.runtime_state.revoke_motion(
-                reason=RunEndReason.FAILED,
-            )
+            self.runtime_state.revoke_motion()
             raise
         finally:
             try:
@@ -83,13 +82,15 @@ class KeyboardTeleop:
             rotation_tolerance=self.jog_config.ik_max_pose_error_rot_rad,
         )
         self.jog = CartesianJog(solver, self.jog_config, self.bounds)
+        startup_epoch = self.runtime_state.cancel_epoch
         self.keys.start()
         if not self.keys.check_health():
             raise RuntimeError("keyboard stop listener unavailable")
         self.robot.check_services = lambda: self.keys.check_health()
         self.robot.connect()
         self.robot.check()
-        self.prepare_jog(self.runtime_state.arm())
+        self.runtime_state.arm(cancel_epoch=startup_epoch)
+        self.prepare_jog(startup_epoch)
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         print(
             "Jog is ready. Release jog keys to brake and hold. "
@@ -120,7 +121,7 @@ class KeyboardTeleop:
             self.tick_due_ns = now_ns + self.period_ns
             self.robot.service_feedback()
             self.keys.allow_start()
-            events = self.keys.poll(timeout=0)
+            events = self.keys.poll(self.runtime_state, timeout=0)[0]
             if self.runtime_state.estop_request:
                 break
             if self.runtime_state.quit_requested:

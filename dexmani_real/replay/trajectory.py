@@ -1,101 +1,79 @@
-"""读取标称频率目标序列及首行实测起点，保存本次回放的真实采样。"""
+"""一次读取当前设备顺序的绝对关节目标；不依赖存档模态。"""
 
+from __future__ import annotations
+
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+import h5py
 import numpy as np
 
-from dexmani_real.data.raw import RawReader, require_published_raw
-from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
-from dexmani_real.utils.io import publish
+from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
+from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
+
+if TYPE_CHECKING:
+    from dexmani_real.config.real import RealConfig
 
 
 @dataclass
 class Trajectory:
-    episode_path: str
-    fps: float
-    task_label: str
+    control_hz: float
     action_arm_joint: np.ndarray
     action_hand_joint: np.ndarray
-    initial_arm_qpos: np.ndarray
-    initial_hand_qpos: np.ndarray
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.action_arm_joint)
 
 
-def load_trajectory(episode_path):
-    require_published_raw(episode_path)
-    with RawReader(episode_path) as reader:
-        meta = reader.meta
-        arm = reader["action_arm_joint_target"][:]
-        hand = reader["action_hand_joint_target"][:]
-        if len(arm) == 0 or not all(np.isfinite(v).all() for v in (arm, hand)):
-            raise ValueError("replay requires nonempty finite targets")
-        initial_arm = reader["arm_qpos"][0]
-        initial_hand = reader["hand_qpos"][0]
-        if not all(np.isfinite(v).all() for v in (initial_arm, initial_hand)):
-            raise ValueError("replay requires finite initial robot states")
-        return Trajectory(
-            str(reader.path),
-            reader.control_hz,
-            meta["task_label"],
-            arm,
-            hand,
-            initial_arm,
-            initial_hand,
-        )
-
-
-def validate_trajectory(trajectory, runtime):
+def load_trajectory(episode_path: str | Path, runtime: RealConfig) -> Trajectory:
+    validate_robot_config(runtime)
     if not runtime.hand.enabled:
-        raise ValueError("physical replay requires XHand")
-    for values, lower, upper in (
-        (trajectory.action_arm_joint, runtime.arm.joint_limit_lower, runtime.arm.joint_limit_upper),
-        (trajectory.action_hand_joint, runtime.hand.qpos_min_rad, runtime.hand.qpos_max_rad),
-    ):
-        if np.any(values < np.asarray(lower) - 1e-9) or np.any(values > np.asarray(upper) + 1e-9):
-            raise ValueError("recorded targets violate configured absolute limits")
-
-
-class ReplayBuffer:
-    def __init__(self, capacity: int):
-        self.count = 0
-        self.data = {
-            name: np.full((capacity, *shape), np.nan)
-            for name, shape in (
-                ("arm_qpos", ARM_JOINT_SHAPE),
-                ("arm_candidate", ARM_JOINT_SHAPE),
-                ("hand_qpos", HAND_JOINT_SHAPE),
-                ("hand_candidate", HAND_JOINT_SHAPE),
-            )
-        }
-        for name in (
-            "arm_observation_ns",
-            "hand_observation_ns",
-            "submit_started_ns",
-            "submit_completed_ns",
+        raise ValueError("replay requires XHand")
+    with h5py.File(Path(episode_path).expanduser() / "data.h5", "r") as data:
+        meta = data["meta"].attrs
+        if meta["joint_units"] != "rad":
+            raise ValueError("replay joint_units must be rad")
+        for field, names in (
+            ("arm_joint_names", XARM7_JOINT_NAMES),
+            ("hand_joint_names", XHAND_SDK_JOINT_NAMES),
         ):
-            self.data[name] = np.full(capacity, -1, dtype=np.int64)
-
-    def append(self, row, arm_target, hand_target):
-        index = self.count
-        for name, state, target in (
-            ("arm", row.arm, arm_target),
-            ("hand", row.hand, hand_target),
+            if json.loads(meta[field]) != list(names):
+                raise ValueError(f"replay {field} order mismatch")
+        hz = float(meta["control_hz"])
+        validate_control_rate(runtime, hz)
+        arrays = []
+        for field, size, lower, upper in (
+            (
+                "action_arm_joint_target",
+                7,
+                runtime.arm.joint_limit_lower,
+                runtime.arm.joint_limit_upper,
+            ),
+            (
+                "action_hand_joint_target",
+                12,
+                runtime.hand.qpos_min_rad,
+                runtime.hand.qpos_max_rad,
+            ),
         ):
-            self.data[f"{name}_qpos"][index] = state["qpos"][0]
-            self.data[f"{name}_observation_ns"][index] = state["timestamp_ns"][0]
-            self.data[f"{name}_candidate"][index] = target
-        self.count += 1
-        return index
-
-    def to_dict(self):
-        return {name: values[: self.count].copy() for name, values in self.data.items()}
-
-
-def save_replay_data(replay_data, output_dir):
-    output = Path(output_dir)
-    temporary = output / "replay_data.tmp.npz"
-    np.savez_compressed(temporary, **replay_data)
-    publish(temporary, output / "replay_data.npz")
+            values = data[field][:]
+            if values.dtype.kind not in "iuf":
+                raise ValueError(f"{field} must contain real numeric targets")
+            values = values.astype(np.float64)
+            if (
+                values.ndim != 2
+                or values.shape[1] != size
+                or not len(values)
+                or not np.isfinite(values).all()
+            ):
+                raise ValueError(
+                    f"{field} requires nonempty finite targets of shape (N, {size})"
+                )
+            if np.any(values < lower) or np.any(values > upper):
+                raise ValueError(f"{field} violates configured absolute limits")
+            arrays.append(values)
+        if len(arrays[0]) != len(arrays[1]):
+            raise ValueError("replay target lengths differ")
+    return Trajectory(hz, *arrays)
