@@ -26,49 +26,26 @@ if TYPE_CHECKING:
 
 
 def run_replay(episode_path: str | Path, runtime: RealConfig) -> None:
+    """起点读取一次姿态；播放和留驻通过公共设备服务处理 I/O 与停止。"""
     trajectory = load_trajectory(episode_path, runtime)
     state = SessionState()
     epoch = state.cancel_epoch
     robot = keyboard = None
     sent_count = 0
     started = time.monotonic()
-    stopped_by_user = False
-    expires_ns: int | None = None
 
     def check_input(robot: Robot, keyboard: Keyboard) -> None:
-        nonlocal stopped_by_user
         robot.check()
-        events, stopped = keyboard.poll(state, timeout=0)
-        stopped_by_user |= any(event.key in {"s", "q"} for event in events)
+        _, stopped = keyboard.poll(state, timeout=0)
         if state.estop_request or state.cancel_epoch != epoch or state.quit_requested:
             raise OperationCancelled("replay cancelled")
         if stopped:
             raise RobotError("replay device stopped without operator input")
 
-    def verify_feedback(robot: Robot):
-        snapshot = robot.read_state()
-        now = time.monotonic_ns()
-        for name, frame, age in (
-            ("arm", snapshot.arm, runtime.arm.feedback_max_age_s),
-            ("hand", snapshot.hand, runtime.hand.feedback_max_age_s),
-        ):
-            if frame is None or not sample_is_fresh(
-                int(frame["timestamp_ns"][0]), age, now
-            ):
-                raise RobotError(f"replay {name} feedback stale")
-        if expires_ns is not None and now >= expires_ns:
-            raise RobotError("replay target lease expired")
-        return snapshot
-
-    def feedback(robot: Robot, keyboard: Keyboard):
-        robot.service_feedback()
-        snapshot = verify_feedback(robot)
-        check_input(robot, keyboard)
-        return snapshot
-
     def wait_until(deadline: float, robot: Robot, keyboard: Keyboard) -> None:
         while True:
-            feedback(robot, keyboard)
+            robot.service_feedback()
+            check_input(robot, keyboard)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
@@ -87,7 +64,17 @@ def run_replay(episode_path: str | Path, runtime: RealConfig) -> None:
         check_input(robot, keyboard)
         state.arm(cancel_epoch=epoch)
         robot.prepare_streaming(epoch)
-        current = feedback(robot, keyboard)
+        robot.service_feedback()
+        check_input(robot, keyboard)
+        current = robot.read_state()
+        check_input(robot, keyboard)
+        now = time.monotonic_ns()
+        for name, frame, age in (
+            ("arm", current.arm, runtime.arm.feedback_max_age_s),
+            ("hand", current.hand, runtime.hand.feedback_max_age_s),
+        ):
+            if frame is None or not sample_is_fresh(int(frame["timestamp_ns"][0]), age, now):
+                raise RobotError(f"replay {name} feedback stale at start")
         if any(
             np.max(np.abs(frame["qpos"][0] - target)) > np.deg2rad(10)
             for frame, target in (
@@ -104,9 +91,11 @@ def run_replay(episode_path: str | Path, runtime: RealConfig) -> None:
             zip(trajectory.action_arm_joint, trajectory.action_hand_joint)
         ):
             iteration_start = time.monotonic()
-            feedback(robot, keyboard)
-            expires_ns = time.monotonic_ns() + COMMAND_LEASE_NS
-            robot.send_action(RobotCommand(arm, hand), expires_ns=expires_ns)
+            robot.service_feedback()
+            check_input(robot, keyboard)
+            robot.send_action(
+                RobotCommand(arm, hand), expires_ns=time.monotonic_ns() + COMMAND_LEASE_NS,
+            )
             sent_count += 1
             wait_until(
                 time.monotonic() + 0.5
@@ -118,20 +107,15 @@ def run_replay(episode_path: str | Path, runtime: RealConfig) -> None:
     except OperationCancelled:
         if robot is not None:
             robot.check()
-            if robot.connected:
-                verify_feedback(robot)
-        if keyboard is not None:
-            stopped_by_user |= any(
-                event.key in {"s", "q"} for event in keyboard.poll(state, timeout=0)[0]
-            )
-        if state.estop_request or not stopped_by_user:
+        if state.estop_request or not (
+            state.cancel_epoch != epoch or state.quit_requested
+        ):
             raise
         logger.info("Replay stopped by operator")
-    except KeyboardInterrupt:
-        state.request_emergency_stop()
-        raise
     finally:
         primary = sys.exc_info()[1]
+        if isinstance(primary, KeyboardInterrupt):
+            state.request_emergency_stop()
         try:
             close_runtime(state, robot, keyboard=keyboard)
         except BaseException:

@@ -92,7 +92,6 @@ class Rollout:
         self.max_duration_ns = int(max_running_s * 1e9) if max_running_s is not None else None
         self.cancel_epoch = cancel_epoch
         self.history: deque[PolicyObservationRow] = deque(maxlen=policy_info.n_obs_steps)
-        self.last_history_timestamp_ns = None
         self.sync_actions = None
         self.sync_cursor = 0
         self.plan: ActionChunk | None = None
@@ -400,8 +399,6 @@ class Rollout:
         )
         if issue is not None or handoff_slot is None:
             return issue
-        if len(self.history) < self.policy_info.n_obs_steps:
-            return "prefetch_history_incomplete" if self.execution.mode == "rtc" else None
         # 与执行使用同一规范化策略动作；不提前映射未来 RobotCommand。
         prefix = (
             plan.actions[slot - plan.anchor_slot:].copy()
@@ -463,6 +460,8 @@ class Rollout:
             row, issue = self.read_observation()
             if not sources_available(row, self.control_needs):
                 row = None
+                if self.execution.mode == "rtc" and self.plan is not None:
+                    self.stop("committed_slot_observation_unavailable")
                 return
             if issue is not None:
                 self.stop(issue)
@@ -471,16 +470,7 @@ class Rollout:
                 # 当前输入持续裁决；等待行是评估事实，不重复插入模型历史。
                 return
             if not (synchronous and prediction_ready):
-                if self.policy_info.n_obs_steps > 1:
-                    # sync 等待预测时不追加样本；只比较真正进入 history 的采样时刻。
-                    # 半周期余量容忍小幅抖动，明确漏槽则直接重建连续窗口。
-                    gap = (
-                        row.control_timestamp_ns - self.last_history_timestamp_ns > 1.5 * self.dt_ns
-                        if self.last_history_timestamp_ns is not None else False
-                    )
-                    if gap:
-                        self.history.clear()
-                    self.last_history_timestamp_ns = row.control_timestamp_ns
+                # 最近 N 次已接纳的实际采样；模型等待与调度抖动可使间隔不均。
                 self.history.append(self.observations.project(row))
 
             if synchronous:
@@ -497,10 +487,6 @@ class Rollout:
                 new_plan, issue = handoff_plan(self.query, slot=slot, mode=self.execution.mode)
                 if issue == "handoff_prediction_exhausted" and self.execution.mode == "async":
                     self.query = None
-                    if self.plan is not None and plan_rejection(
-                        self.plan, slot, self.execution.mode, self.execution.action_steps,
-                    ) is not None:
-                        self.plan = None
                     issue = None
                 if issue is not None:
                     self.stop_rejection(issue)
@@ -511,6 +497,14 @@ class Rollout:
                             new_plan.actions, self.policy_info.action_mode,
                         )
                     self.plan, self.query = new_plan, None
+                if self.plan is not None:
+                    issue = plan_rejection(self.plan, slot, self.execution.mode, self.execution.action_steps)
+                    if issue is not None:
+                        if self.execution.mode == "async":
+                            self.plan = None
+                        else:
+                            self.stop_rejection(issue)
+                            return
                 if self.plan is None:
                     if len(self.history) == self.policy_info.n_obs_steps and self.query is None:
                         issue = self.submit(slot)
@@ -518,9 +512,7 @@ class Rollout:
                             self.stop_rejection(issue)
                     return
 
-                issue = plan_rejection(self.plan, slot, self.execution.mode, self.execution.action_steps)
-                if issue is None:
-                    issue = self.submit_prefetch(self.plan, slot)
+                issue = self.submit_prefetch(self.plan, slot)
                 if issue is not None:
                     self.stop_rejection(issue)
                     return
@@ -530,7 +522,6 @@ class Rollout:
                 self.stop_rejection(issue)
                 return
             # 长计算后重查控制来源；设备最终只收到目标租期。
-            now = time.monotonic_ns()
             if (limit := self.expired_budget()) is not None:
                 self.stop_budget(limit)
                 return
@@ -538,11 +529,16 @@ class Rollout:
             if source_issues:
                 self.stop("control_sources: " + "; ".join(source_issues))
                 return
-            if not synchronous and now >= self.next_step_ns:
-                if self.execution.mode == "rtc":
-                    self.stop("committed_slot_submission_missed")
-                # async 下一 tick 消费仍有效的时间窗口。
+            now = time.monotonic_ns()
+            if self.execution.mode == "rtc" and now >= self.next_step_ns:
+                self.stop("committed_slot_submission_missed")
                 return
+            if self.execution.mode == "async":
+                plan = cast(ActionChunk, self.plan)
+                # 裁剪前缀后的 anchor + 长度仍是原预测截止；A 只决定预取。
+                if now >= self.started_ns + (plan.anchor_slot + len(plan.actions)) * self.dt_ns:
+                    self.plan = None
+                    return
             expires_ns = now + COMMAND_LEASE_NS
             attempted_command = command
             self.robot.send_action(command, expires_ns=expires_ns)

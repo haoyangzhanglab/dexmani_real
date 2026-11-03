@@ -281,6 +281,8 @@ class TeleopLoop:
         logger.debug("Teleop key=%s phase=%s", cmd.upper(), self.phase.value)
         if cmd == "esc":
             self.runtime_state.request_emergency_stop()
+            if self.phase is not TeleopPhase.IDLE:
+                self.request_episode_end("estop", run_end_reason=RunEndReason.ESTOP)
             return True
         if self.runtime_state.estop_request:
             return True
@@ -365,8 +367,9 @@ class TeleopLoop:
     def handle_commands(self, commands):
         if any(event.key == "d" for event in commands) and self.phase is not TeleopPhase.IDLE:
             self.discard_requested = True
-        if any(event.key == "esc" for event in commands):
-            self.runtime_state.request_emergency_stop()
+        emergency = next((event for event in commands if event.key == "esc"), None)
+        if emergency is not None:
+            self.handle_operator_command(emergency)
             return
         # 回调已置停止信号；D 保存意图由本线程登记，再选择本段结束原因。
         for terminal in ("q", "d", "s", "c"):

@@ -58,17 +58,18 @@ def test_slow_sync_mapping_submits_and_advances(monkeypatch):
     assert np.diff(sends).tolist() == [63_000_000] * 3
 
 
-def test_async_history_uses_sample_gap(monkeypatch):
+def test_async_history_keeps_recent_accepted_samples(monkeypatch):
     rollout, clock, _ = make_rollout(monkeypatch, mode='async', history=2)
     origin = clock[0]
     for delta in (61_000_000, 125_100_000):
         clock[0] = origin + delta
         rollout.step()
     assert len(rollout.history) == 2
-    # 真实大于 1.5dt 的断档，旧窗口被丢弃。
+    # 调度间隔变大仍保留最近两次实际采样。
     clock[0] += 120_000_000
     rollout.step()
-    assert len(rollout.history) == 1
+    assert len(rollout.history) == 2
+    assert rollout.history[0].control_timestamp_ns == origin + 125_100_000
 
 
 def test_duration_wins_equal_wait_deadline(monkeypatch):
@@ -305,12 +306,17 @@ def test_close_interrupt_latches_emergency_before_waiting_for_writer(monkeypatch
     assert rollout.result.errors[0]['stage'] == 'robot_close'
 
 
-@pytest.mark.parametrize('prediction_ns,mapping_ns', [(600_000_000, 0), (100_000_000, 63_000_000)])
-def test_async_zero_progress_keeps_first_absolute_budget(monkeypatch, prediction_ns, mapping_ns):
+@pytest.mark.parametrize('prediction_ns,mapping_ns,steps,progress', [
+    (600_000_000, 0, 8, False),
+    (100_000_000, 63_000_000, 8, True),
+    (62_500_000, 63_000_000, 2, False),
+])
+def test_async_progress_requires_valid_window(monkeypatch, prediction_ns, mapping_ns, steps, progress):
     from concurrent.futures import Future
     rollout, clock, sends = make_rollout(monkeypatch, mode='async')
     rollout.runtime_state.revoke_motion = lambda: None
-    rollout.policy_info.future_steps = 8
+    rollout.policy_info.future_steps = steps
+    rollout.execution = replace(rollout.execution, action_steps=min(4, steps))
     rollout.policy_info.control_action_dim = 19
     deadline = rollout.wait_deadline_ns
     pending = [None, None]
@@ -321,20 +327,28 @@ def test_async_zero_progress_keeps_first_absolute_budget(monkeypatch, prediction
             return None
         future = pending[0]
         pending[0] = None
-        future.set_result(np.zeros((8, 19)))
+        future.set_result(np.zeros((steps, 19)))
         return future
     def mapping(*args):
         clock[0] += mapping_ns
         return RobotCommand(np.zeros(7)), None
     rollout.model.predict, rollout.model.poll = predict, poll
     rollout.map_command = mapping
-    with pytest.raises(TimeoutError, match='budget expired'):
-        for _ in range(4000):
+    if progress:
+        for _ in range(3000):
             rollout.step()
             clock[0] += 1_000_000
-    assert not sends
-    assert rollout.wait_deadline_ns == deadline
-    assert clock[0] <= deadline + mapping_ns + 1_000_000
+        assert len(sends) > 20
+        assert clock[0] > deadline
+        assert rollout.wait_deadline_ns is None
+    else:
+        with pytest.raises(TimeoutError, match='budget expired'):
+            for _ in range(4000):
+                rollout.step()
+                clock[0] += 1_000_000
+        assert not sends
+        assert rollout.wait_deadline_ns == deadline
+        assert clock[0] <= deadline + mapping_ns + 1_000_000
 
 
 def test_target_lease_bounds_progress_even_with_plan(monkeypatch):
@@ -405,3 +419,168 @@ def test_operator_cancel_at_duration_still_uses_current_input(monkeypatch):
     with pytest.raises(OperationCancelled):
         rollout.step()
     assert not rollout.finished  # run 的操作者轮询消费终止输入后确定当前段原因。
+
+
+def test_rtc_missing_committed_snapshot_stops(monkeypatch):
+    from dexmani_real.deployment.schedule import ActionChunk
+    rollout, clock, sends = make_rollout(monkeypatch, mode='rtc')
+    rollout.runtime_state.revoke_motion = lambda: None
+    rollout.runtime_state.estop_request = False
+    stopped = []
+    rollout.robot.stop = lambda: stopped.append(True)
+    rollout.control_needs = ObservationNeeds(camera_fields=('rgb',))
+    rollout.plan = ActionChunk(np.zeros((8, 19)), 0)
+    observe = rollout.read_observation
+    def read():
+        row, issue = observe()
+        return replace(row, camera=None if rollout.last_slot == 1 else
+                       dict(timestamp_ns=clock[0])), issue
+    rollout.read_observation = read
+    rollout.map_command = lambda *args: (RobotCommand(np.zeros(7)), None)
+    for _ in range(3):
+        clock[0] = rollout.next_step_ns
+        rollout.step()
+    assert len(sends) == 1 and stopped == [True]
+    assert rollout.finished
+    assert rollout.result.termination_details == 'committed_slot_observation_unavailable'
+
+
+@pytest.mark.parametrize('mode', ['async', 'rtc'])
+def test_bootstrap_missing_snapshot_waits_with_original_budget(monkeypatch, mode):
+    rollout, clock, sends = make_rollout(monkeypatch, mode=mode)
+    rollout.runtime_state.revoke_motion = lambda: None
+    rollout.control_needs = ObservationNeeds(camera_fields=('rgb',))
+    deadline = rollout.wait_deadline_ns
+    rollout.step()
+    assert not rollout.finished and not sends
+    clock[0] = deadline
+    with pytest.raises(TimeoutError, match='budget expired'):
+        rollout.step()
+    assert rollout.wait_deadline_ns == deadline
+
+
+@pytest.mark.parametrize('mapping_ns,stale', [(62_499_999, False), (62_500_000, False), (63_000_000, False), (140_000_000, True)])
+def test_async_full_tail_window_and_source_boundary(monkeypatch, mapping_ns, stale):
+    from dexmani_real.deployment.schedule import ActionChunk
+    rollout, clock, sends = make_rollout(monkeypatch, mode='async')
+    rollout.runtime_state.revoke_motion = lambda: None
+    rollout.runtime_state.estop_request = False
+    rollout.robot.stop = lambda: None
+    rollout.plan = ActionChunk(np.zeros((8, 19)), 0)
+    rollout.last_slot = 6
+    rollout.next_step_ns = clock[0] = rollout.started_ns + 7 * rollout.dt_ns
+    def mapping(*args):
+        clock[0] += mapping_ns
+        return RobotCommand(np.zeros(7)), None
+    rollout.map_command = mapping
+    rollout.step()
+    assert bool(sends) == (mapping_ns < rollout.dt_ns)
+    if stale:
+        assert 'control_sources' in rollout.result.termination_details
+    elif not sends:
+        assert rollout.plan is None and not rollout.finished
+        clock[0] = rollout.wait_deadline_ns
+        with pytest.raises(TimeoutError, match='budget expired'):
+            rollout.step()
+
+
+def test_sync_history_survives_prediction_wait(monkeypatch):
+    from concurrent.futures import Future
+    rollout, clock, sends = make_rollout(monkeypatch, history=2)
+    rollout.execution = replace(rollout.execution, action_steps=1)
+    rollout.policy_info.future_steps = 1
+    rollout.policy_info.control_action_dim = 19
+    submissions = []
+    due = [0]
+    def predict(rows, **kwargs):
+        submissions.append([row.control_timestamp_ns for row in rows])
+        rollout.model.future = Future()
+        due[0] = clock[0] + 100_000_000
+    def poll():
+        future = rollout.model.future
+        if future is None or clock[0] < due[0]:
+            return None
+        rollout.model.future = None
+        future.set_result(np.zeros((1, 19)))
+        return future
+    rollout.model.predict, rollout.model.poll = predict, poll
+    rollout.map_command = lambda *args: (RobotCommand(np.zeros(7)), None)
+    origin = clock[0]
+    for delta in (0, 62_500_000, 125_000_000, 162_500_000, 225_000_000):
+        clock[0] = origin + delta
+        rollout.step()
+    assert submissions == [[origin, origin + 62_500_000],
+                           [origin + 62_500_000, origin + 225_000_000]]
+    assert len(sends) == 1
+
+
+def test_teleop_esc_arriving_in_poll_records_estop():
+    import threading
+    from dexmani_real.runtime.keyboard import Keyboard
+    from dexmani_real.runtime.state import SessionState, SafetyState
+    from dexmani_real.teleop.loop import TeleopLoop, TeleopPhase
+    state = SessionState(safety_state=SafetyState.RUNNING,
+                         stop_signal=threading.Event(), emergency_signal=threading.Event())
+    keyboard = Keyboard(estop_callback=state.request_emergency_stop)
+    keyboard.active = True
+    keyboard.listener = SimpleNamespace(is_alive=lambda: True)
+    poll = keyboard.poll
+    def interrupted_poll(**kwargs):
+        keyboard.handle_key('esc', True)
+        assert state.stop_signal.is_set()
+        return poll(state, timeout=0)
+    keyboard.poll = interrupted_poll
+    loop = TeleopLoop.__new__(TeleopLoop)
+    loop.runtime_state, loop.keyboard = state, keyboard
+    loop.robot = SimpleNamespace(service_feedback=lambda: None, service_idle=lambda: None)
+    loop.phase, loop.next_tick_ns = TeleopPhase.ACTIVE, None
+    loop.recorder = loop.pending_termination_reason = None
+    loop.capture_failed = False
+    loop.termination_details = []
+    assert not loop.service_episode(.005)
+    assert loop.pending_termination_reason == 'estop'
+
+
+@pytest.mark.parametrize('mode', ['async', 'rtc'])
+def test_prefetch_uses_retained_history_with_real_model_future(monkeypatch, mode):
+    from dexmani_real.deployment.inference import PolicyWorker
+
+    rollout, clock, sends = make_rollout(monkeypatch, mode=mode, history=3)
+    rollout.execution = replace(rollout.execution, action_steps=2, rtc_guidance_cap=0.0)
+    rollout.policy_info.future_steps = 8
+    rollout.policy_info.control_action_dim = 19
+    rollout.policy_info.action_mode = 'joint'
+    rollout.action_mapper = SimpleNamespace(normalize_policy_actions=lambda actions, mode: actions)
+    rollout.map_command = lambda *args: (RobotCommand(np.zeros(7)), None)
+    calls = []
+    actions = np.arange(8 * 19).reshape(8, 19).astype(float)
+    worker = PolicyWorker(lambda: None, build_observation=lambda rows: tuple(
+        row.control_timestamp_ns for row in rows))
+    def predict(observation, **kwargs):
+        calls.append((observation, kwargs))
+        return actions
+    worker.model = SimpleNamespace(reset_episode=lambda: None, predict=predict, close=lambda: None)
+    rollout.model = worker
+    origin = clock[0]
+    try:
+        for delta in (0, 62_500_000, 125_000_000):
+            clock[0] = origin + delta
+            rollout.step()
+        worker.future.result(timeout=1)
+        # 预测等待形成不等间隔历史；窗口仍可用于预取。
+        clock[0] += 100_000_000
+        rollout.step()
+        clock[0] = rollout.next_step_ns
+        rollout.step()
+        worker.future.result(timeout=1)
+        assert len(sends) == len(calls) == 2
+        assert calls[0][0] == (origin, origin + 62_500_000, origin + 125_000_000)
+        assert calls[1][0] == (origin + 125_000_000, origin + 225_000_000, origin + 250_000_000)
+        if mode == 'rtc':
+            assert calls[1][1]['delay_steps'] == 1
+            np.testing.assert_array_equal(calls[1][1]['rtc_prefix'], actions[1:])
+        else:
+            assert calls[1][1] == {}
+        assert not rollout.finished
+    finally:
+        worker.close(rollout.runtime_state).result(timeout=1)

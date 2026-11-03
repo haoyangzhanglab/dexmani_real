@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     from dexmani_real.config.real import RealConfig
 
 
+TARGET_LIMIT_TOLERANCE_RAD = 1e-6
+
+
 @dataclass
 class Trajectory:
     control_hz: float
@@ -28,6 +31,7 @@ class Trajectory:
 
 
 def load_trajectory(episode_path: str | Path, runtime: RealConfig) -> Trajectory:
+    """校验配置范围，并归一 1e-6 rad 内的文件边界舍入误差。"""
     validate_robot_config(runtime)
     if not runtime.hand.enabled:
         raise ValueError("replay requires XHand")
@@ -71,8 +75,13 @@ def load_trajectory(episode_path: str | Path, runtime: RealConfig) -> Trajectory
                 raise ValueError(
                     f"{field} requires nonempty finite targets of shape (N, {size})"
                 )
-            if np.any(values < lower) or np.any(values > upper):
+            lower_bound, upper_bound = np.asarray(lower), np.asarray(upper)
+            if np.any(values < lower_bound - TARGET_LIMIT_TOLERANCE_RAD) or np.any(
+                values > upper_bound + TARGET_LIMIT_TOLERANCE_RAD
+            ):
                 raise ValueError(f"{field} violates configured absolute limits")
+            # 仅归一文件精度造成的边界误差；真正越界已在上面拒绝。
+            np.clip(values, lower_bound, upper_bound, out=values)
             arrays.append(values)
         if len(arrays[0]) != len(arrays[1]):
             raise ValueError("replay target lengths differ")

@@ -269,31 +269,28 @@ def test_replay_cancellation_closes_once(monkeypatch, tmp_path, key, stage):
     assert now[0] < 1_563_000_000
 
 
-@pytest.mark.parametrize("kind", ["start", "feedback", "lease", "device_stop"])
+@pytest.mark.parametrize("kind", ["start", "feedback", "device_stop"])
 def test_replay_rejects_real_boundaries(monkeypatch, tmp_path, kind):
     path = tmp_path / "demo"
     cfg = demo(path, 2)
-    now, sent, closed, _, _ = fake_devices(monkeypatch, cfg, 0)
+    _, _, closed, _, _ = fake_devices(monkeypatch, cfg, 0)
     original = Robot.read_state
 
     def read(self):
         state = original(self)
         if kind == "start":
             state.arm["qpos"] += 0.3
-        elif sent:
-            if kind == "feedback":
-                state.arm["timestamp_ns"] = 1
-            elif kind == "device_stop":
-                self.runtime_state.stop_signal.set()
+        elif kind == "feedback":
+            state.arm["timestamp_ns"] = 1
         return state
 
     monkeypatch.setattr(Robot, "read_state", read)
-    if kind == "lease":
+    if kind == "device_stop":
         original_send = Robot.send_action
 
         def send(self, *args, **kwargs):
             original_send(self, *args, **kwargs)
-            now[0] += 2_000_000_000
+            self.runtime_state.stop_signal.set()
 
         monkeypatch.setattr(Robot, "send_action", send)
     with pytest.raises((ValueError, RuntimeError)):
@@ -391,4 +388,165 @@ def test_close_timeout_retains_pending_arm(monkeypatch, tmp_path):
     with pytest.raises(TimeoutError, match="owner still active"):
         run.run_replay(path, cfg)
     assert robots[0].arm is not None and robots[0].stop_required
+    assert closed == ["arm", "hand", "keyboard"]
+
+
+@pytest.mark.parametrize("key", ["s", "q"])
+@pytest.mark.parametrize("failure", [None, "owner", "close"])
+def test_slow_prepare_cancel_does_not_revalidate_old_feedback(monkeypatch, tmp_path, key, failure):
+    from dexmani_real.robot.commands import OperationCancelled, RobotError
+    path = tmp_path / "demo"
+    cfg = demo(path, 1)
+    now, sent, closed, _, keyboard = fake_devices(
+        monkeypatch, cfg, 0, close_failure=failure == "close")
+    def prepare(self, epoch):
+        now[0] += 200_000_000
+        keyboard.handle_key(key, True)
+        # The callback's cancellation fact survives consumption of its event.
+        keyboard.poll(self.runtime_state, timeout=0)
+        if failure == "owner":
+            def fault():
+                raise RobotError("SDK fault")
+            self.arm.check_error = fault
+        raise OperationCancelled("prepare cancelled")
+    monkeypatch.setattr(Robot, "prepare_streaming", prepare)
+    if failure:
+        with pytest.raises(RobotError if failure == "owner" else OSError,
+                           match="SDK fault" if failure == "owner" else "close failed"):
+            run.run_replay(path, cfg)
+    else:
+        run.run_replay(path, cfg)
+    assert not sent and closed == ["arm", "hand", "keyboard"]
+
+
+@pytest.mark.parametrize("key", ["s", "q", "esc"])
+def test_cancel_during_start_snapshot_precedes_feedback_age(monkeypatch, tmp_path, key):
+    from dexmani_real.robot.commands import OperationCancelled
+
+    path = tmp_path / "demo"
+    cfg = demo(path, 1)
+    now, sent, closed, _, keyboard = fake_devices(monkeypatch, cfg, 0)
+    read_state = Robot.read_state
+
+    def delayed_snapshot(self):
+        snapshot = read_state(self)
+        now[0] += 200_000_000
+        keyboard.handle_key(key, True)
+        return snapshot
+
+    monkeypatch.setattr(Robot, "read_state", delayed_snapshot)
+    if key == "esc":
+        with pytest.raises(OperationCancelled):
+            run.run_replay(path, cfg)
+    else:
+        run.run_replay(path, cfg)
+    assert not sent and closed == ["arm", "hand", "keyboard"]
+
+
+@pytest.mark.parametrize("stage", ["prepare", "cancel_check"])
+def test_interrupt_latches_emergency_before_close(monkeypatch, tmp_path, stage):
+    from dexmani_real.robot.commands import OperationCancelled
+
+    path = tmp_path / "demo"
+    cfg = demo(path, 1)
+    _, sent, closed, _, keyboard = fake_devices(monkeypatch, cfg, 0)
+    check, close = Robot.check, Robot.close
+
+    def prepare(self, epoch):
+        if stage == "prepare":
+            raise KeyboardInterrupt()
+        keyboard.handle_key("q", True)
+        raise OperationCancelled("prepare cancelled")
+
+    def interrupted_check(self):
+        check(self)
+        if self.runtime_state.quit_requested:
+            raise KeyboardInterrupt()
+
+    def emergency_close(self):
+        assert self.runtime_state.estop_request
+        assert self.runtime_state.stop_signal.is_set()
+        close(self)
+
+    monkeypatch.setattr(Robot, "prepare_streaming", prepare)
+    monkeypatch.setattr(Robot, "check", interrupted_check)
+    monkeypatch.setattr(Robot, "close", emergency_close)
+    with pytest.raises(KeyboardInterrupt):
+        run.run_replay(path, cfg)
+    assert not sent and closed == ["arm", "hand", "keyboard"]
+
+
+@pytest.mark.parametrize("fault", [False, True])
+def test_tail_without_hand_sample_only_fails_on_io_error(monkeypatch, tmp_path, fault):
+    path = tmp_path / "demo"
+    cfg = demo(path, 1)
+    now, sent, closed, _, _ = fake_devices(monkeypatch, cfg, 0)
+    connect = Robot.connect
+    def setup(self):
+        connect(self)
+        get = self.hand.get_state
+        def sample():
+            if not sent:
+                return get()
+            if fault:
+                raise OSError("hand I/O failed")
+            return None
+        self.hand.get_state = sample
+    monkeypatch.setattr(Robot, "connect", setup)
+    if fault:
+        with pytest.raises(OSError, match="hand I/O failed"):
+            run.run_replay(path, cfg)
+    else:
+        run.run_replay(path, cfg)
+        assert now[0] == 1_500_000_000
+    assert closed == ["arm", "hand", "keyboard"]
+
+
+@pytest.mark.parametrize("dtype", ["f4", "f8"])
+@pytest.mark.parametrize("edge", ["lower", "upper"])
+@pytest.mark.parametrize("offset", [0, 0.5e-6, 2e-6])
+def test_file_limits_normalize_then_pass_public_send(monkeypatch, tmp_path, dtype, edge, offset):
+    from dexmani_real.robot.commands import RobotCommand
+    path = tmp_path / "demo"
+    cfg = demo(path, 1)
+    arm = np.asarray(cfg.arm.joint_limit_lower if edge == "lower" else cfg.arm.joint_limit_upper)
+    hand = np.asarray(cfg.hand.qpos_min_rad if edge == "lower" else cfg.hand.qpos_max_rad)
+    sign = -1 if edge == "lower" else 1
+    with h5py.File(path / "data.h5", "r+") as data:
+        for name, values in (("action_arm_joint_target", arm), ("action_hand_joint_target", hand)):
+            del data[name]
+            data[name] = np.asarray([values + sign * offset], dtype=dtype)
+    if offset > 1e-6:
+        with pytest.raises(ValueError, match="absolute limits"):
+            load_trajectory(path, cfg)
+        return
+    trajectory = load_trajectory(path, cfg)
+    now, sent, _, _, _ = fake_devices(monkeypatch, cfg, 0)
+    state = SessionState(stop_signal=threading.Event(), emergency_signal=threading.Event())
+    robot = Robot(cfg.arm, cfg.hand, runtime_state=state)
+    robot.connect()
+    try:
+        robot.send_action(RobotCommand(trajectory.action_arm_joint[0],
+                                       trajectory.action_hand_joint[0]),
+                          expires_ns=now[0] + 2_000_000_000)
+        assert len(sent) == 1
+    finally:
+        robot.close()
+
+
+def test_hand_feedback_still_checked_at_public_send(monkeypatch, tmp_path):
+    from dexmani_real.robot.commands import OperationCancelled
+    path = tmp_path / "demo"
+    cfg = demo(path, 5)
+    _, sent, closed, _, _ = fake_devices(monkeypatch, cfg, 0)
+    connect = Robot.connect
+    def setup(self):
+        connect(self)
+        get = self.hand.get_state
+        self.hand.get_state = lambda: None if sent else get()
+    monkeypatch.setattr(Robot, "connect", setup)
+    with pytest.raises(OperationCancelled, match="hand feedback unavailable/stale"):
+        run.run_replay(path, cfg)
+    # arm 发布在 hand 检查之前；整体失败仍不能继续提交第五行。
+    assert len(sent) == 4
     assert closed == ["arm", "hand", "keyboard"]

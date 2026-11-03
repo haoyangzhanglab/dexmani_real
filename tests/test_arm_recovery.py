@@ -176,16 +176,17 @@ def test_owner_prepare_and_new_target_after_residual_mailbox():
     assert not thread.is_alive()
 
 
-def test_expired_goal_is_not_revived_by_fresh_feedback(monkeypatch):
+@pytest.mark.parametrize("expired", ["goal", "feedback"])
+def test_owner_stops_on_expired_goal_or_feedback(monkeypatch, expired):
     state = SessionState()
     io = channels(state)
     clock = [time.monotonic_ns()]
     monkeypatch.setattr('dexmani_real.robot.xarm7.worker.time.monotonic_ns', lambda: clock[0])
     sent = []
     owner = ArmController(ArmConfig(), io, None, SimpleNamespace(servo=sent.append))
-    io.publish_goal(RobotCommand(arm_qpos=np.zeros(7)), expires_ns=clock[0] + 10_000_000)
+    io.publish_goal(RobotCommand(arm_qpos=np.zeros(7)), expires_ns=clock[0] + (10_000_000 if expired == "goal" else 2_000_000_000))
     clock[0] += 20_000_000
-    owner.status['timestamp_ns'] = clock[0]
+    owner.status['timestamp_ns'] = clock[0] if expired == "goal" else clock[0] - 200_000_000
     owner.tick()
     assert io.stop.is_set()
     assert sent == []
@@ -248,8 +249,9 @@ def test_owner_fault_and_late_close_error_are_reported(alive):
     arm = ArmProcess(ArmConfig(), runtime_state=state)
     arm.io.fault.value = b'original SDK fault'
     arm.io.stopped.set()
+    close_error = arm.io.close_error
     def join(timeout):
-        arm.io.close_error.value = b'late disconnect failure'
+        close_error.value = b'late disconnect failure'
     arm.process = SimpleNamespace(pid=1, exitcode=None if alive else 0,
                                   is_alive=lambda: alive, join=join)
     try:
