@@ -11,6 +11,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from dexmani_real.runtime.state import RunEndReason
+
 logger = logging.getLogger(__name__)
 
 LISTENER_START_TIMEOUT_S = 2.0
@@ -24,7 +26,6 @@ JOG_KEY_PAIRS = (
 @dataclass(frozen=True)
 class KeyEvent:
     key: str
-    run_id: int | None = None
 
 
 def suppress_terminal_echo():
@@ -44,9 +45,9 @@ def restore_terminal_echo(saved):
 
 
 class Keyboard:
-    def __init__(self, *, get_run_id: Callable[[], int | None], bindings=None, estop_callback=None):
+    def __init__(self, *, bindings=None, estop_callback=None):
         self.events: deque[KeyEvent] = deque()
-        self.get_run_id = get_run_id
+        self.accepting_starts = False
         self.held_keys: set[str] = set()
         self.condition = threading.Condition(threading.Lock())
         self.listener: Any = None
@@ -61,16 +62,12 @@ class Keyboard:
             if not self.active or self.estop_latched:
                 return
             self.estop_latched = True
-        try:
-            if self.estop_callback is not None:
-                self.estop_callback()
-        except Exception:
-            logger.exception("keyboard emergency-stop callback failed")
-        finally:
-            with self.condition:
-                if self.active:
-                    self.events.append(KeyEvent("esc"))
-                    self.condition.notify()
+            try:
+                if self.estop_callback is not None:
+                    self.estop_callback()
+            finally:
+                self.events.append(KeyEvent("esc"))
+                self.condition.notify()
 
     def handle_key(self, name, pressed):
         if name == "esc" and pressed:
@@ -82,19 +79,34 @@ class Keyboard:
             if not pressed:
                 self.held_keys.remove(name)
                 return
-
-        # 不持 Condition 读取身份；None 表示此时输入没有可执行身份。
-        run_id = self.get_run_id() if name in {"b", "h", "r", "t"} else None
-        # 停止回调先撤销权限，再发布按下事件；回调不执行 SDK I/O。
-        callback = self.bindings.get(name)
-        if callback is not None:
-            callback()
-        with self.condition:
-            if not self.active:
-                return
             self.held_keys.add(name)
-            self.events.append(KeyEvent(name, run_id))
+            if name in {"b", "h", "r", "t"} and not self.accepting_starts:
+                return
+            callback = self.bindings.get(name)
+            if callback is not None:
+                callback()
+            self.events.append(KeyEvent(name))
             self.condition.notify()
+
+    def allow_start(self):
+        """主线程仅在上个操作及资源收尾结束后调用。"""
+        with self.condition:
+            self.accepting_starts = True
+
+    def accept_operation(self, state):
+        """与快停回调排序；返回主线程当前操作的取消上下文。"""
+        with self.condition:
+            if not self.accepting_starts or any(
+                event.key in self.bindings or event.key == "esc" for event in self.events
+            ):
+                return None
+            self.accepting_starts = False
+            self.events = deque(event for event in self.events if event.key not in {"b", "h", "t", "r"})
+            with state.motion_lock:
+                if not state.requests_allow_motion():
+                    return None
+                state.run_ended_reason = RunEndReason.NONE
+                return state.cancel_epoch
 
     def callbacks(self, keyboard):
         special = {
@@ -155,19 +167,22 @@ class Keyboard:
 
     def stop(self):
         with self.condition:
-            if not self.active:
-                return
             self.active = False
             self.events.clear()
             self.held_keys.clear()
             self.condition.notify_all()
-        saved, self.saved_termios = self.saved_termios, None
+        saved = self.saved_termios
+
+        def restore():
+            restore_terminal_echo(saved)
+            self.saved_termios = None
         failure = None
         steps: list[Callable[[], None]] = []
         if self.listener is not None:
-            steps.extend((self.listener.stop,
-                          lambda: self.listener.join(timeout=LISTENER_STOP_TIMEOUT_S)))
-        steps.append(lambda: restore_terminal_echo(saved))
+            steps.append(self.listener.stop)
+            if self.listener.ident is not None:
+                steps.append(lambda: self.listener.join(timeout=LISTENER_STOP_TIMEOUT_S))
+        steps.append(restore)
         for step in steps:
             try:
                 step()
@@ -181,6 +196,12 @@ class Keyboard:
                         self.estop_callback()
                     except BaseException:
                         logger.exception("keyboard shutdown emergency callback failed")
+        if self.listener is not None and self.listener.is_alive():
+            pending = TimeoutError("keyboard listener remains active after join")
+            if failure is None:
+                failure = pending
+            else:
+                logger.error("%s", pending)
         if failure is not None:
             raise failure
 

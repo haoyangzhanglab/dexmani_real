@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
-from dexmani_real.config.xarm7 import EXECUTOR_TIMEOUT_S
 from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S
 from dexmani_real.robot.commands import (
     OperationCancelled,
@@ -58,46 +57,27 @@ class Robot:
         self.hand: XHand | None = None
         self.connected = False
         self.stop_required = False
-        self.stop_failure: BaseException | None = None
         self.hand_feedback = XHandFeedback()
         self.feedback_next_ns = 0
 
     def check(self) -> None:
         if self.arm is not None:
             self.arm.check_error()
-        if self.stop_failure is not None:
-            raise self.stop_failure
         if self.check_services is not None and not self.check_services():
             raise RobotError("required runtime service unavailable")
 
-    def check_run(self, run_id, *, expires_ns=None):
-        # stop 与 fault 可以同时到达；不能先把真实失败分类为取消。
+    def check_run(self):
         self.check()
-        if self.runtime_state.stop_signal.is_set() or self.runtime_state.emergency_signal.is_set():
-            raise OperationCancelled("device operation cancelled")
-        lock = self.runtime_state.run_signal.get_lock()
-        timeout_s = (EXECUTOR_TIMEOUT_S if expires_ns is None
-                     else max(0, expires_ns - time.monotonic_ns()) / 1e9)
-        if not lock.acquire(timeout=timeout_s):
-            raise TimeoutError("device generation lock unavailable")
-        try:
-            if self.runtime_state.run_signal.get_obj().value != run_id:
-                raise OperationCancelled("device operation cancelled")
-        finally:
-            lock.release()
-        if self.arm is not None:
-            self.arm.check_error()
-        # 等待共享锁期间可能已有取消；不能在手 SDK 之后才观察到。
         if self.runtime_state.stop_signal.is_set() or self.runtime_state.emergency_signal.is_set():
             raise OperationCancelled("device operation cancelled")
 
     def connect(self):
-        run_id = self.runtime_state.run_signal.value
+        cancel_epoch = self.runtime_state.cancel_epoch
 
         def cancelled():
             self.check()
             return (
-                self.runtime_state.run_signal.value != run_id
+                self.runtime_state.cancel_epoch != cancel_epoch
                 or self.runtime_state.stop_signal.is_set()
                 or self.runtime_state.emergency_signal.is_set()
             )
@@ -125,7 +105,7 @@ class Robot:
         self.connected = True
         self._read_initial_state(cancel_requested=cancelled)
 
-    def reset_tactile_sensors(self, *, run_id, cancel_requested, required_tactile=()) -> None:
+    def reset_tactile_sensors(self, *, cancel_epoch, cancel_requested, required_tactile=()) -> None:
         self.check()
         if self.hand is None:
             raise RobotError("XHand unavailable for tactile reset")
@@ -134,7 +114,7 @@ class Robot:
             self.check()
             return bool(
                 cancel_requested()
-                or self.runtime_state.run_signal.value != run_id
+                or self.runtime_state.cancel_epoch != cancel_epoch
                 or self.runtime_state.emergency_signal.is_set()
             )
 
@@ -214,12 +194,10 @@ class Robot:
             check_wait()
             self.service_feedback()
 
-    def prepare_streaming(self, run_id):
-        if self.stop_failure is not None:
-            raise self.stop_failure
+    def prepare_streaming(self, cancel_epoch):
         self.stop_required = True
-        cast("ArmProcess", self.arm).prepare(run_id, service=self.service_feedback)
-        self.check_run(run_id)
+        cast("ArmProcess", self.arm).prepare(cancel_epoch, service=self.service_feedback)
+        self.check_run()
 
     def send_action(self, command, *, expires_ns):
         """顺序发布 arm、发送 hand；返回不表示原子执行、SDK 回执或到位。"""
@@ -228,8 +206,6 @@ class Robot:
 
     def validate_command(self, command):
         """组合命令格式与绝对限位必须先于任一设备副作用。"""
-        if self.stop_failure is not None:
-            raise self.stop_failure
         if command.arm_qpos is not None or command.arm_hold:
             if not self.connected or self.arm is None or not self.arm.is_connected:
                 raise RobotError("arm device unavailable")
@@ -246,7 +222,7 @@ class Robot:
                 self.stop_required = True
                 cast("ArmProcess", self.arm).submit(command, expires_ns=expires_ns)
             if command.hand_qpos is not None:
-                self.check_run(command.run_id, expires_ns=expires_ns)
+                self.check_run()
                 frame = self.hand_feedback.snapshot()
                 now = time.monotonic_ns()
                 if now >= expires_ns:
@@ -256,41 +232,27 @@ class Robot:
                 if not sample_is_fresh(stamp, self.hand_config.feedback_max_age_s, now):
                     raise OperationCancelled("current hand feedback unavailable/stale at send")
                 cast("XHand", self.hand)._send_action(command.hand_qpos)
-            self.check_run(command.run_id, expires_ns=expires_ns)
+            self.check_run()
         except BaseException:
             self.runtime_state.stop_signal.set()
             raise
 
-    def send_hand_home(self, command, *, expires_ns):
+    def send_hand_home(self, command, *, expires_ns, cancel_epoch):
         if command.arm_qpos is not None or command.arm_hold:
             raise ValueError("hand HOME cannot carry an arm streaming target")
         self.validate_command(command)
         self.stop()
         self.service_feedback()
-        lock = self.runtime_state.run_signal.get_lock()
-        if not lock.acquire(timeout=max(0, expires_ns - time.monotonic_ns()) / 1e9):
-            raise TimeoutError("hand HOME generation lock unavailable")
-        try:
-            if (
-                self.runtime_state.run_signal.get_obj().value != command.run_id
-                or self.runtime_state.emergency_signal.is_set()
-            ):
-                raise OperationCancelled("hand HOME cancelled before submission")
-            self.runtime_state.stop_signal.clear()
-        finally:
-            lock.release()
+        cast("ArmProcess", self.arm).resume(cancel_epoch, deadline_ns=expires_ns)
         self._send_action(command, expires_ns=expires_ns)
 
-    def home_arm(self, waypoints, target, run_id, abort_check, *, deadline_ns):
-        if self.stop_failure is not None:
-            raise self.stop_failure
+    def home_arm(self, waypoints, cancel_epoch, abort_check, *, deadline_ns):
         if abort_check():
             raise OperationCancelled("arm HOME cancelled before submission")
         self.stop_required = True
         cast("ArmProcess", self.arm).home(
             waypoints,
-            target,
-            run_id,
+            cancel_epoch,
             abort=abort_check,
             service=self.service_feedback,
             deadline_ns=deadline_ns,
@@ -336,12 +298,9 @@ class Robot:
         if self.arm is None and self.hand is None:
             errors.append(("stop", RobotError("motion remains unresolved after disconnect")))
         if errors:
-            # 本次会话保留停止故障；后续收尾成功也不能把运行伪装成正常结束。
-            self.stop_failure = self.stop_failure or errors[0][1]
-            for stage, error in errors:
-                if error is not self.stop_failure:
-                    logger.error("%s failed", stage, exc_info=(type(error), error, error.__traceback__))
-            raise self.stop_failure
+            for stage, error in errors[1:]:
+                logger.error("%s failed", stage, exc_info=(type(error), error, error.__traceback__))
+            raise errors[0][1]
         self.stop_required = False
 
     def service_idle(self):
@@ -357,7 +316,7 @@ class Robot:
             return
         # 共用 stop 先通知 arm；owner 退出后的最终故障也由 close 带回。
         self.runtime_state.stop_signal.set()
-        # stop_failure 已由 stop/check 上报；这里仅收集本次关闭产生的失败。
+        # 首次停止失败由操作结果保留；这里只收集本次关闭失败。
         errors = []
         try:
             self.stop_hand(passive=True)

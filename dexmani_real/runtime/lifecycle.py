@@ -17,8 +17,9 @@ WORKER_STOP_TIMEOUT_S = 1.0
 
 
 class SensorWorkers:
-    def __init__(self, channels=None):
+    def __init__(self, channels=None, *, required_names):
         self.channels = channels
+        self.required_names = required_names
         self.processes = []
 
     def start(self, process, *, ring, timeout_s=None, may_start) -> None:
@@ -75,7 +76,9 @@ class SensorWorkers:
                     process.join(timeout=WORKER_STOP_TIMEOUT_S)
                 if process.exitcode is None:
                     raise RuntimeError(f"process {process.name} could not be confirmed stopped")
-                if process.exitcode != 0 or escalation != "graceful":
+                if escalation != "graceful" or (
+                    process.exitcode != 0 and process.name in self.required_names
+                ):
                     errors.append((process.name, RuntimeError(f"worker {process.name}: exitcode={process.exitcode}, {escalation}")))
                     logger.warning(
                         "worker %s stopped: exitcode=%s escalation=%s",
@@ -109,7 +112,7 @@ def close_runtime(runtime_state: SessionState, robot=None, *, sensors=None, keyb
     errors = []
     for stage, close in (
         ("revoke_motion", lambda: runtime_state.revoke_motion(
-            SafetyState.DISARMED, reason=RunEndReason.RUNTIME_SHUTDOWN,
+            SafetyState.DISARMED, reason=RunEndReason.CANCELLED,
         )),
         ("robot_close", robot.close if robot is not None else None),
         ("keyboard_stop", keyboard.stop if keyboard is not None else None),

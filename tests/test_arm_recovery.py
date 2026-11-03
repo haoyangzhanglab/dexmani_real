@@ -1,0 +1,241 @@
+"""恢复顺序的离线回归；所有 SDK 操作使用 fake driver。"""
+import multiprocessing as mp
+import threading
+import time
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from dexmani_real.config.xarm7 import ArmConfig
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand
+from dexmani_real.robot.xarm7.process import ArmProcess
+from dexmani_real.robot.xarm7.protocol import (
+    GOAL_DTYPE,
+    ArmChannels,
+    HomeRequest,
+    PrepareRequest,
+)
+from dexmani_real.robot.xarm7.worker import ArmController
+from dexmani_real.runtime.state import SessionState
+
+
+def channels(state):
+    return ArmChannels(mp.get_context('spawn'), stop_signal=state.stop_signal,
+                       emergency_signal=state.emergency_signal)
+
+
+def test_late_publisher_cannot_install_target_while_stopped():
+    state = SessionState()
+    io = channels(state)
+    entered, release = threading.Event(), threading.Event()
+    sent = []
+
+    class PausedCommand:
+        arm_qpos = np.zeros(7)
+
+        @property
+        def arm_hold(self):
+            # publish_goal 已经检查 stop，且仍持有邮箱锁。
+            entered.set()
+            assert release.wait(2)
+            return False
+
+    owner = ArmController(ArmConfig(), io, None,
+                          SimpleNamespace(stop=lambda: None, servo=sent.append))
+    errors = []
+
+    def publish():
+        try:
+            io.publish_goal(PausedCommand(), expires_ns=time.monotonic_ns() + 2_000_000_000)
+        except BaseException as error:
+            errors.append(error)
+
+    producer = threading.Thread(target=publish)
+    producer.start()
+    try:
+        assert entered.wait(2)
+        owner.stop()
+        owner.tick()
+    finally:
+        release.set()
+        producer.join(2)
+    assert not producer.is_alive()
+    assert not errors
+    owner.tick()
+    assert owner.active is None and owner.reference is None
+    assert np.frombuffer(io.goal, dtype=GOAL_DTYPE)['pending'][0]
+    io.clear_goal(deadline_ns=time.monotonic_ns() + 1_000_000_000)
+    assert io.take_goal() is None
+    assert sent == []
+
+
+def test_mailbox_clear_timeout_keeps_stop():
+    state = SessionState()
+    io = channels(state)
+    state.stop_signal.set()
+    with io.goal_lock:
+        with pytest.raises(TimeoutError):
+            io.clear_goal(deadline_ns=time.monotonic_ns())
+    assert io.stop.is_set()
+
+
+@pytest.mark.parametrize("cancel", ["request_stop", "request_quit", "request_emergency_stop"])
+@pytest.mark.parametrize("stage", ["stop_confirmation", "mailbox_clear"])
+@pytest.mark.parametrize("home", [False, True])
+def test_cancel_during_recovery_is_not_cleared(cancel, stage, home):
+    state = SessionState()
+    process = ArmProcess(ArmConfig(), runtime_state=state)
+    process.process = SimpleNamespace(is_alive=lambda: True)
+    process.io.connected.set()
+    process.check_error = lambda: None
+    process.wait_stopped = lambda **kwargs: None
+    if stage == "stop_confirmation":
+        process.wait_stopped = lambda **kwargs: getattr(state, cancel)()
+    else:
+        clear_goal = process.io.clear_goal
+        def clear_and_cancel(**kwargs):
+            clear_goal(**kwargs)
+            getattr(state, cancel)()
+        process.io.clear_goal = clear_and_cancel
+    # 即使尚未 arm，普通停止也必须改变取消上下文。
+    epoch = state.cancel_epoch
+    try:
+        with pytest.raises(OperationCancelled):
+            deadline = time.monotonic_ns() + 1_000_000_000
+            request = HomeRequest(np.empty((0, 7)), deadline) if home else PrepareRequest(deadline)
+            process.request_operation(request,
+                                      service=lambda: None, abort=lambda: False,
+                                      cancel_epoch=epoch)
+        assert state.stop_signal.is_set()
+    finally:
+        process.pipe.close()
+        process.child_pipe.close()
+
+
+def test_unconsumed_reply_prevents_new_operation():
+    state = SessionState()
+    process = ArmProcess(ArmConfig(), runtime_state=state)
+    process.process = SimpleNamespace(is_alive=lambda: True)
+    process.io.connected.set()
+    process.check_error = lambda: None
+    process.reply_pending = True
+    try:
+        with pytest.raises(RuntimeError, match='reply remains pending'):
+            process.prepare(state.cancel_epoch, service=lambda: None)
+    finally:
+        process.pipe.close()
+        process.child_pipe.close()
+
+
+def test_target_publication_after_stop_is_rejected():
+    state = SessionState()
+    io = channels(state)
+    state.stop_signal.set()
+    with pytest.raises(OperationCancelled):
+        io.publish_goal(RobotCommand(arm_qpos=np.zeros(7)),
+                        expires_ns=time.monotonic_ns() + 1_000_000_000)
+
+
+def test_owner_prepare_and_new_target_after_residual_mailbox():
+    state = SessionState()
+    process = ArmProcess(ArmConfig(), runtime_state=state)
+    sent = threading.Event()
+    q = np.asarray(process.cfg.home_qpos)
+    driver = SimpleNamespace(connect=lambda **kwargs: None, initialize=lambda **kwargs: None,
+                             read=lambda: (q, np.zeros(7)), stop=lambda: None,
+                             enter_mode=lambda *a, **kwargs: None, close=lambda: None,
+                             servo=lambda target: sent.set())
+    owner = ArmController(process.cfg, process.io, process.child_pipe, driver)
+    thread = threading.Thread(target=owner.run, args=(time.monotonic_ns() + 5_000_000_000,))
+    process.process = SimpleNamespace(is_alive=thread.is_alive, pid=1, exitcode=None)
+    thread.start()
+    try:
+        assert process.io.ready.wait(3)
+        process.request_stop()
+        process.wait_stopped()
+        # 模拟旧调用在 stop 后完成发布的残留目标。
+        slot = np.frombuffer(process.io.goal, dtype=GOAL_DTYPE)
+        with process.io.goal_lock:
+            slot[0] = (True, False, time.monotonic_ns() + 1_000_000_000, q)
+        process.prepare(state.cancel_epoch, service=lambda: None)
+        assert not slot['pending'][0]
+        assert not sent.is_set()
+        process.submit(RobotCommand(arm_qpos=q), expires_ns=time.monotonic_ns() + 1_000_000_000)
+        assert sent.wait(2)
+        process.request_stop()
+        process.wait_stopped()
+        assert owner.active is None and owner.reference is None
+    finally:
+        process.io.closing.set()
+        process.io.stop.set()
+        thread.join(3)
+        process.pipe.close()
+        if not process.child_pipe.closed:
+            process.child_pipe.close()
+    assert not thread.is_alive()
+
+
+def test_expired_goal_is_not_revived_by_fresh_feedback(monkeypatch):
+    state = SessionState()
+    io = channels(state)
+    clock = [time.monotonic_ns()]
+    monkeypatch.setattr('dexmani_real.robot.xarm7.worker.time.monotonic_ns', lambda: clock[0])
+    sent = []
+    owner = ArmController(ArmConfig(), io, None, SimpleNamespace(servo=sent.append))
+    io.publish_goal(RobotCommand(arm_qpos=np.zeros(7)), expires_ns=clock[0] + 10_000_000)
+    clock[0] += 20_000_000
+    owner.status['timestamp_ns'] = clock[0]
+    owner.tick()
+    assert io.stop.is_set()
+    assert sent == []
+
+
+def test_old_stop_confirmation_cannot_complete_stop_during_new_sdk_work():
+    state = SessionState()
+    process = ArmProcess(ArmConfig(), runtime_state=state)
+    process.io.stopped.set()
+    entered, release = threading.Event(), threading.Event()
+    replies = []
+    def enter_mode(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        kwargs['check_abort']()
+    owner = ArmController(process.cfg, process.io,
+                          SimpleNamespace(poll=lambda: False, send=replies.append),
+                          SimpleNamespace(enter_mode=enter_mode, stop=lambda: None))
+    thread = threading.Thread(target=owner.operation,
+                              args=(PrepareRequest(time.monotonic_ns() + 2_000_000_000),))
+    process.process = SimpleNamespace(is_alive=thread.is_alive, pid=1, exitcode=None)
+    thread.start()
+    try:
+        assert entered.wait(2)
+        process.request_stop()
+        with pytest.raises(TimeoutError, match='stop unresolved'):
+            process.wait_stopped(deadline=time.monotonic() + .01)
+    finally:
+        release.set()
+        thread.join(2)
+        process.pipe.close()
+        process.child_pipe.close()
+    assert not thread.is_alive()
+    assert len(replies) == 1 and isinstance(replies[0], OperationCancelled)
+    assert process.io.stopped.is_set()
+
+
+def test_recovery_reports_owner_fault_even_when_operator_also_cancelled():
+    from dexmani_real.robot.commands import RobotError
+    state = SessionState()
+    process = ArmProcess(ArmConfig(), runtime_state=state)
+    process.process = SimpleNamespace(is_alive=lambda: True, pid=1, exitcode=None)
+    process.io.connected.set()
+    epoch = state.cancel_epoch
+    state.request_stop()
+    process.io.fault.value = b'OSError: SDK feedback failed'
+    try:
+        with pytest.raises(RobotError, match='SDK feedback failed'):
+            process.prepare(epoch, service=lambda: None)
+        assert not process.child_pipe.poll()
+    finally:
+        process.pipe.close()
+        process.child_pipe.close()

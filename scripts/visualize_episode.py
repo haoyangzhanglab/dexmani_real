@@ -52,35 +52,19 @@ EEF_COLOR = (255, 255, 255)
 
 
 def print_episode_info(episode_path: str) -> None:
-    with RawReader(episode_path) as reader:
-        keys = sorted(reader.fields - {"rgb"})
-        print(f"Episode:    {episode_path}")
-        print(f"Control/depth rows: {reader.num_frames}")
-        print(
-            "Time:",
-            f"relative seconds ({reader.meta['timestamp_source']})",
-        )
-        print()
+    import h5py
 
-        print("Meta:")
-        for attr in sorted(reader.meta.keys()):
-            print(f"  {attr}: {reader.meta[attr]}")
-        print()
-
-        print(f"Datasets ({len(keys)}):")
-        for key in keys:
-            ds = reader[key]
-            print(f"  {key:<28s} shape={str(ds.shape):<22s} dtype={str(ds.dtype):<10s}")
-
-        print()
-        if reader.num_frames:
-            for key in ("arm_qpos", "hand_qpos"):
-                if key not in reader.fields:
-                    continue
-                q = reader[key][:]
-                low = np.array2string(q.min(axis=0), precision=3, suppress_small=True)
-                high = np.array2string(q.max(axis=0), precision=3, suppress_small=True)
-                print(f"{key} range: {low} .. {high}")
+    path = Path(episode_path).expanduser()
+    print(f"Episode: {path} -> {path.resolve()}")
+    print(f"RGB file exists: {(path / 'rgb.mp4').is_file()}")
+    with h5py.File(path / "data.h5", "r") as data:
+        if "meta" in data:
+            for name, value in data["meta"].attrs.items():
+                print(f"  {name}: {value}")
+        def describe(name, obj):
+            if isinstance(obj, h5py.Dataset):
+                print(f"  {name}: shape={obj.shape}, dtype={obj.dtype}")
+        data.visititems(describe)
 
 
 class EpisodeVisualizer:

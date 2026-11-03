@@ -75,17 +75,12 @@ def validate_task_label(task_label) -> None:
 
 
 def encode_raw_row(row, command):
-    arm, hand = (
-        row.arm[0],
-        None if row.hand is None else row.hand[0],
-    )
+    arm, hand = row.arm[0], row.hand[0]
     return {
         "arm_qpos": arm["qpos"],
-        "hand_qpos": hand["qpos"] if hand is not None else np.full(12, np.nan),
-        "hand_contact": hand["tactile_aggregate"] if hand is not None else np.full((5, 3), np.nan),
-        "hand_tactile_force": (
-            hand["tactile_dense"] if hand is not None else np.full((5, 120, 3), np.nan)
-        ),
+        "hand_qpos": hand["qpos"],
+        "hand_contact": hand["tactile_aggregate"],
+        "hand_tactile_force": hand["tactile_dense"],
         "action_arm_joint_target": (
             command.arm_qpos
             if command is not None and command.arm_qpos is not None
@@ -105,9 +100,9 @@ def encode_timing_row(row):
         int(row.observation_timestamp_ns),
         int(row.control_timestamp_ns),
         int(row.arm["timestamp_ns"][0]),
-        int(hand["timestamp_ns"][0]) if hand is not None else -1,
-        int(hand["tactile_aggregate_timestamp_ns"][0]) if hand is not None else -1,
-        int(hand["tactile_dense_timestamp_ns"][0]) if hand is not None else -1,
+        int(hand["timestamp_ns"][0]),
+        int(hand["tactile_aggregate_timestamp_ns"][0]),
+        int(hand["tactile_dense_timestamp_ns"][0]),
         int(row.camera["timestamp_ns"]),
         int(row.camera["ring_sequence"]),
     )
@@ -233,7 +228,6 @@ class RawWriter:
         self.data_file = self.video = None
         self.frame_count = 0
         self.buffered = 0
-        self.previous_stamp = None
 
     def open(self, metadata):
         import h5py
@@ -268,12 +262,12 @@ class RawWriter:
         self.row_times = timing.create_dataset(
             "rows", shape=(0,), maxshape=(None,), dtype=TIMING_ROW_DTYPE
         )
-        self.rgb_shape = (metadata["camera_color_height"], metadata["camera_color_width"], 3)
+        rgb_shape = (metadata["camera_color_height"], metadata["camera_color_width"], 3)
         self.datasets["depth"] = data.create_dataset(
             "depth",
-            shape=(0, *self.rgb_shape[:2]),
-            maxshape=(None, *self.rgb_shape[:2]),
-            chunks=(1, *self.rgb_shape[:2]),
+            shape=(0, *rgb_shape[:2]),
+            maxshape=(None, *rgb_shape[:2]),
+            chunks=(1, *rgb_shape[:2]),
             dtype=np.uint16,
             compression="gzip",
             compression_opts=1,
@@ -289,26 +283,17 @@ class RawWriter:
             for name, dataset in self.datasets.items()
         }
         self.timing_rows = np.empty(batch_size, dtype=TIMING_ROW_DTYPE)
-        height, width, _ = self.rgb_shape
+        height, width, _ = rgb_shape
         self.video = _VideoWriter(
             self.path / "rgb.mp4", fps=self.control_hz, width=width, height=height
         )
         self.video.open()
 
     def append_frame(self, row, command):
-        if row.camera is None:
-            raise ValueError("recording requires RGB-D from the current observation")
-        stamp = int(row.observation_timestamp_ns)
-        if stamp <= 0 or (self.previous_stamp is not None and stamp <= self.previous_stamp):
-            raise ValueError("recording observation timestamps must be positive and increasing")
         values = encode_raw_row(row, command)
         if "vr_landmarks" in self.datasets:
             values.update({name: row.vr[name.removeprefix("vr_")] for name in VR_DATASET_SPECS})
         rgb, depth = row.camera["rgb"], row.camera["depth"]
-        if rgb.shape != self.rgb_shape or rgb.dtype != np.uint8:
-            raise ValueError("RGB shape or dtype mismatch")
-        if depth.shape != self.rgb_shape[:2] or depth.dtype != np.uint16:
-            raise ValueError("depth shape or dtype mismatch")
         timing = encode_timing_row(row)
         values["depth"] = depth
         for name, array in self.arrays.items():
@@ -316,7 +301,6 @@ class RawWriter:
         self.timing_rows[self.buffered] = timing
         self.video.write_frame(rgb)
         self.buffered += 1
-        self.previous_stamp = stamp
         if self.buffered == len(self.timing_rows):
             self.flush()
 
@@ -333,17 +317,10 @@ class RawWriter:
         self.row_times[self.frame_count : end] = self.timing_rows[:count]
         self.frame_count = end
 
-    def finish(self, reason, details, *, expected_frames, technical_status):
-        if technical_status not in {"normal", "failed"}:
-            raise ValueError("invalid technical_status")
+    def finish(self, reason, details, *, technical_status, recording_truncated_reason=None):
         self.flush()
-        if (
-            any(len(dataset) != self.frame_count for dataset in self.datasets.values())
-            or len(self.row_times) != self.frame_count
-            or self.video.frame_count != self.frame_count
-            or self.frame_count != expected_frames
-        ):
-            raise RuntimeError("recording accepted/written/camera row count mismatch")
+        if recording_truncated_reason is not None:
+            self.meta.attrs["recording_truncated_reason"] = recording_truncated_reason
         # 关闭资源成功与否由 recorder 监督方确认，元数据本身不代表已发布。
         if details:
             self.meta.create_dataset(
@@ -371,14 +348,19 @@ class RawWriter:
             raise first
 
 
+def require_published_raw(path):
+    requested = Path(path).expanduser()
+    resolved = requested.resolve()
+    if any(part.startswith(".tmp_") for candidate in (requested, resolved) for part in candidate.parts):
+        raise ValueError(f"unpublished Raw cannot be exported or replayed: {requested}")
+
+
 class RawReader:
     def __init__(self, episode_path: str | Path):
         import h5py
 
         requested_path = Path(episode_path).expanduser()
         self.path = requested_path.resolve()
-        if requested_path.name.startswith(".tmp_") or self.path.name.startswith(".tmp_"):
-            raise ValueError(f"unpublished Raw episode is not readable: {self.path}")
         self.rgb_path = self.path / "rgb.mp4"
         self.video_container = None
         self.dataset_cache: dict[str, h5py.Dataset] = {}
@@ -445,10 +427,6 @@ class RawReader:
 
     def read_camera(self) -> CameraSnapshot:
         return decode_camera_metadata(self.meta)
-
-    def validate_completion(self):
-        if self.meta["technical_status"] != "normal":
-            raise ValueError("capture ended with a technical failure")
 
     def validate_tactile_metadata(self):
         if self.tactile_hold_max_age_s is None:

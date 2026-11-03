@@ -8,27 +8,12 @@ from itertools import pairwise
 import numpy as np
 
 from dexmani_real.config.control import EnvironmentConfig, HomeConfigurationError
-from dexmani_real.config.xarm7 import HOME_DWELL_S, HOME_TARGET_TIMEOUT_S, ArmConfig
+from dexmani_real.config.xarm7 import HOME_DWELL_S, ArmConfig
 from dexmani_real.control.collision import CollisionModel
 from dexmani_real.control.constraints import wrap_nearest_equivalent
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
 
 PROXIMAL_MASK = np.array([True, True, True, True, False, False, False], dtype=bool)
-
-
-def home_segment_timeout_s(distance: float, arm: ArmConfig) -> float:
-    """静止到静止的运动估计，加既有运动余量、停稳及查询预算。"""
-    speed = arm.homing.max_speed_rad_per_s
-    acceleration = arm.max_joint_acceleration_rad_per_s2
-    nominal = (
-        2 * np.sqrt(distance / acceleration)
-        if distance <= speed * speed / acceleration
-        else distance / speed + speed / acceleration
-    )
-    return (
-        2 * nominal + HOME_TARGET_TIMEOUT_S + HOME_DWELL_S
-        + 2 * arm.feedback_max_age_s + 1 / arm.feedback_hz
-    )
 
 
 class HomePathRejected(ValueError):
@@ -113,8 +98,6 @@ class HomePlanner:
             raise HomePathRejected(f"path leaves workspace: {position}")
         distance = float(self.collision_model.minimum_table_distance())
         clearance = distance - float(self.collision_model.table.soft_clearance_m)
-        if not np.isfinite(clearance):
-            raise RuntimeError("table_check_nonfinite")
         return clearance, distance
 
     def _check_path(

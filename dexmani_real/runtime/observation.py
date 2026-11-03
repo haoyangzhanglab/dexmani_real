@@ -76,9 +76,16 @@ def read_observation(channels, robot, *, needs=ObservationNeeds()):
     )
 
 
-def check_observation(row, runtime, needs, *, require_hand=True):
-    """在入口对需求并集裁决一次；缓存读取不续期或传播来源期限。"""
-    now = time.monotonic_ns()
+def sources_available(row, needs):
+    """只区分尚无完整快照；已有快照的过期仍由 TTL 检查负责。"""
+    return (not needs.vr or row.vr is not None) and (
+        not needs.camera_fields or row.camera is not None
+    ) and (not needs.point_cloud or row.point_cloud is not None)
+
+
+def check_observation(row, runtime, needs, *, require_hand=True, now_ns=None):
+    """按消费者需求检查来源；发布前可重新检查长计算期间的年龄。"""
+    now = time.monotonic_ns() if now_ns is None else now_ns
     issues = []
     stamp = int(row.arm["timestamp_ns"][0])
     if not sample_is_fresh(stamp, runtime.arm.feedback_max_age_s, now):

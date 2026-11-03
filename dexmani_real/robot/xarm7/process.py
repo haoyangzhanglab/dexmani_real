@@ -36,12 +36,12 @@ class ArmProcess:
         self.ctx = mp.get_context("spawn")
         self.io = ArmChannels(
             self.ctx,
-            run_signal=runtime_state.run_signal,
             stop_signal=runtime_state.stop_signal,
             emergency_signal=runtime_state.emergency_signal,
         )
         self.pipe, self.child_pipe = self.ctx.Pipe()
         self.process: BaseProcess | None = None
+        self.reply_pending = False
         self._fault_error: RobotError | None = None
         self._close_error: RobotError | None = None
 
@@ -69,42 +69,25 @@ class ArmProcess:
         if self.process is not None:
             raise RuntimeError("arm process is single-use")
 
-        run_id = self.io.run_id.value
+        cancel_epoch = self.runtime_state.cancel_epoch
         startup_deadline_ns = time.monotonic_ns() + int(
             (HOME_CONVERGENCE_TIMEOUT_S + EXECUTOR_TIMEOUT_S) * 1e9
         )
 
         def check_startup():
-            lock = self.io.run_id.get_lock()
-            while True:
-                # 故障也会设置 stop；真实故障先于取消报告。
-                self.check_error()
-                if check_services is not None and not check_services():
-                    raise RobotError("runtime service unavailable during arm startup")
-                acquired = lock.acquire(False)
-                if acquired:
-                    try:
-                        current_run_id = self.io.run_id.get_obj().value
-                    finally:
-                        lock.release()
-                if (
-                    self.io.stop.is_set()
-                    or self.io.emergency.is_set()
-                    or self.io.closing.is_set()
-                    or (acquired and current_run_id != run_id)
-                ):
-                    raise OperationCancelled("arm startup cancelled")
-                remaining_ns = startup_deadline_ns - time.monotonic_ns()
-                if remaining_ns <= 0:
-                    raise TimeoutError("arm initialization unresolved; owner process may still be in SDK")
-                if acquired:
-                    return
-                self.io.stop.wait(min(0.005, remaining_ns / 1e9))
+            self.check_error()
+            if check_services is not None and not check_services():
+                raise RobotError("runtime service unavailable during arm startup")
+            if (self.io.stop.is_set() or self.io.emergency.is_set()
+                    or self.io.closing.is_set() or self.runtime_state.cancel_epoch != cancel_epoch):
+                raise OperationCancelled("arm startup cancelled")
+            if time.monotonic_ns() >= startup_deadline_ns:
+                raise TimeoutError("arm initialization unresolved; owner may still be in SDK")
 
         check_startup()
         self.process = self.ctx.Process(
             target=run_arm,
-            args=(self.cfg, self.io, self.child_pipe, run_id, startup_deadline_ns),
+            args=(self.cfg, self.io, self.child_pipe, startup_deadline_ns),
             name="xarm-owner",
             daemon=False,
         )
@@ -166,35 +149,32 @@ class ArmProcess:
             raise RuntimeError("arm unavailable for target submission")
         self.io.publish_goal(command, expires_ns=expires_ns)
 
-    def request_operation(self, request: PrepareRequest | HomeRequest, *, service, abort):
-        """准备和 HOME 共用停止、授权、提交与回复收尾边界。"""
-        deadline_ns = request.deadline_ns
+    def resume(self, cancel_epoch, *, deadline_ns):
+        """旧发布调用已返回；确认停止、清空邮箱后才恢复设备接纳。"""
         self.check_error()
         if not self.is_connected:
             raise RuntimeError("arm unavailable for lifecycle operation")
+        if self.reply_pending:
+            raise RuntimeError("previous arm reply remains pending")
         self.request_stop()
         self.wait_stopped(deadline=min(
             time.monotonic() + EXECUTOR_TIMEOUT_S, deadline_ns / 1e9,
         ))
-        lock = self.io.run_id.get_lock()
-        if not lock.acquire(timeout=max(0, min(
-            EXECUTOR_TIMEOUT_S, (deadline_ns - time.monotonic_ns()) / 1e9,
-        ))):
-            raise TimeoutError("arm operation generation lock unavailable")
-        try:
+        self.io.clear_goal(deadline_ns=min(deadline_ns, time.monotonic_ns() + int(EXECUTOR_TIMEOUT_S * 1e9)))
+        with self.runtime_state.motion_lock:
             self.check_error()
-            if (
-                self.io.run_id.get_obj().value != request.run_id
-                or self.io.emergency.is_set()
-            ):
+            if (self.runtime_state.cancel_epoch != cancel_epoch
+                    or not self.runtime_state.requests_allow_motion() or self.io.closing.is_set()):
                 raise OperationCancelled("operation cancelled before preparation")
             if time.monotonic_ns() >= deadline_ns:
                 raise TimeoutError("arm operation deadline expired before preparation")
-            self.io.stopped.clear()
+            # stopped 仅由 owner 写入；它在接纳请求时失效旧确认。
+            # 父进程此时清确认会使 owner 把尚未清除的 stop 当作新停止。
             self.io.stop.clear()
-        finally:
-            lock.release()
-        reply_pending = False
+
+    def request_operation(self, request: PrepareRequest | HomeRequest, *, service, abort, cancel_epoch):
+        deadline_ns = request.deadline_ns
+        self.resume(cancel_epoch, deadline_ns=deadline_ns)
         try:
             service()
             if abort():
@@ -202,7 +182,7 @@ class ArmProcess:
             if time.monotonic_ns() >= deadline_ns:
                 raise TimeoutError("arm operation deadline expired before submission")
             self.pipe.send(request)
-            reply_pending = True
+            self.reply_pending = True
             while not self.pipe.poll(0.005):
                 service()
                 if abort():
@@ -210,7 +190,7 @@ class ArmProcess:
                 if time.monotonic_ns() >= deadline_ns or not self.is_connected:
                     raise TimeoutError("arm operation unresolved before deadline")
             error = self.pipe.recv()
-            reply_pending = False
+            self.reply_pending = False
             if error is not None:
                 if isinstance(error, Exception) and self.fault:
                     raise self._read_fault() from error
@@ -231,10 +211,11 @@ class ArmProcess:
             # 本请求仍独占自己的回复；停止等待绝不接管 Pipe。
             cleanup_until = time.monotonic() + EXECUTOR_TIMEOUT_S
             try:
-                if reply_pending:
+                if self.reply_pending:
                     if not self.pipe.poll(max(0, cleanup_until - time.monotonic())):
                         raise TimeoutError("cancelled arm operation reply remains pending")
                     reply = self.pipe.recv()
+                    self.reply_pending = False
                     if isinstance(reply, KeyboardInterrupt):
                         raise reply
                     if reply is not None:
@@ -266,21 +247,22 @@ class ArmProcess:
                 logger.error("%s also failed", stage, exc_info=(type(error), error, error.__traceback__))
             raise
 
-    def prepare(self, run_id, *, service):
+    def prepare(self, cancel_epoch, *, service):
         self.request_operation(
             PrepareRequest(
-                run_id,
                 time.monotonic_ns() + int((HOME_CONVERGENCE_TIMEOUT_S + EXECUTOR_TIMEOUT_S) * 1e9),
             ),
             service=service,
-            abort=lambda: self.io.run_id.value != run_id or self.io.stop.is_set(),
+            abort=lambda: self.runtime_state.cancel_epoch != cancel_epoch or self.io.stop.is_set(),
+            cancel_epoch=cancel_epoch,
         )
 
-    def home(self, waypoints, target, run_id, *, service, abort, deadline_ns):
+    def home(self, waypoints, cancel_epoch, *, service, abort, deadline_ns):
         self.request_operation(
-            HomeRequest(run_id, waypoints, target, deadline_ns),
+            HomeRequest(waypoints, deadline_ns),
             service=service,
             abort=abort,
+            cancel_epoch=cancel_epoch,
         )
 
     def request_stop(self):

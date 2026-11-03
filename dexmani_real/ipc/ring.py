@@ -9,6 +9,8 @@ class SharedRing:
     def __init__(self, ctx, dtype: np.dtype, capacity: int):
         self.dtype = np.dtype(dtype)
         self.capacity = capacity
+        self._last_fields: frozenset[str] | None = None
+        self._last_snapshot: tuple[np.void | dict, int] | None = None
         names = self.dtype.names
         if names is None or self.dtype.hasobject:
             raise ValueError("shared-memory payload requires fields without Python objects")
@@ -46,18 +48,23 @@ class SharedRing:
         return sequence
 
     def read(self, *, fields=None) -> tuple[np.void | dict, int] | None:
-        sequence = self.latest_sequence
-        if sequence <= 0:
-            return None
-        slot = self.slots[sequence % self.capacity]
-        marker = 2 * sequence
-        if int(slot["sequence"]) != marker:
-            return None
-
-        payload = slot["data"]
-        if fields is None:
-            data = payload.copy()
-        else:
-            # 每个字段取得独立副本，避免视图长期持有未请求的载荷。
-            data = {name: payload[name].copy() for name in fields}
-        return (data, sequence) if marker == int(slot["sequence"]) else None
+        field_key = None if fields is None else frozenset(fields)
+        for _ in range(2):
+            sequence = self.latest_sequence
+            if sequence <= 0:
+                break
+            slot = self.slots[sequence % self.capacity]
+            marker = 2 * sequence
+            if int(slot["sequence"]) != marker:
+                continue
+            payload = slot["data"]
+            data = payload.copy() if fields is None else {
+                name: payload[name].copy() for name in fields
+            }
+            if marker == int(slot["sequence"]):
+                self._last_fields = field_key
+                self._last_snapshot = (data, sequence)
+                return self._last_snapshot
+        if field_key == self._last_fields:
+            return self._last_snapshot
+        return None

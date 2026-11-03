@@ -16,15 +16,16 @@ class TeleopConfig:
     ema_alpha_rot: float = 0.85
     vr_pos_scale: float = 0.7
     vr_stale_threshold_s: float = 0.5
+    target_max_age_s: float = 0.5
 
     def validate(self) -> None:
         if not (0.0 <= self.ema_alpha_pos <= 1.0 and 0.0 <= self.ema_alpha_rot <= 1.0):
             raise ValueError("EMA alphas must be in [0, 1]")
         if not all(
             np.isfinite(v) and v > 0
-            for v in (self.vr_pos_scale, self.vr_stale_threshold_s)
+            for v in (self.vr_pos_scale, self.vr_stale_threshold_s, self.target_max_age_s)
         ):
-            raise ValueError("VR position scale and stale threshold must be finite and positive")
+            raise ValueError("VR position scale, source age and target lease must be finite and positive")
 
 
 @dataclass(frozen=True)

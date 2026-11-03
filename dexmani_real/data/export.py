@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import tempfile
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
@@ -15,7 +16,12 @@ import numpy as np
 import zarr
 
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
-from dexmani_real.data.raw import ROBOT_DATASET_SPECS, RawReader, validate_task_label
+from dexmani_real.data.raw import (
+    ROBOT_DATASET_SPECS,
+    RawReader,
+    require_published_raw,
+    validate_task_label,
+)
 from dexmani_real.geometry.camera import (
     CameraSnapshot,
     camera_parameters_cv,
@@ -82,7 +88,6 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     frames = reader.num_frames
     if frames <= 0:
         raise ValueError("episode contains no rows")
-    reader.validate_completion()
     reader.require_fields(*ROBOT_DATASET_SPECS, "rgb", "depth")
     camera = reader.read_camera()
     validate_aligned_depth_distortion(camera.color.distortion_model)
@@ -108,19 +113,13 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
 
     control, observation = rows["control_ns"], rows["observation_ns"]
     reject_invalid((control <= 0) | (observation < control), "invalid_control_or_observation_clock")
-    reject_invalid(np.diff(observation) <= 0, "observation_clock_not_increasing", 1)
     grid_error = control - int(control[0]) - np.arange(frames) * period
     reject_invalid(np.abs(np.diff(control) - period) > tolerance, "control_interval_gap_or_drift", 1)
     mean_period = None
     if frames >= 2:
         duration = int(control[-1]) - int(control[0])
-        expected_duration = (frames - 1) * period
-        # 固定 5% 平均周期容差；局部采样质量仍由相邻间隔约束。
-        if 20 * abs(duration - expected_duration) > expected_duration:
-            raise ValueError("mean_control_period_drift")
         mean_period = duration / (frames - 1)
     readout = observation - control
-    reject_invalid(readout >= period, "observation_crossed_control_period")
     reject_invalid(observation[:-1] >= control[1:], "overlapping_control_observations")
 
     for name in ("arm_ns", "hand_ns", "tactile_aggregate_ns", "tactile_dense_ns", "camera_ns"):
@@ -141,15 +140,18 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
         max_control_grid_deviation_ns=int(np.abs(grid_error).max()),
         max_readout_ns=int(readout.max()),
         mean_control_period_ns=mean_period,
+        max_control_interval_ns=int(np.diff(control).max()) if frames > 1 else None,
+        termination_reason=reader.meta.get("termination_reason"),
+        technical_status=reader.meta.get("technical_status"),
+        recording_truncated_reason=reader.meta.get("recording_truncated_reason"),
     )
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
     """枚举所有 episode 目录，损坏文件由读取边界直接报错。"""
     requested_path = Path(input_root).expanduser()
+    require_published_raw(requested_path)
     root = requested_path.resolve()
-    if requested_path.name.startswith(".tmp_") or root.name.startswith(".tmp_"):
-        raise ValueError(f"unpublished Raw episode is not readable: {root}")
     if not root.is_dir():
         raise NotADirectoryError(root)
     if (root / "data.h5").is_file():
@@ -262,6 +264,7 @@ def export_zarr(
         raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {output}")
     selected, excluded = select_episodes(requested_source, exclude)
     staging = None
+    store = None
     ends: list[int] = []
     episode_ids: list[str] = []
     episode_quality = []
@@ -271,6 +274,7 @@ def export_zarr(
                 progress_callback(index, len(selected))
             offset = ends[-1] if ends else 0
             try:
+                require_published_raw(episode)
                 with RawReader(episode) as reader:
                     camera, quality = validate_export_episode(reader)
                     frames = reader.num_frames
@@ -284,8 +288,9 @@ def export_zarr(
                         staging = Path(
                             tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
                         )
+                        store = zarr.DirectoryStore(str(staging))
                         root, arrays, chunk = create_store(
-                            staging,
+                            store,
                             processing,
                             camera,
                             task=task,
@@ -327,6 +332,8 @@ def export_zarr(
         root.attrs["episode_ids"] = episode_ids
         root.attrs["episode_quality"] = episode_quality
         root.attrs["source_id"] = str(uuid4())
+        root.store.close()
+        store = None
         publish(cast(Path, staging), target)
         staging = None
         if progress_callback:
@@ -337,10 +344,18 @@ def export_zarr(
         )
     finally:
         if staging is not None:
-            logger.warning("Export staging retained: %s", staging)
+            try:
+                if store is not None:
+                    store.close()
+            except BaseException:
+                logger.exception("export store close also failed")
+            try:
+                shutil.rmtree(staging)
+            except BaseException:
+                logger.exception("export staging cleanup also failed: %s", staging)
 
 
-def create_store(path, processing, camera, *, task, control_hz):
+def create_store(store, processing, camera, *, task, control_hz):
     height, width = camera.color.height, camera.color.width
     specs = canonical_array_specs(
         processing.pointcloud.num_points,
@@ -350,7 +365,7 @@ def create_store(path, processing, camera, *, task, control_hz):
     )
     row_bytes = sum(int(np.prod(shape)) * dtype.itemsize for shape, dtype in specs.values())
     chunk = min(MAX_BATCH_FRAMES, max(1, PROCESSING_BYTES // row_bytes))
-    root = zarr.open_group(str(path), mode="w")
+    root = zarr.group(store=store, overwrite=True)
     root.attrs.update(
         format=CANONICAL_FORMAT,
         task_name=task,

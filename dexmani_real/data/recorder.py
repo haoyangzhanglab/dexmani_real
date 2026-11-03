@@ -29,6 +29,7 @@ class _FinishRequest:
     reason: str
     details: tuple[dict, ...]
     technical_status: str
+    recording_truncated_reason: str | None
 
 
 class EpisodeRecorder:
@@ -43,7 +44,7 @@ class EpisodeRecorder:
         self.ready = threading.Event()
         self.error = None
         self.is_recording = False
-        self.start_attempted = False
+        self.recording_truncated_reason = None
         self.finish_request = None
         self.staging_path: Path | None = None
         self.published_path: Path | None = None
@@ -74,8 +75,6 @@ class EpisodeRecorder:
 
     def result(self):
         """仅报告最后可观察的结果，pending 不推断线程之后的结局。"""
-        if not self.start_attempted:
-            return None
         pending = self.writer_pending
         published, staging = self.published_path, self.staging_path
         if published is not None:
@@ -91,6 +90,7 @@ class EpisodeRecorder:
             path=str(published) if published is not None else None,
             staging_path=str(staging) if staging is not None and published is None else None,
             row_count=self.written_frames,
+            recording_truncated_reason=self.recording_truncated_reason,
         )
 
     def start(
@@ -101,9 +101,6 @@ class EpisodeRecorder:
         metadata,
         episode_name=None,
     ):
-        if self.start_attempted or self.finish_request is not None:
-            raise RecordingError("recorder permits only one START attempt")
-        self.start_attempted = True
         try:
             validate_task_label(task_label)
             metadata = dict(metadata, task_label=task_label, collection_source=collection_source)
@@ -148,18 +145,26 @@ class EpisodeRecorder:
                 raise
             self.check_error()
 
-    def append(self, row, command=None):
+    def freeze(self, reason):
+        if self.recording_truncated_reason is None:
+            self.recording_truncated_reason = reason
+            self.is_recording = False
+            logger.warning("录制已截断：%s；运动结束后按保存/丢弃意图收尾。", reason)
+
+    def append(self, row, command=None, *, quality_issue=None):
         self.check_error()
         if not self.is_recording:
+            return
+        if quality_issue is not None:
+            self.freeze(quality_issue)
             return
         # 数组已脱离共享缓冲，入队后生产者不再修改。
         snapshot = replace(row, point_cloud=None)
         try:
             self.queue.put_nowait((snapshot, command))
-        except Full as exc:
-            error = RecordingError("recording queue full (capacity=16)")
-            self.store_error(error)
-            raise error from exc
+        except Full:
+            self.freeze("recording_queue_full")
+            return
         self.submitted_frames += 1
 
     def finish(self, *, save, reason, details=None, technical_status="failed"):
@@ -167,14 +172,15 @@ class EpisodeRecorder:
         if self.finish_request is not None:
             self.check_error()
             return self.published_path
-        was_recording, self.is_recording = self.is_recording, False
+        self.is_recording = False
         self.finish_request = request = _FinishRequest(
             reason, tuple(dict(item) for item in (details or ())), technical_status,
+            self.recording_truncated_reason,
         )
         # START 只报错；外层先停止设备，再由首次 finish 建立等待预算。
         deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
         try:
-            if was_recording and self.writer_pending and self.error is None:
+            if self.writer_pending and self.error is None:
                 self.queue.put(request, timeout=max(0.0, deadline - time.monotonic()))
             if self.thread is not None and self.thread.ident is not None:
                 self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -194,7 +200,11 @@ class EpisodeRecorder:
                 destination = self.staging_path.with_name(self.staging_path.name.removeprefix(".tmp_"))
                 publish(self.staging_path, destination)
                 self.published_path, self.staging_path = destination, None
-                logger.info("Raw 已保存：%s（%d 帧）。", destination.name, self.written_frames)
+                if self.recording_truncated_reason is not None:
+                    logger.warning("录制已截断：%s（%d 行），%s。",
+                                   destination, self.written_frames, self.recording_truncated_reason)
+                else:
+                    logger.info("Raw 已保存：%s（%d 帧）。", destination, self.written_frames)
             else:
                 shutil.rmtree(self.staging_path)
                 self.staging_path = None
@@ -228,8 +238,8 @@ class EpisodeRecorder:
                     writer.finish(
                         finish.reason,
                         finish.details,
-                        expected_frames=self.submitted_frames,
                         technical_status=finish.technical_status,
+                        recording_truncated_reason=finish.recording_truncated_reason,
                     )
                 else:
                     writer.flush()

@@ -1,6 +1,7 @@
 """模型生命周期与预测在同一个工作线程串行执行。"""
 
 import logging
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, cast
 
@@ -20,10 +21,12 @@ class PolicyWorker:
         self.model = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-model")
         self.future = self.close_future = None
+        self.cleanup_deadline = None
 
     def _submit(self, function, *args, **kwargs):
         if self.close_future is not None or self.future is not None:
             raise RuntimeError("Policy worker already has an unreclaimed task or is closing")
+        self.cleanup_deadline = None
         self.future = self.executor.submit(function, *args, **kwargs)
 
     def _load(self):
@@ -61,9 +64,13 @@ class PolicyWorker:
         if future is None:
             return
         # 超时瞬间可能刚好完成；未确认回收时保留归属，不能只凭 done 清掉异常。
-        if future not in wait((future,), timeout=max(0.0, timeout_s)).done:
+        if self.cleanup_deadline is None:
+            self.cleanup_deadline = time.monotonic() + timeout_s
+        remaining = max(0.0, self.cleanup_deadline - time.monotonic())
+        if future not in wait((future,), timeout=remaining).done:
             raise TimeoutError("episode model task remains pending")
         self.future = None
+        self.cleanup_deadline = None
         future.result()
 
     def close(self, runtime_state: "SessionState"):
@@ -100,7 +107,10 @@ class PolicyWorker:
 
     def wait_closed(self, timeout_s=0.0) -> bool:
         future = cast(Future[None], self.close_future)
-        if future not in wait((future,), timeout=max(0.0, timeout_s)).done:
+        if self.cleanup_deadline is None:
+            self.cleanup_deadline = time.monotonic() + timeout_s
+        remaining = max(0.0, self.cleanup_deadline - time.monotonic())
+        if future not in wait((future,), timeout=remaining).done:
             return False
         future.result()
         return True

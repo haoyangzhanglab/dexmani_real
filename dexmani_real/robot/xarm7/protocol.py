@@ -19,7 +19,6 @@ ARM_STATE_DTYPE = np.dtype(
 GOAL_DTYPE = np.dtype(
     [
         ("pending", "?"),
-        ("run_id", "<i8"),
         ("hold", "?"),
         ("expires_ns", "<i8"),
         ("q_goal", "<f8", ARM_JOINT_SHAPE),
@@ -29,23 +28,20 @@ GOAL_DTYPE = np.dtype(
 
 @dataclass(frozen=True)
 class PrepareRequest:
-    run_id: int
     deadline_ns: int
 
 
 @dataclass(frozen=True)
 class HomeRequest:
-    run_id: int
     waypoints: np.ndarray
-    target: np.ndarray
     deadline_ns: int
 
 
 class ArmChannels:
     def __init__(
-        self, ctx, *, run_signal, stop_signal, emergency_signal
+        self, ctx, *, stop_signal, emergency_signal
     ):
-        self.run_id, self.stop, self.emergency = run_signal, stop_signal, emergency_signal
+        self.stop, self.emergency = stop_signal, emergency_signal
         self.closing, self.stopped, self.ready = (ctx.Event() for _ in range(3))
         self.connected = ctx.Event()
         self.fault = ctx.Array("c", 1024, lock=False)
@@ -58,30 +54,29 @@ class ArmChannels:
         if not self.goal_lock.acquire(timeout=max(0, expires_ns - time.monotonic_ns()) / 1e9):
             raise TimeoutError("arm target publication expired waiting for mailbox")
         try:
-            # IPC 等待之后重新检查运行身份和停止信号。
-            generation_lock = self.run_id.get_lock()
-            if not generation_lock.acquire(timeout=max(0, expires_ns - time.monotonic_ns()) / 1e9):
-                raise TimeoutError("arm target generation lock unavailable")
-            try:
-                run_id = self.run_id.get_obj().value
-            finally:
-                generation_lock.release()
             if (
                 self.closing.is_set()
                 or self.stop.is_set()
                 or self.emergency.is_set()
-                or run_id != command.run_id
             ):
                 raise OperationCancelled("arm target run cancelled")
             if time.monotonic_ns() >= expires_ns:
                 raise OperationCancelled("arm target deadline expired")
             np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)[0] = (
                 True,
-                command.run_id,
                 command.arm_hold,
                 expires_ns,
                 command.arm_qpos if command.arm_qpos is not None else 0.0,
             )
+        finally:
+            self.goal_lock.release()
+
+    def clear_goal(self, *, deadline_ns):
+        """调用方已停止旧发布者；停止态持锁完成清空，不执行 SDK。"""
+        if not self.goal_lock.acquire(timeout=max(0, deadline_ns - time.monotonic_ns()) / 1e9):
+            raise TimeoutError("arm mailbox clear timed out")
+        try:
+            np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)["pending"][0] = False
         finally:
             self.goal_lock.release()
 

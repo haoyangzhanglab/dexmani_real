@@ -35,7 +35,7 @@ Controls:
         type=str,
         help=(
             "Published Raw episode directory (episodes/<task_name>/episode_*) "
-            "with a technically normal capture and complete finite submission-attempt targets."
+            "with complete finite submission-attempt targets; prior capture failure does not disqualify valid data."
         ),
     )
     parser.add_argument(

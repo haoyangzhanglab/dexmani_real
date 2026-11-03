@@ -111,6 +111,4 @@ def read_camera_frame(channels, *, fields=("rgb", "depth")):
     if result is None:
         return None
     data, sequence = result
-    data["ring_sequence"] = sequence
-    data["timestamp_ns"] = int(data["timestamp_ns"])
-    return data
+    return dict(data, ring_sequence=sequence, timestamp_ns=int(data["timestamp_ns"]))

@@ -14,9 +14,9 @@ from dexmani_real.runtime.home import build_home_planner, home_robot
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
-from dexmani_real.runtime.state import SafetyState, SessionState
+from dexmani_real.runtime.state import SessionState
 from dexmani_real.utils.io import write_json
-from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.log import configure_logging, error_detail
 
 DEFAULT_OUTPUT_DIR = "replay_results"
 logger = logging.getLogger(__name__)
@@ -60,7 +60,6 @@ def run_replay(
         )
 
         keyboard = Keyboard(
-            get_run_id=lambda: runtime_state.run_id,
             estop_callback=runtime_state.request_emergency_stop,
             bindings={'q': runtime_state.request_quit, 's': runtime_state.request_stop},
         )
@@ -68,10 +67,12 @@ def run_replay(
         robot.check_services = lambda: keyboard.check_health()
         robot.connect()
         robot.check()
-        run_id = runtime_state.arm()
-        outcome = JointReplay(runtime_state, runtime, keyboard, robot=robot).run(
-            trajectory, run_id=run_id, hand_start_duration_s=hand_start_duration_s,
-        )
+        cancel_epoch = runtime_state.arm()
+        replay = JointReplay(runtime_state, runtime, keyboard, robot=robot)
+        try:
+            replay.run(trajectory, cancel_epoch=cancel_epoch, hand_start_duration_s=hand_start_duration_s)
+        finally:
+            outcome = replay.result
         trajectory_status = outcome.status.value
         if outcome.successful:
             wait_for_home(
@@ -83,7 +84,7 @@ def run_replay(
             if robot is not None:
                 robot.check()
         except Exception as failure:
-            runtime_state.mark_error()
+            runtime_state.stop_signal.set()
             outcome.status = ReplayStatus.FAULT
             if not any(failure is error for error in outcome.errors):
                 outcome.errors.append(failure)
@@ -98,7 +99,7 @@ def run_replay(
         runtime_state.request_emergency_stop()
         outcome.status, outcome.reason = ReplayStatus.ESTOP, "KeyboardInterrupt"
     except Exception as exc:
-        runtime_state.mark_error()
+        runtime_state.stop_signal.set()
         outcome.status = ReplayStatus.FAULT
         if not any(exc is error for error in outcome.errors):
             outcome.errors.append(exc)
@@ -108,7 +109,7 @@ def run_replay(
         shutdown_failure = False
         try:
             close_runtime(runtime_state, robot, keyboard=keyboard)
-            shutdown_clean = not runtime_state.error_state and not runtime_state.estop_request
+            shutdown_clean = not runtime_state.estop_request
         except BaseException as exc:
             shutdown_failure = True
             if not any(exc is error for error in outcome.errors):
@@ -116,7 +117,7 @@ def run_replay(
                 logger.exception("replay shutdown failed")
             if isinstance(exc, KeyboardInterrupt):
                 runtime_state.request_emergency_stop()
-        if outcome.status == ReplayStatus.FAULT or runtime_state.error_state or shutdown_failure:
+        if outcome.status == ReplayStatus.FAULT or shutdown_failure:
             outcome.status = ReplayStatus.FAULT
             if not outcome.reason and not outcome.errors:
                 outcome.reason = "hardware/shutdown failure"
@@ -132,13 +133,10 @@ def run_replay(
             outcome.errors.append(exc)
         finally:
             # 保留非异常原因，各真实错误只写一份简短结果。
-            outcome.reason = "; ".join(filter(None, (
-                outcome.reason,
-                *(f"{type(exc).__name__}: {exc}" for exc in outcome.errors),
-            )))
             summary.update(
                 status=outcome.status.value,
                 reason=outcome.reason,
+                errors=[error_detail("replay", error) for error in outcome.errors],
                 shutdown_clean=shutdown_clean,
                 trajectory_status=trajectory_status,
                 replay_rows=len(outcome.replay_data["arm_qpos"]),
@@ -163,24 +161,24 @@ def wait_for_home(runtime_state, runtime, robot, keyboard, outcome, home_results
     print("H: planned return_home; Q: exit", flush=True)
     while not runtime_state.quit_requested:
         robot.service_idle()
-        if runtime_state.error_state or runtime_state.estop_request:
+        if runtime_state.estop_request:
             break
+        keyboard.allow_start()
         signals = keyboard.poll(timeout=0.1)
         keys = {event.key for event in signals}
         if runtime_state.quit_requested or "q" in keys:
             break
         if "s" in keys:
             continue
-        home_event = next((event for event in signals if event.key == "h" and runtime_state.can_move(
-            run_id=event.run_id, required_safety_state=SafetyState.ARMED,
-        )), None)
-        if home_event is not None:
+        home_event = next((event for event in signals if event.key == "h"), None)
+        epoch = keyboard.accept_operation(runtime_state) if home_event is not None else None
+        if epoch is not None:
             try:
                 home_robot(
                     runtime_state,
                     robot,
                     get_planner,
-                    run_id=home_event.run_id,
+                    cancel_epoch=epoch,
                     cancel_requested=home_cancelled,
                 )
             except OperationCancelled as exc:
@@ -206,8 +204,6 @@ def wait_for_home(runtime_state, runtime, robot, keyboard, outcome, home_results
                 outcome.reason = outcome.reason or "return_home incomplete"
                 outcome.errors.append(exc)
                 logger.exception("replay HOME failed")
-                break
-            finally:
-                runtime_state.revoke_motion()
+                raise
             home_results.append(dict(ok=True, interrupted=False, reason=""))
             print("Return-home completed. H: planned return_home; Q: exit", flush=True)

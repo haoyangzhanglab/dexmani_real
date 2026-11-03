@@ -17,9 +17,9 @@ from dexmani_real.runtime.preflight import (
     jog_bounds,
     validate_robot_config,
 )
-from dexmani_real.runtime.state import RunEndReason, SessionState, device_failure_reason
+from dexmani_real.runtime.state import RunEndReason, SessionState
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
+from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,6 @@ class KeyboardTeleop:
         )
 
         self.keys = Keyboard(
-            get_run_id=self.running_run_id,
             estop_callback=self.runtime_state.request_emergency_stop,
             bindings={'q': self.runtime_state.request_quit},
         )
@@ -58,10 +57,10 @@ class KeyboardTeleop:
         except KeyboardInterrupt:
             self.runtime_state.request_emergency_stop()
             raise
-        except Exception as exc:
-            self.runtime_state.mark_error()
+        except Exception:
+            self.runtime_state.stop_signal.set()
             self.runtime_state.revoke_motion(
-                reason=device_failure_reason(exc) or RunEndReason.RUNTIME_FAILURE,
+                reason=RunEndReason.FAILED,
             )
             raise
         finally:
@@ -73,7 +72,7 @@ class KeyboardTeleop:
                 shutdown_clean = True
         return int(
             not clean or not shutdown_clean
-            or self.runtime_state.error_state or self.runtime_state.estop_request
+            or self.runtime_state.estop_request
         )
 
     def start(self):
@@ -99,19 +98,13 @@ class KeyboardTeleop:
         self.period_ns = sampling_clock_ns(self.jog_config.control_hz)
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
 
-    def running_run_id(self) -> int | None:
-        # 输入绑定时确定资格；忙时读到的 R 不因延迟入队而获得授权。
-        with self.runtime_state.motion_lock:
-            run_id = self.runtime_state.run_id
-            return run_id if self.runtime_state.can_move(run_id=run_id) else None
-
-    def prepare_jog(self, run_id):
+    def prepare_jog(self, cancel_epoch):
         self.jog.clear_reference()
-        self.robot.prepare_streaming(run_id)
-        if self.runtime_state.begin_motion(run_id=run_id) is None:
+        self.robot.prepare_streaming(cancel_epoch)
+        if self.runtime_state.begin_motion(cancel_epoch=cancel_epoch) is None:
             raise OperationCancelled("jog cancelled during preparation")
         self.robot.send_action(
-            RobotCommand(run_id, arm_hold=True),
+            RobotCommand(arm_hold=True),
             expires_ns=time.monotonic_ns() + int(self.jog_config.target_max_age_s * 1e9),
         )
         logger.info("Keyboard jog ready")
@@ -124,38 +117,36 @@ class KeyboardTeleop:
                 if remaining_ns > 0:
                     time.sleep(min(0.005, remaining_ns / 1e9))
             now_ns = time.monotonic_ns()
-            self.tick_due_ns += ((now_ns - self.tick_due_ns) // self.period_ns) * self.period_ns
+            self.tick_due_ns = now_ns + self.period_ns
             self.robot.service_feedback()
+            self.keys.allow_start()
             events = self.keys.poll(timeout=0)
-            if (
-                self.runtime_state.estop_request
-                or self.runtime_state.error_state
-            ):
+            if self.runtime_state.estop_request:
                 break
             if self.runtime_state.quit_requested:
                 return True
 
             home_event = next((
                 event for event in events
-                if event.key == "r" and event.run_id == self.runtime_state.run_id
+                if event.key == "r"
             ), None)
             if home_event is not None:
-                self.run_home(home_event.run_id)
+                epoch = self.keys.accept_operation(self.runtime_state)
+                if epoch is not None:
+                    self.run_home(epoch)
                 continue
             self.jog.step(
                 self.robot, self.keys, self.runtime_state, self.runtime,
-                tick_end_ns=self.tick_due_ns + self.period_ns,
             )
-            self.tick_due_ns = next_tick_ns(self.tick_due_ns, self.period_ns, time.monotonic_ns())
         return bool(self.runtime_state.quit_requested)
 
-    def run_home(self, expected_run_id):
+    def run_home(self, expected_cancel_epoch):
         with self.runtime_state.motion_lock:
-            if not self.runtime_state.can_move(run_id=expected_run_id):
+            if not self.runtime_state.can_move(cancel_epoch=expected_cancel_epoch):
                 logger.info("Ignored revoked HOME intent")
                 return
             self.runtime_state.revoke_motion()
-            run_id = self.runtime_state.run_id
+            cancel_epoch = self.runtime_state.cancel_epoch
         logger.info("Returning home...")
 
         def cancelled():
@@ -165,7 +156,7 @@ class KeyboardTeleop:
         try:
             home_robot(
                 self.runtime_state, self.robot, self.get_home_planner,
-                run_id=run_id,
+                cancel_epoch=cancel_epoch,
                 cancel_requested=cancelled,
             )
         except (HomeConfigurationError, HomePathRejected) as exc:
@@ -173,7 +164,7 @@ class KeyboardTeleop:
             logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
         else:
             logger.info("HOME completed")
-        self.prepare_jog(run_id)
+        self.prepare_jog(cancel_epoch)
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
 
     def get_home_planner(self):

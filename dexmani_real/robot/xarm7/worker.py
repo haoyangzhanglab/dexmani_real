@@ -32,44 +32,23 @@ class ArmController:
         self.cfg, self.io, self.pipe, self.driver = cfg, io, pipe, driver
         self.status = np.zeros((), dtype=ARM_STATE_DTYPE)
         self.active = self.reference = None
-        self.prepared_run_id = 0
 
-    def authorized(self, run_id: int, *, timeout_s: float = 0.0) -> bool | None:
-        if (self.io.stop.is_set() or self.io.emergency.is_set()
-                or self.io.closing.is_set() or self.io.fault.value):
-            return False
-        lock = self.io.run_id.get_lock()
-        if not lock.acquire(timeout=timeout_s):
-            return None  # 争用时本次不发送，不阻挡停止。
-        try:
-            return (
-                self.io.run_id.get_obj().value == run_id
-                and not self.io.stop.is_set()
-                and not self.io.emergency.is_set()
-                and not self.io.closing.is_set()
-            )
-        finally:
-            lock.release()
+    def cancelled(self):
+        return (self.io.stop.is_set() or self.io.emergency.is_set()
+                or self.io.closing.is_set() or bool(self.io.fault.value))
 
-    def check_lifecycle(self, run_id, *, deadline_ns, stage):
-        """短轮询仅限制取消观察间隔；授权等待共用阶段的绝对期限。"""
-        while True:
-            remaining = max(0, deadline_ns - time.monotonic_ns()) / 1e9
-            authorization = self.authorized(run_id, timeout_s=min(0.005, remaining))
-            # 等锁期间父进程可能关闭或提交重叠请求，必须在设备操作前观察。
-            if self.pipe.poll():
-                try:
-                    self.pipe.recv()
-                except EOFError as exc:
-                    self.io.closing.set()
-                    raise OperationCancelled("parent pipe closed") from exc
-                raise RuntimeError("overlapping arm lifecycle requests")
-            if authorization is False:
-                raise OperationCancelled(f"{stage} authority revoked")
-            if time.monotonic_ns() >= deadline_ns:
-                raise _OperationTimeout(f"{stage} execution deadline expired")
-            if authorization:
-                return
+    def check_lifecycle(self, *, deadline_ns, stage):
+        if self.pipe.poll():
+            try:
+                self.pipe.recv()
+            except EOFError as exc:
+                self.io.closing.set()
+                raise OperationCancelled("parent pipe closed") from exc
+            raise RuntimeError("overlapping arm lifecycle requests")
+        if self.cancelled():
+            raise OperationCancelled(f"{stage} cancelled")
+        if time.monotonic_ns() >= deadline_ns:
+            raise _OperationTimeout(f"{stage} execution deadline expired")
 
     def fault(self, reason):
         if isinstance(reason, KeyboardInterrupt):
@@ -202,7 +181,6 @@ class ArmController:
 
     def stop(self):
         self.io.stop.set()
-        self.prepared_run_id = 0
         self.active = self.reference = None
         try:
             self.driver.stop()
@@ -215,18 +193,17 @@ class ArmController:
                 logger.exception("arm stop also failed")
             self.fault(exc)
         finally:
-            self.io.take_goal()
             self.io.publish_status(self.status)
             self.io.stopped.set()  # 处理结束；停止失败仍保存在 fault/close_error。
 
     def operation(self, message: PrepareRequest | HomeRequest):
+        self.io.stopped.clear()
         kind = "home" if isinstance(message, HomeRequest) else "prepare"
         error = None
         try:
-            run_id = message.run_id
 
             def check_abort():
-                self.check_lifecycle(run_id, deadline_ns=message.deadline_ns, stage=kind)
+                self.check_lifecycle(deadline_ns=message.deadline_ns, stage=kind)
 
             check_abort()
             # request_operation 已等待本 owner 的停止确认，目标和伺服参考已清除。
@@ -236,7 +213,7 @@ class ArmController:
                         check_abort, stage="arm standstill", deadline_ns=message.deadline_ns,
                     )
                 self.home(
-                    message.waypoints, message.target,
+                    message.waypoints, self.cfg.home_qpos,
                     check_abort=check_abort, deadline_ns=message.deadline_ns,
                 )
             else:
@@ -247,12 +224,11 @@ class ArmController:
                 )
                 self.wait_settled(
                     lambda: self.check_lifecycle(
-                        run_id, deadline_ns=settled_deadline_ns, stage="prepare standstill",
+                        deadline_ns=settled_deadline_ns, stage="prepare standstill",
                     ),
                     stage="arm standstill", deadline_ns=settled_deadline_ns,
                 )
                 check_abort()
-                self.prepared_run_id = run_id
         except BaseException as exc:
             error = exc
             if not isinstance(exc, (OperationCancelled, _OperationTimeout)):
@@ -267,13 +243,8 @@ class ArmController:
             self.io.closing.set()
 
     def command_issue(self, goal, now):
-        authorized = self.authorized(int(goal["run_id"]))
-        if authorized is None:
-            return "generation_busy"
-        if not authorized:
-            return "revoked"
-        if self.prepared_run_id != goal["run_id"]:
-            return "unprepared_run"
+        if self.cancelled():
+            return "cancelled"
         if now >= goal["expires_ns"]:
             return "command_expired"
         stamp = int(self.status["timestamp_ns"])
@@ -282,6 +253,8 @@ class ArmController:
         return None
 
     def tick(self) -> int | None:
+        if self.cancelled():
+            return None
         # 先消费最新目标再判时效；旧 active 到期不能覆盖邮箱中的新目标。
         pending = self.io.take_goal()
         goal = pending if pending is not None else self.active
@@ -290,8 +263,7 @@ class ArmController:
         self.active = goal
         issue = self.command_issue(goal, time.monotonic_ns())
         if issue:
-            if issue != "generation_busy":
-                self.io.stop.set()
+            self.io.stop.set()
             return None
         if self.reference is None:
             q, v = self.status["qpos"], self.status["qvel"]
@@ -305,18 +277,17 @@ class ArmController:
         # 计算结束后、进入 SDK 前统一检查期限、反馈和最新控制器上报。
         issue = self.command_issue(goal, time.monotonic_ns())
         if issue:
-            if issue != "generation_busy":
-                self.io.stop.set()
+            self.io.stop.set()
             return None
         started = time.monotonic_ns()
         self.driver.servo(q)
         self.reference.commit()
         return started
 
-    def run(self, run_id, startup_deadline_ns):
+    def run(self, startup_deadline_ns):
         try:
             def startup_abort():
-                self.check_lifecycle(run_id, deadline_ns=startup_deadline_ns, stage="startup")
+                self.check_lifecycle(deadline_ns=startup_deadline_ns, stage="startup")
 
             startup_abort()
             self.driver.connect(check_abort=startup_abort)
@@ -327,7 +298,7 @@ class ArmController:
             )
             self.wait_settled(
                 lambda: self.check_lifecycle(
-                    run_id, deadline_ns=settled_deadline_ns, stage="startup standstill",
+                    deadline_ns=settled_deadline_ns, stage="startup standstill",
                 ),
                 stage="arm standstill", deadline_ns=settled_deadline_ns,
             )
@@ -391,8 +362,8 @@ class ArmController:
             self.pipe.close()
 
 
-def run_arm(cfg, io, pipe, run_id, startup_deadline_ns):
+def run_arm(cfg, io, pipe, startup_deadline_ns):
     configure_logging()
     from dexmani_real.robot.xarm7.driver import XArm7
 
-    ArmController(cfg, io, pipe, XArm7(cfg)).run(run_id, startup_deadline_ns)
+    ArmController(cfg, io, pipe, XArm7(cfg)).run(startup_deadline_ns)

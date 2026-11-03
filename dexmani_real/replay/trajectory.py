@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dexmani_real.data.raw import RawReader
+from dexmani_real.data.raw import RawReader, require_published_raw
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 from dexmani_real.utils.io import publish
 
@@ -25,9 +25,9 @@ class Trajectory:
 
 
 def load_trajectory(episode_path):
+    require_published_raw(episode_path)
     with RawReader(episode_path) as reader:
         meta = reader.meta
-        reader.validate_completion()
         arm = reader["action_arm_joint_target"][:]
         hand = reader["action_hand_joint_target"][:]
         if len(arm) == 0 or not all(np.isfinite(v).all() for v in (arm, hand)):

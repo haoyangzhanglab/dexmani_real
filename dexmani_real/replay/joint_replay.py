@@ -1,13 +1,14 @@
 """结合当前反馈，按标称节拍逐行尝试提交 Raw 目标。"""
 
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
 
-from dexmani_real.config.deployment import ACTION_TIMEOUT_NS
+from dexmani_real.config.deployment import COMMAND_LEASE_NS
 from dexmani_real.control.actions import (
     ActionMapper,
     project_arm_command,
@@ -25,7 +26,7 @@ from dexmani_real.runtime.observation import (
     check_observation,
     read_observation,
 )
-from dexmani_real.runtime.state import RunEndReason, device_failure_reason
+from dexmani_real.runtime.state import RunEndReason
 from dexmani_real.utils.timing import sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -57,9 +58,10 @@ class JointReplay:
         self.runtime = runtime
         self.keyboard = keyboard
         self.robot = robot
+        self.result = ReplayResult(ReplayStatus.REJECTED)
 
-    def run(self, trajectory, *, run_id, hand_start_duration_s):
-        self.run_id = run_id
+    def run(self, trajectory, *, cancel_epoch, hand_start_duration_s):
+        self.cancel_epoch = cancel_epoch
         self.capture = ReplayBuffer(len(trajectory))
         self.action_mapper = ActionMapper.for_mode(
             "joint",
@@ -69,8 +71,8 @@ class JointReplay:
             environment=self.runtime.environment,
         )
         period_ns = sampling_clock_ns(trajectory.fps)
-        result = ReplayResult(ReplayStatus.COMPLETED)
-        run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
+        result = self.result = ReplayResult(ReplayStatus.COMPLETED)
+        run_end_reason = RunEndReason.CANCELLED
         try:
             try:
                 result.status, result.reason, row = self.admit_replay(trajectory)
@@ -95,13 +97,16 @@ class JointReplay:
             self.runtime_state.request_emergency_stop()
             result.status, result.reason = ReplayStatus.ESTOP, "KeyboardInterrupt"
             run_end_reason = RunEndReason.ESTOP
+            raise
         except Exception as exc:
-            self.runtime_state.mark_error()
+            self.runtime_state.stop_signal.set()
             logger.exception("replay failed")
             result.status = ReplayStatus.FAULT
             result.errors.append(exc)
-            run_end_reason = device_failure_reason(exc) or RunEndReason.RUNTIME_FAILURE
+            run_end_reason = RunEndReason.FAILED
+            raise
         finally:
+            primary_failure = sys.exc_info()[1]
             if result.status == ReplayStatus.USER_QUIT:
                 run_end_reason = RunEndReason.QUIT
             elif result.status == ReplayStatus.ESTOP:
@@ -110,17 +115,17 @@ class JointReplay:
             try:
                 self.robot.stop()
             except BaseException as exc:
-                self.runtime_state.mark_error()
+                self.runtime_state.stop_signal.set()
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
                 if not any(exc is error for error in result.errors):
                     result.errors.append(exc)
                     logger.exception("replay stop failed")
                 result.status = ReplayStatus.FAULT
+                if primary_failure is None:
+                    raise
             finally:
-                # 停止等待期间取得身份但尚未入队的 HOME 也属于旧回放。
-                self.runtime_state.revoke_motion()
-        result.replay_data = self.capture.to_dict()
+                result.replay_data = self.capture.to_dict()
         return result
 
     def read_feedback(self):
@@ -131,7 +136,7 @@ class JointReplay:
         return row
 
     def admit_replay(self, trajectory):
-        self.robot.prepare_streaming(self.run_id)
+        self.robot.prepare_streaming(self.cancel_epoch)
         row = self.read_feedback()
         start_arm = wrap_nearest_equivalent(
             trajectory.initial_arm_qpos,
@@ -149,7 +154,7 @@ class JointReplay:
         ):
             return ReplayStatus.REJECTED, "start posture differs by more than 10 degrees", row
 
-        if self.runtime_state.begin_motion(run_id=self.run_id) is None:
+        if self.runtime_state.begin_motion(cancel_epoch=self.cancel_epoch) is None:
             return ReplayStatus.REJECTED, "motion authority unavailable", row
         return ReplayStatus.COMPLETED, "", row
 
@@ -192,8 +197,8 @@ class JointReplay:
         self.capture.data["submit_started_ns"][captured] = started_ns
         try:
             self.robot.send_action(
-                RobotCommand(self.run_id, arm, hand),
-                expires_ns=started_ns + ACTION_TIMEOUT_NS,
+                RobotCommand(arm, hand),
+                expires_ns=started_ns + COMMAND_LEASE_NS,
             )
         finally:
             self.capture.data["submit_completed_ns"][captured] = time.monotonic_ns()
@@ -205,11 +210,9 @@ class JointReplay:
             keys = {event.key for event in signals}
             if self.runtime_state.estop_request:
                 return ReplayStatus.ESTOP, "operator emergency stop"
-            if self.runtime_state.error_state:
-                return ReplayStatus.FAULT, "runtime failure"
             if self.runtime_state.quit_requested or "q" in keys:
                 return ReplayStatus.USER_QUIT, "operator quit"
-            if self.runtime_state.run_id != self.run_id:
+            if self.runtime_state.cancel_epoch != self.cancel_epoch:
                 cause = self.runtime_state.run_ended_reason
                 if cause == RunEndReason.QUIT:
                     return ReplayStatus.USER_QUIT, "operator quit"
@@ -262,9 +265,9 @@ class JointReplay:
             )
             if rejection is not None:
                 return ReplayStatus.REJECTED, f"hand start target: {rejection}"
-            expires_ns = time.monotonic_ns() + ACTION_TIMEOUT_NS
+            expires_ns = time.monotonic_ns() + COMMAND_LEASE_NS
             self.robot.send_action(
-                RobotCommand(self.run_id, arm_hold, hand),
+                RobotCommand(arm_hold, hand),
                 expires_ns=expires_ns,
             )
             submitted_ns = time.monotonic_ns()

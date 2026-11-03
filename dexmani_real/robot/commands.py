@@ -7,7 +7,6 @@ from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 @dataclass(frozen=True)
 class RobotCommand:
-    run_id: int
     arm_qpos: np.ndarray | None = None
     hand_qpos: np.ndarray | None = None
     arm_hold: bool = False  # 从当前伺服参考减速到零并保持，不退出 Mode 1。

@@ -35,12 +35,12 @@ class CartesianJog:
     def clear_reference(self):
         self.command_pose = self.command_qpos = None
 
-    def step(self, robot, keys, state, runtime, *, tick_end_ns):
+    def step(self, robot, keys, state, runtime):
         """发布点动目标或减速保持；故障由会话边界记录、撤权并收尾。"""
         pressed_keys = keys.snapshot()
         with state.motion_lock:
-            run_id = state.run_id
-            if not state.can_move(run_id=run_id):
+            cancel_epoch = state.cancel_epoch
+            if not state.can_move(cancel_epoch=cancel_epoch):
                 raise OperationCancelled("jog authority revoked")
 
         row = read_observation(None, robot)
@@ -64,10 +64,13 @@ class CartesianJog:
         if rejection_reason is not None and rejection_reason != self.rejection_reason:
             logger.warning("IK rejected target; braking and holding: %s", rejection_reason)
         self.rejection_reason = rejection_reason
-        # 运动目标错过本轮就丢弃；松键或目标拒绝后的制动不能等下一轮。
-        if target is not None and time.monotonic_ns() >= tick_end_ns:
-            return
-        command = RobotCommand(run_id, arm_qpos=target, arm_hold=target is None)
+        if target is not None:
+            issues = check_observation(
+                row, runtime, ObservationNeeds(), require_hand=runtime.hand.enabled,
+            )
+            if issues:
+                raise OperationCancelled("jog mapping sources expired: " + "; ".join(issues))
+        command = RobotCommand(arm_qpos=target, arm_hold=target is None)
         robot.send_action(
             command,
             expires_ns=time.monotonic_ns() + int(self.config.target_max_age_s * 1e9),

@@ -11,7 +11,7 @@ from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePathRejected
 from dexmani_real.data.raw import camera_metadata
 from dexmani_real.deployment.inference import MODEL_SHUTDOWN_TIMEOUT_S, PolicyWorker
-from dexmani_real.deployment.rollout import Rollout, failure_reason, utc_now
+from dexmani_real.deployment.rollout import Rollout, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
@@ -28,7 +28,7 @@ from dexmani_real.runtime.observation import (
     check_observation,
     read_observation,
 )
-from dexmani_real.runtime.state import SafetyState, SessionState
+from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.teleop.audio import AudioFeedback
 from dexmani_real.utils.io import write_json, write_yaml
@@ -59,14 +59,16 @@ class PolicySession:
             ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
             if record_raw else ObservationNeeds()
         )
-        self.needs = observations.needs.union(record_needs)
+        self.control_needs = observations.needs
+        self.record_needs = record_needs
+        self.capture_needs = self.control_needs.union(record_needs)
         self.runtime_state = SessionState()
         self.sensors = self.robot = self.keyboard = self.model = None
         self.audio = None
         self.episode = None
         self.episodes, self.errors = [], []
         self.summary = dict(
-            started_utc=utc_now(), ended_utc=None, outcome="incomplete", reason=None, shutdown=None,
+            started_utc=utc_now(), ended_utc=None, outcome="incomplete", termination_reason=None, shutdown=None,
         )
 
     def save_results(self, *, overwrite=True):
@@ -101,7 +103,7 @@ class PolicySession:
                 ):
                     raise
                 self.runtime_state.request_quit()
-                self.summary["reason"] = "startup_cancelled"
+                self.summary["termination_reason"] = "startup_cancelled"
             else:
                 print("就绪：B 新段 | S/C 保存结束 | D 丢弃 | Q 保存退出 | Esc 急停退出 | 空闲 H 回初始位、T 复位触觉。", flush=True)
                 self.run_control_loop()
@@ -111,8 +113,8 @@ class PolicySession:
             self.runtime_state.request_emergency_stop()
         except Exception as exc:
             failure = exc
-            self.runtime_state.mark_error()
-            self.runtime_state.revoke_motion(reason=failure_reason(exc))
+            self.runtime_state.stop_signal.set()
+            self.runtime_state.revoke_motion(reason=RunEndReason.FAILED)
             logger.exception("policy session failed")
         finally:
             exit_code = self.close(failure=failure)
@@ -121,7 +123,7 @@ class PolicySession:
     def prepare_resources(self):
         from dexmani_policy.deployment import load_policy
 
-        needs = self.needs
+        needs = self.capture_needs
         camera_required = needs.camera_worker or self.observations.camera_static
         if camera_required:
             self.runtime.camera.validate()
@@ -132,11 +134,10 @@ class PolicySession:
             motion=self.runtime.motion, environment=self.runtime.environment,
         )
         self.keyboard = Keyboard(
-            get_run_id=lambda: self.runtime_state.run_id,
             estop_callback=self.runtime_state.request_emergency_stop,
             bindings={
                 "s": self.runtime_state.request_stop, "c": self.runtime_state.request_stop,
-                "d": self.request_discard, "q": self.runtime_state.request_quit,
+                "d": self.runtime_state.request_stop, "q": self.runtime_state.request_quit,
             },
         )
         self.keyboard.start()
@@ -154,7 +155,11 @@ class PolicySession:
                 pointcloud_camera_fields=needs.camera_fields,
             ) if camera_required else None
         )
-        self.sensors = SensorWorkers(channels)
+        required_names = tuple(name for name, needed in (
+            ("camera", self.control_needs.camera_worker),
+            ("pointcloud", self.control_needs.point_cloud),
+        ) if needed)
+        self.sensors = SensorWorkers(channels, required_names=required_names)
         self.robot = Robot(
             self.runtime.arm, self.runtime.hand, runtime_state=self.runtime_state,
             check_services=self.check_services,
@@ -164,12 +169,12 @@ class PolicySession:
         if not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
             return False
-        if not self.sensors.check():
+        if not self.sensors.check(names=self.sensors.required_names):
             raise RobotError("required sensor process exited")
         return True
 
     def start_devices(self):
-        needs = self.needs
+        needs = self.capture_needs
         self.robot.connect()
         if needs.camera_worker or self.observations.camera_static:
             self.sensors.start(
@@ -219,9 +224,9 @@ class PolicySession:
             self.sensors.shutdown(self.runtime_state)
             self.sensors.channels = None
         self.robot.check()
-        startup_run_id = self.runtime_state.arm()
+        startup_cancel_epoch = self.runtime_state.arm()
         initialize_hand(
-            self.runtime_state, self.robot, run_id=startup_run_id,
+            self.runtime_state, self.robot, cancel_epoch=startup_cancel_epoch,
             required_tactile=needs.required_tactile,
             cancel_requested=self.home_abort_requested,
         )
@@ -271,20 +276,14 @@ class PolicySession:
             "pending" if pending else "completed"
             if model_status == "completed" and not close_errors else "failed"
         )
-        failure_detail = None
-        if failure is not None:
-            # episode 已完成归因；会话只登记独立的启动/运行时错误。
-            if self.episode is not None and self.episode.result.errors:
-                failure_detail = self.episode.result.errors[0]
-            else:
-                failure_detail = error_detail("session", failure)
-                self.errors.append(failure_detail)
+        if failure is not None and not (self.episode is not None and self.episode.result.errors):
+            self.errors.append(error_detail("session", failure))
         self.errors.extend(error_detail(stage, error) for stage, error in close_errors)
         successful = (
             not self.errors and shutdown == "completed"
             and failure is None
             and self.runtime_state.quit_requested
-            and not self.runtime_state.estop_request and not self.runtime_state.error_state
+            and not self.runtime_state.estop_request
         )
         if self.audio is not None:
             try:
@@ -298,13 +297,7 @@ class PolicySession:
                 successful = False
                 if shutdown != "pending":
                     shutdown = "failed"
-        reason = self.summary["reason"]
-        reason_error = failure_detail or (self.errors[0] if self.errors else None)
-        if reason_error is not None:
-            reason = reason_error["message"] or reason_error["exception_type"]
-        elif not successful:
-            reason = "shutdown_pending" if pending else "session_stopped"
-        self.summary.update(ended_utc=utc_now(), outcome="finished" if successful else "fault", reason=reason, shutdown=shutdown)
+        self.summary.update(ended_utc=utc_now(), outcome="finished" if successful else "fault", shutdown=shutdown)
         try:
             self.save_results()
         except BaseException as exc:
@@ -312,8 +305,6 @@ class PolicySession:
             if isinstance(exc, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()
             self.summary["outcome"] = "fault"
-            if successful:
-                self.summary["reason"] = str(exc) or type(exc).__name__
             successful = False
             logger.exception("session result publication failed")
         if pending:
@@ -341,8 +332,8 @@ class PolicySession:
         deadline = time.monotonic() + MODEL_STARTUP_TIMEOUT_S
         self.wait_model(deadline)
         self.check_startup()
-        row = read_observation(self.sensors.channels, self.robot, needs=self.needs)
-        issues = check_observation(row, self.runtime, self.needs)
+        row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
+        issues = check_observation(row, self.runtime, self.control_needs)
         if issues:
             raise ValueError("warmup observation: " + "; ".join(issues))
         # 仅预热重复一个快照；features 缓存此后由唯一模型线程独占。
@@ -356,13 +347,6 @@ class PolicySession:
         self.model.warmup(rows, samples=1, **kwargs)
         self.wait_model(time.monotonic() + MODEL_STARTUP_TIMEOUT_S)
 
-    def request_discard(self) -> None:
-        # 与保存决定排序；决定之后的 D 仍停止，但不逆转局部 save。
-        with self.runtime_state.motion_lock:
-            if self.episode is not None:
-                self.episode.discard_requested = True
-            self.runtime_state.request_stop()
-
     def poll_operator(self, *, allow_tactile_reset: bool = False) -> int | None:
         return self.handle_command_batch(
             self.keyboard.poll(timeout=0),
@@ -371,6 +355,8 @@ class PolicySession:
 
     def handle_command_batch(self, signals, *, allow_tactile_reset=False) -> int | None:
         keys = {event.key for event in signals}
+        if "d" in keys and self.episode is not None:
+            self.episode.discard_requested = True
         if "esc" in keys:
             self.runtime_state.request_emergency_stop()
             return None
@@ -381,13 +367,18 @@ class PolicySession:
             return None
         for event in signals:
             signal = event.key
+            if signal not in {"b", "h", "t"}:
+                continue
+            cancel_epoch = self.keyboard.accept_operation(self.runtime_state)
+            if cancel_epoch is None:
+                return None
             if signal == "b":
                 if self.episode is None and self.runtime_state.can_move(
-                    run_id=event.run_id, required_safety_state=SafetyState.ARMED,
+                    cancel_epoch=cancel_epoch, required_safety_state=SafetyState.ARMED,
                 ):
-                    return event.run_id
+                    return cancel_epoch
             elif signal == "h":
-                if self.run_home(event.run_id):
+                if self.run_home(cancel_epoch):
                     return None
             elif signal == "t":
                 if not self.runtime.hand.enabled:
@@ -397,29 +388,27 @@ class PolicySession:
                     logger.warning("T ignored: tactile reset requires idle")
                     continue
                 if not self.runtime_state.can_move(
-                    run_id=event.run_id, required_safety_state=SafetyState.ARMED,
+                    cancel_epoch=cancel_epoch, required_safety_state=SafetyState.ARMED,
                 ):
                     continue
                 try:
                     logger.info("正在复位触觉，请保持手部无接触；S/Q/Esc 可中断。")
                     self.robot.reset_tactile_sensors(
-                        run_id=event.run_id,
+                        cancel_epoch=cancel_epoch,
                         cancel_requested=self.home_abort_requested,
-                        required_tactile=self.needs.required_tactile,
+                        required_tactile=self.capture_needs.required_tactile,
                     )
                 except OperationCancelled as exc:
                     self.robot.check()
                     logger.info("%s", exc)
-                finally:
-                    self.runtime_state.revoke_motion()
                 return None
         return None
 
-    def run_home(self, run_id) -> bool:
+    def run_home(self, cancel_epoch) -> bool:
         home_allowed = (
             self.episode is None
             and self.runtime_state.can_move(
-                run_id=run_id, required_safety_state=SafetyState.ARMED,
+                cancel_epoch=cancel_epoch, required_safety_state=SafetyState.ARMED,
             )
         )
         if not home_allowed:
@@ -430,7 +419,7 @@ class PolicySession:
         try:
             home_robot(
                 self.runtime_state, self.robot, self.get_home_planner,
-                run_id=run_id,
+                cancel_epoch=cancel_epoch,
                 cancel_requested=self.home_abort_requested,
             )
         except OperationCancelled as exc:
@@ -442,8 +431,6 @@ class PolicySession:
         else:
             self.audio.play("home_done")
             logger.info("已回初始位，按 B 开始。")
-        finally:
-            self.runtime_state.revoke_motion()
         return True
 
     def get_home_planner(self):
@@ -469,24 +456,26 @@ class PolicySession:
 
     def run_control_loop(self):
         while not self.runtime_state.quit_requested:
-            run_id = self.poll_operator(allow_tactile_reset=True)
+            self.keyboard.allow_start()
+            cancel_epoch = self.poll_operator(allow_tactile_reset=True)
             self.robot.service_idle()
-            if self.runtime_state.estop_request or self.runtime_state.error_state:
+            if self.runtime_state.estop_request:
                 break
-            if run_id is not None and not self.runtime_state.can_move(
-                run_id=run_id, required_safety_state=SafetyState.ARMED,
+            if cancel_epoch is not None and not self.runtime_state.can_move(
+                cancel_epoch=cancel_epoch, required_safety_state=SafetyState.ARMED,
             ):
-                run_id = None
-            if run_id is None:
+                cancel_epoch = None
+            if cancel_epoch is None:
                 time.sleep(0.005)
                 continue
             episode = self.episode = Rollout(
-                self.runtime_state, self.runtime, self.info, run_id=run_id,
+                self.runtime_state, self.runtime, self.info, cancel_epoch=cancel_epoch,
                 robot=self.robot, sensors=self.sensors, observations=self.observations,
-                needs=self.needs, action_mapper=self.action_mapper, model=self.model,
+                control_needs=self.control_needs,
+                record_needs=self.record_needs, action_mapper=self.action_mapper, model=self.model,
                 max_running_s=self.max_running_s,
                 index=len(self.episodes) + 1, output_dir=self.output_dir, record_raw=self.record_raw,
-                camera_snapshot=self.camera_snapshot, audio=self.audio,
+                camera_snapshot=self.camera_snapshot, audio=self.audio, keyboard=self.keyboard,
             )
             try:
                 episode.run(poll_operator=self.poll_operator)

@@ -13,13 +13,13 @@ from dexmani_real.robot.model import ARM_DOF, XARM7_HARD_LOWER, XARM7_HARD_UPPER
 SDK_TIMEOUT_S = 1.0
 SDK_STREAM_TIMEOUT_S = 0.020
 EXECUTOR_TIMEOUT_S = 3.0
-HOME_TARGET_TIMEOUT_S = 0.5
 HOME_DWELL_S = 0.30
 HOME_CONVERGENCE_TIMEOUT_S = 15.0
 
 
 @dataclass(frozen=True)
 class HomingConfig:
+    timeout_s: float = 60.0
     convergence_rad: float = 0.002618
     max_speed_deg_s: float = 45.0
     velocity_convergence_rad_s: float = 0.03
@@ -29,7 +29,7 @@ class HomingConfig:
         return radians(self.max_speed_deg_s)
 
     def validate(self) -> None:
-        for name in ("convergence_rad", "velocity_convergence_rad_s"):
+        for name in ("timeout_s", "convergence_rad", "velocity_convergence_rad_s"):
             value = getattr(self, name)
             if not isfinite(value) or value <= 0:
                 raise ValueError(f"homing.{name} must be finite and positive")

@@ -11,7 +11,6 @@ from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
 from dexmani_real.config.teleop import DEFAULT_TASK_NAME
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.data.raw import validate_task_label
-from dexmani_real.data.recorder import RecordingError
 from dexmani_real.ipc.sensors import (
     SensorChannels,
     read_vr_frame,
@@ -103,7 +102,7 @@ def run_teleop(
     keyboard = audio = None
     primary_failure: BaseException | None = None
     try:
-        sensors = SensorWorkers(channels)
+        sensors = SensorWorkers(channels, required_names=("vr",))
         robot = Robot(
             runtime.arm,
             runtime.hand,
@@ -111,7 +110,6 @@ def run_teleop(
             check_services=sensors.check,
         )
         keyboard = Keyboard(
-            get_run_id=lambda: runtime_state.run_id,
             estop_callback=runtime_state.request_emergency_stop,
             bindings={
                 "s": runtime_state.request_stop,
@@ -133,14 +131,12 @@ def run_teleop(
             max_duration_s=max_duration_s,
             runtime_config_json=runtime_config_json,
         )
-        keyboard.bindings["d"] = loop.request_discard
+        keyboard.bindings["d"] = runtime_state.request_stop
         keyboard.start()
 
         def check_services():
             if not keyboard.check_health() or not sensors.check(names=("vr",)):
                 raise RobotError("teleop control service unavailable")
-            if record and not sensors.check(names=("camera",)):
-                raise RecordingError("recording camera process exited")
             return True
 
         robot.check_services = check_services
@@ -162,10 +158,10 @@ def run_teleop(
                 camera_calibration_path,
             )
         robot.check()
-        startup_run_id = runtime_state.arm()
+        startup_cancel_epoch = runtime_state.arm()
         if initialize_teleop(
             loop, ctx.Process(name="vr", target=run_vr, args=(channels, runtime.vr)),
-            run_id=startup_run_id,
+            cancel_epoch=startup_cancel_epoch,
         ):
             loop.run()
         robot.check()
@@ -184,7 +180,7 @@ def run_teleop(
                 raise
         except Exception as failure:
             primary_failure = failure
-            runtime_state.mark_error()
+            runtime_state.stop_signal.set()
             logger.exception("teleop cancellation also failed")
         else:
             runtime_state.request_quit()
@@ -192,7 +188,7 @@ def run_teleop(
             logger.info("Teleop startup cancelled")
     except Exception as exc:
         primary_failure = exc
-        runtime_state.mark_error()
+        runtime_state.stop_signal.set()
         logger.exception("teleop session failed")
     finally:
         try:
@@ -203,9 +199,10 @@ def run_teleop(
             if exc is not primary_failure:
                 logger.exception("teleop capture cleanup interrupted")
         except Exception as exc:
-            runtime_state.mark_error()
+            runtime_state.stop_signal.set()
             if exc is not primary_failure:
                 logger.exception("teleop capture cleanup failed")
+            primary_failure = primary_failure or exc
         finally:
             try:
                 close_runtime(runtime_state, robot, sensors=sensors, keyboard=keyboard)
@@ -226,17 +223,17 @@ def run_teleop(
                     except Exception:
                         logger.warning("teleop audio cleanup failed", exc_info=True)
     return int(
-        not clean or not shutdown_clean or runtime_state.error_state or runtime_state.estop_request
+        not clean or not shutdown_clean or primary_failure is not None or runtime_state.estop_request
     )
 
 
-def initialize_teleop(loop, vr_process, *, run_id) -> bool:
+def initialize_teleop(loop, vr_process, *, cancel_epoch) -> bool:
     # 自动复位前，键盘停止回调已经生效。
     initialize_hand(
         loop.runtime_state,
         loop.robot,
-        run_id=run_id,
-        required_tactile=loop.needs.required_tactile,
+        cancel_epoch=cancel_epoch,
+        required_tactile=loop.capture_needs.required_tactile,
         cancel_requested=loop.poll_blocking_commands,
     )
     if loop.poll_blocking_commands():

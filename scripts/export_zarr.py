@@ -18,7 +18,7 @@ from dexmani_real.utils.table_plane import load_table_plane
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Export complete, technically normal teleop Raw episodes to a canonical multimodal Zarr. "
+            "Export published teleop Raw episodes with valid data to a canonical multimodal Zarr. "
             "Other Raw collection sources are currently unsupported. "
             "Validate structure and timing first, numeric values during chunk conversion. "
             "Reject the whole export on any invalid row and publish only after all episodes succeed; "

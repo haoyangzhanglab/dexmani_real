@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-OBSERVATION_MAX_AGE_PERIODS = 4
+from math import isfinite
 
 
 @dataclass(frozen=True)
@@ -13,18 +12,17 @@ class CameraConfig:
     width: int = 640
     height: int = 480
     fps: int = 30
+    max_frame_age_s: float = 4 / 30
     l515_visual_preset: int = 5
     l515_confidence_threshold: int | None = None
-
-    @property
-    def max_frame_age_s(self) -> float:
-        return OBSERVATION_MAX_AGE_PERIODS / self.fps
 
     @property
     def depth_shape(self) -> tuple[int, int]:
         return (self.height, self.width)
 
     def validate(self) -> None:
+        if not isfinite(self.max_frame_age_s) or self.max_frame_age_s <= 0:
+            raise ValueError("camera max_frame_age_s must be finite and positive")
         for name in ("width", "height", "fps"):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
