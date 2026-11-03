@@ -130,7 +130,7 @@ def home_arm(state, robot, planner, *, cancel_epoch, cancel_requested, deadline_
         if cancelled():
             raise OperationCancelled("home interrupted during planning")
 
-        logger.debug("arm home: %d planned milestones", len(waypoints))
+        logger.debug("arm home: %d path endpoints", len(waypoints))
         if time.monotonic_ns() >= deadline_ns:
             raise TimeoutError("arm HOME budget exhausted during planning")
         robot.home_arm(

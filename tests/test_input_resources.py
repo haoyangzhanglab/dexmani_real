@@ -1,3 +1,4 @@
+import signal
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -158,14 +159,115 @@ def test_unstarted_sensor_is_owned_but_not_joined():
     assert not workers.processes
 
 
-def test_failed_archive_worker_is_reported_without_retaining_dead_handle():
+@pytest.mark.parametrize('exitcode', [1, -signal.SIGTERM, -signal.SIGKILL])
+def test_failed_archive_worker_is_reported_without_retaining_dead_handle(exitcode):
     from dexmani_real.runtime.lifecycle import SensorWorkers
     workers = SensorWorkers()
-    workers.processes = [SimpleNamespace(name='camera', pid=10, exitcode=1,
+    workers.processes = [SimpleNamespace(name='camera', pid=10, exitcode=exitcode,
                                         join=lambda **kwargs: None, is_alive=lambda: False)]
-    with pytest.raises(RuntimeError, match='exitcode=1'):
+    with pytest.raises(RuntimeError, match=f'exitcode={exitcode}'):
         workers.shutdown(SessionState())
     assert not workers.processes
+
+
+@pytest.mark.parametrize('initial_exitcode,terminate_exitcode,kill_exitcode,outcome', [
+    (0, None, None, 'normal'),
+    (None, -signal.SIGTERM, None, 'warning'),
+    (None, None, -signal.SIGKILL, 'warning'),
+    (None, None, -signal.SIGTERM, 'warning'),
+    (None, 0, None, 'normal'),  # terminate 调用时已恰好自行退出。
+    (None, 1, None, 'error'),
+    (None, -signal.SIGKILL, None, 'error'),  # 本方只尝试过 SIGTERM。
+    (None, None, 1, 'error'),
+    (None, None, None, 'pending'),
+])
+def test_sensor_shutdown_matches_only_attempted_signals(
+    caplog, initial_exitcode, terminate_exitcode, kill_exitcode, outcome,
+):
+    from dexmani_real.runtime.lifecycle import SensorWorkers
+    workers = SensorWorkers(SimpleNamespace(is_running=SimpleNamespace(value=True)))
+    calls = []
+    process = SimpleNamespace(name='camera', pid=10, exitcode=initial_exitcode)
+    process.join = lambda **kwargs: calls.append('join')
+    process.is_alive = lambda: process.exitcode is None
+    def terminate():
+        calls.append('terminate')
+        process.exitcode = terminate_exitcode
+    def kill():
+        calls.append('kill')
+        process.exitcode = kill_exitcode
+    process.terminate, process.kill = terminate, kill
+    workers.processes = [process]
+    if outcome in {'error', 'pending'}:
+        message = 'could not be confirmed stopped' if outcome == 'pending' else 'exitcode='
+        with pytest.raises(RuntimeError, match=message):
+            workers.shutdown(SessionState())
+    else:
+        workers.shutdown(SessionState())
+        assert bool(caplog.records) == (outcome == 'warning')
+        assert all(record.levelname == 'WARNING' for record in caplog.records)
+    expected_calls = ['join']
+    if initial_exitcode is None:
+        expected_calls += ['terminate', 'join']
+        if terminate_exitcode is None:
+            expected_calls += ['kill', 'join']
+    assert calls == expected_calls
+    assert not workers.channels.is_running.value
+    assert workers.processes == ([process] if outcome == 'pending' else [])
+
+
+@pytest.mark.parametrize('failed_call', ['join', 'terminate', 'kill'])
+def test_sensor_cleanup_call_errors_are_reported(failed_call):
+    from dexmani_real.runtime.lifecycle import SensorWorkers
+    workers = SensorWorkers()
+    process = SimpleNamespace(name='camera', pid=10, exitcode=None)
+    def cleanup_call(name):
+        if name == failed_call:
+            if name == 'join':
+                process.exitcode = 0  # 已退出仍不能掩盖 join 本身的错误。
+            raise OSError(f'{name} failed')
+    process.join = lambda **kwargs: cleanup_call('join')
+    process.terminate = lambda: cleanup_call('terminate')
+    process.kill = lambda: cleanup_call('kill')
+    process.is_alive = lambda: process.exitcode is None
+    joined = []
+    other = SimpleNamespace(name='vr', pid=11, exitcode=0,
+                            join=lambda **kwargs: joined.append('vr'), is_alive=lambda: False)
+    workers.processes = [process, other]
+    with pytest.raises(OSError, match=f'{failed_call} failed'):
+        workers.shutdown(SessionState())
+    assert joined == ['vr']
+    assert workers.processes == ([] if failed_call == 'join' else [process])
+
+
+@pytest.mark.parametrize('prior_result', ['session', 'stop', 'estop'])
+def test_sensor_recovery_preserves_policy_failure(prior_result):
+    from dexmani_real.deployment.session import PolicySession
+    from dexmani_real.runtime.lifecycle import SensorWorkers
+    from dexmani_real.utils.log import error_detail
+
+    session = PolicySession.__new__(PolicySession)
+    session.runtime_state = SessionState()
+    session.robot = session.keyboard = session.episode = session.model = session.audio = None
+    session.summary = {'termination_reason': None}
+    session.save_results = lambda: None
+    session.errors = []
+    if prior_result == 'estop':
+        session.runtime_state.request_emergency_stop()
+    else:
+        session.errors.append(error_detail(prior_result, OSError('existing failure')))
+    original_errors = list(session.errors)
+    session.sensors = SensorWorkers()
+    process = SimpleNamespace(name='camera', pid=10, exitcode=None,
+                              join=lambda **kwargs: None)
+    process.is_alive = lambda: process.exitcode is None
+    process.terminate = lambda: setattr(process, 'exitcode', -signal.SIGTERM)
+    session.sensors.processes = [process]
+
+    assert session.close() == 1
+    assert session.errors == original_errors
+    assert not session.sensors.processes
+    assert session.summary['termination_reason'] == ('estop' if prior_result == 'estop' else 'failed')
 
 
 @pytest.mark.parametrize('keys', [('x',), ('x', 'b')])

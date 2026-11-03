@@ -76,11 +76,10 @@ class ArmController:
         stage,
         deadline_ns,
         target=None,
-        tolerance_rad=None,
         strict=False,
     ):
         """在绝对期限内确认连续停稳；strict 遇到位置或速度不合格立即失败。"""
-        tolerance = self.cfg.homing.convergence_rad if tolerance_rad is None else tolerance_rad
+        tolerance = self.cfg.homing.convergence_rad
         interval_ns = round(1e9 / self.cfg.feedback_hz)
         stable = None
         anchor = None
@@ -126,7 +125,7 @@ class ArmController:
         if np.any(waypoints < lower) or np.any(waypoints > upper):
             raise ValueError("home waypoint violates joint limits")
         if len(waypoints) and np.max(np.abs(waypoints[-1] - final_qpos)) > 1e-6:
-            raise ValueError("final milestone does not match canonical home")
+            raise ValueError("home path endpoint does not match canonical home")
         check_abort()
         if len(waypoints):
             self.driver.enter_mode(0, check_abort=check_abort)
@@ -148,14 +147,13 @@ class ArmController:
             raise RuntimeError("current state moved too far from planned path start")
         if len(waypoints):
             check_abort()
-            self.driver.move_home_milestone(final_qpos)
+            self.driver.move_home(final_qpos)
             check_abort()
             self.wait_settled(
                 check_abort,
                 stage="arm HOME",
                 deadline_ns=deadline_ns,
                 target=final_qpos,
-                tolerance_rad=min(self.cfg.homing.convergence_rad, np.deg2rad(0.5)),
             )
         else:
             self.wait_settled(

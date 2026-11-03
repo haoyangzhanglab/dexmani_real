@@ -1,6 +1,7 @@
 """传感进程启停与会话资源回收。"""
 
 import logging
+import signal
 import time
 
 from dexmani_real.robot.commands import OperationCancelled
@@ -75,16 +76,23 @@ class SensorWorkers:
                     escalation = "kill"
                     process.kill()
                     process.join(timeout=WORKER_STOP_TIMEOUT_S)
-                if process.exitcode is None:
+                exitcode = process.exitcode
+                if exitcode is None:
                     raise RuntimeError(f"process {process.name} could not be confirmed stopped")
-                if escalation != "graceful" or process.exitcode != 0:
-                    errors.append((process.name, RuntimeError(f"worker {process.name}: exitcode={process.exitcode}, {escalation}")))
-                    logger.warning(
-                        "worker %s stopped: exitcode=%s escalation=%s",
-                        process.name,
-                        process.exitcode,
-                        escalation,
-                    )
+                if exitcode == 0:
+                    continue
+                # 升级 kill 后，退出仍可能由先前尝试的 SIGTERM 引起。
+                if not (
+                    escalation != "graceful" and exitcode == -signal.SIGTERM
+                    or escalation == "kill" and exitcode == -signal.SIGKILL
+                ):
+                    raise RuntimeError(f"worker {process.name}: exitcode={exitcode}, {escalation}")
+                logger.warning(
+                    "worker %s stopped: exitcode=%s escalation=%s",
+                    process.name,
+                    exitcode,
+                    escalation,
+                )
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     runtime_state.request_emergency_stop()

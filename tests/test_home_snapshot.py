@@ -57,15 +57,72 @@ def test_home_sdk_return_does_not_mean_measured_arrival():
     moves = []
     io = SimpleNamespace(stop=threading.Event(), publish_status=lambda status: None)
     driver = SimpleNamespace(enter_mode=lambda *a, **kw: None,
-                             move_home_milestone=moves.append,
+                             move_home=moves.append,
                              read=lambda: (measured, np.zeros(7)))
     owner = ArmController(config, io, None, driver)
-    owner.status['qpos'] = measured
-    owner.status['timestamp_ns'] = time.monotonic_ns()
     with pytest.raises(TimeoutError, match='not confirmed'):
         owner.home(np.stack((measured, target)),
                    check_abort=lambda: None, deadline_ns=time.monotonic_ns() + 20_000_000)
     assert len(moves) == 1
+
+
+@pytest.mark.parametrize('moving', [False, True], ids=['empty_path', 'moving_path'])
+@pytest.mark.parametrize('tolerance_deg, final_error_deg, converged', [
+    (2., 1., True), (2., 3., False),
+    (None, .1, True), (None, .2, False),
+])
+def test_home_paths_use_configured_arrival_tolerance(
+    monkeypatch, moving, tolerance_deg, final_error_deg, converged,
+):
+    from dexmani_real.config.xarm7 import HOME_DWELL_S
+    from dexmani_real.control.homing import HomePlanner
+    from dexmani_real.robot.xarm7.worker import ArmController
+
+    config = RealConfig().arm
+    if tolerance_deg is not None:
+        config = replace(config, homing=replace(
+            config.homing, convergence_rad=np.deg2rad(tolerance_deg),
+        ))
+    config.validate_home()
+    target = np.asarray(config.home_qpos)
+    start, final = target.copy(), target.copy()
+    start[0] += np.deg2rad(5. if moving else .1)
+    final[0] += np.deg2rad(final_error_deg)
+    planner = HomePlanner.__new__(HomePlanner)
+    planner.arm = config
+    planner.limits = np.column_stack((config.joint_limit_lower, config.joint_limit_upper))
+    planner._check_state = lambda q: (.1, .1)
+    path = planner.plan(start, target)
+    assert len(path) == (2 if moving else 0)
+
+    now = [1_000_000_000]
+    monkeypatch.setattr('dexmani_real.robot.xarm7.worker.time.monotonic_ns', lambda: now[0])
+    samples, moves = [], []
+    def read():
+        q = start if not samples else final
+        # 移动后先收到仍运动的反馈，不能从这帧开始计算停稳。
+        v = np.full(7, 1. if moving and len(samples) == 1 else 0.)
+        samples.append((now[0], v.copy()))
+        now[0] += 1_000_000
+        return q, v
+    def wait(delay):
+        now[0] += round(delay * 1e9)
+    driver = SimpleNamespace(enter_mode=lambda *a, **kw: None,
+                             move_home=moves.append, read=read)
+    io = SimpleNamespace(stop=SimpleNamespace(wait=wait), publish_status=lambda row: None)
+    owner = ArmController(config, io, None, driver)
+    deadline_ns = now[0] + 1_000_000_000
+    if converged:
+        owner.home(path, check_abort=lambda: None, deadline_ns=deadline_ns)
+        stationary = [stamp for stamp, v in samples[1:] if not np.any(v)]
+        assert stationary[-1] - stationary[0] >= HOME_DWELL_S * 1e9
+        assert now[0] - owner.status['timestamp_ns'] <= config.feedback_max_age_s * 1e9
+        np.testing.assert_array_equal(owner.status['qpos'], final)
+    else:
+        error = TimeoutError if moving else RuntimeError
+        with pytest.raises(error, match='not confirmed|interrupted by position/velocity'):
+            owner.home(path, check_abort=lambda: None, deadline_ns=deadline_ns)
+    assert len(moves) == int(moving)
 
 
 def test_home_cancellation_after_submission_stops_confirmation():
@@ -87,10 +144,8 @@ def test_home_cancellation_after_submission_stops_confirmation():
             raise OperationCancelled('operator stop')
     io = SimpleNamespace(stop=threading.Event(), publish_status=lambda status: None)
     driver = SimpleNamespace(enter_mode=lambda *a, **kw: None,
-                             move_home_milestone=move, read=lambda: (measured, np.zeros(7)))
+                             move_home=move, read=lambda: (measured, np.zeros(7)))
     owner = ArmController(config, io, None, driver)
-    owner.status['qpos'] = measured
-    owner.status['timestamp_ns'] = time.monotonic_ns()
     with pytest.raises(OperationCancelled, match='operator stop'):
         owner.home(np.stack((measured, target)),
                    check_abort=check_abort, deadline_ns=time.monotonic_ns() + 1_000_000_000)
@@ -221,11 +276,9 @@ def test_home_rechecks_measured_start_after_mode_change(changed):
     driver = SimpleNamespace(
         enter_mode=enter_mode,
         read=lambda: (measured[0], velocity),
-        move_home_milestone=lambda q: pytest.fail('moved from an unchecked start'),
+        move_home=lambda q: pytest.fail('moved from an unchecked start'),
     )
     owner = ArmController(config, SimpleNamespace(publish_status=lambda row: None), None, driver)
-    owner.status['qpos'] = planned_start
-    owner.status['timestamp_ns'] = time.monotonic_ns()
     with pytest.raises(RuntimeError, match='planned path start|HOME preparation'):
         owner.home(np.stack((planned_start, target)), check_abort=lambda: None,
                    deadline_ns=time.monotonic_ns() + 1_000_000_000)

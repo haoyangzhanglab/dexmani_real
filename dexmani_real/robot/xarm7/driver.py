@@ -111,7 +111,7 @@ class XArm7:
             self.api.set_timeout(SDK_TIMEOUT_S)
         check_sdk_return_code(code, "servo")
 
-    def move_home_milestone(self, target: np.ndarray) -> None:
+    def move_home(self, target: np.ndarray) -> None:
         code = self.api.set_servo_angle(
             angle=target,
             is_radian=True,
@@ -120,7 +120,7 @@ class XArm7:
             wait=False,
             radius=None,
         )
-        check_sdk_return_code(code, "home milestone")
+        check_sdk_return_code(code, "home move")
 
     def enter_mode(self, mode, *, check_abort):
         check_abort()

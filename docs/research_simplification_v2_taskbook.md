@@ -568,7 +568,7 @@ CLI 的 `--help`、`--print-config` 只做无设备检查；不得为了“验�
 
 - **取消分类：** Policy/teleop 的 prepare/HOME 只把当前操作取消计数已改变或 quit/estop 作为干净用户取消。意外 OperationCancelled 保留原异常并非零退出；teleop 的启动取消捕获限定在初始化阶段，历史正常 S 不再导致运行中故障被吞掉。
 - **设备异常边界：** arm resume 的停止确认、清邮箱、最终清 stop 也纳入 request_operation 的异常退出边界，取消或超时后置 closing，不返回故障 owner 的复用路径。
-- **实际传感故障：** 删除 required_names 镜像清单，健康检查依据实际持有的进程；所有已启动 sensor 非零退出都报告关闭错误，录制专用相机不再获得豁免。已正常结束的静态参数相机从 owner 列表移除。
+- **实际传感故障：** 删除 required_names 镜像清单，健康检查依据实际持有的进程，录制专用相机不再获得故障豁免。关闭时确认退出码为 0 即正常回收；本次关闭主动尝试 terminate/kill 且退出码对应已尝试的 SIGTERM/SIGKILL 时只记 warning，不单独使会话失败。其他非零退出、清理调用异常及未确认退出仍报错，不清除已有会话错误。已正常结束的静态参数相机从 owner 列表移除。
 - **HOME 调用链：** owner 仅接受空路径或 current/HOME 两端点，直接向配置 HOME 提交一次，删除任意多路点循环和重复终点参数。模式切换后实际查询反馈，复核起点与速度，避免 TTL 内旧缓存掩盖漂移；父层直接按既有 1° 分辨率采样，删除无其他消费者的通用多路点插值 helper。
 - **启动姿态：** 删除精确 HOME 门槛后，在 Policy 首次观测准入补齐实测 arm 的配置关节范围检查；shape/finite 继续由 SDK 读取边界负责，未增加内部重复校验。
 - **录制完整性：** 控制主错期间的传感等次错只报告，不再污染 writer I/O error 而中止健康前缀。recorder.finish 请求和期限建立过程中的中断纳入现有异常边界，重入不再误报完成；append 的 str/None 返回契约补齐。正常完成的 Rollout 释放 recorder，避免最终会话收尾重复 finish/提示音；失败句柄仍保留。
