@@ -97,7 +97,8 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
             "%s: single row, no sampling interval to verify", reader.path
         )
     rows = reader["timing/rows"][:]
-    period, tolerance = sampling_clock_ns(reader.control_hz)
+    period = sampling_clock_ns(reader.control_hz)
+    tolerance = period // 4
 
     def reject_invalid(bad, detail, offset=0):
         indices = np.flatnonzero(bad)

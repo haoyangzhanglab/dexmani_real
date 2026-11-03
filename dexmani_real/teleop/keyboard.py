@@ -96,7 +96,7 @@ class KeyboardTeleop:
             "Jog is ready. Release jog keys to brake and hold. "
             "Rejected targets brake and hold; valid targets resume motion."
         )
-        self.period_ns, _ = sampling_clock_ns(self.jog_config.control_hz)
+        self.period_ns = sampling_clock_ns(self.jog_config.control_hz)
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
 
     def running_run_id(self) -> int | None:

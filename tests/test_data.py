@@ -406,7 +406,7 @@ def test_interrupted_writer_wait_stays_pending_without_restarting_finish(tmp_pat
     (65_625_000, 3, True), (65_625_001, 3, False),
     (59_375_000, 3, True), (59_374_999, 3, False), (62_500_000, 1, True),
 ])
-def test_export_mean_period_boundary(tmp_path, capture, period, frames, accepted, monkeypatch):
+def test_export_mean_period_boundary(tmp_path, capture, period, frames, accepted, monkeypatch, caplog):
     from dexmani_real.data.export import validate_export_episode
     from queue import Queue
     # 批量构造磁盘 fixture，不以生产速度提交合成帧。
@@ -427,6 +427,8 @@ def test_export_mean_period_boundary(tmp_path, capture, period, frames, accepted
         else:
             _, quality = validate_export_episode(reader)
             assert quality['mean_control_period_ns'] == (period if frames > 1 else None)
+            if frames == 1:
+                assert 'single row, no sampling interval to verify' in caplog.text
 
 
 @pytest.mark.parametrize('frames', [2, 4])
@@ -467,3 +469,68 @@ def test_single_125ms_gap_at_16hz_rejects_episode(tmp_path, capture):
     with RawReader(path) as reader:
         with pytest.raises(ValueError, match='control_interval_gap_or_drift at row 2'):
             validate_export_episode(reader)
+
+
+@pytest.mark.parametrize('stage', ['prepare', 'send'])
+@pytest.mark.parametrize('key', ['s', 'c', 'd', 'q', 'esc'])
+def test_teleop_blocking_stop_preserves_recorder_boundary(tmp_path, capture, monkeypatch, stage, key):
+    from test_interaction import make_loop
+    from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.teleop.loop import TeleopPhase
+    loop = make_loop()
+    metadata, row, command = capture
+    clock = [1_000_000_000]
+    monkeypatch.setattr('time.monotonic_ns', lambda: clock[0])
+    loop.runtime.hand.feedback_max_age_s = .5
+    loop.controller.rotation.as_matrix.return_value = np.eye(3)
+    loop.recording_dir = tmp_path
+    loop.runtime_config_json = "{}"
+    monkeypatch.setattr('dexmani_real.teleop.loop.snapshot_recording_metadata', lambda *a, **kw: metadata.copy())
+    monkeypatch.setattr('dexmani_real.teleop.loop.read_observation', lambda *a, **kw: row(0))
+    loop.admit_observation = lambda row: []
+    loop.controller.compute_target.return_value.hand_qpos = command.hand_qpos
+    finished, captured = [], []
+    finish = EpisodeRecorder.finish
+    def finish_once(recorder, **kwargs):
+        finished.append((recorder.submitted_frames, kwargs))
+        return finish(recorder, **kwargs)
+    monkeypatch.setattr(EpisodeRecorder, 'finish', finish_once)
+    def interrupt(*args, **kwargs):
+        loop.runtime_state.stop_signal.clear()
+        recorder = loop.recorder
+        captured.append(recorder)
+        for name in ('b', 'h', 't', key):
+            loop.keyboard.handle_key(name, True)
+        assert loop.poll_blocking_commands()
+        assert loop.recorder is recorder and recorder.finish_request is None
+        assert not finished
+        raise OperationCancelled('device revoked')
+    if stage == 'prepare':
+        loop.robot.prepare_streaming.side_effect = interrupt
+    else:
+        loop.robot.send_action.side_effect = interrupt
+    loop.run_episode(loop.runtime_state.run_id)
+    assert loop.phase is TeleopPhase.IDLE and loop.recorder is None
+    assert len(finished) == 1 and finished[0][0] == (stage == 'send')
+    assert finished[0][1]['save'] == (key != 'd')
+    assert not loop.keyboard.poll(0)
+    loop.robot.reset_tactile_sensors.assert_not_called()
+    assert loop.robot.prepare_streaming.call_count == 1
+    recorder = captured[0]
+    if stage == 'send' and key != 'd':
+        with RawReader(recorder.published_path) as reader:
+            assert reader.num_frames == 1
+            np.testing.assert_array_equal(reader['arm_qpos'][0], row(0).arm['qpos'][0])
+
+
+@pytest.mark.parametrize('hz', [0, -1, float('nan'), float('inf'), 3e9])
+def test_sampling_clock_rejects_invalid_period(hz):
+    from dexmani_real.utils.timing import sampling_clock_ns
+    with pytest.raises(ValueError):
+        sampling_clock_ns(hz)
+
+
+def test_sampling_clock_returns_integer_period():
+    from dexmani_real.utils.timing import sampling_clock_ns
+    assert type(sampling_clock_ns(16)) is int
+    assert sampling_clock_ns(16) == 62_500_000

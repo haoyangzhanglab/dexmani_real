@@ -418,7 +418,7 @@ def test_emergency_signals_precede_motion_lock():
         worker.start()
         assert state.emergency_signal.wait(2)
         assert state.stop_signal.wait(2)
-        assert not state.estop_request  # 本地状态仍在等锁，owner 已可观察停止。
+        assert state.estop_request  # 共享急停事实不等待本地锁。
     worker.join(2)
     assert not worker.is_alive() and state.estop_request
 
@@ -488,3 +488,46 @@ def test_record_duration_only_applies_to_recording(monkeypatch, recording):
     monkeypatch.setattr('dexmani_real.teleop.loop.time.monotonic_ns', lambda: 100)
     loop.run_control_tick()
     assert loop.pending_termination_reason == ('duration_complete' if recording else None)
+
+
+@pytest.mark.parametrize('key', ['s', 'c', 'd', 'q'])
+def test_blocking_poll_handles_stop_before_event_is_enqueued(key):
+    loop = make_loop()
+    begin(loop)
+    stopped, release = Event(), Event()
+    callback = loop.keyboard.bindings[key]
+    def delayed_callback():
+        callback()
+        stopped.set()
+        assert release.wait(2)
+    loop.keyboard.bindings[key] = delayed_callback
+    thread = Thread(target=loop.keyboard.handle_key, args=(key, True))
+    thread.start()
+    try:
+        assert stopped.wait(2)
+        assert loop.poll_blocking_commands()
+        assert not loop.capture_failed and loop.pending_termination_reason is None
+        assert loop.service_episode(0) == (key != 'q')
+        assert not loop.capture_failed
+    finally:
+        release.set()
+        thread.join(2)
+    assert not thread.is_alive()
+    assert loop.poll_blocking_commands()
+    assert not loop.capture_failed
+    loop.end_episode()
+
+
+@pytest.mark.parametrize('phase', [TeleopPhase.IDLE, TeleopPhase.PREPARING, TeleopPhase.ACTIVE])
+def test_blocking_poll_drops_preparation_keys_without_termination(phase):
+    loop = make_loop()
+    if phase is not TeleopPhase.IDLE:
+        begin(loop)
+        loop.phase = phase
+    loop.runtime.hand.enabled = True
+    for key in ('b', 'h', 't'):
+        loop.keyboard.handle_key(key, True)
+    assert not loop.poll_blocking_commands()
+    assert not loop.keyboard.poll(0)
+    loop.robot.reset_tactile_sensors.assert_not_called()
+    assert loop.robot.prepare_streaming.call_count == (phase is not TeleopPhase.IDLE)

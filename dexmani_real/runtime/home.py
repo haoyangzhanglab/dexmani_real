@@ -142,7 +142,8 @@ def home_arm(state, robot, planner, *, run_id, cancel_requested):
             raise OperationCancelled("home interrupted during planning")
 
         logger.debug("arm home: %d planned milestones", len(waypoints))
-        # worker 先停稳，再查询起点/切换模式；每段允许计划起点的收敛误差。
+        # 总预算只在此估算；owner 的停稳、各段和最终确认共用同一绝对期限。
+        # 每段距离估算允许计划起点的收敛误差。
         duration_s = HOME_CONVERGENCE_TIMEOUT_S + EXECUTOR_TIMEOUT_S + config.feedback_max_age_s
         duration_s += (
             sum(

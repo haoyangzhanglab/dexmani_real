@@ -75,12 +75,11 @@ class TeleopLoop:
         self.camera_snapshot = camera_snapshot
         self.keyboard = keyboard
         self.audio = audio
-        self.pending_commands = []
 
         self.phase = TeleopPhase.IDLE
         self.run_id = None
         self.next_tick_ns = None
-        self.control_dt_ns, _ = sampling_clock_ns(runtime.teleop.control_hz)
+        self.control_dt_ns = sampling_clock_ns(runtime.teleop.control_hz)
 
         self.recorder = None
         self.capture_deadline_ns = None
@@ -198,22 +197,21 @@ class TeleopLoop:
     def poll_blocking_commands(self):
         self.robot.check()
         commands = self.keyboard.poll(timeout=0)
-        if self.phase in (TeleopPhase.PREPARING, TeleopPhase.ACTIVE):
-            # 准备或提交尚未返回时只收集意图；不在旧帧的 finally 中更换 recorder。
-            self.pending_commands.extend(commands)
-            return (
-                any(event.key in ("esc", "q", "s", "d", "c") for event in self.pending_commands)
-                or not self.runtime_state.requests_allow_motion()
-                # 快停止回调可能刚撤权，按键还未入队；下一次主循环再消费意图。
-                or (self.runtime_state.stop_signal.is_set() and self.runtime_state.run_id != self.run_id)
-            )
         terminal = tuple(
             event for event in commands
             if event.key in ("esc", "q", "s", "c", "d")
         )
         if terminal:
             self.handle_commands(terminal)
-        return bool(terminal) or not self.runtime_state.requests_allow_motion()
+        return (
+            bool(terminal) or not self.runtime_state.requests_allow_motion()
+            # 快停止回调可能已撤权，但按键还未入队。
+            or (
+                self.phase in (TeleopPhase.PREPARING, TeleopPhase.ACTIVE)
+                and self.runtime_state.stop_signal.is_set()
+                and self.runtime_state.run_id != self.run_id
+            )
+        )
 
     def preparation_valid(self):
         return self.phase is TeleopPhase.PREPARING and self.runtime_state.can_move(
@@ -475,7 +473,7 @@ class TeleopLoop:
                 self.first_target_pending = False
                 self.audio.play("begin")
         except OperationCancelled as exc:
-            # 取消不能掩盖同时发生的 SDK/worker 故障；排队的按键随后决定保存意图。
+            # 先检查 SDK/worker 故障，再即时登记已入队的终止意图。
             interrupted = self.poll_blocking_commands()
             if self.pending_termination_reason is None and not interrupted:
                 self.request_episode_end(f"control_interrupted: {exc}")
@@ -572,8 +570,7 @@ class TeleopLoop:
             self.recorder.check_error()
         if self.phase is TeleopPhase.ACTIVE and self.next_tick_ns is not None:
             timeout = min(timeout, max(0.0, (self.next_tick_ns - time.monotonic_ns()) / 1e9))
-        commands, self.pending_commands = self.pending_commands, []
-        self.handle_commands((*commands, *self.keyboard.poll(timeout=timeout)))
+        self.handle_commands(self.keyboard.poll(timeout=timeout))
         if (
             self.phase is TeleopPhase.ACTIVE and self.pending_termination_reason is None
             and self.runtime_state.stop_signal.is_set()
@@ -620,5 +617,4 @@ class TeleopLoop:
             self.robot.service_idle()
             if self.runtime_state.estop_request or self.runtime_state.error_state:
                 break
-            commands, self.pending_commands = self.pending_commands, []
-            self.handle_commands((*commands, *self.keyboard.poll(timeout=0.005)))
+            self.handle_commands(self.keyboard.poll(timeout=0.005))

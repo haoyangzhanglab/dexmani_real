@@ -68,7 +68,7 @@ class JointReplay:
             motion=self.runtime.motion,
             environment=self.runtime.environment,
         )
-        period_ns, _ = sampling_clock_ns(trajectory.fps)
+        period_ns = sampling_clock_ns(trajectory.fps)
         result = ReplayResult(ReplayStatus.COMPLETED)
         run_end_reason = RunEndReason.EXECUTOR_BOUNDARY
         try:
@@ -196,10 +196,7 @@ class JointReplay:
                 expires_ns=started_ns + ACTION_TIMEOUT_NS,
             )
         finally:
-            completed_ns = time.monotonic_ns()
-            self.capture.data["submit_completed_ns"][captured] = completed_ns
-        if completed_ns >= tick_end_ns:
-            raise OperationCancelled(f"replay slot {index} submission returned after deadline")
+            self.capture.data["submit_completed_ns"][captured] = time.monotonic_ns()
 
     def wait_replay(self, deadline_ns):
         while True:

@@ -50,7 +50,6 @@ class SessionState:
     run_ended_id: int = 0
     run_ended_reason: RunEndReason = RunEndReason.NONE
     error_state: bool = False
-    estop_request: bool = False
     quit_requested: bool = False
     safety_state: SafetyState = SafetyState.DISARMED
     # 仅父进程线程使用；child 只读取共享代际，不共享本地流程锁。
@@ -60,6 +59,10 @@ class SessionState:
     )
     stop_signal: Event = field(default_factory=lambda: mp.get_context("spawn").Event(), repr=False)
     emergency_signal: Event = field(default_factory=lambda: mp.get_context("spawn").Event(), repr=False)
+
+    @property
+    def estop_request(self) -> bool:
+        return self.emergency_signal.is_set()
 
     @property
     def run_id(self):
@@ -128,16 +131,13 @@ class SessionState:
         self.emergency_signal.set()
         self.stop_signal.set()
         with self.motion_lock:
-            already_requested = self.estop_request
-            self.estop_request = True
-            if not already_requested:
-                self.revoke_motion(
-                    (
-                        SafetyState.DISARMED
-                        if self.safety_state == SafetyState.DISARMED else SafetyState.ARMED
-                    ),
-                    reason=RunEndReason.ESTOP,
-                )
+            self.revoke_motion(
+                (
+                    SafetyState.DISARMED
+                    if self.safety_state == SafetyState.DISARMED else SafetyState.ARMED
+                ),
+                reason=RunEndReason.ESTOP,
+            )
 
     def mark_error(self):
         """保留会话错误并通知执行器停止。"""

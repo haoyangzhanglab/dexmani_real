@@ -10,7 +10,6 @@ from dexmani_real.config.xarm7 import (
     HOME_CONVERGENCE_TIMEOUT_S,
     HOME_DWELL_S,
 )
-from dexmani_real.control.homing import home_segment_timeout_s
 from dexmani_real.robot.commands import OperationCancelled, validate_arm_target
 from dexmani_real.robot.xarm7.protocol import (
     ARM_STATE_DTYPE,
@@ -53,11 +52,13 @@ class ArmController:
             lock.release()
 
     def fault(self, reason):
+        if isinstance(reason, KeyboardInterrupt):
+            self.io.emergency.set()
+        self.io.stop.set()
         if not self.io.fault.value:
             self.io.fault.value = f"{type(reason).__name__}: {reason}".encode()[:1023]
             # traceback 不能经共享字符串/普通 pickle 传递，在 SDK 所有者处保留。
             logger.error("arm controller failed", exc_info=(type(reason), reason, reason.__traceback__))
-        self.io.stop.set()
 
     def read_feedback(self):
         started = time.monotonic_ns()
@@ -78,23 +79,22 @@ class ArmController:
         check_abort,
         *,
         stage,
-        timeout_s,
+        deadline_ns,
         target=None,
         tolerance_rad=None,
         strict=False,
     ):
-        """确认位置与速度连续稳定，strict 模式遇到不合格样本立即失败。"""
+        """在绝对期限内确认连续停稳；strict 遇到位置或速度不合格立即失败。"""
         tolerance = self.cfg.homing.convergence_rad if tolerance_rad is None else tolerance_rad
         interval_ns = round(1e9 / self.cfg.feedback_hz)
-        deadline = time.monotonic_ns() + int(timeout_s * 1e9)
         stable = None
         anchor = None
-        while time.monotonic_ns() < deadline:
+        while time.monotonic_ns() < deadline_ns:
             check_abort()
             self.read_feedback()
             check_abort()
             completed_ns = time.monotonic_ns()
-            if completed_ns >= deadline:
+            if completed_ns >= deadline_ns:
                 break
             q, v = self.status["qpos"], self.status["qvel"]
             sample_ns = int(self.status["timestamp_ns"])
@@ -115,18 +115,11 @@ class ArmController:
             else:
                 stable = anchor = None
             # 按查询开始时刻限频，查询耗时既不拉长采样间隔，也不充作停稳时长。
-            remaining_ns = min(sample_ns + interval_ns, deadline) - time.monotonic_ns()
+            remaining_ns = min(sample_ns + interval_ns, deadline_ns) - time.monotonic_ns()
             self.io.stop.wait(max(0, remaining_ns) / 1e9)
         raise _OperationTimeout(f"{stage}: measured position/velocity dwell not confirmed")
 
-    def wait_stationary(self, check_abort):
-        self.wait_settled(
-            check_abort,
-            stage="arm standstill",
-            timeout_s=HOME_CONVERGENCE_TIMEOUT_S,
-        )
-
-    def home(self, waypoints, final_qpos, *, check_abort):
+    def home(self, waypoints, final_qpos, *, check_abort, deadline_ns):
         waypoints = np.asarray(waypoints, dtype=np.float64)
         lower, upper = (
             np.asarray(self.cfg.joint_limit_lower),
@@ -171,7 +164,7 @@ class ArmController:
                 self.wait_settled(
                     check_abort,
                     stage=f"home milestone {index}",
-                    timeout_s=home_segment_timeout_s(float(np.max(np.abs(target - current))), self.cfg),
+                    deadline_ns=deadline_ns,
                     target=target,
                     tolerance_rad=min(self.cfg.homing.convergence_rad, np.deg2rad(0.5)),
                 )
@@ -184,7 +177,7 @@ class ArmController:
                 stage="home dwell",
                 strict=True,
                 target=final_qpos,
-                timeout_s=HOME_CONVERGENCE_TIMEOUT_S,
+                deadline_ns=deadline_ns,
             )
         check_abort()
 
@@ -195,6 +188,9 @@ class ArmController:
         try:
             self.driver.stop()
         except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                self.io.emergency.set()
+                self.io.stop.set()
             if self.io.fault.value:
                 self.io.close_error.value = f"stop SDK failure: {exc}".encode()[:1023]
                 logger.exception("arm stop also failed")
@@ -232,11 +228,22 @@ class ArmController:
             # request_operation 已等待本 owner 的停止确认，目标和伺服参考已清除。
             if isinstance(message, HomeRequest):
                 if len(message.waypoints) > 1:
-                    self.wait_stationary(check_abort)
-                self.home(message.waypoints, message.target, check_abort=check_abort)
+                    self.wait_settled(
+                        check_abort, stage="arm standstill", deadline_ns=message.deadline_ns,
+                    )
+                self.home(
+                    message.waypoints, message.target,
+                    check_abort=check_abort, deadline_ns=message.deadline_ns,
+                )
             else:
                 self.driver.enter_mode(1, check_abort=check_abort)
-                self.wait_stationary(check_abort)
+                self.wait_settled(
+                    check_abort, stage="arm standstill",
+                    deadline_ns=min(
+                        message.deadline_ns,
+                        time.monotonic_ns() + int(HOME_CONVERGENCE_TIMEOUT_S * 1e9),
+                    ),
+                )
                 check_abort()
                 self.prepared_run_id = run_id
         except BaseException as exc:
@@ -320,12 +327,15 @@ class ArmController:
 
             self.driver.connect(check_abort=startup_abort)
             self.io.connected.set()
-            self.wait_stationary(startup_abort)
+            self.wait_settled(
+                startup_abort, stage="arm standstill",
+                deadline_ns=time.monotonic_ns() + int(HOME_CONVERGENCE_TIMEOUT_S * 1e9),
+            )
             self.driver.initialize(check_abort=startup_abort)
             self.read_feedback()
             self.io.ready.set()
             period = round(1e9 / self.cfg.servo_hz)
-            feedback_period, _ = sampling_clock_ns(self.cfg.feedback_hz)
+            feedback_period = sampling_clock_ns(self.cfg.feedback_hz)
             tick = time.monotonic_ns() + period
             feedback_due = time.monotonic_ns() + feedback_period
             while not self.io.closing.is_set() and not self.io.fault.value:
@@ -367,6 +377,9 @@ class ArmController:
             try:
                 self.driver.close()
             except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    self.io.emergency.set()
+                    self.io.stop.set()
                 logger.exception("arm disconnect failed")
                 previous = self.io.close_error.value.decode(errors="replace")
                 detail = f"disconnect failure: {exc}"

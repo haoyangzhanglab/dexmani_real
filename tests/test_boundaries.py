@@ -39,7 +39,7 @@ def test_keyboard_shutdown_interrupt_keeps_first_and_cleans(monkeypatch, stage):
     keyboard.stop()
 
 
-@pytest.mark.parametrize('stage', ['reply', 'stop'])
+@pytest.mark.parametrize('stage', ['reply', 'recv', 'returned', 'stop'])
 @pytest.mark.parametrize('cancel', [False, True])
 def test_arm_rollback_interrupt_latches_and_preserves_owner(stage, cancel):
     state = SessionState()
@@ -52,7 +52,9 @@ def test_arm_rollback_interrupt_latches_and_preserves_owner(stage, cancel):
     primary = OperationCancelled('cancel') if cancel else OSError('primary')
     arm.pipe = Mock()
     arm.pipe.poll.side_effect = [primary, KeyboardInterrupt()] if stage == 'reply' else [primary, True]
-    arm.pipe.recv.return_value = None
+    arm.pipe.recv.return_value = KeyboardInterrupt() if stage == 'returned' else None
+    if stage == 'recv':
+        arm.pipe.recv.side_effect = KeyboardInterrupt()
     arm.wait_stopped = Mock(side_effect=[None, KeyboardInterrupt() if stage == 'stop' else None])
     try:
         with pytest.raises(BaseException) as caught:
@@ -450,3 +452,245 @@ def test_keyboard_start_primary_survives_cleanup_interrupt(monkeypatch):
     assert caught.value is primary and state.estop_request
     restore.assert_called_once()
     listener.stop.assert_called_once()
+
+
+@pytest.mark.parametrize('stage', ['stop', 'disconnect', 'fault'])
+@pytest.mark.parametrize('existing', [False, True])
+def test_owner_interrupt_exposes_emergency_even_after_fault(stage, existing):
+    from dexmani_real.robot.xarm7.worker import ArmController
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    driver = Mock()
+    owner = ArmController(arm.cfg, arm.io, arm.child_pipe, driver)
+    original = b'OSError: original' if existing else b''
+    arm.io.fault.value = original
+    interrupt = KeyboardInterrupt()
+    try:
+        if stage == 'stop':
+            driver.stop.side_effect = interrupt
+            owner.stop()
+            assert arm.io.stopped.is_set()
+        elif stage == 'fault':
+            owner.fault(interrupt)
+        else:
+            # 取消启动，走真实 run 的 stop/disconnect finally。
+            driver.connect.side_effect = OperationCancelled('cancel startup')
+            driver.close.side_effect = interrupt
+            owner.run()
+            assert arm.io.stopped.is_set() and arm.child_pipe.closed
+            assert arm.io.close_error.value
+        assert state.estop_request and state.stop_signal.is_set()
+        if existing:
+            assert arm.io.fault.value == original
+        with pytest.raises(Exception):
+            arm.check_error()
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+@pytest.mark.parametrize('prior_stop', [False, True])
+def test_shared_emergency_still_revokes_parent_and_cannot_rearm(prior_stop):
+    from dexmani_real.runtime.state import SafetyState, RunEndReason
+    state = SessionState()
+    run_id = state.arm()
+    state.stop_signal.clear()
+    assert state.begin_motion(run_id=run_id) is not None
+    if prior_stop:
+        state.request_stop()
+    state.emergency_signal.set()  # 模拟 owner 先报告急停。
+    before = state.run_id
+    assert state.estop_request and not state.can_move(run_id=run_id)
+    state.request_emergency_stop()
+    assert state.run_id > before
+    reason = RunEndReason.OPERATOR if prior_stop else RunEndReason.ESTOP
+    assert state.run_ended_reason == reason
+    state.revoke_motion(SafetyState.DISARMED)
+    state.request_emergency_stop()
+    assert state.safety_state == SafetyState.DISARMED
+    assert state.run_ended_reason == reason
+    state.stop_signal.clear()
+    assert state.begin_motion(run_id=run_id) is None
+    assert state.begin_motion(run_id=state.run_id) is None
+    with pytest.raises(OperationCancelled):
+        state.arm()
+
+
+@pytest.mark.parametrize('mode', ['late', 'missed', 'expired', 'error', 'cancel'])
+def test_replay_keeps_original_slots_and_submission_times(monkeypatch, mode):
+    from dexmani_real.replay.joint_replay import JointReplay, ReplayStatus
+    from dexmani_real.replay.trajectory import ReplayBuffer
+    from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
+    from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
+    state = SessionState()
+    clock = [1_000_000_000]
+    origin = clock[0]
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: clock[0])
+    monkeypatch.setattr(time, 'sleep', lambda delay: clock.__setitem__(0, clock[0] + round(delay * 1e9)))
+    row = SimpleNamespace(arm=np.zeros(1, dtype=ARM_STATE_DTYPE), hand=np.zeros(1, dtype=HAND_STATE_DTYPE))
+    robot = Mock()
+    keyboard = SimpleNamespace(poll=lambda **kw: [])
+    replay = JointReplay(state, RealConfig(), keyboard, robot=robot)
+    replay.run_id = state.run_id
+    replay.capture = ReplayBuffer(2)
+    replay.read_feedback = lambda: row
+    sends = []
+    error = OSError('device failed') if mode == 'error' else OperationCancelled('device lease refused')
+    def send(command, **kw):
+        sends.append(clock[0])
+        clock[0] = origin + (125_000_000 if mode == 'missed' else 63_000_000)
+        if mode in ('error', 'cancel'):
+            raise error
+    robot.send_action.side_effect = send
+    def mapped(*args):
+        if mode == 'expired':
+            clock[0] = origin + 62_500_000
+        return SimpleNamespace(arm_qpos=np.zeros(7), hand_qpos=np.zeros(12), rejection_reason=None)
+    replay.action_mapper = SimpleNamespace(map_joint=mapped)
+    class Trajectory:
+        action_arm_joint = np.zeros((2, 7))
+        action_hand_joint = np.zeros((2, 12))
+        def __len__(self):
+            return 2
+    if mode == 'late':
+        assert replay.replay_rows(Trajectory(), 62_500_000) == (ReplayStatus.COMPLETED, '')
+        assert sends == [origin, origin + 63_000_000]
+    else:
+        with pytest.raises((OSError, OperationCancelled)) as caught:
+            replay.replay_rows(Trajectory(), 62_500_000)
+        if mode in ('error', 'cancel'):
+            assert caught.value is error
+        assert len(sends) == (0 if mode == 'expired' else 1)
+    assert replay.capture.data['submit_started_ns'][0] == (-1 if mode == 'expired' else origin)
+    assert replay.capture.data['submit_completed_ns'][0] == (
+        -1 if mode == 'expired' else origin + (125_000_000 if mode == 'missed' else 63_000_000)
+    )
+
+
+@pytest.mark.parametrize('mode', ['success', 'stationary', 'timeout', 'cancel', 'empty', 'away', 'velocity', 'stale'])
+def test_home_consumes_one_deadline_with_real_dwell(monkeypatch, mode):
+    from dexmani_real.robot.xarm7.protocol import HomeRequest
+    from dexmani_real.robot.xarm7.worker import ArmController, _OperationTimeout
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    clock = [1_000_000_000]
+    origin = clock[0]
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: clock[0])
+    monkeypatch.setattr(arm.io.stop, 'wait', lambda delay: clock.__setitem__(0, clock[0] + round(delay * 1e9)))
+    q = np.array(arm.cfg.home_qpos)
+    targets = np.array([q + .02, q + .01, q])
+    empty = mode in ('empty', 'away', 'velocity', 'stale')
+    if empty:
+        targets = np.empty((0, 7))
+    current = [q.copy() if empty else targets[0].copy()]
+    moves = []
+    ready_at = [origin + (16_000_000_000 if mode == 'stationary' else 0)]
+    driver = Mock()
+    def move(target):
+        moves.append(clock[0])
+        current[0] = target.copy()
+        # 第一段超过旧的距离预算，但仍在总预算内。
+        ready_at[0] = clock[0] + (2_000_000_000 if len(moves) == 1 else 0)
+    def read():
+        if mode == 'cancel' and moves:
+            arm.io.stop.set()
+        if mode == 'stale':
+            clock[0] += 200_000_000
+        pos = current[0] + (.1 if mode == 'away' else 0)
+        velocity = np.ones(7) if clock[0] < ready_at[0] or mode == 'velocity' else np.zeros(7)
+        return pos, velocity
+    driver.read.side_effect = read
+    driver.move_home_milestone.side_effect = move
+    owner = ArmController(arm.cfg, arm.io, arm.child_pipe, driver)
+    deadline = origin + (2_700_000_000 if mode == 'timeout' else 4_000_000_000)
+    if mode == 'stationary':
+        deadline = origin + 20_000_000_000
+    try:
+        owner.operation(HomeRequest(state.run_id, targets, q, deadline))
+        assert arm.pipe.poll(1)
+        reply = arm.pipe.recv()
+        if mode in ('success', 'stationary', 'empty'):
+            assert reply is None
+            assert clock[0] < deadline and clock[0] - origin >= 300_000_000
+            assert len(moves) == (0 if empty else 2)
+        elif mode in ('timeout', 'stale'):
+            assert isinstance(reply, _OperationTimeout)
+        elif mode == 'cancel':
+            assert isinstance(reply, OperationCancelled) and len(moves) == 1
+        else:
+            assert isinstance(reply, RuntimeError)
+        if mode == 'timeout':
+            assert clock[0] == deadline and len(moves) == 2
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+@pytest.mark.parametrize('stage', ['startup', 'prepare'])
+def test_standstill_outside_home_retains_independent_budget(monkeypatch, stage):
+    from dexmani_real.config.xarm7 import HOME_CONVERGENCE_TIMEOUT_S
+    from dexmani_real.robot.xarm7.worker import ArmController, _OperationTimeout
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    clock = [1_000_000_000]
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: clock[0])
+    monkeypatch.setattr(arm.io.stop, 'wait', lambda delay: clock.__setitem__(0, clock[0] + round(delay * 1e9)))
+    driver = Mock()
+    driver.read.return_value = (np.array(arm.cfg.home_qpos), np.ones(7))
+    owner = ArmController(arm.cfg, arm.io, arm.child_pipe, driver)
+    try:
+        if stage == 'startup':
+            owner.run()
+            assert b'_OperationTimeout' in arm.io.fault.value
+            driver.initialize.assert_not_called()
+        else:
+            owner.operation(PrepareRequest(state.run_id, clock[0] + 30_000_000_000))
+            assert isinstance(arm.pipe.recv(), _OperationTimeout)
+            assert not owner.prepared_run_id
+        assert clock[0] == 1_000_000_000 + int(HOME_CONVERGENCE_TIMEOUT_S * 1e9)
+        assert arm.io.stopped.is_set()
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+def test_arm_interrupt_reply_traverses_real_pipe():
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    arm.process = Mock()
+    arm.process.is_alive.return_value = True
+    arm.io.connected.set()
+    arm.io.stopped.set()
+    arm.child_pipe.send(KeyboardInterrupt())
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            arm.request_operation(
+                PrepareRequest(state.run_id, time.monotonic_ns() + 10**9),
+                service=arm.io.stopped.set, abort=lambda: False,
+            )
+        assert state.estop_request and state.stop_signal.is_set()
+        assert not arm.is_closed and not arm.pipe.closed
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+def test_arm_startup_wait_interrupt_latches_before_cleanup(monkeypatch):
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    process = Mock()
+    monkeypatch.setattr(arm.ctx, 'Process', lambda **kwargs: process)
+    monkeypatch.setattr(arm.io.ready, 'wait', Mock(side_effect=KeyboardInterrupt()))
+    stop = arm.request_stop
+    def stop_after_interrupt():
+        assert state.estop_request and state.stop_signal.is_set()
+        stop()
+    arm.request_stop = stop_after_interrupt
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            arm.connect()
+        assert arm.io.closing.is_set()
+        assert arm.process is process and not arm.pipe.closed
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()

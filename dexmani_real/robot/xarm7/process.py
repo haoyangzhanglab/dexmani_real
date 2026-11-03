@@ -101,7 +101,9 @@ class ArmProcess:
                         "arm initialization unresolved; owner process may still be in SDK"
                     )
             check_startup()
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                self.runtime_state.request_emergency_stop()
             self.request_stop()
             self.io.closing.set()
             raise
@@ -219,6 +221,8 @@ class ArmProcess:
                     if not self.pipe.poll(max(0, cleanup_until - time.monotonic())):
                         raise TimeoutError("cancelled arm operation reply remains pending")
                     reply = self.pipe.recv()
+                    if isinstance(reply, KeyboardInterrupt):
+                        raise reply
                     if reply is not None:
                         from dexmani_real.robot.xarm7.worker import _OperationTimeout
 
