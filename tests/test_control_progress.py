@@ -543,7 +543,7 @@ def test_teleop_esc_arriving_in_poll_records_estop():
     loop.robot = SimpleNamespace(service_feedback=lambda: None, service_idle=lambda: None)
     loop.phase, loop.next_tick_ns = TeleopPhase.ACTIVE, None
     loop.recorder = loop.pending_termination_reason = None
-    loop.capture_failed = False
+    loop.audio = SimpleNamespace(play=lambda sound: None)
     loop.termination_details = []
     assert not loop.service_episode(.005)
     assert loop.pending_termination_reason == 'estop'
@@ -769,3 +769,18 @@ def test_teleop_prepare_only_accepts_current_operator_cancellation(monkeypatch, 
         with pytest.raises(OperationCancelled, match='prepare interrupted'):
             loop.start_episode(epoch)
         assert not state.quit_requested
+
+
+@pytest.mark.parametrize('scale,accepted', [(.001, True), (float(np.float32(.001)), True), (.01, False)])
+def test_observation_builder_depth_scale(scale, accepted):
+    from dexmani_real.deployment.observation import ObservationBuilder
+    from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
+    builder = ObservationBuilder(SimpleNamespace(observation_fields=('depth',),
+                                 depth_config={'depth_scale_m': .001}), RealConfig())
+    camera = CameraSnapshot('test', CameraIntrinsics(4, 4, 4., 4., 2., 2., 'none', (0.,) * 5),
+                            scale, np.eye(4))
+    if accepted:
+        builder.configure_camera(camera)
+    else:
+        with pytest.raises(ValueError, match='Live depth scale'):
+            builder.configure_camera(camera)

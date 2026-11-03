@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from typing import Any
 
 import numpy as np
+
+
+def depth_scales_match(a: float, b: float) -> bool:
+    """容纳 SDK/序列化的尺度表示误差，不改变原始深度计数。"""
+    return math.isclose(a, b, rel_tol=1e-6, abs_tol=0.0)
 
 
 def validate_aligned_depth_distortion(model: str) -> None:

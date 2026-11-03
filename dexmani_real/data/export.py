@@ -25,6 +25,7 @@ from dexmani_real.data.raw import (
 from dexmani_real.geometry.camera import (
     CameraSnapshot,
     camera_parameters_cv,
+    depth_scales_match,
     validate_aligned_depth_distortion,
 )
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
@@ -117,7 +118,7 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     reject_invalid(np.diff(control) <= 0, "control_clock_not_increasing", 1)
     reject_invalid(np.diff(observation) <= 0, "observation_clock_not_increasing", 1)
     if np.any(np.abs(np.diff(control) - period) > tolerance):
-        logger.warning("%s: control interval jitter/gaps; exporting original timestamps", reader.path)
+        logger.warning("%s: control interval jitter/gaps; 不重采样，实际时间保留于 Raw", reader.path)
     mean_period = None
     if frames >= 2:
         duration = int(control[-1]) - int(control[0])
@@ -133,18 +134,14 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     sequence = rows["camera_sequence"]
     reject_invalid(sequence < 0, "invalid_camera_sequence")
     reject_invalid(np.diff(sequence) < 0, "camera_sequence_regressed", 1)
-    tactile_age = int(reader.validate_tactile_metadata() * 1e9)
-    for name in ("tactile_aggregate_ns", "tactile_dense_ns"):
-        if np.any(observation - rows[name] >= tactile_age):
-            logger.warning("%s: stale source %s; maximum age=%d ns",
-                           reader.path, name, int((observation - rows[name]).max()))
-
     # 访问 dataset 触发 RawReader 的结构/dtype 校验，不读取数值切片。
     for name in ROBOT_DATASET_SPECS:
         reader[name]
     return camera, dict(
         max_control_grid_deviation_ns=int(np.abs(grid_error).max()),
         max_readout_ns=int(readout.max()),
+        max_tactile_aggregate_age_ns=int((observation - rows["tactile_aggregate_ns"]).max()),
+        max_tactile_dense_age_ns=int((observation - rows["tactile_dense_ns"]).max()),
         mean_control_period_ns=mean_period,
         max_control_interval_ns=int(np.diff(control).max()) if frames > 1 else None,
         termination_reason=reader.meta.get("termination_reason"),
@@ -306,7 +303,7 @@ def export_zarr(
                             reader.dt, root.attrs["dt"], rtol=0, atol=1e-12
                         ):
                             raise ValueError("one canonical store requires uniform task and dt")
-                        if camera.depth_scale_m != root.attrs["depth_scale_m_per_unit"]:
+                        if not depth_scales_match(camera.depth_scale_m, root.attrs["depth_scale_m_per_unit"]):
                             raise ValueError("depth_scale_m_per_unit must be uniform")
                         if (height, width, 3) != arrays["rgb"].shape[1:]:
                             raise ValueError("inconsistent RGB shape")

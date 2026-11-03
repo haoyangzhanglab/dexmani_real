@@ -151,7 +151,7 @@ def decode_camera_metadata(meta) -> CameraSnapshot:
 
 
 def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata, tactile_hold_max_age_s):
-    """复用初始化相机快照，补入当前 capture 消费的触觉处理语义。"""
+    """记录实际相机、触觉语义与采集时的 hold 配置。"""
     metadata = camera_metadata(camera_snapshot)
     metadata.update(tactile_reset_metadata)
     metadata.update(
@@ -360,7 +360,6 @@ class RawReader:
         self.rgb_path = self.path / "rgb.mp4"
         self.video_container = None
         self.dataset_cache: dict[str, h5py.Dataset] = {}
-        self.tactile_hold_max_age_s: float | None = None
         self.data_file = h5py.File(self.path / "data.h5", "r")
         try:
             meta = self.meta
@@ -424,19 +423,13 @@ class RawReader:
     def read_camera(self) -> CameraSnapshot:
         return decode_camera_metadata(self.meta)
 
-    def validate_tactile_metadata(self):
-        if self.tactile_hold_max_age_s is None:
-            for name, expected in (
-                ("hand_tactile_units", TACTILE_UNITS),
-                ("hand_tactile_finger_order", TACTILE_FINGER_ORDER),
-            ):
-                if self.meta[name] != expected:
-                    raise ValueError(f"Raw {name}: incompatible tactile semantics")
-            age = float(self.meta["hand_tactile_hold_max_age_s"])
-            if not np.isfinite(age) or age <= 0:
-                raise ValueError("hand_tactile_hold_max_age_s must be finite and positive")
-            self.tactile_hold_max_age_s = age
-        return self.tactile_hold_max_age_s
+    def validate_tactile_metadata(self) -> None:
+        for name, expected in (
+            ("hand_tactile_units", TACTILE_UNITS),
+            ("hand_tactile_finger_order", TACTILE_FINGER_ORDER),
+        ):
+            if self.meta[name] != expected:
+                raise ValueError(f"Raw {name}: incompatible tactile semantics")
 
     @property
     def timestamps_s(self):

@@ -1,11 +1,10 @@
 """从已校验的传感快照构造策略观测。"""
 
-import math
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from dexmani_real.geometry.camera import camera_parameters_cv
+from dexmani_real.geometry.camera import camera_parameters_cv, depth_scales_match
 from dexmani_real.geometry.kinematics import (
     ArmFK,
     HandFK,
@@ -89,8 +88,8 @@ class ObservationBuilder:
         requested = set(self.fields) & {"depth", "camera_intrinsic", "camera_extrinsic"}
         if not requested:
             return
-        if "depth" in requested and not math.isclose(
-            camera.depth_scale_m, self.info.depth_config["depth_scale_m"], rel_tol=1e-9, abs_tol=0.0,
+        if "depth" in requested and not depth_scales_match(
+            camera.depth_scale_m, self.info.depth_config["depth_scale_m"],
         ):
             raise ValueError("Live depth scale differs from the saved raw-count input recipe")
         requested.discard("depth")

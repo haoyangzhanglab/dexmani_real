@@ -81,7 +81,6 @@ class TeleopLoop:
 
         self.recorder = None
         self.capture_deadline_ns = None
-        self.capture_failed = False
         self.discard_requested = False
         self.pending_termination_reason = None
         self.termination_details = []
@@ -91,9 +90,8 @@ class TeleopLoop:
             self.runtime_state.request_emergency_stop()
         else:
             self.runtime_state.stop_signal.set()
-        if self.recorder is not None and self.recorder.published_path is None:
-            self.capture_failed = True
         self.termination_details.append(error_detail(stage, exc))
+        self.audio.play("emergency")
 
     def end_episode(self):
         primary_failure = sys.exc_info()[1]
@@ -108,7 +106,7 @@ class TeleopLoop:
                 logger.exception("teleop stop also failed")
         self.controller.clear()
 
-        if self.capture_failed:
+        if self.runtime_state.estop_request:
             self.audio.play("emergency")
         if failure is None and not self.runtime_state.quit_requested and not self.runtime_state.estop_request:
             try:
@@ -134,23 +132,24 @@ class TeleopLoop:
         )
         # finish 失败时保留 recorder，让会话收尾继续持有未释放的 writer。
         self.recorder = None
-        interrupted = self.runtime_state.estop_request
-        if interrupted and not self.capture_failed:
+        if self.runtime_state.estop_request:
             self.audio.play("emergency")
+            return
+        if reason not in {"operator", "quit", "duration_complete"} or any(
+            "exception_type" in detail for detail in self.termination_details
+        ):
+            return
         if published is not None and recorder.recording_truncated_reason is None:
             logger.info("本段已保存。")
-            if not self.capture_failed and not interrupted:
-                self.audio.play("save")
+            self.audio.play("save")
         elif not save:
             logger.info("本段已丢弃。")
-            if not self.capture_failed and not interrupted:
-                self.audio.play("discard")
+            self.audio.play("discard")
 
     def request_episode_end(
-        self, reason, *, run_end_reason=RunEndReason.CANCELLED, failed=True,
+        self, reason, *, run_end_reason=RunEndReason.CANCELLED,
     ):
         """先请求停止并保留结束意图，资源收尾由 run_episode 的边界执行。"""
-        self.capture_failed |= failed
         self.runtime_state.stop_signal.set()
         if self.pending_termination_reason is None:
             self.pending_termination_reason = run_end_reason.name.lower()
@@ -198,7 +197,7 @@ class TeleopLoop:
                 return
             self.runtime_state.stop_signal.set()
             self.cancel_epoch = self.runtime_state.cancel_epoch
-            self.capture_failed = self.discard_requested = False
+            self.discard_requested = False
             self.phase = TeleopPhase.PREPARING
         logger.info("Teleop preparing")
         self.pending_termination_reason = None
@@ -250,7 +249,7 @@ class TeleopLoop:
                 return
             if (issue := self.recording_issue(row)) is not None:
                 self.recorder.append(row, quality_issue=issue)
-                self.request_episode_end(issue, failed=False)
+                self.request_episode_end(issue)
                 return
             self.try_begin(row)
         except OperationCancelled:
@@ -271,6 +270,7 @@ class TeleopLoop:
         logger.debug("Teleop key=%s phase=%s", cmd.upper(), self.phase.value)
         if cmd == "esc":
             self.runtime_state.request_emergency_stop()
+            self.audio.play("emergency")
             if self.phase is not TeleopPhase.IDLE:
                 self.request_episode_end("estop", run_end_reason=RunEndReason.ESTOP)
             return True
@@ -280,7 +280,7 @@ class TeleopLoop:
         if cmd == "q":
             self.audio.play("quit")
             if self.phase is not TeleopPhase.IDLE:
-                self.request_episode_end("quit", run_end_reason=RunEndReason.QUIT, failed=False)
+                self.request_episode_end("quit", run_end_reason=RunEndReason.QUIT)
             return True
         if self.runtime_state.quit_requested:
             return True
@@ -288,7 +288,6 @@ class TeleopLoop:
             if self.phase is not TeleopPhase.IDLE:
                 self.request_episode_end(
                     "discard" if cmd == "d" else "stop", run_end_reason=RunEndReason.OPERATOR,
-                    failed=False,
                 )
         elif cmd == "t":
             if not self.runtime.hand.enabled:
@@ -454,7 +453,7 @@ class TeleopLoop:
                         issue = "recording_no_command"
                     issue = self.recorder.append(row, command, quality_issue=issue)
                     if issue is not None:
-                        self.request_episode_end(issue, failed=False)
+                        self.request_episode_end(issue)
                 except BaseException as exc:
                     if primary_error is None:
                         raise
@@ -482,7 +481,7 @@ class TeleopLoop:
             and time.monotonic_ns() >= cast(int, self.capture_deadline_ns)
         ):
             self.request_episode_end(
-                "max_record_duration", run_end_reason=RunEndReason.DURATION_COMPLETE, failed=False,
+                "max_record_duration", run_end_reason=RunEndReason.DURATION_COMPLETE,
             )
             return
         now_ns = time.monotonic_ns()
@@ -492,7 +491,7 @@ class TeleopLoop:
         row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
         if self.recorder is not None and (quality := self.recording_issue(row)) is not None:
             self.recorder.append(row, quality_issue=quality)
-            self.request_episode_end(quality, failed=False)
+            self.request_episode_end(quality)
             return
         if not sources_available(row, self.control_needs):
             return
@@ -543,7 +542,7 @@ class TeleopLoop:
             if self.phase is not TeleopPhase.IDLE:
                 if self.pending_termination_reason is None:
                     self.request_episode_end(
-                        "interrupted", failed=False,
+                        "interrupted",
                         run_end_reason=(
                             RunEndReason.QUIT if self.runtime_state.quit_requested
                             else RunEndReason.CANCELLED

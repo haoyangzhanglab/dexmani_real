@@ -1,4 +1,4 @@
-> **历史记录：** 本文保存上一阶段实施事实；当前行为以[第二阶段任务书](research_simplification_v2_taskbook.md)及其实施记录为准。
+> **历史记录：** 本文及[第二阶段任务书](research_simplification_v2_taskbook.md)保存各自阶段的实施事实，不作为当前行为约定；当前行为以源码和 [README](../README.md) 为准。
 
 # DexMani Real：验收修复与 demo 回放减法任务书
 

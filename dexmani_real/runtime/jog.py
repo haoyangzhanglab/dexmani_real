@@ -39,8 +39,7 @@ class CartesianJog:
         """发布点动目标或减速保持；故障由会话边界记录、撤权并收尾。"""
         pressed_keys = keys.snapshot()
         with state.motion_lock:
-            cancel_epoch = state.cancel_epoch
-            if not (state.cancel_epoch == cancel_epoch and state.requests_allow_motion() and not state.stop_signal.is_set()):
+            if not (state.requests_allow_motion() and not state.stop_signal.is_set()):
                 raise OperationCancelled("jog authority revoked")
 
         row = read_observation(None, robot)

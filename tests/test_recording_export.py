@@ -81,8 +81,6 @@ def reader_with_intervals(intervals, *, termination_reason='operator'):
         def read_camera(self):
             return SimpleNamespace(color=SimpleNamespace(height=2, width=2, distortion_model='none'),
                                    T_xarm_base_from_color=np.eye(4))
-        def validate_tactile_metadata(self):
-            return .2
         def __getitem__(self, name):
             return data[name]
     return Reader()
@@ -152,43 +150,64 @@ def test_failed_export_closes_store_and_removes_only_its_staging(monkeypatch, tm
     assert (episode / 'data.h5').read_bytes() == b'raw sentinel'
 
 
-@pytest.mark.parametrize('reason', ['operator', 'failed'])
-def test_real_raw_container_termination_and_corruption_boundaries(tmp_path, reason):
-    import h5py
-
-    from dexmani_real.data.raw import RawReader, RawWriter, snapshot_recording_metadata
-    from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
-    from dexmani_real.replay.trajectory import load_trajectory
+def raw_frames():
     from dexmani_real.config.real import RealConfig
     from dexmani_real.robot.commands import RobotCommand
     from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
     from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
 
-    path = tmp_path / 'episode_real'
-    path.mkdir()
-    camera = CameraSnapshot('fake', CameraIntrinsics(4, 4, 4., 4., 2., 2., 'none', (0.,) * 5),
-                            .001, np.eye(4))
-    metadata = snapshot_recording_metadata(camera, tactile_reset_metadata={}, tactile_hold_max_age_s=.2)
-    metadata.update(task_label='test', collection_source='teleop')
-    writer = RawWriter(path, control_hz=16)
-    try:
-        writer.open(metadata)
-        for i in range(3):
-            stamp = 1_000_000_000 + i * 66_000_000
-            arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
-            hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
-            arm['timestamp_ns'] = stamp
-            for field in ('timestamp_ns', 'tactile_aggregate_timestamp_ns', 'tactile_dense_timestamp_ns'):
-                hand[field] = stamp
-            row = Observation(arm, hand, dict(timestamp_ns=stamp, ring_sequence=i,
-                              rgb=np.zeros((4, 4, 3), dtype=np.uint8), depth=np.ones((4, 4), dtype=np.uint16)),
-                              dict(recv_ts_ns=stamp, sequence_id=i, landmarks=np.zeros((21, 3)), wrist_pos=np.zeros(3),
-                                   wrist_quat_wxyz=np.array([1., 0, 0, 0])), None,
-                              stamp + 1_000_000, control_timestamp_ns=stamp)
-            writer.append_frame(row, RobotCommand(np.zeros(7), np.deg2rad(RealConfig().hand.home_qpos_deg)))
-        writer.finish(reason, [])
-    finally:
-        writer.close()
+    for i in range(3):
+        stamp = 1_000_000_000 + i * 66_000_000
+        arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+        hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
+        arm['timestamp_ns'] = stamp
+        for field in ('timestamp_ns', 'tactile_aggregate_timestamp_ns', 'tactile_dense_timestamp_ns'):
+            hand[field] = stamp
+        row = Observation(arm, hand, dict(timestamp_ns=stamp, ring_sequence=i,
+                          rgb=np.zeros((16, 16, 3), dtype=np.uint8),
+                          depth=np.full((16, 16), 500, dtype=np.uint16)),
+                          dict(recv_ts_ns=stamp, sequence_id=i, landmarks=np.zeros((21, 3)),
+                               wrist_pos=np.zeros(3), wrist_quat_wxyz=np.array([1., 0, 0, 0])),
+                          None, stamp + 1_000_000, control_timestamp_ns=stamp)
+        yield row, RobotCommand(np.zeros(7), np.deg2rad(RealConfig().hand.home_qpos_deg))
+
+
+def raw_metadata(scale=.001):
+    from dexmani_real.data.raw import snapshot_recording_metadata
+    from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
+    camera = CameraSnapshot('fake', CameraIntrinsics(16, 16, 100., 100., 8., 8., 'none', (0.,) * 5),
+                            scale, np.eye(4))
+    return dict(snapshot_recording_metadata(camera, tactile_reset_metadata={}, tactile_hold_max_age_s=.2),
+                task_label='test', collection_source='teleop')
+
+
+@pytest.fixture
+def raw_episode(tmp_path):
+    from dexmani_real.data.raw import RawWriter
+
+    def make(name='episode_real', *, scale=.001, reason='operator'):
+        path = tmp_path / name
+        path.mkdir(parents=True)
+        writer = RawWriter(path, control_hz=16)
+        try:
+            writer.open(raw_metadata(scale))
+            for row, command in raw_frames():
+                writer.append_frame(row, command)
+            writer.finish(reason, [])
+        finally:
+            writer.close()
+        return path
+    return make
+
+
+@pytest.mark.parametrize('reason', ['operator', 'failed'])
+def test_real_raw_container_termination_and_corruption_boundaries(raw_episode, reason):
+    import h5py
+    from dexmani_real.data.raw import RawReader
+    from dexmani_real.replay.trajectory import load_trajectory
+    from dexmani_real.config.real import RealConfig
+
+    path = raw_episode(reason=reason)
     with RawReader(path) as reader:
         validate_export_episode(reader)
         assert len(list(reader.iter_rgb_frames())) == 3
@@ -489,9 +508,254 @@ def test_export_rejects_nonincreasing_primary_clocks(field, delta):
         validate_export_episode(reader)
 
 
-def test_old_tactile_sources_export_with_warning(caplog):
+def test_old_tactile_sources_export_with_age_statistics(caplog):
     reader = reader_with_intervals([62_500_000] * 2)
     for field in ('tactile_aggregate_ns', 'tactile_dense_ns'):
         reader['timing/rows'][field] = 1
-    validate_export_episode(reader)
-    assert 'stale source' in caplog.text
+    _, quality = validate_export_episode(reader)
+    for channel in ('aggregate', 'dense'):
+        assert quality[f'max_tactile_{channel}_age_ns'] == 1_125_999_999
+    assert 'stale source' not in caplog.text
+
+
+def export_processing():
+    from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
+    from dexmani_real.data.export import ExportConfig
+    return ExportConfig(PointCloudConfig(remove_table=False, num_points=16,
+                        workspace=(-1., -1., 0., 1., 1., 2.)), HandCloudConfig())
+
+
+@pytest.mark.parametrize('first,second,accepted', [
+    (.001, float(np.float32(.001)), True),
+    (float(np.float32(.001)), .001, True),
+    (.001, .01, False),
+])
+def test_real_export_depth_scale_merge(raw_episode, tmp_path, first, second, accepted):
+    import zarr
+    from dexmani_real.data.export import export_zarr
+    from dexmani_real.data.raw import RawReader
+    paths = [raw_episode('raw/episode_001', scale=first),
+             raw_episode('raw/episode_002', scale=second)]
+    files = [p / name for p in paths for name in ('data.h5', 'rgb.mp4')]
+    before = [p.read_bytes() for p in files]
+    target = tmp_path / 'merged.zarr'
+    if accepted:
+        result = export_zarr(paths[0].parent, target, processing=export_processing())
+        assert result['total_frames'] == 6
+        with zarr.DirectoryStore(str(target)) as store:
+            root = zarr.open_group(store, mode='r')
+            assert root.attrs['depth_scale_m_per_unit'] == first
+            assert root['meta/episode_ends'][:].tolist() == [3, 6]
+            assert len(root['data']) == 13
+            np.testing.assert_array_equal(root['data/depth'][:], np.full((6, 16, 16), 500))
+        for path, scale in zip(paths, (first, second)):
+            with RawReader(path) as reader:
+                assert reader.meta['depth_scale'] == scale
+    else:
+        with pytest.raises(ValueError, match='episode_002.*depth_scale_m_per_unit'):
+            export_zarr(paths[0].parent, target, processing=export_processing())
+        assert not target.exists()
+    assert not list(tmp_path.glob('.merged.zarr.tmp-*'))
+    assert before == [p.read_bytes() for p in files]
+
+
+@pytest.mark.parametrize('ttl', [None, 'invalid', 0., -1., np.nan, np.inf])
+def test_real_tactile_read_and_export_ignore_ttl(raw_episode, tmp_path, ttl, caplog):
+    import h5py
+    import zarr
+    from dexmani_real.data.raw import RawReader
+    from dexmani_real.data.export import export_zarr
+    path = raw_episode()
+    with h5py.File(path / 'data.h5', 'r+') as data:
+        del data['meta'].attrs['hand_tactile_hold_max_age_s']
+        if ttl is not None:
+            data['meta'].attrs['hand_tactile_hold_max_age_s'] = ttl
+        rows = data['timing/rows'][:]
+        rows['tactile_aggregate_ns'] = 1
+        rows['tactile_dense_ns'] = 2
+        data['timing/rows'][:] = rows
+    with RawReader(path) as reader:
+        assert reader['hand_contact'].shape == (3, 5, 3)
+        assert reader['hand_tactile_force'].shape == (3, 5, 120, 3)
+    target = tmp_path / 'result.zarr'
+    result = export_zarr(path, target, processing=export_processing())
+    quality = result['episode_quality'][0]
+    assert quality['max_tactile_aggregate_age_ns'] == 1_132_999_999
+    assert quality['max_tactile_dense_age_ns'] == 1_132_999_998
+    with zarr.DirectoryStore(str(target)) as store:
+        root = zarr.open_group(store, mode='r')
+        assert root.attrs['episode_quality'] == [quality]
+        assert len(root['data']) == 13
+    assert 'stale source' not in caplog.text
+
+
+@pytest.mark.parametrize('field,value', [
+    ('hand_tactile_units', 'newton'),
+    ('hand_tactile_finger_order', 'pinky,ring,middle,index,thumb'),
+])
+def test_real_tactile_semantics_still_rejected(raw_episode, tmp_path, field, value):
+    import h5py
+    from dexmani_real.data.raw import RawReader
+    from dexmani_real.data.export import export_zarr
+    path = raw_episode()
+    with h5py.File(path / 'data.h5', 'r+') as data:
+        del data['meta'].attrs['hand_tactile_hold_max_age_s']
+        data['meta'].attrs[field] = value
+    with RawReader(path) as reader, pytest.raises(ValueError, match=field):
+        reader['hand_contact']
+    with pytest.raises(ValueError, match=field):
+        export_zarr(path, tmp_path / 'bad.zarr', processing=export_processing())
+
+
+@pytest.mark.parametrize('channel', ['aggregate', 'dense'])
+@pytest.mark.parametrize('damage', ['zero', 'negative', 'future', 'regression', 'shape'])
+def test_real_tactile_damage_still_rejected(raw_episode, tmp_path, channel, damage):
+    import h5py
+    from dexmani_real.data.export import export_zarr
+    path = raw_episode()
+    with h5py.File(path / 'data.h5', 'r+') as data:
+        del data['meta'].attrs['hand_tactile_hold_max_age_s']
+        if damage == 'shape':
+            name = 'hand_contact' if channel == 'aggregate' else 'hand_tactile_force'
+            shape = list(data[name].shape)
+            shape[-1] = 2
+            del data[name]
+            data.create_dataset(name, shape=shape, dtype=np.float32)
+        else:
+            rows = data['timing/rows'][:]
+            name = f'tactile_{channel}_ns'
+            rows[name][1] = dict(zero=0, negative=-1,
+                                 future=rows['observation_ns'][1] + 1,
+                                 regression=rows[name][0] - 1)[damage]
+            data['timing/rows'][:] = rows
+    with pytest.raises(ValueError, match='invalid_source_clock|source_clock_regressed|shape/dtype'):
+        export_zarr(path, tmp_path / 'bad.zarr', processing=export_processing())
+    assert not (tmp_path / 'bad.zarr').exists()
+
+
+@pytest.fixture
+def teleop_recording(tmp_path):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.runtime.state import SessionState
+    from dexmani_real.teleop.loop import TeleopLoop, TeleopPhase
+
+    sounds = []
+    loop = TeleopLoop(SessionState(stop_signal=threading.Event(), emergency_signal=threading.Event()),
+                     RealConfig(), SimpleNamespace(stop=lambda: None), task_label='test', sensors=None,
+                     controller=SimpleNamespace(clear=lambda: None), recording_dir=tmp_path, max_duration_s=60,
+                     runtime_config_json=None, keyboard=None, audio=SimpleNamespace(play=sounds.append))
+    recorder = loop.recorder = recording.EpisodeRecorder(tmp_path, control_hz=16)
+    try:
+        recorder.start(task_label='test', collection_source='teleop', metadata=raw_metadata())
+        loop.phase = TeleopPhase.ACTIVE
+        yield loop, recorder, sounds
+    finally:
+        # 断言失败也要结束非 daemon writer，避免测试进程一直等候。
+        if recorder.writer_pending:
+            recorder.finish(save=False, reason='test_cleanup')
+
+
+@pytest.mark.parametrize('case', ['save', 'discard', 'empty', 'truncated', 'cancelled', 'estop'])
+def test_teleop_real_recording_finish_sounds(teleop_recording, case):
+    from dexmani_real.data.raw import RawReader
+    from dexmani_real.runtime.state import RunEndReason
+
+    loop, recorder, sounds = teleop_recording
+    if case != 'empty':
+        for row, command in raw_frames():
+            recorder.append(row, command)
+    loop.request_episode_end('stop', run_end_reason=(
+        RunEndReason.CANCELLED if case == 'cancelled' else RunEndReason.OPERATOR
+    ))
+    loop.discard_requested = case == 'discard'
+    if case == 'truncated':
+        recorder.append(row, command, quality_issue='recording_no_command')
+    elif case == 'estop':
+        loop.runtime_state.request_emergency_stop()
+    loop.end_episode()
+    loop.finish_recording()
+    assert loop.recorder is None and not recorder.writer_pending
+    if case in {'empty', 'discard'}:
+        assert recorder.published_path is None and recorder.staging_path is None
+    else:
+        with RawReader(recorder.published_path) as reader:
+            assert reader.num_frames == 3
+            validate_export_episode(reader)
+    assert ('save' in sounds) == (case == 'save')
+    assert ('discard' in sounds) == (case == 'discard')
+    assert ('emergency' in sounds) == (case == 'estop')
+
+
+@pytest.mark.parametrize('error_type', [ValueError, KeyboardInterrupt])
+def test_teleop_episode_error_propagates_before_prefix_publish(teleop_recording, monkeypatch, error_type):
+    from dexmani_real.data.raw import RawReader
+    from dexmani_real.teleop.loop import TeleopPhase
+
+    loop, recorder, sounds = teleop_recording
+    for row, command in raw_frames():
+        recorder.append(row, command)
+    failure = error_type('mapping failed')
+    def stop():
+        assert loop.runtime_state.estop_request == (error_type is KeyboardInterrupt)
+    loop.robot.stop = stop
+    def fail_tick():
+        raise failure
+    monkeypatch.setattr(loop, 'start_episode', lambda epoch: None)
+    monkeypatch.setattr(loop, 'service_episode', lambda timeout: True)
+    monkeypatch.setattr(loop, 'run_control_tick', fail_tick)
+    with pytest.raises(error_type, match='mapping failed') as caught:
+        loop.run_episode(loop.runtime_state.cancel_epoch)
+    assert caught.value is failure
+    assert loop.phase is TeleopPhase.IDLE and loop.recorder is recorder
+    assert recorder.published_path is None and recorder.writer_pending
+    loop.finish_recording()
+    assert loop.recorder is None and not recorder.writer_pending
+    with RawReader(recorder.published_path) as reader:
+        assert reader.num_frames == 3 and reader.meta['termination_reason'] == 'failed'
+        validate_export_episode(reader)
+    assert any(detail.get('message') == 'mapping failed' for detail in loop.termination_details)
+    assert 'emergency' in sounds and 'save' not in sounds and 'discard' not in sounds
+
+
+def test_teleop_stop_error_defers_prefix_publish(teleop_recording):
+    from dexmani_real.data.raw import RawReader
+    from dexmani_real.runtime.state import RunEndReason
+
+    loop, recorder, sounds = teleop_recording
+    for row, command in raw_frames():
+        recorder.append(row, command)
+    loop.request_episode_end('stop', run_end_reason=RunEndReason.OPERATOR)
+    failure = OSError('stop failed')
+    def fail_stop():
+        raise failure
+    loop.robot.stop = fail_stop
+    with pytest.raises(OSError, match='stop failed') as caught:
+        loop.end_episode()
+    assert caught.value is failure
+    assert loop.recorder is recorder and recorder.writer_pending
+    loop.finish_recording()
+    with RawReader(recorder.published_path) as reader:
+        assert reader.num_frames == 3
+        validate_export_episode(reader)
+    assert 'emergency' in sounds and 'save' not in sounds and 'discard' not in sounds
+
+
+def test_teleop_writer_error_retains_staging(teleop_recording, monkeypatch):
+    from dexmani_real.runtime.state import RunEndReason
+
+    loop, recorder, sounds = teleop_recording
+    for row, command in raw_frames():
+        recorder.append(row, command)
+    loop.request_episode_end('stop', run_end_reason=RunEndReason.OPERATOR)
+    close = recorder.writer.close
+    def fail_close():
+        close()
+        raise OSError('writer close failed')
+    monkeypatch.setattr(recorder.writer, 'close', fail_close)
+    with pytest.raises(recording.RecordingError, match='writer close failed'):
+        loop.end_episode()
+    assert loop.recorder is recorder and not recorder.writer_pending
+    assert recorder.published_path is None and recorder.staging_path.is_dir()
+    with pytest.raises(recording.RecordingError, match='writer close failed'):
+        loop.finish_recording()
+    assert 'emergency' in sounds and 'save' not in sounds and 'discard' not in sounds

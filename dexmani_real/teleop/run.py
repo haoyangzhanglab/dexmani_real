@@ -182,20 +182,26 @@ def run_teleop(
             loop.run()
             robot.check()
             clean = bool(runtime_state.quit_requested)
-    except KeyboardInterrupt as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         primary_failure = exc
-        runtime_state.request_emergency_stop()
-    except Exception as exc:
-        primary_failure = exc
-        runtime_state.stop_signal.set()
+        if loop is not None:
+            loop.record_error("session", exc)
+        elif isinstance(exc, KeyboardInterrupt):
+            runtime_state.request_emergency_stop()
+        else:
+            runtime_state.stop_signal.set()
         logger.exception("teleop session failed")
     finally:
+        if audio is not None and runtime_state.estop_request:
+            audio.play("emergency")
         try:
             close_runtime(runtime_state, robot, sensors=sensors, keyboard=keyboard)
         except BaseException as exc:
-            if isinstance(exc, KeyboardInterrupt):
-                runtime_state.request_emergency_stop()
             primary_failure = primary_failure or exc
+            if loop is not None:
+                loop.record_error("runtime_cleanup", exc)
+            elif isinstance(exc, KeyboardInterrupt):
+                runtime_state.request_emergency_stop()
             logger.exception("teleop runtime cleanup failed")
         else:
             shutdown_clean = True
@@ -203,9 +209,9 @@ def run_teleop(
             if loop is not None:
                 loop.finish_recording()
         except BaseException as exc:
-            if isinstance(exc, KeyboardInterrupt):
-                runtime_state.request_emergency_stop()
             primary_failure = primary_failure or exc
+            if loop is not None:
+                loop.record_error("recording_cleanup", exc)
             logger.exception("teleop capture cleanup failed")
         if audio is not None:
             try:

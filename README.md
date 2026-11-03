@@ -101,7 +101,7 @@ Canonical 保留 [固定 13 模态](dexmani_real/data/export.py)、原单位和 
 
 `timing/rows` 使用主机单调时钟，单位 ns，缺失值为 -1；control_ns 是读取开始，observation_ns 是读取完成。臂、手、触觉、相机保留来源时间，缓存不续期；同行不表示硬件同步。每段固定按控制与录制需求并集读取。录制质量失败或队列满立即结束本段；健康 writer 排空已接纳前缀，关闭成功后按主线程已确定的保存意图发布。收尾开始后到达的 D 不追溯丢弃旧段，已接纳 D 不被 Q 覆盖。实际 writer I/O 或传感进程故障退出会话。零行不发布；线程仍存活或关闭失败保留 staging 与真实句柄。Raw 动作表示提交尝试，不保证前缀包含最后一次实际提交。
 
-teleop/jog/sync/replay 从每轮开始计时，只等待剩余周期；慢计算降低实际频率，不补发积压 tick，sync 只在提交后推进动作游标。async 保留时间锚点，RTC 保留严格前缀与交接承诺。Canonical 时间质量采用警告：包括超过名义周期 ±25%、125 ms 断档、读取跨下一周期和较旧触觉来源。control/observation 各自必须严格递增，observation 不早于本次 control；来源时间仍须因果有效且不倒退。episode_quality 保存平均周期、最大间隔、最大 readout、网格漂移和截断信息。dt 保留名义周期，不重采样。实际时序通过 Raw 的 `timing/rows` 和 `RawReader.timestamps_s` 追溯；Canonical 保持固定训练字段，不增加时间数组。可导出不代表数据质量适合当前实验。
+teleop/jog/sync/replay 从每轮开始计时，只等待剩余周期；慢计算降低实际频率，不补发积压 tick，sync 只在提交后推进动作游标。async 保留时间锚点，RTC 保留严格前缀与交接承诺。Canonical 时间质量采用警告：包括超过名义周期 ±25%、125 ms 断档、读取跨下一周期。control/observation 各自必须严格递增，observation 不早于本次 control；来源时间仍须因果有效且不倒退。episode_quality 保存平均周期、最大间隔、最大 readout、网格漂移和截断信息；触觉实际来源年龄通过 max_tactile_aggregate_age_ns、max_tactile_dense_age_ns 查看（单位 ns）。dt 保留名义周期，不重采样。实际时序通过 Raw 的 `timing/rows` 和 `RawReader.timestamps_s` 追溯；Canonical 保持固定训练字段，不增加时间数组。可导出不代表数据质量适合当前实验。
 
 导出先验证元数据、结构、dtype、计数和时间规则；六个原始数值 dataset 随转换逐块各读取一次，整块有限值检查通过后才进入几何计算，转换结果仍检查有限值。前置验证成功不代表全部数值已通过；坏数值可能在转换开始后甚至末块才发现，整段及整批拒绝语义不变。保留 RGB 逐帧解码和流式写入，成功时导出全部帧，不截断、切分、插值、补帧或重采样。批量遇到不合格 episode 明确失败，错误标明 episode、原因及适用的行索引；可通过 `--exclude EPISODE` 排除整段后重试，不自动跳过或改写 Raw。全部完成后才原子发布 Canonical；准入或转换失败关闭资源并删除本次新建的 Canonical staging，清理失败另行记录且不覆盖原错；不删除源 Raw 或既有目标。
 
@@ -115,7 +115,7 @@ replay 在 prepare 后读取一次当前 arm/hand 姿态并检查新鲜度，只
 
 遥操作额外逐行保存 `vr_wrist_pos`、`vr_wrist_quat_wxyz`、`vr_landmarks`、`vr_recv_ts_ns`、`vr_sequence_id`，用于调试，不进入训练导出。VR 使用右手数据，21 个 landmark 保持 SDK 原顺序；来源时间取所需通道首次主机接收时间的较早者。接收端先校验并归一化原始姿态四元数，再转换为 FLU；零范数或非有限姿态被拒绝。位置用米、四元数 WXYZ；来源帧重复时 ID 和时间保持原值。`runtime_config_json`、VR 变换、手标定和每段一份初始锚点随 Raw 保存。逐次操作与失败控制时点用日志诊断。
 
-触觉 aggregate `(5,3)` 与 dense `(5,120,3)` 分别保存 SDK 最后一份完整有效通道帧及来源时间，按各自来源年龄及配置的 hold 上限限时保持。数据使用 SDK sensor axes，原生物理尺度未知，指序为 thumb/index/middle/ring/pinky；不解释为牛顿或布尔接触，也不假定 dense 求和等于 aggregate。原生单位、指序、hold age 和实际触觉复位结果继续归档；读取仍校验数值语义，不据说明文案推断校准或真实接触。
+触觉 aggregate `(5,3)` 与 dense `(5,120,3)` 分别保存 SDK 最后一份完整有效通道帧及来源时间，按各自来源年龄及配置的 hold 上限限时保持。数据使用 SDK sensor axes，原生物理尺度未知，指序为 thumb/index/middle/ring/pinky；不解释为牛顿或布尔接触，也不假定 dense 求和等于 aggregate。原生单位、指序、hold age 和实际触觉复位结果继续归档。RawReader 校验单位、指序和数据形状；Canonical 导出还校验数值及来源时间，两者均不依赖采集 TTL 元信息。这些记录不代表校准或真实接触。
 
 ## 控制和几何边界
 

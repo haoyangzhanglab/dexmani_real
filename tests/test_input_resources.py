@@ -102,7 +102,7 @@ def test_discard_intent_freezes_before_writer_wait(late_discard):
     loop.keyboard, loop.runtime_state = keyboard, state
     loop.pending_termination_reason = 'quit'
     loop.termination_details = []
-    loop.discard_requested = loop.capture_failed = False
+    loop.discard_requested = False
     loop.audio = SimpleNamespace(play=lambda sound: None)
     decisions = []
     def finish(**kwargs):
@@ -282,7 +282,7 @@ def test_poll_waits_for_fast_stop_and_returns_consistent_snapshot():
 
 @pytest.mark.parametrize('stage,key,exit_code', [
     ('vr', 's', 0), ('vr', 'c', 0), ('vr', 'd', 0), ('vr', 'q', 0), ('vr', 'esc', 1),
-    ('connect', None, 1), ('running', 's', 1),
+    ('connect', None, 1), ('running', 's', 1), ('cleanup', None, 1), ('idle', 'esc', 1),
 ])
 def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_code):
     import threading
@@ -293,7 +293,7 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
     from dexmani_real.robot.commands import OperationCancelled
     from dexmani_real.teleop import run
 
-    keyboards, closed = [], []
+    keyboards, closed, sounds = [], [], []
     def start_keyboard(self):
         keyboards.append(self)
         self.active = True
@@ -329,6 +329,8 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
             pass
         def close(self):
             closed.append('robot')
+            if stage == 'cleanup':
+                raise OSError('robot close failed')
 
     monkeypatch.setattr(run.mp, 'get_context', lambda kind: SimpleNamespace(Process=Process, Event=threading.Event))
     monkeypatch.setattr(run, 'SensorChannels', lambda *a, **kw: SimpleNamespace(
@@ -338,10 +340,18 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
     monkeypatch.setattr(run.ActionMapper, 'for_mode', lambda *a, **kw: None)
     monkeypatch.setattr(run, 'build_hand_retargeter', lambda runtime: None)
     monkeypatch.setattr(run, 'VRController', lambda *args: SimpleNamespace(hand_retargeter=None))
-    monkeypatch.setattr(run, 'AudioFeedback', lambda: SimpleNamespace(play=lambda sound: None,
+    monkeypatch.setattr(run, 'AudioFeedback', lambda: SimpleNamespace(play=sounds.append,
                                                                    close=lambda: closed.append('audio')))
     monkeypatch.setattr(run, 'initialize_hand', lambda *args, **kwargs: None)
+    run_loop_idle = run.TeleopLoop.run
     def run_loop(self):
+        if stage == 'idle':
+            self.keyboard.handle_key(key, True)
+            run_loop_idle(self)
+            return
+        if stage == 'cleanup':
+            self.runtime_state.request_quit()
+            return
         if stage == 'running':
             self.runtime_state.request_stop()  # 之前一段的正常 S 不能授权吞掉新故障。
             raise OperationCancelled('unexpected running interruption')
@@ -350,6 +360,8 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
     result = run.run_teleop(RealConfig(), record=False, episodes_dir='unused', max_duration_s=1,
                             runtime_config_json=None)
     assert result == exit_code
+    if stage in {'connect', 'running', 'cleanup'} or key == 'esc':
+        assert 'emergency' in sounds
     assert 'robot' in closed and 'keyboard' in closed and 'audio' in closed
     if stage == 'vr':
         assert 'vr' in closed
@@ -388,7 +400,7 @@ def test_unconsumed_discard_does_not_change_finished_segment():
     loop.keyboard, loop.runtime_state = keyboard, state
     loop.pending_termination_reason = 'operator'
     loop.termination_details = []
-    loop.discard_requested = loop.capture_failed = False
+    loop.discard_requested = False
     loop.audio = SimpleNamespace(play=lambda sound: None)
     decisions = []
     loop.recorder = SimpleNamespace(
