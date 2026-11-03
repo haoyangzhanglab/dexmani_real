@@ -12,7 +12,6 @@ from dexmani_real.control.homing import (
     HomePlanner,
 )
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
-from dexmani_real.runtime.state import SafetyState
 from dexmani_real.utils.table_plane import load_table_plane
 from dexmani_real.utils.timing import sample_is_fresh
 
@@ -62,9 +61,7 @@ def home_robot(state, robot, get_planner, *, cancel_epoch, cancel_requested):
     except (ValueError, TypeError) as exc:
         raise HomeConfigurationError(f"arm HOME configuration: {exc}") from exc
     home_hand(state, robot, cancel_epoch=cancel_epoch, cancel_requested=cancel_requested)
-    if cancel_requested() or not state.can_move(
-        cancel_epoch=cancel_epoch, required_safety_state=SafetyState.ARMED,
-    ):
+    if cancel_requested() or not (state.cancel_epoch == cancel_epoch and state.requests_allow_motion()):
         raise OperationCancelled("HOME interrupted before planner initialization")
     deadline_ns = time.monotonic_ns() + int(robot.arm_config.homing.timeout_s * 1e9)
     robot.stop()
@@ -82,9 +79,7 @@ def initialize_hand(state, robot, *, cancel_epoch, required_tactile, cancel_requ
     logger.info("手部 HOME 已到位，正在请求触觉复位，请保持手部无接触。")
 
     def cancelled():
-        return cancel_requested() or not state.can_move(
-            cancel_epoch=cancel_epoch, required_safety_state=SafetyState.ARMED,
-        )
+        return cancel_requested() or not (state.cancel_epoch == cancel_epoch and state.requests_allow_motion())
 
     robot.reset_tactile_sensors(
         cancel_epoch=cancel_epoch, cancel_requested=cancelled, required_tactile=required_tactile,
@@ -95,13 +90,9 @@ def initialize_hand(state, robot, *, cancel_epoch, required_tactile, cancel_requ
 def home_arm(state, robot, planner, *, cancel_epoch, cancel_requested, deadline_ns):
     config, hand = robot.arm_config, robot.hand_config
     target = np.asarray(config.home_qpos, dtype=np.float64)
-    if state.safety_state != SafetyState.ARMED:
-        raise OperationCancelled("home requires ARMED")
 
     def cancelled():
-        return cancel_requested() or not state.can_move(
-            cancel_epoch=cancel_epoch, required_safety_state=SafetyState.ARMED,
-        )
+        return cancel_requested() or not (state.cancel_epoch == cancel_epoch and state.requests_allow_motion())
 
     with _home_motion(state, robot):
         deadline = deadline_ns / 1e9
@@ -152,8 +143,6 @@ def home_hand(state, robot, *, cancel_epoch, cancel_requested):
     hand = robot.hand_config
     if not hand.enabled:
         return
-    if state.safety_state != SafetyState.ARMED:
-        raise OperationCancelled("hand home requires ARMED")
     try:
         hand.validate_home()
     except (ValueError, TypeError) as exc:
@@ -163,9 +152,7 @@ def home_hand(state, robot, *, cancel_epoch, cancel_requested):
     tolerance = np.deg2rad(hand.home_tolerance_deg)
 
     def cancelled():
-        return cancel_requested() or not state.can_move(
-            cancel_epoch=cancel_epoch, required_safety_state=SafetyState.ARMED,
-        )
+        return cancel_requested() or not (state.cancel_epoch == cancel_epoch and state.requests_allow_motion())
 
     if cancelled():
         raise OperationCancelled("home interrupted")

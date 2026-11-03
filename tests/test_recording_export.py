@@ -15,7 +15,7 @@ from dexmani_real.data.raw import (
 from dexmani_real.runtime.observation import Observation
 
 
-def test_queue_overflow_freezes_prefix_and_finish_wakes_writer(monkeypatch, tmp_path):
+def test_queue_overflow_returns_reason_and_finish_drains_prefix(monkeypatch, tmp_path):
     entered, release = threading.Event(), threading.Event()
 
     class Writer:
@@ -43,7 +43,7 @@ def test_queue_overflow_freezes_prefix_and_finish_wakes_writer(monkeypatch, tmp_
         assert entered.wait(3)
         for _ in range(16):
             recorder.append(row)
-        recorder.append(row)
+        assert recorder.append(row) == 'recording_queue_full'
         assert recorder.recording_truncated_reason == 'recording_queue_full'
         assert recorder.queue.qsize() == 16
         assert recorder.error is None
@@ -95,9 +95,10 @@ def test_bounded_drift_export_preserves_termination_reason(reason):
     assert quality['termination_reason'] == reason
 
 
-def test_actual_missing_period_is_rejected():
-    with pytest.raises(ValueError, match='control_interval'):
-        validate_export_episode(reader_with_intervals([62_500_000, 125_000_000]))
+def test_actual_missing_period_is_reported(caplog):
+    _, quality = validate_export_episode(reader_with_intervals([62_500_000, 125_000_000]))
+    assert quality['max_control_interval_ns'] == 125_000_000
+    assert 'jitter/gaps' in caplog.text
 
 
 def test_export_rejects_staging_symlink(tmp_path):
@@ -297,7 +298,10 @@ def test_export_rejects_invalid_time_relationships(invalid):
         rows['camera_ns'][0] = rows['observation_ns'][0] + 1
     else:
         rows['camera_sequence'][2] = 0
-    with pytest.raises(ValueError, match='overlapping|regressed|invalid_source_clock'):
+    if invalid == 'overlap':
+        validate_export_episode(reader)
+        return
+    with pytest.raises(ValueError, match='regressed|invalid_source_clock'):
         validate_export_episode(reader)
 
 
@@ -402,3 +406,92 @@ def test_zero_row_writer_is_closed_without_publication(monkeypatch, tmp_path):
     assert recorder.finish(save=True, reason='operator') is None
     assert closed == [True] and not recorder.writer_pending
     assert recorder.written_frames == 0 and recorder.staging_path is None
+
+
+def test_finish_setup_interrupt_is_not_reported_as_completed(monkeypatch, tmp_path):
+    closed = threading.Event()
+
+    class Writer:
+        frame_count = 0
+        def __init__(self, *args, **kwargs):
+            pass
+        def open(self, metadata):
+            pass
+        def flush(self):
+            pass
+        def close(self):
+            closed.set()
+
+    monkeypatch.setattr(recording, 'RawWriter', Writer)
+    recorder = recording.EpisodeRecorder(tmp_path, control_hz=16)
+    recorder.start(task_label='test', collection_source='teleop', metadata={})
+
+    def interrupted_clock():
+        raise KeyboardInterrupt()
+
+    # request 已建立，但尚未把 finish 放进队列；重入不能当作成功或续等待预算。
+    with monkeypatch.context() as patch:
+        patch.setattr(recording.time, 'monotonic', interrupted_clock)
+        with pytest.raises(KeyboardInterrupt):
+            recorder.finish(save=True, reason='operator')
+        with pytest.raises(recording.RecordingError, match='KeyboardInterrupt'):
+            recorder.finish(save=True, reason='operator')
+    recorder.thread.join(1)
+    assert closed.is_set() and not recorder.writer_pending
+    assert recorder.staging_path.is_dir() and recorder.published_path is None
+    assert recorder.result()['status'] == 'failed'
+
+
+@pytest.mark.parametrize('stage', ['write', 'finish', 'close'])
+def test_writer_failure_never_publishes_or_retries_finish(monkeypatch, tmp_path, stage):
+    closes = []
+
+    class Writer:
+        frame_count = 0
+        def __init__(self, *args, **kwargs):
+            pass
+        def open(self, metadata):
+            pass
+        def append_frame(self, *args):
+            if stage == 'write':
+                raise OSError('write failed')
+            self.frame_count += 1
+        def flush(self):
+            pass
+        def finish(self, *args, **kwargs):
+            if stage == 'finish':
+                raise OSError('finish failed')
+        def close(self):
+            closes.append(True)
+            if stage == 'close':
+                raise OSError('close failed')
+
+    monkeypatch.setattr(recording, 'RawWriter', Writer)
+    recorder = recording.EpisodeRecorder(tmp_path, control_hz=16)
+    recorder.start(task_label='test', collection_source='teleop', metadata={})
+    recorder.append(Observation(None, None, None, None, None, 1))
+    for _ in range(2):
+        with pytest.raises(recording.RecordingError, match=stage + ' failed'):
+            recorder.finish(save=True, reason='operator')
+    assert closes == [True]
+    assert not recorder.writer_pending
+    assert recorder.staging_path.is_dir() and recorder.published_path is None
+    assert recorder.result()['status'] == 'failed'
+
+
+@pytest.mark.parametrize('field', ['control_ns', 'observation_ns'])
+@pytest.mark.parametrize('delta', [0, -1])
+def test_export_rejects_nonincreasing_primary_clocks(field, delta):
+    reader = reader_with_intervals([62_500_000] * 2)
+    rows = reader['timing/rows']
+    rows[field][1] = rows[field][0] + delta
+    with pytest.raises(ValueError, match='clock'):
+        validate_export_episode(reader)
+
+
+def test_old_tactile_sources_export_with_warning(caplog):
+    reader = reader_with_intervals([62_500_000] * 2)
+    for field in ('tactile_aggregate_ns', 'tactile_dense_ns'):
+        reader['timing/rows'][field] = 1
+    validate_export_episode(reader)
+    assert 'stale source' in caplog.text

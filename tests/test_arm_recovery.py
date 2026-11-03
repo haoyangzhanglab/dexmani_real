@@ -1,4 +1,4 @@
-"""恢复顺序的离线回归；所有 SDK 操作使用 fake driver。"""
+"""正常停止复用与异常退出的离线回归；所有 SDK 操作使用 fake driver。"""
 import multiprocessing as mp
 import threading
 import time
@@ -106,7 +106,7 @@ def test_cancel_during_recovery_is_not_cleared(cancel, stage, home):
             clear_goal(**kwargs)
             getattr(state, cancel)()
         process.io.clear_goal = clear_and_cancel
-    # 即使尚未 arm，普通停止也必须改变取消上下文。
+    # 启动早期的普通停止也必须改变取消上下文。
     epoch = state.cancel_epoch
     try:
         with pytest.raises(OperationCancelled):
@@ -299,6 +299,73 @@ def test_repeated_close_does_not_renew_pending_owner_budget(monkeypatch):
         arm.io.stopped.set()
         arm.close()
         assert waits[-1] == 0.0 and arm.is_closed
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+def test_cancelled_lifecycle_request_cannot_reuse_owner():
+    from dexmani_real.robot.commands import OperationCancelled
+    state = SessionState()
+    arm = ArmProcess(ArmConfig(), runtime_state=state)
+    arm.resume = lambda *args, **kwargs: None
+    epoch = state.cancel_epoch
+    try:
+        with pytest.raises(OperationCancelled):
+            arm.request_operation(
+                PrepareRequest(time.monotonic_ns() + 1_000_000_000),
+                service=state.request_stop,
+                abort=lambda: state.cancel_epoch != epoch,
+                cancel_epoch=epoch,
+            )
+        assert arm.io.stop.is_set() and arm.io.closing.is_set()
+        assert not arm.reply_pending
+        assert not arm.is_connected
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+def test_cancel_inflight_keeps_reply_owned_and_closes_session():
+    from dexmani_real.robot.commands import OperationCancelled
+    state = SessionState()
+    arm = ArmProcess(ArmConfig(), runtime_state=state)
+    arm.process = SimpleNamespace(is_alive=lambda: True, pid=1, exitcode=None)
+    arm.io.connected.set()
+    arm.resume = lambda *args, **kwargs: None
+    services = []
+    def service():
+        services.append(True)
+        if len(services) == 2:
+            state.request_stop()
+    epoch = state.cancel_epoch
+    try:
+        with pytest.raises(OperationCancelled):
+            arm.request_operation(
+                PrepareRequest(time.monotonic_ns() + 1_000_000_000),
+                service=service, abort=lambda: state.cancel_epoch != epoch,
+                cancel_epoch=epoch,
+            )
+        assert arm.reply_pending and arm.io.closing.is_set()
+        assert isinstance(arm.child_pipe.recv(), PrepareRequest)
+        arm.resume = ArmProcess.resume.__get__(arm, ArmProcess)
+        with pytest.raises(RuntimeError, match='unavailable'):
+            arm.prepare(state.cancel_epoch, service=lambda: None)
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
+@pytest.mark.parametrize('error', [OperationCancelled('cancelled'), TimeoutError('stop unresolved')])
+def test_preparation_resume_failure_also_closes_owner(error):
+    state = SessionState()
+    arm = ArmProcess(ArmConfig(), runtime_state=state)
+    arm.resume = lambda *args, **kwargs: (_ for _ in ()).throw(error)
+    try:
+        with pytest.raises(type(error), match=str(error)):
+            arm.prepare(state.cancel_epoch, service=lambda: None)
+        assert arm.io.stop.is_set() and arm.io.closing.is_set()
+        assert not arm.reply_pending and not arm.child_pipe.poll()
     finally:
         arm.pipe.close()
         arm.child_pipe.close()

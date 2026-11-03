@@ -1,6 +1,6 @@
 # DexMani Real 第二阶段减法重构任务书
 
-> **状态：待实施。** 本文确定目标设计、实施任务和验收标准，不代表代码已经完成。
+> **状态：代码与离线回归已实施，真机验收未执行。** 实施范围与实际验证见第 9 节。
 >
 > **审查基线：** [025451cc5ae3e1c77be221f50273c296dbf26769](https://github.com/haoyangzhanglab/dexmani_real/commit/025451cc5ae3e1c77be221f50273c296dbf26769)。
 >
@@ -110,7 +110,7 @@ D03 不等于删除所有 Pipe 处理：正常请求仍只能有一个在途回�
 | point cloud timestamp / source_camera_sequence | 继承源 RGB-D；点云计算结束时间不能替代源时间。 |
 | VR timestamp | 继续使用已接入 SDK 的接收时间语义；未核实 SDK 硬件时钟前不假设与主机可直接比较。 |
 | control_ns / observation_ns | 本轮观测读取开始/读取完成；都不是 arm 与 hand 的同步执行时间。 |
-| video PTS / Canonical timestamps_s | 视频按名义 fps 编码；实际观测时间另存。相对时间先用整数做差，再转浮点。 |
+| video PTS / RawReader.timestamps_s | 视频按名义 fps 编码；实际观测时间另存。相对时间先用整数做差，再转浮点。 |
 
 统一时钟不等于统一采样网格，多路数据均新鲜不等于严格同步。当前任务不增加跨模态同步器、时钟校准协议或全局最大 skew 门槛。
 
@@ -337,24 +337,24 @@ Future 已完成但结果为 None，与 Future 未完成必须区分；模型自
 
 ## 7. 实施任务与顺序
 
-以下均为待完成项。一个任务完成后同步相关测试；不等到最后才补调用方。每一步结束检查新增状态和跨层参数是否确实减少。
+以下任务已完成代码、调用方与相关离线测试更新；勾选不代表已通过真机验收。
 
 ### T0 — 确认当前基线和影响范围
 
-- [ ] 阅读当前 `AGENTS.md`、本文及相关入口；检查工作区已有改动，保留用户工作。
-- [ ] 如果 HEAD 已变化，核实本文涉及的符号与行为；已经实现的项目不重复重写。
-- [ ] 记录实际可用的离线依赖及目标测试基线；不把旧任务书测试数量当成本轮结果。
-- [ ] 按第 2 节建立简短实施清单即可，不再生成另一份通用规划文档。
+- [x] 阅读当前 `AGENTS.md`、本文及相关入口；检查工作区已有改动，保留用户工作。
+- [x] 如果 HEAD 已变化，核实本文涉及的符号与行为；已经实现的项目不重复重写。
+- [x] 记录实际可用的离线依赖及目标测试基线；不把旧任务书测试数量当成本轮结果。
+- [x] 按第 2 节建立简短实施清单即可，不再生成另一份通用规划文档。
 
 ### T1 — 时间语义与单一实验时长
 
 主要文件：`deployment/rollout.py`、`deployment/schedule.py`、`config/deployment.py`、`runtime/observation.py`、`utils/timing.py`。
 
-- [ ] 删除 D01 的字段、常量、仲裁函数及无消费者分支；直接用单一 episode 截止时刻。
-- [ ] 等待模型时也轮询 operator、服务反馈、检查 owner stop/fault；耗时映射后在发送前再次检查时长和必要来源。
-- [ ] 保留 async 有效尾部、RTC 交接、sync 游标和当前 history 行为。
-- [ ] 删除只验证旧等待预算竞争的测试；改测第 8 节 A01–A07。
-- [ ] 更新注释：没有新采样或新目标，就没有“续期”。
+- [x] 删除 D01 的字段、常量、仲裁函数及无消费者分支；直接用单一 episode 截止时刻。
+- [x] 等待模型时也轮询 operator、服务反馈、检查 owner stop/fault；耗时映射后在发送前再次检查时长和必要来源。
+- [x] 保留 async 有效尾部、RTC 交接、sync 游标和当前 history 行为。
+- [x] 删除只验证旧等待预算竞争的测试；改测第 8 节 A01–A07。
+- [x] 更新注释：没有新采样或新目标，就没有“续期”。
 
 完成条件：父进程不再维护目标租期镜像或 prediction wait deadline；慢首推理可继续等待，设备一旦停机不会因预测完成恢复。
 
@@ -362,12 +362,12 @@ Future 已完成但结果为 None，与 Future 未完成必须区分；模型自
 
 主要文件：`robot/xarm7/process.py`、`robot/xarm7/worker.py`、`robot/xarm7/protocol.py`、`robot/system.py`、`runtime/lifecycle.py`。
 
-- [ ] 将在途 prepare/HOME 的取消、超时和技术失败收敛为停止并关闭会话；删除为下一操作恢复的旧回复清理协议。
-- [ ] 正常请求保留一个 Pipe 在途事实和正常回复消费；异常关闭仍读取故障，不能让取消遮盖 SDK 失败。
-- [ ] 保留 owner 停止态不消费邮箱、停止确认、锁内清邮箱和旧确认失效顺序。
-- [ ] 避免段内故障分支和最外层各执行一套完整设备关闭；保留真实 stop/close 失败传播。
-- [ ] 不把故障或未完成句柄清成 None 来满足“已关闭”。
-- [ ] 更新 arm/replay 相关异常测试，明确取消 prepare/HOME 后退出而非重试。
+- [x] 将在途 prepare/HOME 的取消、超时和技术失败收敛为停止并关闭会话；删除为下一操作恢复的旧回复清理协议。
+- [x] 正常请求保留一个 Pipe 在途事实和正常回复消费；异常关闭仍读取故障，不能让取消遮盖 SDK 失败。
+- [x] 保留 owner 停止态不消费邮箱、停止确认、锁内清邮箱和旧确认失效顺序。
+- [x] 避免段内故障分支和最外层各执行一套完整设备关闭；保留真实 stop/close 失败传播。
+- [x] 不把故障或未完成句柄清成 None 来满足“已关闭”。
+- [x] 更新 arm/replay 相关异常测试，明确取消 prepare/HOME 后退出而非重试。
 
 完成条件：故障路径没有返回正常复用的隐式分支，正常 S 后仍可干净开始下一段。
 
@@ -375,12 +375,12 @@ Future 已完成但结果为 None，与 Future 未完成必须区分；模型自
 
 依赖 T2。主要文件：`runtime/state.py`、`runtime/keyboard.py`、`runtime/home.py`、`runtime/jog.py`、`teleop/loop.py`、`deployment/session.py`、`deployment/rollout.py`、`replay/run.py`、`robot/system.py`。
 
-- [ ] 删除 `SafetyState`、通用授权方法、`required_safety_state` 参数链和无消费者导入。
-- [ ] 各入口用实际操作流程及取消信号约束动作，正确区分普通发送和显式 prepare/HOME。
-- [ ] 保留一个本地取消计数及最终清 stop 的短锁检查；覆盖启动早期取消。
-- [ ] 删除结束阶段回扫键盘队列/追认 D；一次决定保存意图。
-- [ ] 保留忙时键盘行为、快停、急停 latch 与 Ctrl+C 收尾。
-- [ ] 对纯配置/几何拒绝只保留明确无在途请求的简单返回，不恢复异常请求。
+- [x] 删除 `SafetyState`、通用授权方法、`required_safety_state` 参数链和无消费者导入。
+- [x] 各入口用实际操作流程及取消信号约束动作，正确区分普通发送和显式 prepare/HOME。
+- [x] 保留一个本地取消计数及最终清 stop 的短锁检查；覆盖启动早期取消。
+- [x] 删除结束阶段回扫键盘队列/追认 D；一次决定保存意图。
+- [x] 保留忙时键盘行为、快停、急停 latch 与 Ctrl+C 收尾。
+- [x] 对纯配置/几何拒绝只保留明确无在途请求的简单返回，不恢复异常请求。
 
 完成条件：没有换名后的授权状态机；取消与重新开始的关键竞态仍由真实测试覆盖。
 
@@ -388,12 +388,12 @@ Future 已完成但结果为 None，与 Future 未完成必须区分；模型自
 
 依赖 T2、T3。主要文件：`deployment/session.py`、`deployment/rollout.py`、`deployment/inference.py`、`runtime/lifecycle.py`、`ipc/sensors.py`。
 
-- [ ] 正常 episode 收尾与会话最终关闭职责分开，设备先停，模型/录制等待随后执行。
-- [ ] 删除 session pending/completed/failed 汇总、shutdown matrix 及其专用报表推导。
-- [ ] 模型继续单线程串行；保留实际需要的 Future、close Future 和局部清理预算。
-- [ ] 只在已确认资源结束后移除句柄；部分 start 失败取得的资源仍能关闭。
-- [ ] 简化结果为第 5.3 节内容，真实错误非零退出，无需错误身份去重。
-- [ ] 删除重叠的通用 cleanup 包装；只保留有独立资源职责的函数。
+- [x] 正常 episode 收尾与会话最终关闭职责分开，设备先停，模型/录制等待随后执行。
+- [x] 删除 session pending/completed/failed 汇总、shutdown matrix 及其专用报表推导。
+- [x] 模型继续单线程串行；保留实际需要的 Future、close Future 和局部清理预算。
+- [x] 只在已确认资源结束后移除句柄；部分 start 失败取得的资源仍能关闭。
+- [x] 简化结果为第 5.3 节内容，真实错误非零退出，无需错误身份去重。
+- [x] 删除重叠的通用 cleanup 包装；只保留有独立资源职责的函数。
 
 完成条件：沿入口能指出每个资源由谁收尾；没有多层重新等待同一模型任务、并发模型 close 或虚假的关闭成功。
 
@@ -401,12 +401,12 @@ Future 已完成但结果为 None，与 Future 未完成必须区分；模型自
 
 依赖 T3、T4。主要文件：`data/recorder.py`、`data/raw.py`、`teleop/loop.py`、`deployment/rollout.py`、`deployment/session.py`、`deployment/run.py`、`scripts/run_policy.py`。
 
-- [ ] Policy Raw 默认关闭，CLI 改成 `--record-raw`；更新配置快照和示例。
-- [ ] 录制质量失败/队列满结束当前段；删除冻结后继续控制与动态 needs 分支。
-- [ ] 质量终止原因与 writer I/O error 分开；健康 writer 排空已接纳前缀后可发布。
-- [ ] 保留有界队列、真实线程、一次 finish、关闭后发布、零行不发布和失败保留 staging。
-- [ ] 默认不录制时不额外要求仅用于归档的传感器/标定。
-- [ ] 使用真实 writer 线程的目标测试验证前缀、失败及关闭时序。
+- [x] Policy Raw 默认关闭，CLI 改成 `--record-raw`；更新配置快照和示例。
+- [x] 录制质量失败/队列满结束当前段；删除冻结后继续控制与动态 needs 分支。
+- [x] 质量终止原因与 writer I/O error 分开；健康 writer 排空已接纳前缀后可发布。
+- [x] 保留有界队列、真实线程、一次 finish、关闭后发布、零行不发布和失败保留 staging。
+- [x] 默认不录制时不额外要求仅用于归档的传感器/标定。
+- [x] 使用真实 writer 线程的目标测试验证前缀、失败及关闭时序。
 
 完成条件：没有“本段仍运动但录制已冻结”的隐含模式；默认策略评估只承担模型实际输入成本。
 
@@ -414,11 +414,11 @@ Future 已完成但结果为 None，与 Future 未完成必须区分；模型自
 
 可在 T0 后独立实施；最终与 T5 的元信息对齐。主要文件：`data/export.py`、`data/raw.py`、`tests/test_recording_export.py`。
 
-- [ ] 将三项时间质量硬拒绝改为 warning/简单统计。
-- [ ] 显式保留主时间严格递增和各来源时间因果/非倒退检查，防止删除旧门槛时顺带漏掉原先间接成立的不变量。
-- [ ] 保留数值、结构、模态、RGB 帧数、标定和实际发布边界。
-- [ ] 不改变 Canonical schema、名义 dt、timestamps_s 含义，不扩大到 policy Raw。
-- [ ] 更新导出测试：抖动可过，时间损坏仍失败；用真实容器测试验证结果。
+- [x] 将三项时间质量硬拒绝改为 warning/简单统计。
+- [x] 显式保留主时间严格递增和各来源时间因果/非倒退检查，防止删除旧门槛时顺带漏掉原先间接成立的不变量。
+- [x] 保留数值、结构、模态、RGB 帧数、标定和实际发布边界。
+- [x] 不改变 Canonical schema、名义 dt、timestamps_s 含义，不扩大到 policy Raw。
+- [x] 更新导出测试：抖动可过，时间损坏仍失败；用真实容器测试验证结果。
 
 完成条件：真实时序不均匀不再单独阻止导出，损坏数据仍被清楚拒绝。
 
@@ -426,11 +426,11 @@ Future 已完成但结果为 None，与 Future 未完成必须区分；模型自
 
 依赖 T2、T3。主要文件：`control/homing.py`、`runtime/home.py`、`deployment/rollout.py`、`config/deployment.py`、`deployment/preflight.py`。
 
-- [ ] 删除 Policy 全局精确 HOME 检查及无消费者常量，保留有效反馈和准备停稳。
-- [ ] HOME 按第 6.2 节原地缩减，保留路径采样检查和真实收敛确认。
-- [ ] 删除多候选专用函数/导入/测试；检查共用 helper 和桌面标定仍有消费者。
-- [ ] 测试直接路径接受/拒绝、预算贯穿、反馈不续期、SDK 返回不等于到位和取消。
-- [ ] 文档明确 HOME 能力收缩及策略初始姿态由具体实验负责。
+- [x] 删除 Policy 全局精确 HOME 检查及无消费者常量，保留有效反馈和准备停稳。
+- [x] HOME 按第 6.2 节原地缩减，保留路径采样检查和真实收敛确认。
+- [x] 删除多候选专用函数/导入/测试；检查共用 helper 和桌面标定仍有消费者。
+- [x] 测试直接路径接受/拒绝、预算贯穿、反馈不续期、SDK 返回不等于到位和取消。
+- [x] 文档明确 HOME 能力收缩及策略初始姿态由具体实验负责。
 
 完成条件：HOME 行为确定且容易阅读，不依赖未提供的人工路点，不偷偷降低路径检查。
 
@@ -438,12 +438,12 @@ Future 已完成但结果为 None，与 Future 未完成必须区分；模型自
 
 依赖 T1–T7。
 
-- [ ] 全调用链删除失效 API、常量、CLI 和只服务旧协议的测试，不留下死分支。
-- [ ] 清理只有在已证明不可达时才删除的分支，例如 policy 当前明确要求启用 hand 的路径；不能破坏其他入口的禁用手部能力。
-- [ ] 更新 `README.md` 的启动、停止、录制、HOME、导出和失败后重启说明。
-- [ ] 为上一阶段任务书增加清楚的历史说明/本任务书链接，不改写历史测试事实。
-- [ ] 按第 8 节运行针对性离线验证，检查 diff 无无关格式化、依赖或新框架。
-- [ ] 在本文实施记录中勾选实际完成项，记录实际验证及未验证限制；不把任务书发布当作代码实施完成。
+- [x] 全调用链删除失效 API、常量、CLI 和只服务旧协议的测试，不留下死分支。
+- [x] 清理只有在已证明不可达时才删除的分支，例如 policy 当前明确要求启用 hand 的路径；不能破坏其他入口的禁用手部能力。
+- [x] 更新 `README.md` 的启动、停止、录制、HOME、导出和失败后重启说明。
+- [x] 为上一阶段任务书增加清楚的历史说明/本任务书链接，不改写历史测试事实。
+- [x] 按第 8 节运行针对性离线验证，检查 diff 无无关格式化、依赖或新框架。
+- [x] 在本文实施记录中勾选实际完成项，记录实际验证及未验证限制；不把任务书发布当作代码实施完成。
 
 ## 8. 验收标准
 
@@ -524,17 +524,67 @@ CLI 的 `--help`、`--print-config` 只做无设备检查；不得为了“验�
 
 只有代码、测试、配置、调用方和使用文档一致，才算完成。不能只删符号，也不能保留旧行为后宣称“结构已简化”。
 
-实施后在此填写：
+### 初次实施记录（后续审查前）
 
-- 实施基线与提交：
-- 已完成任务：
-- 有依据的偏离及对应源码证据：
-- 实际运行的验证及结果：
-- 未运行的验证及具体原因：
-- 尚需操作者完成的真机验收：
-- 可感知变化：默认 Raw、慢首推理、异常后退出、录制失败结束、导出质量提示、Policy 初始姿态、HOME 路径范围。
+- **实施基线：** `main` / `c53f4425ef42d7fde693f83c1d8929eb3a93381c`。相对审查基线 `025451c` 仅新增本文；开始时工作区干净。本轮为工作区改动，未创建提交。
+- **完成范围：** T0–T8 的代码、调用方、CLI、相关测试和 README 已更新；旧任务书增加历史说明，未改写旧验证事实。
+- **删除机制：** 父层预测等待预算、目标租期镜像和仲裁；SafetyState 及通用授权 API；prepare/HOME 异常恢复回复协议；session shutdown/outcome 汇总；结束后回扫键盘追认 D；录制 freeze/动态 needs；HOME 多候选、等价端点及软间隙逃逸；精确 HOME 起点门槛及无用常量。
+- **保留边界：** 来源时间与发送前新鲜度、取消计数和短锁、stop/emergency/closing/fault、设备租期、停止确认与清邮箱、单个在途 Pipe 回复事实、单模型线程及 Future/局部清理期限、有界 writer 与关闭后发布、几何检查和实测到位确认。Raw/Canonical 训练接口未改。
+- **收尾归属：** 正常段完成 writer/prediction 后才返回待命；故障或退出保留段内资源，由会话入口先关闭设备，再完成 writer 和模型关闭。删除重复的段内设备 close 与 teleop close 包装。模型关闭未完成直接记错误并非零退出，实际 Future 保持可达。
 
-交付摘要重点说明减少了哪些独立机制、保留了哪些真实边界以及行为代价。不要把“删除了多少行”作为唯一成功指标。
+### 实际源码约束及处理依据
+
+- `data/export.py::validate_export_episode` 原先通过周期和跨周期拒绝间接约束主时间顺序。本轮放宽质量门槛时显式增加 control/observation 各自严格递增，防止损坏数据被误放行。
+- `robot/xarm7/worker.py::operation` 原先将 owner 的 `_OperationTimeout` 排除于 fault；该区别只服务异常后恢复。现在生命周期超时与其他技术失败都终止会话，删除专用异常，保留共享 fault 与最终 close 的晚到故障读取。
+- `recording_issue` 对来源缺失/过期返回质量原因；实际相机 worker 退出抛出故障。依据第 4.3 节，进程死亡不能被质量截断掩盖为可继续复用。
+- `control/constraints.py::wrap_nearest_equivalent` 仍被 IK 和动作映射使用，仅删除 HOME 内的调用；`table_plane_abcd` 归档和共用插值职责保留。
+- 保留小型 RunEndReason 报表枚举、recorder finish 幂等保护，以及真实模型关闭 Future；没有新增状态框架或兼容 API。
+
+### 实际验证
+
+环境：`/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`（Python 3.10.20）。系统 PATH 的 `python` 不存在，但既有 Conda 环境依赖可用，无需安装新依赖。
+
+- 修改前六个指定文件：**188 passed in 1.37 s**，仅作为旧代码基线。
+- 初次实施六个指定文件：**204 passed in 1.42 s**；使用 `PYTHONDONTWRITEBYTECODE=1` 和 `-p no:cacheprovider`。
+- `python -B -m ruff check --no-cache --select F dexmani_real scripts tests`：通过。
+- Policy、collect_teleop、replay、keyboard_teleop、export_zarr 的 `--help`：通过。Policy 与 collect_teleop 的 `--print-config`：通过；均未进入设备运行。
+- 新增/调整验证涵盖慢首推理、无隐藏等待预算、映射跨实验期限、owner stop、固定录制 needs、质量失败结束、取消在途请求保留归属并禁止复用、急停与清 stop 并发、正常/异常收尾顺序、迟到 D、不精确处于 HOME 的启动、单路径几何拒绝、主时间损坏拒绝、旧触觉及周期抖动警告，以及 Raw 显式开启。
+- 真实 writer 线程和现有 HDF5/video/Zarr 容器回归继续通过；测试使用 fake 设备，不涉及真机或历史实验目录。
+
+### 未验证与使用变化
+
+- **未做真机验证**，未加载真实 checkpoint 进行硬件策略实验，也未执行真实 HOME/servo/hand 动作。停止延迟、急停、多轮重新开始、慢推理/断流、录制前缀及单路径 HOME 的物理表现需操作者另行验收。
+- Policy Raw 默认关闭，显式 `--record-raw` 开启；不再接受 Policy `--no-record`。teleop 默认录制不变。
+- 首推理不受旧 2 s 期限约束；已有目标仍受设备租期约束。异常准备退出会话，正常 S 仍可多轮复用。
+- 录制质量失败立即结束本段，健康 writer 可发布有效前缀；离线时间抖动改为提示，不补帧、不改源时间。
+- Policy 可以从有效停稳姿态开始；HOME 只接受经检查的直接路径，失败需人工调整。离散几何检查和离线回归不构成物理安全证明。
+
+
+### 后续全链路审查与清理
+
+本次在上述未提交改动上继续审查，保留初次验证结果作为历史事实。重点沿 Policy/teleop、设备 owner、录制/导出、脚本及文档检查上下游；未增加依赖、兼容 API 或新的控制状态。
+
+已修复及简化：
+
+- **取消分类：** Policy/teleop 的 prepare/HOME 只把当前操作取消计数已改变或 quit/estop 作为干净用户取消。意外 OperationCancelled 保留原异常并非零退出；teleop 的启动取消捕获限定在初始化阶段，历史正常 S 不再导致运行中故障被吞掉。
+- **设备异常边界：** arm resume 的停止确认、清邮箱、最终清 stop 也纳入 request_operation 的异常退出边界，取消或超时后置 closing，不返回故障 owner 的复用路径。
+- **实际传感故障：** 删除 required_names 镜像清单，健康检查依据实际持有的进程；所有已启动 sensor 非零退出都报告关闭错误，录制专用相机不再获得豁免。已正常结束的静态参数相机从 owner 列表移除。
+- **HOME 调用链：** owner 仅接受空路径或 current/HOME 两端点，直接向配置 HOME 提交一次，删除任意多路点循环和重复终点参数。模式切换后实际查询反馈，复核起点与速度，避免 TTL 内旧缓存掩盖漂移；父层直接按既有 1° 分辨率采样，删除无其他消费者的通用多路点插值 helper。
+- **启动姿态：** 删除精确 HOME 门槛后，在 Policy 首次观测准入补齐实测 arm 的配置关节范围检查；shape/finite 继续由 SDK 读取边界负责，未增加内部重复校验。
+- **录制完整性：** 控制主错期间的传感等次错只报告，不再污染 writer I/O error 而中止健康前缀。recorder.finish 请求和期限建立过程中的中断纳入现有异常边界，重入不再误报完成；append 的 str/None 返回契约补齐。正常完成的 Rollout 释放 recorder，避免最终会话收尾重复 finish/提示音；失败句柄仍保留。
+- **死接口与文档：** 删除 Rollout 无消费者的 keyboard 参数；清理旧授权措辞和重复临时变量。README 移除双期限/平局规则、合并重复录制和导出说明，明确无手入口、HOME 拒绝后状态、Policy 平面归档和音效错误处理。RawReader.timestamps_s 来自 Raw，Canonical 保持现有固定 13 模态，不增加时间数组。
+- **哈希及版本机制：** 此影响范围内未发现冗余 SHA-256/内容哈希校验或旧格式 reader。保留实际追溯用 source_id、设备 CRC、ring 一致性版本及来源序列，不把不同职责的正确性边界机械删除。
+
+本次实际验证（real_robot Conda 环境）：
+
+- 六个相关回归文件合计 **224 passed in 1.52 s**；真实 writer、HDF5/video/Zarr、取消与故障传播、HOME 模式后反馈和上下游 API 回归均包含在内。使用 `PYTHONDONTWRITEBYTECODE=1`、`-p no:cacheprovider`。
+- mypy 检查相关 **39 个源码文件通过**；使用 `--no-incremental --follow-imports=skip --ignore-missing-imports`，缓存目录在 `/tmp`，范围为现有类型注解检查，未启用 `--check-untyped-defs`。
+- ruff `--no-cache --select F dexmani_real scripts tests`：通过。
+- 五个相关 CLI 的 `--help`、Policy/collect_teleop 的 `--print-config`：通过。
+- 在 `/tmp` 复制当前 Python package 与 pyproject，使用 `pip wheel --no-deps --no-build-isolation --no-cache-dir` 构建成功，检查 wheel 包含相关源码及配置包数据；临时构建目录随验证删除，未在仓库生成构建产物。
+- 最终 diff 检查和旧接口/引用搜索通过；未新增仓库内 pytest/mypy/ruff 缓存。
+
+本次仍未连接真机、执行真实运动或加载真实 checkpoint 做策略实验；物理停止、急停、断流、重新开始和单路径 HOME 仍由操作者独立验收。离线和构建检查不代替这些验证。
 
 ## 10. 核查入口与参考源码
 

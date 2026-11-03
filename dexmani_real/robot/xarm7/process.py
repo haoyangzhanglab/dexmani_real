@@ -165,8 +165,8 @@ class ArmProcess:
 
     def request_operation(self, request: PrepareRequest | HomeRequest, *, service, abort, cancel_epoch):
         deadline_ns = request.deadline_ns
-        self.resume(cancel_epoch, deadline_ns=deadline_ns)
         try:
+            self.resume(cancel_epoch, deadline_ns=deadline_ns)
             service()
             if abort():
                 raise OperationCancelled("arm operation cancelled before submission")
@@ -192,50 +192,10 @@ class ArmProcess:
         except BaseException as failure:
             if isinstance(failure, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()
-            errors = []
-            try:
-                self.request_stop()
-            except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                errors.append(("arm_operation_stop_request", exc))
-            # 本请求仍独占自己的回复；停止等待绝不接管 Pipe。
-            cleanup_until = time.monotonic() + EXECUTOR_TIMEOUT_S
-            try:
-                if self.reply_pending:
-                    if not self.pipe.poll(max(0, cleanup_until - time.monotonic())):
-                        raise TimeoutError("cancelled arm operation reply remains pending")
-                    reply = self.pipe.recv()
-                    self.reply_pending = False
-                    if isinstance(reply, KeyboardInterrupt):
-                        raise reply
-                    if reply is not None:
-                        from dexmani_real.robot.xarm7.worker import _OperationTimeout
-
-                        # owner 自身的预算回复已消费；SDK TimeoutError 仍是故障。
-                        if self.fault or not isinstance(reply, (OperationCancelled, _OperationTimeout)):
-                            if self.fault:
-                                raise self._read_fault() from reply
-                            raise RobotError("arm operation also failed") from reply
-            except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                errors.append(("arm_operation_reply", exc))
-            try:
-                self.wait_stopped(deadline=cleanup_until)
-            except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                errors.append(("arm_operation_stop", exc))
-            if errors:
-                # 回复和停止分别收尾；任一未确认都禁止复用这个 owner。
-                self.io.closing.set()
-                for stage, error in errors[1:]:
-                    logger.error("%s failed", stage, exc_info=(type(error), error, error.__traceback__))
-                if isinstance(failure, OperationCancelled):
-                    raise errors[0][1]
-                stage, error = errors[0]
-                logger.error("%s also failed", stage, exc_info=(type(error), error, error.__traceback__))
+            self.request_stop()
+            self.io.closing.set()
+            # 异常请求不再恢复；最终 close 读取 owner 的晚到故障。
+            self.check_error()
             raise
 
     def prepare(self, cancel_epoch, *, service):

@@ -62,7 +62,8 @@ def run_replay(episode_path: str | Path, runtime: RealConfig) -> None:
         check_input(robot, keyboard)
         robot.connect()
         check_input(robot, keyboard)
-        state.arm(cancel_epoch=epoch)
+        if not (state.cancel_epoch == epoch and state.requests_allow_motion()):
+            raise OperationCancelled("startup cancelled")
         robot.prepare_streaming(epoch)
         robot.service_feedback()
         check_input(robot, keyboard)
@@ -85,7 +86,7 @@ def run_replay(episode_path: str | Path, runtime: RealConfig) -> None:
             raise ValueError(
                 "start differs by more than 10 degrees; position the robot before replay"
             )
-        if state.begin_motion(cancel_epoch=epoch) is None:
+        if not (state.cancel_epoch == epoch and state.requests_allow_motion() and not state.stop_signal.is_set()):
             raise OperationCancelled("replay admission cancelled")
         for i, (arm, hand) in enumerate(
             zip(trajectory.action_arm_joint, trajectory.action_hand_joint)

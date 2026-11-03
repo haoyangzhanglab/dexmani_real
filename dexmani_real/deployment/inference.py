@@ -59,7 +59,7 @@ class PolicyWorker:
         return future
 
     def discard_pending(self, timeout_s):
-        """本段撤权后回收尚未消费的任务；超时保留归属，禁止下一段复用。"""
+        """本段停止后回收尚未消费的任务；超时保留归属，禁止下一段复用。"""
         future = self.future
         if future is None:
             return

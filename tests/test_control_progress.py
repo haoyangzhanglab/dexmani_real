@@ -10,7 +10,9 @@ from dexmani_real.deployment.schedule import Prediction
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
 from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
+from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.observation import Observation, ObservationNeeds
+from dexmani_real.runtime.state import SessionState
 
 
 def make_rollout(monkeypatch, *, mode='sync', history=1):
@@ -19,17 +21,16 @@ def make_rollout(monkeypatch, *, mode='sync', history=1):
     sends = []
     runtime = RealConfig()
     runtime = replace(runtime, execution=replace(runtime.execution, mode=mode, action_steps=4, prefetch_steps=1))
-    rollout = Rollout(SimpleNamespace(can_move=lambda **kwargs: True), runtime,
+    rollout = Rollout(SessionState(), runtime,
                       SimpleNamespace(control_dt_s=.0625, n_obs_steps=history), cancel_epoch=1,
-                      robot=SimpleNamespace(send_action=lambda *a, **kw: sends.append(clock[0])),
+                      robot=SimpleNamespace(stop=lambda: None, check=lambda: None, send_action=lambda *a, **kw: sends.append(clock[0])),
                       observations=SimpleNamespace(project=lambda row: row),
                       control_needs=ObservationNeeds(), record_needs=ObservationNeeds(),
                       sensors=None, action_mapper=None,
                       model=SimpleNamespace(future=None, poll=lambda: None, predict=lambda *a, **kw: None),
                       max_running_s=None, index=1, output_dir='/tmp', record_raw=False,
-                      audio=SimpleNamespace(play=lambda sound: None), keyboard=None)
+                      audio=SimpleNamespace(play=lambda sound: None))
     rollout.started_ns = rollout.next_step_ns = clock[0]
-    rollout.wait_deadline_ns = clock[0] + 2_000_000_000
 
     def observe():
         arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
@@ -39,6 +40,20 @@ def make_rollout(monkeypatch, *, mode='sync', history=1):
 
     rollout.read_observation = observe
     return rollout, clock, sends
+
+
+def close_rollout_session(rollout, *, failure=None):
+    from dexmani_real.deployment.session import PolicySession
+    session = PolicySession.__new__(PolicySession)
+    session.runtime_state = rollout.runtime_state
+    session.robot, session.episode, session.model = rollout.robot, rollout, rollout.model
+    session.sensors = session.keyboard = session.audio = None
+    session.errors = []
+    session.summary = {'termination_reason': None}
+    session.save_results = lambda: None
+    session.model.close = lambda state: session.model.discard_pending(0)
+    session.model.wait_closed = lambda timeout: True
+    return session.close(failure=failure)
 
 
 def test_slow_sync_mapping_submits_and_advances(monkeypatch):
@@ -72,10 +87,12 @@ def test_async_history_keeps_recent_accepted_samples(monkeypatch):
     assert rollout.history[0].control_timestamp_ns == origin + 125_100_000
 
 
-def test_duration_wins_equal_wait_deadline(monkeypatch):
-    rollout, clock, _ = make_rollout(monkeypatch)
-    rollout.run_deadline_ns = rollout.wait_deadline_ns = clock[0]
-    assert rollout.expired_budget() == (clock[0], 'duration')
+def test_duration_stops_waiting_model(monkeypatch):
+    rollout, clock, sends = make_rollout(monkeypatch)
+    rollout.run_deadline_ns = clock[0]
+    rollout.step()
+    assert rollout.result.termination_reason == 'duration_complete'
+    assert not sends
 
 
 def test_completed_none_prediction_is_invalid_not_pending(monkeypatch):
@@ -101,8 +118,6 @@ def test_fault_closes_robot_before_slow_resources(monkeypatch):
     rollout, _, _ = make_rollout(monkeypatch)
     order = []
     rollout.runtime_state.quit_requested = False
-    rollout.runtime_state.estop_request = False
-    rollout.runtime_state.revoke_motion = lambda **kw: None
     rollout.robot.stop = lambda: order.append('stop')
     rollout.robot.close = lambda: order.append('robot_close')
     rollout.prepare = lambda poll: (_ for _ in ()).throw(ValueError('prepare failed'))
@@ -110,25 +125,27 @@ def test_fault_closes_robot_before_slow_resources(monkeypatch):
     rollout.model.discard_pending = lambda timeout: order.append('model_finish')
     with pytest.raises(ValueError, match='prepare failed'):
         rollout.run(poll_operator=lambda: None)
+    assert order == ['stop']
+    assert close_rollout_session(rollout, failure=ValueError('prepare failed')) == 1
     assert order == ['stop', 'robot_close', 'writer_finish', 'model_finish']
     assert rollout.result.errors[0]['message'] == 'prepare failed'
 
 
 def test_vr_expiring_during_mapping_cannot_receive_new_lease(monkeypatch):
-    from dexmani_real.runtime.state import SafetyState, SessionState
+    from dexmani_real.runtime.state import SessionState
     from dexmani_real.teleop.loop import TeleopLoop
     rollout, clock, sends = make_rollout(monkeypatch)
     row, _ = rollout.read_observation()
     row = replace(row, vr={'recv_ts_ns': clock[0]})
     loop = TeleopLoop.__new__(TeleopLoop)
     loop.runtime = rollout.runtime
-    loop.runtime_state = SessionState(safety_state=SafetyState.RUNNING)
+    loop.runtime_state = SessionState()
     loop.cancel_epoch = loop.runtime_state.cancel_epoch
     loop.control_needs = ObservationNeeds(vr=True)
     loop.recorder = None
     loop.robot = rollout.robot
     ended = []
-    loop.request_episode_end = ended.append
+    loop.request_episode_end = lambda reason, **kwargs: ended.append(reason)
     def compute(*args, **kwargs):
         clock[0] += 600_000_000
         # 独立设备反馈仍新鲜，唯独此次候选依赖的 VR 已过期。
@@ -145,8 +162,6 @@ def test_stop_failure_survives_successful_close(monkeypatch):
     rollout, _, _ = make_rollout(monkeypatch)
     order = []
     rollout.runtime_state.quit_requested = False
-    rollout.runtime_state.estop_request = False
-    rollout.runtime_state.revoke_motion = lambda **kw: None
     def failed_stop():
         order.append('stop')
         raise RuntimeError('stop failed')
@@ -157,12 +172,14 @@ def test_stop_failure_survives_successful_close(monkeypatch):
     rollout.model.discard_pending = lambda timeout: order.append('model')
     with pytest.raises(RuntimeError, match='stop failed'):
         rollout.run(poll_operator=lambda: None)
+    assert order == ['stop']
+    assert close_rollout_session(rollout, failure=RuntimeError('stop failed')) == 1
     assert order == ['stop', 'close', 'writer', 'model']
     assert rollout.result.errors[0]['stage'] == 'stop'
 
 
-@pytest.mark.parametrize('loss', ['missing', 'stale', 'worker_exit'])
-def test_archive_source_loss_freezes_recording_while_control_continues(monkeypatch, tmp_path, loss):
+@pytest.mark.parametrize('loss', ['missing', 'stale'])
+def test_archive_source_loss_ends_recorded_segment(monkeypatch, tmp_path, loss):
     from dexmani_real.data.recorder import EpisodeRecorder
     rollout, clock, sends = make_rollout(monkeypatch)
     rollout.recorder = EpisodeRecorder(tmp_path, control_hz=16)
@@ -188,7 +205,8 @@ def test_archive_source_loss_freezes_recording_while_control_continues(monkeypat
         available[0] = present
         clock[0] = max(clock[0], rollout.next_step_ns)
         rollout.step()
-    assert len(sends) == 3
+    assert len(sends) == 1
+    assert rollout.finished
     assert rollout.recorder.queue.qsize() == 1
     assert rollout.recorder.recording_truncated_reason == {
         'missing': 'camera_source_unavailable_or_unmatched', 'stale': 'camera_source_stale',
@@ -201,11 +219,11 @@ def test_archive_source_loss_freezes_recording_while_control_continues(monkeypat
 def test_jog_late_candidate_depends_on_source_age_not_tick(monkeypatch, mapping_ns):
     from dexmani_real.robot.commands import OperationCancelled
     from dexmani_real.runtime.jog import CartesianJog
-    from dexmani_real.runtime.state import SafetyState, SessionState
+    from dexmani_real.runtime.state import SessionState
     rollout, clock, sends = make_rollout(monkeypatch)
     row, _ = rollout.read_observation()
     monkeypatch.setattr('dexmani_real.runtime.jog.read_observation', lambda *a: row)
-    state = SessionState(safety_state=SafetyState.RUNNING)
+    state = SessionState()
     jog = CartesianJog(None, SimpleNamespace(target_max_age_s=.5), (None, None))
     def propose(*args, **kwargs):
         clock[0] += mapping_ns
@@ -223,10 +241,10 @@ def test_jog_late_candidate_depends_on_source_age_not_tick(monkeypatch, mapping_
 
 def test_teleop_slow_tick_commits_then_quits_through_episode_cleanup(monkeypatch):
     from dexmani_real.runtime.keyboard import Keyboard
-    from dexmani_real.runtime.state import SafetyState, SessionState
+    from dexmani_real.runtime.state import SessionState
     from dexmani_real.teleop.loop import TeleopLoop, TeleopPhase
     rollout, clock, _ = make_rollout(monkeypatch)
-    state = SessionState(safety_state=SafetyState.ARMED)
+    state = SessionState()
     keyboard = Keyboard(bindings={'q': state.request_quit})
     keyboard.active = True
     keyboard.listener = SimpleNamespace(is_alive=lambda: True)
@@ -256,12 +274,12 @@ def test_teleop_slow_tick_commits_then_quits_through_episode_cleanup(monkeypatch
     keyboard.allow_start()
     keyboard.handle_key('b', True)
     loop.handle_commands(keyboard.poll(state, timeout=0)[0])
-    assert order == ['send', 'commit', 'stop', 'close', 'clear']
+    assert order == ['send', 'commit', 'stop', 'clear']  # 设备关闭归会话入口。
     assert state.quit_requested and loop.phase is TeleopPhase.IDLE
 
 
 
-def test_teleop_final_mapping_failure_freezes_before_invalid_action_row(monkeypatch, tmp_path):
+def test_teleop_final_mapping_failure_preserves_valid_prefix(monkeypatch, tmp_path):
     from dexmani_real.data.recorder import EpisodeRecorder
     from dexmani_real.teleop.loop import TeleopLoop
     rollout, _, _ = make_rollout(monkeypatch)
@@ -275,20 +293,20 @@ def test_teleop_final_mapping_failure_freezes_before_invalid_action_row(monkeypa
     loop.record_needs = ObservationNeeds()
     loop.sensors = SimpleNamespace(check=lambda **kw: True)
     ended = []
-    loop.request_episode_end = ended.append
+    loop.request_episode_end = lambda reason, **kwargs: ended.append(reason)
     loop.controller = SimpleNamespace(compute_target=lambda *a, **kw: SimpleNamespace(
         rejection_reason='no feasible target', arm_qpos=None))
     loop.execute_control_step(row)
-    assert ended == ['target_unavailable: no feasible target']
+    assert ended == ['target_unavailable: no feasible target', 'recording_no_command']
     assert loop.recorder.queue.qsize() == 1
     assert loop.recorder.recording_truncated_reason == 'recording_no_command'
     assert loop.recorder.queue.qsize() == 1 and loop.recorder.finish_request is None
 
 
 def test_close_interrupt_latches_emergency_before_waiting_for_writer(monkeypatch):
-    from dexmani_real.runtime.state import RunEndReason, SafetyState, SessionState
+    from dexmani_real.runtime.state import RunEndReason, SessionState
     rollout, _, _ = make_rollout(monkeypatch)
-    rollout.runtime_state = SessionState(safety_state=SafetyState.RUNNING, quit_requested=True)
+    rollout.runtime_state = SessionState(quit_requested=True)
     rollout.robot.stop = lambda: None
     def close():
         raise KeyboardInterrupt()
@@ -300,10 +318,9 @@ def test_close_interrupt_latches_emergency_before_waiting_for_writer(monkeypatch
         cleanup.append(stage)
     rollout.finish_recording = lambda: finish('writer')
     rollout.model.discard_pending = lambda timeout: finish('model')
-    with pytest.raises(KeyboardInterrupt):
-        rollout.run(poll_operator=lambda: None)
+    rollout.run(poll_operator=lambda: None)
+    assert close_rollout_session(rollout) == 1
     assert cleanup == ['writer', 'model']
-    assert rollout.result.errors[0]['stage'] == 'robot_close'
 
 
 @pytest.mark.parametrize('prediction_ns,mapping_ns,steps,progress', [
@@ -314,11 +331,10 @@ def test_close_interrupt_latches_emergency_before_waiting_for_writer(monkeypatch
 def test_async_progress_requires_valid_window(monkeypatch, prediction_ns, mapping_ns, steps, progress):
     from concurrent.futures import Future
     rollout, clock, sends = make_rollout(monkeypatch, mode='async')
-    rollout.runtime_state.revoke_motion = lambda: None
     rollout.policy_info.future_steps = steps
     rollout.execution = replace(rollout.execution, action_steps=min(4, steps))
     rollout.policy_info.control_action_dim = 19
-    deadline = rollout.wait_deadline_ns
+    deadline = clock[0] + 2_000_000_000
     pending = [None, None]
     def predict(*args, **kwargs):
         pending[:] = [Future(), clock[0] + prediction_ns]
@@ -340,28 +356,26 @@ def test_async_progress_requires_valid_window(monkeypatch, prediction_ns, mappin
             clock[0] += 1_000_000
         assert len(sends) > 20
         assert clock[0] > deadline
-        assert rollout.wait_deadline_ns is None
+        assert not rollout.finished
     else:
-        with pytest.raises(TimeoutError, match='budget expired'):
-            for _ in range(4000):
-                rollout.step()
-                clock[0] += 1_000_000
-        assert not sends
-        assert rollout.wait_deadline_ns == deadline
-        assert clock[0] <= deadline + mapping_ns + 1_000_000
+        for _ in range(4000):
+            rollout.step()
+            clock[0] += 1_000_000
+        assert not sends and not rollout.finished
 
 
-def test_target_lease_bounds_progress_even_with_plan(monkeypatch):
-    rollout, clock, _ = make_rollout(monkeypatch, mode='async')
-    rollout.wait_deadline_ns = None
-    rollout.target_expires_ns = clock[0]
-    assert rollout.expired_budget() == (clock[0], 'wait')
-    rollout.run_deadline_ns = clock[0]
-    assert rollout.expired_budget() == (clock[0], 'duration')
+def test_owner_stop_prevents_late_prediction_submission(monkeypatch):
+    from dexmani_real.robot.commands import OperationCancelled
+    rollout, clock, sends = make_rollout(monkeypatch)
+    rollout.sync_actions = np.zeros((4, 19))
+    rollout.runtime_state.stop_signal.set()
+    with pytest.raises(OperationCancelled):
+        rollout.step()
+    assert not sends
 
 
 @pytest.mark.parametrize('control_camera', [False, True])
-def test_frozen_recorder_stops_archive_only_reads(monkeypatch, control_camera):
+def test_capture_needs_remain_fixed(monkeypatch, control_camera):
     rollout, _, _ = make_rollout(monkeypatch)
     control = ObservationNeeds(camera_fields=('rgb',) if control_camera else ())
     rollout.control_needs = control
@@ -378,22 +392,22 @@ def test_frozen_recorder_stops_archive_only_reads(monkeypatch, control_camera):
     Rollout.read_observation(rollout)
     rollout.recorder.is_recording = False
     Rollout.read_observation(rollout)
-    assert needs == [rollout.capture_needs, control]
+    assert needs == [rollout.capture_needs, rollout.capture_needs]
 
 
 @pytest.mark.parametrize('model_fails', [False, True])
 def test_duration_and_owner_lease_stop_together_preserve_faults(monkeypatch, model_fails):
     from concurrent.futures import Future
 
-    from dexmani_real.runtime.state import SafetyState, SessionState
+    from dexmani_real.runtime.state import SessionState
 
     rollout, clock, sends = make_rollout(monkeypatch, mode='async')
-    rollout.runtime_state = state = SessionState(safety_state=SafetyState.RUNNING)
+    rollout.runtime_state = state = SessionState()
     rollout.cancel_epoch = state.cancel_epoch
     state.stop_signal.set()  # owner 已观察到目标租期到期。
     rollout.robot.check = lambda: None
     rollout.robot.stop = lambda: None
-    rollout.run_deadline_ns = rollout.target_expires_ns = clock[0]
+    rollout.run_deadline_ns = clock[0]
     if model_fails:
         done = Future()
         done.set_exception(ValueError('model computation failed'))
@@ -408,10 +422,10 @@ def test_duration_and_owner_lease_stop_together_preserve_faults(monkeypatch, mod
 
 def test_operator_cancel_at_duration_still_uses_current_input(monkeypatch):
     from dexmani_real.robot.commands import OperationCancelled
-    from dexmani_real.runtime.state import SafetyState, SessionState
+    from dexmani_real.runtime.state import SessionState
 
     rollout, clock, _ = make_rollout(monkeypatch)
-    rollout.runtime_state = state = SessionState(safety_state=SafetyState.RUNNING)
+    rollout.runtime_state = state = SessionState()
     rollout.cancel_epoch = state.cancel_epoch
     rollout.robot.check = lambda: None
     rollout.run_deadline_ns = clock[0]
@@ -424,8 +438,6 @@ def test_operator_cancel_at_duration_still_uses_current_input(monkeypatch):
 def test_rtc_missing_committed_snapshot_stops(monkeypatch):
     from dexmani_real.deployment.schedule import ActionChunk
     rollout, clock, sends = make_rollout(monkeypatch, mode='rtc')
-    rollout.runtime_state.revoke_motion = lambda: None
-    rollout.runtime_state.estop_request = False
     stopped = []
     rollout.robot.stop = lambda: stopped.append(True)
     rollout.control_needs = ObservationNeeds(camera_fields=('rgb',))
@@ -446,25 +458,22 @@ def test_rtc_missing_committed_snapshot_stops(monkeypatch):
 
 
 @pytest.mark.parametrize('mode', ['async', 'rtc'])
-def test_bootstrap_missing_snapshot_waits_with_original_budget(monkeypatch, mode):
+def test_bootstrap_missing_snapshot_has_no_hidden_wait_budget(monkeypatch, mode):
     rollout, clock, sends = make_rollout(monkeypatch, mode=mode)
-    rollout.runtime_state.revoke_motion = lambda: None
     rollout.control_needs = ObservationNeeds(camera_fields=('rgb',))
-    deadline = rollout.wait_deadline_ns
+    deadline = clock[0] + 2_000_000_000
     rollout.step()
     assert not rollout.finished and not sends
-    clock[0] = deadline
-    with pytest.raises(TimeoutError, match='budget expired'):
-        rollout.step()
-    assert rollout.wait_deadline_ns == deadline
+    clock[0] = deadline + 1
+    rollout.step()
+    assert not rollout.finished and not sends
+
 
 
 @pytest.mark.parametrize('mapping_ns,stale', [(62_499_999, False), (62_500_000, False), (63_000_000, False), (140_000_000, True)])
 def test_async_full_tail_window_and_source_boundary(monkeypatch, mapping_ns, stale):
     from dexmani_real.deployment.schedule import ActionChunk
     rollout, clock, sends = make_rollout(monkeypatch, mode='async')
-    rollout.runtime_state.revoke_motion = lambda: None
-    rollout.runtime_state.estop_request = False
     rollout.robot.stop = lambda: None
     rollout.plan = ActionChunk(np.zeros((8, 19)), 0)
     rollout.last_slot = 6
@@ -479,9 +488,9 @@ def test_async_full_tail_window_and_source_boundary(monkeypatch, mapping_ns, sta
         assert 'control_sources' in rollout.result.termination_details
     elif not sends:
         assert rollout.plan is None and not rollout.finished
-        clock[0] = rollout.wait_deadline_ns
-        with pytest.raises(TimeoutError, match='budget expired'):
-            rollout.step()
+        clock[0] += 3_000_000_000
+        rollout.step()
+        assert not rollout.finished
 
 
 def test_sync_history_survives_prediction_wait(monkeypatch):
@@ -517,10 +526,9 @@ def test_sync_history_survives_prediction_wait(monkeypatch):
 def test_teleop_esc_arriving_in_poll_records_estop():
     import threading
     from dexmani_real.runtime.keyboard import Keyboard
-    from dexmani_real.runtime.state import SessionState, SafetyState
+    from dexmani_real.runtime.state import SessionState
     from dexmani_real.teleop.loop import TeleopLoop, TeleopPhase
-    state = SessionState(safety_state=SafetyState.RUNNING,
-                         stop_signal=threading.Event(), emergency_signal=threading.Event())
+    state = SessionState(stop_signal=threading.Event(), emergency_signal=threading.Event())
     keyboard = Keyboard(estop_callback=state.request_emergency_stop)
     keyboard.active = True
     keyboard.listener = SimpleNamespace(is_alive=lambda: True)
@@ -584,3 +592,180 @@ def test_prefetch_uses_retained_history_with_real_model_future(monkeypatch, mode
         assert not rollout.finished
     finally:
         worker.close(rollout.runtime_state).result(timeout=1)
+
+
+def test_slow_first_prediction_has_only_episode_duration(monkeypatch):
+    rollout, clock, sends = make_rollout(monkeypatch)
+    rollout.run_deadline_ns = clock[0] + 60_000_000_000
+    rollout.model.future = object()
+    clock[0] += 3_000_000_000
+    rollout.step()
+    assert not rollout.finished and not sends
+    clock[0] = rollout.run_deadline_ns
+    rollout.step()
+    assert rollout.result.termination_reason == 'duration_complete'
+
+
+def test_recording_worker_exit_is_a_session_fault(monkeypatch, tmp_path):
+    from dexmani_real.data.recorder import EpisodeRecorder
+    rollout, _, _ = make_rollout(monkeypatch)
+    rollout.recorder = EpisodeRecorder(tmp_path, control_hz=16)
+    rollout.recorder.is_recording = True
+    rollout.sensors = SimpleNamespace(check=lambda **kwargs: False)
+    with pytest.raises(RuntimeError, match='camera worker exited'):
+        rollout.step()
+    assert rollout.runtime_state.stop_signal.is_set()
+
+
+def test_policy_raw_is_explicit_opt_in():
+    import inspect
+    from dexmani_real.deployment.run import run_policy
+    from scripts.run_policy import build_parser
+    assert inspect.signature(run_policy).parameters['record_raw'].default is False
+    parser = build_parser()
+    assert not parser.parse_args([]).record_raw
+    assert parser.parse_args(['--record-raw']).record_raw
+    with pytest.raises(SystemExit):
+        parser.parse_args(['--no-record'])
+
+
+def test_mapping_crossing_episode_deadline_does_not_submit(monkeypatch):
+    rollout, clock, sends = make_rollout(monkeypatch)
+    rollout.run_deadline_ns = clock[0] + 10_000_000
+    rollout.sync_actions = np.zeros((4, 19))
+    def mapping(*args):
+        clock[0] += 20_000_000
+        return RobotCommand(np.zeros(7)), None
+    rollout.map_command = mapping
+    rollout.step()
+    assert not sends
+    assert rollout.result.termination_reason == 'duration_complete'
+
+
+def test_policy_initial_observation_need_not_be_home(monkeypatch):
+    rollout, _, _ = make_rollout(monkeypatch)
+    rollout.robot.service_feedback = lambda: None
+    row = rollout.start_observation()
+    assert row is not None
+    assert not np.allclose(row.arm['qpos'][0], rollout.runtime.arm.home_qpos)
+
+
+@pytest.mark.parametrize('cancelled', [False, True])
+def test_policy_prepare_only_accepts_current_operator_cancellation(monkeypatch, cancelled):
+    from dexmani_real.robot.commands import OperationCancelled
+    rollout, _, _ = make_rollout(monkeypatch)
+    rollout.started_ns = 0
+    def prepare(poll):
+        if cancelled:
+            rollout.runtime_state.request_stop()
+        raise OperationCancelled('prepare interrupted')
+    rollout.prepare = prepare
+    if cancelled:
+        rollout.run(poll_operator=lambda: None)
+        assert rollout.runtime_state.quit_requested
+        assert rollout.result.termination_reason == 'start_cancelled'
+    else:
+        with pytest.raises(OperationCancelled, match='prepare interrupted'):
+            rollout.run(poll_operator=lambda: None)
+        assert not rollout.runtime_state.quit_requested
+        assert rollout.result.termination_reason == 'preparation_failed'
+
+
+@pytest.mark.parametrize('cancelled', [False, True])
+def test_policy_home_only_accepts_current_operator_cancellation(monkeypatch, cancelled):
+    from dexmani_real.deployment.session import PolicySession
+    from dexmani_real.robot.commands import OperationCancelled
+    session = PolicySession.__new__(PolicySession)
+    session.runtime_state = state = SessionState()
+    state.request_stop()  # 之前正常结束过一段，不能据此吞掉这次意外中断。
+    epoch = state.cancel_epoch
+    session.episode = None
+    session.robot = SimpleNamespace(check=lambda: None)
+    session.audio = SimpleNamespace(play=lambda sound: None)
+    session.get_home_planner = lambda: None
+    session.home_abort_requested = lambda: False
+    def home(*args, **kwargs):
+        if cancelled:
+            state.request_stop()
+        raise OperationCancelled('home interrupted')
+    monkeypatch.setattr('dexmani_real.deployment.session.home_robot', home)
+    if cancelled:
+        assert session.run_home(epoch)
+        assert state.quit_requested
+    else:
+        with pytest.raises(OperationCancelled, match='home interrupted'):
+            session.run_home(epoch)
+        assert not state.quit_requested
+
+
+def test_rollout_releases_completed_recorder_once(monkeypatch):
+    rollout, _, _ = make_rollout(monkeypatch)
+    writes, sounds = [], []
+    rollout.result.termination_reason = 'operator'
+    rollout.audio.play = sounds.append
+    rollout.recorder = SimpleNamespace(
+        finish=lambda **kwargs: writes.append(kwargs) or '/published',
+        result=lambda: {'recording_truncated_reason': None, 'path': '/published'},
+    )
+    rollout.finish_recording()
+    rollout.finish_recording()
+    assert len(writes) == 1 and sounds == ['save']
+    assert rollout.recorder is None and rollout.result.raw['path'] == '/published'
+
+
+def test_policy_secondary_sensor_error_does_not_poison_writer(monkeypatch):
+    rollout, _, _ = make_rollout(monkeypatch)
+    rollout.sync_actions = np.zeros((4, 19))
+    rollout.recorder = SimpleNamespace(error=None, check_error=lambda: None, append=lambda *a, **kw: None)
+    reads = []
+    def quality(row):
+        reads.append(True)
+        if len(reads) == 2:
+            raise RuntimeError('camera exited')
+    rollout.recording_issue = quality
+    def mapping(*args):
+        raise ValueError('mapping failed')
+    rollout.map_command = mapping
+    with pytest.raises(ValueError, match='mapping failed'):
+        rollout.step()
+    assert rollout.recorder.error is None and len(reads) == 2
+    assert rollout.runtime_state.stop_signal.is_set()
+
+
+def test_policy_rejects_initial_arm_posture_outside_operational_limits(monkeypatch):
+    rollout, _, _ = make_rollout(monkeypatch)
+    row, _ = rollout.read_observation()
+    row.arm['qpos'][0, 0] = rollout.runtime.arm.joint_limit_upper[0] + .1
+    rollout.read_observation = lambda: (row, None)
+    rollout.robot.service_feedback = lambda: None
+    with pytest.raises(ValueError, match='operational joint limits'):
+        rollout.start_observation()
+
+
+@pytest.mark.parametrize('cancelled', [False, True])
+def test_teleop_prepare_only_accepts_current_operator_cancellation(monkeypatch, cancelled):
+    from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.teleop.loop import TeleopLoop
+    rollout, _, _ = make_rollout(monkeypatch)
+    state = rollout.runtime_state
+    state.request_stop()
+    epoch = state.cancel_epoch
+    keyboard = Keyboard()
+    loop = TeleopLoop(
+        state, rollout.runtime, rollout.robot, task_label='test',
+        sensors=None, controller=None, recording_dir=None, max_duration_s=60,
+        runtime_config_json=None, keyboard=keyboard, audio=rollout.audio,
+    )
+    loop.poll_blocking_commands = lambda: False
+    def prepare(epoch):
+        if cancelled:
+            state.request_stop()
+        raise OperationCancelled('prepare interrupted')
+    rollout.robot.prepare_streaming = prepare
+    if cancelled:
+        loop.start_episode(epoch)
+        assert state.quit_requested
+    else:
+        with pytest.raises(OperationCancelled, match='prepare interrupted'):
+            loop.start_episode(epoch)
+        assert not state.quit_requested

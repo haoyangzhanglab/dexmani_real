@@ -6,10 +6,8 @@ from dataclasses import dataclass
 
 DEFAULT_NUM_EPISODES = 20
 DEFAULT_MAX_RUNNING_S = 60.0
-START_ARM_TOLERANCE_DEG = 0.5
-# 预测等待与目标租期是独立预算，均不代表物理停止延迟。
+# 设备 owner 检查目标租期；它不代表物理停止延迟。
 COMMAND_LEASE_NS = 2_000_000_000
-PREDICTION_WAIT_TIMEOUT_NS = 2_000_000_000
 RUNTIME_SECTIONS = (
     "execution", "arm", "hand", "motion", "camera", "pointcloud", "hand_pointcloud", "environment",
 )

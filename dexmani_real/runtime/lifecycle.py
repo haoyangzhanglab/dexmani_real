@@ -4,7 +4,7 @@ import logging
 import time
 
 from dexmani_real.robot.commands import OperationCancelled
-from dexmani_real.runtime.state import SafetyState, SessionState
+from dexmani_real.runtime.state import SessionState
 
 logger = logging.getLogger(__name__)
 
@@ -17,9 +17,8 @@ WORKER_STOP_TIMEOUT_S = 1.0
 
 
 class SensorWorkers:
-    def __init__(self, channels=None, *, required_names):
+    def __init__(self, channels=None):
         self.channels = channels
-        self.required_names = required_names
         self.processes = []
 
     def start(self, process, *, ring, timeout_s=None, may_start) -> None:
@@ -78,9 +77,7 @@ class SensorWorkers:
                     process.join(timeout=WORKER_STOP_TIMEOUT_S)
                 if process.exitcode is None:
                     raise RuntimeError(f"process {process.name} could not be confirmed stopped")
-                if escalation != "graceful" or (
-                    process.exitcode != 0 and process.name in self.required_names
-                ):
+                if escalation != "graceful" or process.exitcode != 0:
                     errors.append((process.name, RuntimeError(f"worker {process.name}: exitcode={process.exitcode}, {escalation}")))
                     logger.warning(
                         "worker %s stopped: exitcode=%s escalation=%s",
@@ -109,11 +106,10 @@ class SensorWorkers:
 
 
 def close_runtime(runtime_state: SessionState, robot=None, *, sensors=None, keyboard=None) -> None:
-    """撤权后尝试全部关闭；即时锁存中断，首错传播，其余错误记录 traceback。"""
+    """停止后尝试全部关闭；即时锁存中断，首错传播，其余错误记录 traceback。"""
     runtime_state.stop_signal.set()
     errors = []
     for stage, close in (
-        ("revoke_motion", lambda: runtime_state.revoke_motion(SafetyState.DISARMED)),
         ("robot_close", robot.close if robot is not None else None),
         ("keyboard_stop", keyboard.stop if keyboard is not None else None),
         ("sensor_shutdown", (lambda: sensors.shutdown(runtime_state)) if sensors is not None else None),

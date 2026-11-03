@@ -115,7 +115,6 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
         ),
     )
     validate_robot_config(runtime)
-    runtime.arm.validate_home()
     runtime.hand.validate_home()
     runtime.environment.validate()
     validate_control_rate(runtime, 1.0 / info.control_dt_s)

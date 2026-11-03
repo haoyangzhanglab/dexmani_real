@@ -59,7 +59,7 @@ def run_policy(
     seed=0,
     num_episodes=DEFAULT_NUM_EPISODES,
     max_running_s=DEFAULT_MAX_RUNNING_S,
-    record_raw=True,
+    record_raw=False,
     output=None,
     camera_calibration_path=None,
 ) -> int:

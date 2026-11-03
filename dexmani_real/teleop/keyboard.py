@@ -60,7 +60,6 @@ class KeyboardTeleop:
             raise
         except Exception:
             self.runtime_state.stop_signal.set()
-            self.runtime_state.revoke_motion()
             raise
         finally:
             try:
@@ -89,7 +88,8 @@ class KeyboardTeleop:
         self.robot.check_services = lambda: self.keys.check_health()
         self.robot.connect()
         self.robot.check()
-        self.runtime_state.arm(cancel_epoch=startup_epoch)
+        if not (self.runtime_state.cancel_epoch == startup_epoch and self.runtime_state.requests_allow_motion()):
+            raise OperationCancelled("startup cancelled")
         self.prepare_jog(startup_epoch)
         print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
         print(
@@ -102,7 +102,7 @@ class KeyboardTeleop:
     def prepare_jog(self, cancel_epoch):
         self.jog.clear_reference()
         self.robot.prepare_streaming(cancel_epoch)
-        if self.runtime_state.begin_motion(cancel_epoch=cancel_epoch) is None:
+        if not (self.runtime_state.cancel_epoch == cancel_epoch and self.runtime_state.requests_allow_motion() and not self.runtime_state.stop_signal.is_set()):
             raise OperationCancelled("jog cancelled during preparation")
         self.robot.send_action(
             RobotCommand(arm_hold=True),
@@ -143,10 +143,10 @@ class KeyboardTeleop:
 
     def run_home(self, expected_cancel_epoch):
         with self.runtime_state.motion_lock:
-            if not self.runtime_state.can_move(cancel_epoch=expected_cancel_epoch):
+            if not (self.runtime_state.cancel_epoch == expected_cancel_epoch and self.runtime_state.requests_allow_motion() and not self.runtime_state.stop_signal.is_set()):
                 logger.info("Ignored revoked HOME intent")
                 return
-            self.runtime_state.revoke_motion()
+            self.runtime_state.stop_signal.set()
             cancel_epoch = self.runtime_state.cancel_epoch
         logger.info("Returning home...")
 

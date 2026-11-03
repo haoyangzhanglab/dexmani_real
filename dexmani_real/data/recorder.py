@@ -21,7 +21,7 @@ RECORDER_STOP_TIMEOUT_S = 60.0
 
 
 class RecordingError(RuntimeError):
-    """录制失败，由控制线程撤销运动授权。"""
+    """录制 I/O 失败，由控制线程停止本段并退出会话。"""
 
 
 @dataclass(frozen=True)
@@ -142,26 +142,22 @@ class EpisodeRecorder:
                 raise
             self.check_error()
 
-    def freeze(self, reason):
-        if self.recording_truncated_reason is None:
-            self.recording_truncated_reason = reason
-            self.is_recording = False
-            logger.warning("录制已截断：%s；运动结束后按保存/丢弃意图收尾。", reason)
-
-    def append(self, row, command=None, *, quality_issue=None):
+    def append(self, row, command=None, *, quality_issue=None) -> str | None:
+        """质量拒绝返回原因，调用方立即结束本段；I/O 错误继续抛出。"""
         self.check_error()
         if not self.is_recording:
-            return
+            return None
         if quality_issue is not None:
-            self.freeze(quality_issue)
-            return
+            self.recording_truncated_reason = quality_issue
+            return quality_issue
         # 数组已脱离共享缓冲，入队后生产者不再修改。
         snapshot = replace(row, point_cloud=None)
         try:
             self.queue.put_nowait((snapshot, command))
         except Full:
-            self.freeze("recording_queue_full")
-            return
+            self.recording_truncated_reason = "recording_queue_full"
+            return self.recording_truncated_reason
+        return None
 
     def finish(self, *, save, reason, details=None):
         """关闭后由监督方发布；首次 finish 建立唯一收尾预算。"""
@@ -169,13 +165,13 @@ class EpisodeRecorder:
             self.check_error()
             return self.published_path
         self.is_recording = False
-        self.finish_request = request = _FinishRequest(
-            reason, tuple(dict(item) for item in (details or ())),
-            self.recording_truncated_reason,
-        )
-        # START 只报错；外层先停止设备，再由首次 finish 建立等待预算。
-        deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
         try:
+            self.finish_request = request = _FinishRequest(
+                reason, tuple(dict(item) for item in (details or ())),
+                self.recording_truncated_reason,
+            )
+            # 建立 finish 后的中断也须记为失败，不能让重入误报已完成。
+            deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
             if self.writer_pending and self.error is None:
                 self.queue.put(request, timeout=max(0.0, deadline - time.monotonic()))
             if self.thread is not None and self.thread.ident is not None:

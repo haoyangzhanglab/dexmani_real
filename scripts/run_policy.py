@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_NUM_EPISODES,
         help=(
-            f"exit after N episodes that entered RUNNING have ended (default: {DEFAULT_NUM_EPISODES}); "
+            f"exit after N episodes that started running have ended (default: {DEFAULT_NUM_EPISODES}); "
             "press B for each episode or Q to exit early; "
             "failed/cancelled preparations do not count; independent of Raw recording"
         ),
@@ -72,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MAX_RUNNING_S,
         help=(
-            "per-episode cooperative duration budget from RUNNING admission "
+            "per-episode cooperative duration budget from the actual episode start "
             f"(default: {DEFAULT_MAX_RUNNING_S:g} seconds)"
         ),
     )
@@ -86,9 +86,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--camera-calibration", type=Path, default=None)
     parser.add_argument(
-        "--no-record",
+        "--record-raw",
         action="store_true",
-        help="Disable Raw recording; evaluation results are always saved",
+        help="Enable full Raw recording; evaluation results are always saved",
     )
     research = parser.add_argument_group("Policy inference")
     research.add_argument("--weights", choices=("ema", "raw"), default=None)
@@ -130,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         num_episodes=args.num_episodes,
         max_running_s=args.max_running_s,
-        record_raw=not args.no_record,
+        record_raw=args.record_raw,
         output=args.output,
         camera_calibration_path=args.camera_calibration,
     )

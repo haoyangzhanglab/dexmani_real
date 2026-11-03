@@ -1,4 +1,4 @@
-"""动作映射只生成目标，执行授权由运行层管理。"""
+"""动作映射只生成目标，实际发送由运行层控制。"""
 
 from dataclasses import dataclass
 

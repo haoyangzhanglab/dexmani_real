@@ -104,126 +104,117 @@ def run_teleop(
     keyboard = audio = None
     primary_failure: BaseException | None = None
     try:
-        sensors = SensorWorkers(channels, required_names=("vr",))
-        robot = Robot(
-            runtime.arm,
-            runtime.hand,
-            runtime_state=runtime_state,
-            check_services=sensors.check,
-        )
-        keyboard = Keyboard(
-            estop_callback=runtime_state.request_emergency_stop,
-            bindings={
-                "s": runtime_state.request_stop,
-                "c": runtime_state.request_stop,
-                "q": runtime_state.request_quit,
-            },
-        )
-        audio = AudioFeedback()
-        loop = TeleopLoop(
-            runtime_state,
-            runtime,
-            robot,
-            task_label=task_name,
-            sensors=sensors,
-            controller=controller,
-            keyboard=keyboard,
-            audio=audio,
-            recording_dir=recording_dir,
-            max_duration_s=max_duration_s,
-            runtime_config_json=runtime_config_json,
-        )
-        keyboard.bindings["d"] = runtime_state.request_stop
-        keyboard.start()
-
-        def check_services():
-            if not keyboard.check_health() or not sensors.check(names=("vr",)):
-                raise RobotError("teleop control service unavailable")
-            return True
-
-        robot.check_services = check_services
-        robot.connect()
-        if record:
-            sensors.start(
-                ctx.Process(
-                    name="camera",
-                    target=run_camera,
-                    args=(sensors.channels, runtime.camera),
-                ),
-                ring=sensors.channels.camera_ring,
-                timeout_s=CAMERA_READY_TIMEOUT_S,
-                may_start=lambda: keyboard.check_health() and runtime_state.requests_allow_motion()
-                    and runtime_state.cancel_epoch == startup_cancel_epoch,
-            )
-            loop.camera_snapshot = snapshot_camera_parameters(
-                channels,
-                runtime.camera,
-                camera_calibration_path,
-            )
-        robot.check()
-        if runtime_state.cancel_epoch != startup_cancel_epoch:
-            raise OperationCancelled("teleop startup cancelled")
-        runtime_state.arm(cancel_epoch=startup_cancel_epoch)
-        initialize_teleop(
-            loop, ctx.Process(name="vr", target=run_vr, args=(channels, runtime.vr)),
-            cancel_epoch=startup_cancel_epoch,
-        )
-        loop.run()
-        robot.check()
-        clean = bool(runtime_state.quit_requested)
-    except KeyboardInterrupt as exc:
-        primary_failure = exc
-        runtime_state.request_emergency_stop()
-    except OperationCancelled:
         try:
+            sensors = SensorWorkers(channels)
+            robot = Robot(
+                runtime.arm,
+                runtime.hand,
+                runtime_state=runtime_state,
+                check_services=sensors.check,
+            )
+            keyboard = Keyboard(
+                estop_callback=runtime_state.request_emergency_stop,
+                bindings={
+                    "s": runtime_state.request_stop,
+                    "c": runtime_state.request_stop,
+                    "q": runtime_state.request_quit,
+                },
+            )
+            audio = AudioFeedback()
+            loop = TeleopLoop(
+                runtime_state,
+                runtime,
+                robot,
+                task_label=task_name,
+                sensors=sensors,
+                controller=controller,
+                keyboard=keyboard,
+                audio=audio,
+                recording_dir=recording_dir,
+                max_duration_s=max_duration_s,
+                runtime_config_json=runtime_config_json,
+            )
+            keyboard.bindings["d"] = runtime_state.request_stop
+            keyboard.start()
+
+            def check_services():
+                if not keyboard.check_health() or not sensors.check():
+                    raise RobotError("teleop control service unavailable")
+                return True
+
+            robot.check_services = check_services
+            robot.connect()
+            if record:
+                sensors.start(
+                    ctx.Process(
+                        name="camera",
+                        target=run_camera,
+                        args=(sensors.channels, runtime.camera),
+                    ),
+                    ring=sensors.channels.camera_ring,
+                    timeout_s=CAMERA_READY_TIMEOUT_S,
+                    may_start=lambda: keyboard.check_health() and runtime_state.requests_allow_motion()
+                        and runtime_state.cancel_epoch == startup_cancel_epoch,
+                )
+                loop.camera_snapshot = snapshot_camera_parameters(
+                    channels,
+                    runtime.camera,
+                    camera_calibration_path,
+                )
+            robot.check()
+            if (runtime_state.cancel_epoch != startup_cancel_epoch
+                    or not runtime_state.requests_allow_motion()):
+                raise OperationCancelled("startup cancelled")
+            initialize_teleop(
+                loop, ctx.Process(name="vr", target=run_vr, args=(channels, runtime.vr)),
+                cancel_epoch=startup_cancel_epoch,
+            )
+        except OperationCancelled:
             if robot is not None:
                 robot.check()
-            if not (
-                runtime_state.cancel_epoch != startup_cancel_epoch
-                or runtime_state.quit_requested or runtime_state.estop_request
-            ):
+            if (runtime_state.cancel_epoch == startup_cancel_epoch
+                    and runtime_state.requests_allow_motion()):
                 raise
-        except Exception as failure:
-            primary_failure = failure
-            runtime_state.stop_signal.set()
-            logger.exception("teleop cancellation also failed")
-        else:
             runtime_state.request_quit()
             clean = True
             logger.info("Teleop startup cancelled")
+        else:
+            loop.run()
+            robot.check()
+            clean = bool(runtime_state.quit_requested)
+    except KeyboardInterrupt as exc:
+        primary_failure = exc
+        runtime_state.request_emergency_stop()
     except Exception as exc:
         primary_failure = exc
         runtime_state.stop_signal.set()
         logger.exception("teleop session failed")
     finally:
         try:
-            if loop is not None:
-                loop.close()
-        except KeyboardInterrupt:
-            runtime_state.request_emergency_stop()
-            logger.exception("teleop capture cleanup interrupted")
-        except Exception as exc:
-            runtime_state.stop_signal.set()
-            logger.exception("teleop capture cleanup failed")
+            close_runtime(runtime_state, robot, sensors=sensors, keyboard=keyboard)
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                runtime_state.request_emergency_stop()
             primary_failure = primary_failure or exc
-        finally:
+            logger.exception("teleop runtime cleanup failed")
+        else:
+            shutdown_clean = True
+        try:
+            if loop is not None:
+                loop.finish_recording()
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                runtime_state.request_emergency_stop()
+            primary_failure = primary_failure or exc
+            logger.exception("teleop capture cleanup failed")
+        if audio is not None:
             try:
-                close_runtime(runtime_state, robot, sensors=sensors, keyboard=keyboard)
+                audio.close()
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     runtime_state.request_emergency_stop()
-                logger.exception("teleop runtime cleanup failed")
-            else:
-                shutdown_clean = True
-            finally:
-                if audio is not None:
-                    try:
-                        audio.close()
-                    except KeyboardInterrupt:
-                        runtime_state.request_emergency_stop()
-                        logger.exception("teleop audio cleanup interrupted")
-                    except Exception:
-                        logger.warning("teleop audio cleanup failed", exc_info=True)
+                primary_failure = primary_failure or exc
+                logger.exception("teleop audio cleanup failed")
     return int(
         not clean or not shutdown_clean or primary_failure is not None or runtime_state.estop_request
     )
@@ -266,7 +257,7 @@ def initialize_teleop(loop, vr_process, *, cancel_epoch) -> None:
     calibrate_hand(loop, cancel_epoch)
     if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
         raise OperationCancelled("teleop startup cancelled")
-    loop.runtime_state.revoke_motion()
+    loop.runtime_state.stop_signal.set()
     print(
         "就绪：B 空闲时开始新段 | S/C 保存结束本段 | D 丢弃本段 | "
         "Q 保存并退出 | Esc 急停 | H 空闲时回初始位 | "

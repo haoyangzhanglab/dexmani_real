@@ -77,17 +77,16 @@ def test_model_cleanup_deadline_is_not_restarted(monkeypatch):
 
 
 def test_busy_admission_and_cancellation_preserve_operator_intent():
-    from dexmani_real.runtime.state import SafetyState
-    state = SessionState(safety_state=SafetyState.ARMED)
+    state = SessionState()
     keyboard = Keyboard(bindings={'s': state.request_stop})
     keyboard.active = True
     keyboard.allow_start()
     epoch = keyboard.accept_operation(state)
     # 内部准备停止不应成为一次用户取消，或提前占据结束原因。
-    state.revoke_motion()
+    state.stop_signal.set()
     assert state.cancel_epoch == epoch
     state.stop_signal.clear()
-    assert state.begin_motion(cancel_epoch=epoch) is not None
+    assert state.cancel_epoch == epoch and not state.stop_signal.is_set()
     keyboard.handle_key('s', True)
     assert [event.key for event in keyboard.events] == ["s"]
     assert state.cancel_epoch != epoch
@@ -114,6 +113,7 @@ def test_discard_intent_freezes_before_writer_wait(late_discard):
     loop.recorder = SimpleNamespace(finish=finish, recording_truncated_reason=None)
     if not late_discard:
         keyboard.handle_key('d', True)
+        loop.discard_requested = True  # 主线程已接纳 D。
     keyboard.handle_key('q', True)
     loop.finish_recording()
     assert decisions == [late_discard]
@@ -149,7 +149,7 @@ def test_fast_stop_and_event_publish_are_one_admission_boundary():
 
 def test_unstarted_sensor_is_owned_but_not_joined():
     from dexmani_real.runtime.lifecycle import SensorWorkers
-    workers = SensorWorkers(required_names=("camera",))
+    workers = SensorWorkers()
     process = SimpleNamespace(pid=None, name='camera', join=lambda **kwargs: pytest.fail('unstarted join'),
                               start=lambda: (_ for _ in ()).throw(OSError('start failed')))
     with pytest.raises(OSError, match='start failed'):
@@ -158,16 +158,12 @@ def test_unstarted_sensor_is_owned_but_not_joined():
     assert not workers.processes
 
 
-@pytest.mark.parametrize('required', [False, True])
-def test_finished_archive_worker_is_not_a_pending_or_close_failure(required):
+def test_failed_archive_worker_is_reported_without_retaining_dead_handle():
     from dexmani_real.runtime.lifecycle import SensorWorkers
-    workers = SensorWorkers(required_names=('camera',) if required else ())
+    workers = SensorWorkers()
     workers.processes = [SimpleNamespace(name='camera', pid=10, exitcode=1,
                                         join=lambda **kwargs: None, is_alive=lambda: False)]
-    if required:
-        with pytest.raises(RuntimeError, match='exitcode=1'):
-            workers.shutdown(SessionState())
-    else:
+    with pytest.raises(RuntimeError, match='exitcode=1'):
         workers.shutdown(SessionState())
     assert not workers.processes
 
@@ -176,9 +172,8 @@ def test_finished_archive_worker_is_not_a_pending_or_close_failure(required):
 def test_policy_ignores_unbound_keys_before_start_admission(keys):
     from dexmani_real.deployment.session import PolicySession
     from dexmani_real.runtime.keyboard import KeyEvent
-    from dexmani_real.runtime.state import SafetyState
     session = PolicySession.__new__(PolicySession)
-    session.runtime_state = SessionState(safety_state=SafetyState.ARMED)
+    session.runtime_state = SessionState()
     session.keyboard = Keyboard()
     session.keyboard.allow_start()
     session.episode = None
@@ -232,7 +227,7 @@ def test_sensor_ready_and_cancel_together_never_admits(failure):
             return 1
     process = SimpleNamespace(name='camera', start=lambda: None,
                               is_alive=lambda: not failure, exitcode=1)
-    workers = SensorWorkers(required_names=('camera',))
+    workers = SensorWorkers()
     with pytest.raises(RuntimeError if failure else OperationCancelled):
         workers.start(process, ring=Ring(), timeout_s=1,
                       may_start=lambda: state.cancel_epoch == epoch)
@@ -287,7 +282,7 @@ def test_poll_waits_for_fast_stop_and_returns_consistent_snapshot():
 
 @pytest.mark.parametrize('stage,key,exit_code', [
     ('vr', 's', 0), ('vr', 'c', 0), ('vr', 'd', 0), ('vr', 'q', 0), ('vr', 'esc', 1),
-    ('connect', None, 1),
+    ('connect', None, 1), ('running', 's', 1),
 ])
 def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_code):
     import threading
@@ -330,6 +325,8 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
                 raise OperationCancelled('device stopped without operator input')
         def check(self):
             pass
+        def service_idle(self):
+            pass
         def close(self):
             closed.append('robot')
 
@@ -344,7 +341,12 @@ def test_teleop_startup_cancel_has_one_exit_path(monkeypatch, stage, key, exit_c
     monkeypatch.setattr(run, 'AudioFeedback', lambda: SimpleNamespace(play=lambda sound: None,
                                                                    close=lambda: closed.append('audio')))
     monkeypatch.setattr(run, 'initialize_hand', lambda *args, **kwargs: None)
-    monkeypatch.setattr(run.TeleopLoop, 'run', lambda self: pytest.fail('cancelled startup entered control'))
+    def run_loop(self):
+        if stage == 'running':
+            self.runtime_state.request_stop()  # 之前一段的正常 S 不能授权吞掉新故障。
+            raise OperationCancelled('unexpected running interruption')
+        pytest.fail('cancelled startup entered control')
+    monkeypatch.setattr(run.TeleopLoop, 'run', run_loop)
     result = run.run_teleop(RealConfig(), record=False, episodes_dir='unused', max_duration_s=1,
                             runtime_config_json=None)
     assert result == exit_code
@@ -368,10 +370,76 @@ def test_policy_does_not_treat_internal_stop_as_startup_cancel():
     session.summary = {}
     failures = []
     def prepare():
-        state.revoke_motion()
+        state.stop_signal.set()
         raise OperationCancelled('device preparation unexpectedly stopped')
     session.prepare_resources = prepare
     session.close = lambda **kwargs: failures.append(kwargs['failure']) or 1
     assert session.run() == 1
     assert isinstance(failures[0], OperationCancelled)
     assert not state.quit_requested
+
+
+def test_unconsumed_discard_does_not_change_finished_segment():
+    from dexmani_real.teleop.loop import TeleopLoop
+    state = SessionState()
+    keyboard = Keyboard(bindings={'d': state.request_stop})
+    keyboard.active = True
+    loop = TeleopLoop.__new__(TeleopLoop)
+    loop.keyboard, loop.runtime_state = keyboard, state
+    loop.pending_termination_reason = 'operator'
+    loop.termination_details = []
+    loop.discard_requested = loop.capture_failed = False
+    loop.audio = SimpleNamespace(play=lambda sound: None)
+    decisions = []
+    loop.recorder = SimpleNamespace(
+        finish=lambda **kwargs: decisions.append(kwargs['save']),
+        recording_truncated_reason=None,
+    )
+    keyboard.handle_key('d', True)
+    loop.finish_recording()
+    assert decisions == [True]
+    assert state.stop_signal.is_set()
+
+
+def test_emergency_latches_before_lock_and_survives_concurrent_stop_clear():
+    import threading
+    state = SessionState()
+    request = threading.Thread(target=state.request_emergency_stop)
+    with state.motion_lock:
+        request.start()
+        assert state.emergency_signal.wait(1)
+        state.stop_signal.clear()  # 模拟准备边界已经读完条件、随后清 stop。
+    request.join(1)
+    assert not request.is_alive()
+    assert state.estop_request and state.stop_signal.is_set()
+
+
+@pytest.mark.parametrize('record_raw', [False, True])
+def test_policy_starts_only_sensors_requested_by_control_or_recording(monkeypatch, tmp_path, record_raw):
+    import sys
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.deployment import session as deployment
+    from dexmani_real.runtime.observation import ObservationNeeds
+
+    channels = []
+    monkeypatch.setitem(sys.modules, 'dexmani_policy.deployment', SimpleNamespace(load_policy=lambda *a, **kw: None))
+    monkeypatch.setattr(deployment, 'AudioFeedback', lambda: None)
+    monkeypatch.setattr(deployment.ActionMapper, 'for_mode', lambda *a, **kw: None)
+    monkeypatch.setattr(deployment, 'Keyboard', lambda **kwargs: SimpleNamespace(
+        start=lambda: None, check_health=lambda: True,
+    ))
+    monkeypatch.setattr(deployment, 'PolicyWorker', lambda *a, **kw: SimpleNamespace(load=lambda: None))
+    def sensor_channels(*args, **kwargs):
+        channels.append(kwargs)
+        return object()
+    monkeypatch.setattr(deployment, 'SensorChannels', sensor_channels)
+    session = deployment.PolicySession(
+        RealConfig(), SimpleNamespace(action_mode='joint'), output_dir=tmp_path,
+        run_config={}, device='cpu', seed=0, max_running_s=60, num_episodes=1,
+        record_raw=record_raw, camera_calibration_path=None,
+        observations=SimpleNamespace(needs=ObservationNeeds(), camera_static=False, build=lambda rows: rows),
+    )
+    session.prepare_resources()
+    assert bool(channels) == record_raw
+    assert session.capture_needs.camera_worker == record_raw
+    assert session.capture_needs.required_tactile == (('aggregate', 'dense') if record_raw else ())

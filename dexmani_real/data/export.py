@@ -114,13 +114,17 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     control, observation = rows["control_ns"], rows["observation_ns"]
     reject_invalid((control <= 0) | (observation < control), "invalid_control_or_observation_clock")
     grid_error = control - int(control[0]) - np.arange(frames) * period
-    reject_invalid(np.abs(np.diff(control) - period) > tolerance, "control_interval_gap_or_drift", 1)
+    reject_invalid(np.diff(control) <= 0, "control_clock_not_increasing", 1)
+    reject_invalid(np.diff(observation) <= 0, "observation_clock_not_increasing", 1)
+    if np.any(np.abs(np.diff(control) - period) > tolerance):
+        logger.warning("%s: control interval jitter/gaps; exporting original timestamps", reader.path)
     mean_period = None
     if frames >= 2:
         duration = int(control[-1]) - int(control[0])
         mean_period = duration / (frames - 1)
     readout = observation - control
-    reject_invalid(observation[:-1] >= control[1:], "overlapping_control_observations")
+    if np.any(observation[:-1] >= control[1:]):
+        logger.warning("%s: observation readout overlaps the next control sample", reader.path)
 
     for name in ("arm_ns", "hand_ns", "tactile_aggregate_ns", "tactile_dense_ns", "camera_ns"):
         values = rows[name]
@@ -131,7 +135,9 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     reject_invalid(np.diff(sequence) < 0, "camera_sequence_regressed", 1)
     tactile_age = int(reader.validate_tactile_metadata() * 1e9)
     for name in ("tactile_aggregate_ns", "tactile_dense_ns"):
-        reject_invalid(observation - rows[name] >= tactile_age, f"stale_source:{name}")
+        if np.any(observation - rows[name] >= tactile_age):
+            logger.warning("%s: stale source %s; maximum age=%d ns",
+                           reader.path, name, int((observation - rows[name]).max()))
 
     # 访问 dataset 触发 RawReader 的结构/dtype 校验，不读取数值切片。
     for name in ROBOT_DATASET_SPECS:

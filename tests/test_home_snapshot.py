@@ -8,7 +8,7 @@ import pytest
 from dexmani_real.config.real import RealConfig
 from dexmani_real.ipc.ring import SharedRing
 from dexmani_real.runtime.home import home_robot
-from dexmani_real.runtime.state import SafetyState, SessionState
+from dexmani_real.runtime.state import SessionState
 
 
 def test_snapshot_contention_reuses_complete_snapshot_without_renewal():
@@ -36,7 +36,7 @@ def test_home_planner_construction_uses_same_total_deadline(monkeypatch):
     monkeypatch.setattr('dexmani_real.runtime.home.time.monotonic_ns', lambda: now[0])
     monkeypatch.setattr('dexmani_real.runtime.home.time.monotonic', lambda: now[0] / 1e9)
     runtime = RealConfig()
-    state = SessionState(safety_state=SafetyState.ARMED)
+    state = SessionState()
     robot = SimpleNamespace(arm_config=runtime.arm, hand_config=replace(runtime.hand, enabled=False),
                             stop=lambda: None)
     def planner():
@@ -63,12 +63,12 @@ def test_home_sdk_return_does_not_mean_measured_arrival():
     owner.status['qpos'] = measured
     owner.status['timestamp_ns'] = time.monotonic_ns()
     with pytest.raises(TimeoutError, match='not confirmed'):
-        owner.home(np.stack((measured, target + .005, target)), target,
+        owner.home(np.stack((measured, target)),
                    check_abort=lambda: None, deadline_ns=time.monotonic_ns() + 20_000_000)
     assert len(moves) == 1
 
 
-def test_home_cancellation_after_first_waypoint_prevents_later_moves():
+def test_home_cancellation_after_submission_stops_confirmation():
     import threading
     import time
 
@@ -92,7 +92,7 @@ def test_home_cancellation_after_first_waypoint_prevents_later_moves():
     owner.status['qpos'] = measured
     owner.status['timestamp_ns'] = time.monotonic_ns()
     with pytest.raises(OperationCancelled, match='operator stop'):
-        owner.home(np.stack((measured, target + .005, target)), target,
+        owner.home(np.stack((measured, target)),
                    check_abort=check_abort, deadline_ns=time.monotonic_ns() + 1_000_000_000)
     assert len(moves) == 1
 
@@ -149,7 +149,7 @@ def test_unused_home_config_does_not_gate_streaming_but_home_rejects(part):
     else:
         runtime = replace(runtime, hand=replace(runtime.hand, home_timeout_s=0))
     validate_robot_config(runtime)
-    state = SessionState(safety_state=SafetyState.ARMED)
+    state = SessionState()
     robot = SimpleNamespace(arm_config=runtime.arm, hand_config=runtime.hand)
     # invalid HOME 必须在请求规划或发送任何目标前失败。
     with pytest.raises(HomeConfigurationError):
@@ -169,3 +169,63 @@ def test_streaming_keeps_standstill_thresholds_and_disabled_hand_geometry_checks
     fixed_hand = replace(runtime.hand, enabled=False, home_qpos_deg=(float('nan'),) * 12)
     with pytest.raises(ValueError, match='finite'):
         validate_robot_config(replace(runtime, hand=fixed_hand))
+
+
+@pytest.mark.parametrize('bad_sample', [None, 'middle', 'start'])
+def test_home_checks_only_direct_path_without_soft_escape(bad_sample):
+    from dexmani_real.control.homing import HomePlanner, HomePathRejected
+    planner = HomePlanner.__new__(HomePlanner)
+    planner.arm = RealConfig().arm
+    planner.limits = np.tile((-4., 4.), (7, 1))
+    current, target = np.zeros(7), np.full(7, .1)
+    visited = []
+    def check(q):
+        visited.append(np.array(q))
+        if bad_sample == 'middle' and .04 < q[0] < .06:
+            raise HomePathRejected('collision')
+        return (-.01 if bad_sample == 'start' and q[0] == 0 else .01), .1
+    planner._check_state = check
+    if bad_sample:
+        with pytest.raises(HomePathRejected):
+            planner.plan(current, target)
+    else:
+        np.testing.assert_array_equal(planner.plan(current, target), [current, target])
+        assert len(visited) > 2
+    assert all(np.allclose(q, q[0]) for q in visited)
+
+
+def test_owner_rejects_obsolete_multi_waypoint_home_before_motion():
+    from dexmani_real.robot.xarm7.worker import ArmController
+    config = RealConfig().arm
+    target = np.asarray(config.home_qpos)
+    owner = ArmController(config, None, None, SimpleNamespace())
+    with pytest.raises(ValueError, match='endpoints'):
+        owner.home(np.stack((target + .02, target + .01, target)),
+                   check_abort=lambda: None, deadline_ns=1)
+
+
+@pytest.mark.parametrize('changed', ['position', 'velocity'])
+def test_home_rechecks_measured_start_after_mode_change(changed):
+    import time
+    from dexmani_real.robot.xarm7.worker import ArmController
+    config = RealConfig().arm
+    target = np.asarray(config.home_qpos)
+    planned_start = target + .02
+    measured = [planned_start.copy()]
+    velocity = np.zeros(7)
+    def enter_mode(*args, **kwargs):
+        if changed == 'position':
+            measured[0] = planned_start + .01
+        else:
+            velocity[:] = 1
+    driver = SimpleNamespace(
+        enter_mode=enter_mode,
+        read=lambda: (measured[0], velocity),
+        move_home_milestone=lambda q: pytest.fail('moved from an unchecked start'),
+    )
+    owner = ArmController(config, SimpleNamespace(publish_status=lambda row: None), None, driver)
+    owner.status['qpos'] = planned_start
+    owner.status['timestamp_ns'] = time.monotonic_ns()
+    with pytest.raises(RuntimeError, match='planned path start|HOME preparation'):
+        owner.home(np.stack((planned_start, target)), check_abort=lambda: None,
+                   deadline_ns=time.monotonic_ns() + 1_000_000_000)

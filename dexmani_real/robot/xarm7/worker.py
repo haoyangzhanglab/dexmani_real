@@ -23,10 +23,6 @@ from dexmani_real.utils.timing import next_tick_ns, sample_is_fresh, sampling_cl
 logger = logging.getLogger(__name__)
 
 
-class _OperationTimeout(TimeoutError):
-    """owner 自己的等待预算耗尽，与 SDK 抛出的超时故障区分。"""
-
-
 class ArmController:
     def __init__(self, cfg, io, pipe, driver):
         self.cfg, self.io, self.pipe, self.driver = cfg, io, pipe, driver
@@ -48,7 +44,7 @@ class ArmController:
         if self.cancelled():
             raise OperationCancelled(f"{stage} cancelled")
         if time.monotonic_ns() >= deadline_ns:
-            raise _OperationTimeout(f"{stage} execution deadline expired")
+            raise TimeoutError(f"{stage} execution deadline expired")
 
     def fault(self, reason):
         if isinstance(reason, KeyboardInterrupt):
@@ -98,7 +94,7 @@ class ArmController:
             q, v = self.status["qpos"], self.status["qvel"]
             sample_ns = int(self.status["timestamp_ns"])
             if not sample_is_fresh(sample_ns, self.cfg.feedback_max_age_s, completed_ns):
-                raise _OperationTimeout(f"{stage}: current arm feedback unavailable/stale")
+                raise TimeoutError(f"{stage}: current arm feedback unavailable/stale")
             valid = np.max(np.abs(v)) <= self.cfg.homing.velocity_convergence_rad_s
             if target is not None:
                 valid = valid and np.max(np.abs(q - target)) <= tolerance
@@ -116,59 +112,51 @@ class ArmController:
             # 按查询开始时刻限频，查询耗时既不拉长采样间隔，也不充作停稳时长。
             remaining_ns = min(sample_ns + interval_ns, deadline_ns) - time.monotonic_ns()
             self.io.stop.wait(max(0, remaining_ns) / 1e9)
-        raise _OperationTimeout(f"{stage}: measured position/velocity dwell not confirmed")
+        raise TimeoutError(f"{stage}: measured position/velocity dwell not confirmed")
 
-    def home(self, waypoints, final_qpos, *, check_abort, deadline_ns):
+    def home(self, waypoints, *, check_abort, deadline_ns):
         waypoints = np.asarray(waypoints, dtype=np.float64)
         lower, upper = (
             np.asarray(self.cfg.joint_limit_lower),
             np.asarray(self.cfg.joint_limit_upper),
         )
-        if waypoints.ndim != 2 or waypoints.shape[1:] != (7,) or not np.isfinite(waypoints).all():
-            raise ValueError("invalid home waypoint array")
-        final_qpos = validate_arm_target(final_qpos, lower, upper)
+        if waypoints.shape not in {(0, 7), (2, 7)} or not np.isfinite(waypoints).all():
+            raise ValueError("HOME requires an empty path or current/home endpoints")
+        final_qpos = validate_arm_target(self.cfg.home_qpos, lower, upper)
         if np.any(waypoints < lower) or np.any(waypoints > upper):
             raise ValueError("home waypoint violates joint limits")
         if len(waypoints) and np.max(np.abs(waypoints[-1] - final_qpos)) > 1e-6:
             raise ValueError("final milestone does not match canonical home")
         check_abort()
-        targets = waypoints[1:]
-        if len(targets):
+        if len(waypoints):
             self.driver.enter_mode(0, check_abort=check_abort)
         # 模式操作可能阻塞；紧接着才取得并裁决真正用于起点检查的反馈。
-        now = time.monotonic_ns()
-        stamp = int(self.status["timestamp_ns"])
-        if not sample_is_fresh(stamp, self.cfg.feedback_max_age_s, now):
-            self.read_feedback()
+        self.read_feedback()
         check_abort()
         now = time.monotonic_ns()
         stamp = int(self.status["timestamp_ns"])
         if not sample_is_fresh(stamp, self.cfg.feedback_max_age_s, now):
-            raise _OperationTimeout("HOME start feedback unavailable/stale")
+            raise TimeoutError("HOME start feedback unavailable/stale")
         current = self.status["qpos"]
         velocity = self.status["qvel"]
+        if np.max(np.abs(velocity)) > self.cfg.homing.velocity_convergence_rad_s:
+            raise RuntimeError("arm moved during HOME preparation")
         if len(waypoints) == 0:
-            if (
-                np.max(np.abs(current - final_qpos)) > self.cfg.homing.convergence_rad
-                or np.max(np.abs(velocity)) > self.cfg.homing.velocity_convergence_rad_s
-            ):
+            if np.max(np.abs(current - final_qpos)) > self.cfg.homing.convergence_rad:
                 raise RuntimeError("empty home path while away from canonical home")
         elif np.max(np.abs(current - waypoints[0])) > self.cfg.homing.convergence_rad:
             raise RuntimeError("current state moved too far from planned path start")
-        if len(targets):
-            for index, target in enumerate(targets, 1):
-                check_abort()
-                self.driver.move_home_milestone(target)
-                check_abort()
-                self.wait_settled(
-                    check_abort,
-                    stage=f"home milestone {index}",
-                    deadline_ns=deadline_ns,
-                    target=target,
-                    tolerance_rad=min(self.cfg.homing.convergence_rad, np.deg2rad(0.5)),
-                )
-            if np.max(np.abs(self.status["qpos"] - final_qpos)) > self.cfg.homing.convergence_rad:
-                raise RuntimeError("home final target error")
+        if len(waypoints):
+            check_abort()
+            self.driver.move_home_milestone(final_qpos)
+            check_abort()
+            self.wait_settled(
+                check_abort,
+                stage="arm HOME",
+                deadline_ns=deadline_ns,
+                target=final_qpos,
+                tolerance_rad=min(self.cfg.homing.convergence_rad, np.deg2rad(0.5)),
+            )
         else:
             self.wait_settled(
                 check_abort,
@@ -213,7 +201,7 @@ class ArmController:
                         check_abort, stage="arm standstill", deadline_ns=message.deadline_ns,
                     )
                 self.home(
-                    message.waypoints, self.cfg.home_qpos,
+                    message.waypoints,
                     check_abort=check_abort, deadline_ns=message.deadline_ns,
                 )
             else:
@@ -231,8 +219,9 @@ class ArmController:
                 check_abort()
         except BaseException as exc:
             error = exc
-            if not isinstance(exc, (OperationCancelled, _OperationTimeout)):
+            if not isinstance(exc, OperationCancelled):
                 self.fault(exc)
+            self.io.closing.set()
             # 无需等待可能阻塞在其他设备 SDK 内的父进程。
             self.stop()
 
