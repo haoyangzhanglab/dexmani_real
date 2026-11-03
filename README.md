@@ -173,5 +173,3 @@ python -m cordvip_geometry view /tmp/cordvip/scene_001
 默认日志为终端 INFO、拒绝原因、完整异常 traceback 和简短段结果，需要留档时使用 shell 重定向。几何环境检查使用独立命令 `python -m cordvip_geometry check`。
 
 开发约定见 [AGENTS.md](AGENTS.md)。
-
-离线回归：`python -m pytest -p no:cacheprovider tests`。测试使用 fake、Mock、可控时钟和 Event，不连接真实设备；覆盖授权、期限、输入竞争、收尾归属及 Raw/导出准入。需在已安装项目依赖和 pytest 的环境运行；离线通过不代表真机停止延迟或 SDK 实时性已验证。
