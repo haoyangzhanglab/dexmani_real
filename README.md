@@ -163,11 +163,13 @@ python scripts/tools/view_realsense.py --cloud processed
 python scripts/tools/view_pointcloud.py
 ```
 
-collect 的相机持续连接，Enter 为一组只读机械臂采样，完成立即断开臂；Q 结束。五帧原 RGB、检测、来源时间、实测位置/速度和样本 ID 保存为 NPZ，速度、帧新鲜度及前后漂移仍检查。solve 不连接设备，按原 ID 排除样本，保存逐样本残差和 used/excluded/worst IDs；质量合格后写入原 serial 映射格式外参，报告使用同名 `.result.json`。VR 头朝向直接消费头帧，不要求右手就绪。
+collect 的相机持续连接，Enter 为一组只读机械臂采样，完成立即断开臂；Q 结束。五帧原 RGB、检测、来源时间、实测位置/速度和样本 ID 保存为 NPZ，检查速度、帧新鲜度以及每次反馈相对采样起点的漂移。solve 不连接设备，按原 ID 排除样本，保存逐样本残差和 used/excluded/worst IDs；质量合格后写入原 serial 映射格式外参，报告使用同名 `.result.json`。VR 头朝向直接消费头帧，不要求右手就绪。
 
 VR 运行读取 JSON 中有限且位于 `[-180, 180]` 的 `theta_deg`，例如 `{"theta_deg": 30.0}`，构造 `R_z(-theta)`。ref、质量和时间报告不参与运行准入。手工角度的正确性由研究者确认；自动标定在保存时拒绝低质量结果，并输出完整报告。Raw 归档实际使用的旋转矩阵。
 
 solve 的外参输出与派生报告不得覆盖 `capture.json` 或原始采样 NPZ。
+
+采样使用逐帧 IPPE_SQUARE：重投影 RMS ≤ 1 px，至少四帧有效，帧间位置/旋转跨度 ≤ 5 mm / 3°；不一致则重新采样。collect 仅接受 none 或 Brown-Conrady 相机畸变模型。手眼求解固定 HORAUD，闭环 RMS ≤ 5 mm / 3° 才更新外参；这些内部残差不代表真实空间定位精度。solve 直接读取 NPZ 中的 EEF 与 Marker 位姿，不重算 RGB 或逐帧 PnP。
 
 实时相机查看使用 view_realsense.py：默认 RGB-D，在 RGB-D 或点云窗口内按 P 开关点云、S 切换 raw/processed（默认 processed）；`--cloud raw/processed` 可在启动时打开点云并指定初始类型。Q/Esc 或关闭 RGB-D 窗口退出；关闭点云窗口仅关闭点云，按 P 可重新打开。预览不修改曝光优先级，不提供逐帧诊断面板。RGB-D 仅预览时不加载外参、桌面或点云处理器；启用对应点云类型时才加载所需资源。窗口需要桌面/OpenGL。
 

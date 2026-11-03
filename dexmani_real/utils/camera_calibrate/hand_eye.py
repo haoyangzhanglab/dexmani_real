@@ -1,6 +1,5 @@
 """Eye-to-hand 求解与刚性标记的闭环残差。"""
 
-import logging
 from dataclasses import dataclass
 
 import cv2
@@ -14,14 +13,6 @@ MIN_ROTATION_DEG = 5.0
 MIN_AXIS_SEPARATION_DEG = 15.0
 MAX_POSITION_RMS_MM = 5.0
 MAX_ROTATION_RMS_DEG = 3.0
-HAND_EYE_METHODS = {
-    "TSAI": cv2.CALIB_HAND_EYE_TSAI,
-    "PARK": cv2.CALIB_HAND_EYE_PARK,
-    "HORAUD": cv2.CALIB_HAND_EYE_HORAUD,
-    "ANDREFF": cv2.CALIB_HAND_EYE_ANDREFF,
-    "DANIILIDIS": cv2.CALIB_HAND_EYE_DANIILIDIS,
-}
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -81,7 +72,7 @@ def closed_loop_errors(transform, eef_inverse, marker_poses):
 
 
 def solve_hand_eye(eef_poses: np.ndarray, marker_poses: np.ndarray) -> HandEyeResult:
-    """由 T_base_from_eef、T_camera_from_marker 求外参与残差，优先返回合格解。"""
+    """由 T_base_from_eef、T_camera_from_marker 求外参与残差，固定使用 HORAUD；质量门槛由写入边界执行。"""
     if len(eef_poses) < MIN_SAMPLES:
         raise ValueError(f"need at least {MIN_SAMPLES} samples, have {len(eef_poses)}")
     check_excitation(eef_poses[:, :3, :3])
@@ -89,33 +80,17 @@ def solve_hand_eye(eef_poses: np.ndarray, marker_poses: np.ndarray) -> HandEyeRe
     eef_inverse = np.broadcast_to(np.eye(4), eef_poses.shape).copy()
     eef_inverse[:, :3, :3] = eef_poses[:, :3, :3].transpose(0, 2, 1)
     eef_inverse[:, :3, 3] = -np.einsum("nij,nj->ni", eef_inverse[:, :3, :3], eef_poses[:, :3, 3])
-    best = None
-    best_score = (True, float("inf"), float("inf"))
-    for name, method in HAND_EYE_METHODS.items():
-        try:
-            rotation, translation = cv2.calibrateHandEye(  # type: ignore[call-overload]  # 类型桩未声明 ndarray。
-                eef_inverse[:, :3, :3],
-                eef_inverse[:, :3, 3],
-                marker_poses[:, :3, :3],
-                marker_poses[:, :3, 3],
-                method=method,
-            )
-            transform = np.eye(4)
-            transform[:3, :3] = rotation
-            transform[:3, 3] = translation.ravel()
-            transform = validate_rigid_transform(transform, label=f"{name} hand-eye candidate")
-            errors_mm, errors_deg = closed_loop_errors(transform, eef_inverse, marker_poses)
-            result = HandEyeResult(transform, name, errors_mm, errors_deg)
-            rms = result.position_rms_mm, result.rotation_rms_deg
-            if not np.isfinite(rms).all():
-                raise ValueError("nonfinite hand-eye residuals")
-        except (cv2.error, ValueError) as exc:
-            logger.warning("%s: %s", name, exc)
-            continue
-        score = (not result.quality_ok, *rms)
-        if score < best_score:
-            best, best_score = result, score
-
-    if best is None:
-        raise ValueError("no hand-eye candidate produced a valid transform and residuals")
-    return best
+    # Eye-to-Hand 必须传入 T_eef_from_base，输出才是 T_base_from_camera。
+    rotation, translation = cv2.calibrateHandEye(
+        list(eef_inverse[:, :3, :3]), list(eef_inverse[:, :3, 3]),
+        list(marker_poses[:, :3, :3]), list(marker_poses[:, :3, 3]),
+        method=cv2.CALIB_HAND_EYE_HORAUD,
+    )
+    transform = np.eye(4)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = translation.ravel()
+    transform = validate_rigid_transform(transform, label="HORAUD hand-eye result")
+    errors_mm, errors_deg = closed_loop_errors(transform, eef_inverse, marker_poses)
+    if not np.isfinite(errors_mm).all() or not np.isfinite(errors_deg).all():
+        raise ValueError("nonfinite hand-eye residuals")
+    return HandEyeResult(transform, "HORAUD", errors_mm, errors_deg)

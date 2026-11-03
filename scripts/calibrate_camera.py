@@ -21,7 +21,10 @@ def main(argv: list[str] | None = None) -> int:
     solve.add_argument("--exclude", type=int, action="append", default=[], metavar="SAMPLE_ID",
                        help="剔除原始 sample ID，可重复指定不同 ID")
     args = parser.parse_args(argv)
-    from dexmani_real.utils.camera_calibrate.calibrate import collect_samples, solve_samples
+    from dexmani_real.utils.camera_calibrate.calibrate import (
+        collect_samples,
+        solve_samples,
+    )
 
     if args.command == "collect":
         from dexmani_real.config.real import load_config

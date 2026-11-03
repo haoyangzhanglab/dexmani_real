@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import logging
-import sys
+import os
+import tempfile
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -20,14 +20,16 @@ from dexmani_real.utils.camera_calibrate.aruco import (
     CAPTURE_FRAMES,
     MARKER_ID,
     MARKER_SIZE_M,
+    MAX_POSITION_SPREAD_M,
+    MAX_REPROJECTION_RMS_PX,
+    MAX_ROTATION_SPREAD_DEG,
+    MIN_DETECTED_FRAMES,
     ArucoSampler,
 )
 from dexmani_real.utils.camera_calibrate.extrinsics import save_camera_calibration
 from dexmani_real.utils.camera_calibrate.hand_eye import HandEyeResult, solve_hand_eye
-from dexmani_real.utils.io import write_json
+from dexmani_real.utils.io import publish, write_json
 from dexmani_real.utils.timing import sample_is_fresh
-
-logger = logging.getLogger(__name__)
 
 
 def read_arm_feedback(arm, max_age_s):
@@ -36,48 +38,18 @@ def read_arm_feedback(arm, max_age_s):
     qpos, qvel = arm.read()
     if not sample_is_fresh(timestamp_ns, max_age_s, time.monotonic_ns()):
         raise TimeoutError("arm feedback query exceeded calibration freshness budget")
-    return dict(qpos=qpos, qvel=qvel, timestamp_ns=timestamp_ns)
+    return {"qpos": qpos, "qvel": qvel, "timestamp_ns": timestamp_ns}
 
 
 def save_sample(path, sample_id, sample, eef_pose):
-    frames = sample["frames"]
-    arrays = dict(
-        sample_id=sample_id,
-        T_base_from_eef=eef_pose,
-        T_camera_from_marker=sample["T_camera_from_marker"],
-        rgb=np.stack([frame["rgb"] for frame in frames]),
-        camera_timestamp_ns=np.array([frame["timestamp_ns"] for frame in frames], dtype=np.int64),
-        color_frame_number=np.array([frame["color_frame_number"] for frame in frames], dtype=np.int64),
-        marker_corners_xy=np.stack([frame["corners"] for frame in frames]),
-        marker_rvec=np.stack([frame["rvec"] for frame in frames]),
-        marker_tvec=np.stack([frame["tvec"] for frame in frames]),
-        marker_detected=np.array([frame["detected"] for frame in frames]),
-        arm_qpos=np.stack([frame["arm"]["qpos"] for frame in frames]),
-        arm_qvel=np.stack([frame["arm"]["qvel"] for frame in frames]),
-        arm_timestamp_ns=np.array([frame["arm"]["timestamp_ns"] for frame in frames], dtype=np.int64),
-    )
-    for stage in ("before", "after"):
-        for name, value in sample[f"arm_{stage}"].items():
-            arrays[f"arm_{stage}_{name}"] = value
     path = Path(path)
-    stream = path.open("xb")
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
     try:
-        try:
-            np.savez_compressed(stream, **arrays)
-        except BaseException:
-            try:
-                stream.close()
-            except BaseException:
-                logger.exception("calibration sample close also failed: %s", path)
-            raise
-        else:
-            stream.close()
-    except BaseException:
-        try:
-            path.unlink()
-        except BaseException:
-            logger.exception("failed to remove incomplete calibration sample: %s", path)
-        raise
+        with os.fdopen(fd, "wb") as stream:
+            np.savez_compressed(stream, sample_id=sample_id, T_base_from_eef=eef_pose, **sample)
+        publish(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def collect_samples(runtime, output_dir):
@@ -87,14 +59,17 @@ def collect_samples(runtime, output_dir):
     from dexmani_real.sensor.realsense import RealSenseCamera
 
     runtime.camera.validate()
-    criteria = dict(
-        capture_frames=CAPTURE_FRAMES,
-        min_detected_frames=CAPTURE_FRAMES // 2,
-        arm_max_speed_rad_s=runtime.arm.homing.velocity_convergence_rad_s,
-        arm_max_drift_rad=runtime.arm.homing.convergence_rad,
-        arm_feedback_max_age_s=runtime.arm.feedback_max_age_s,
-        camera_max_age_s=runtime.camera.max_frame_age_s,
-    )
+    criteria = {
+        "capture_frames": CAPTURE_FRAMES,
+        "min_detected_frames": MIN_DETECTED_FRAMES,
+        "max_reprojection_rms_px": MAX_REPROJECTION_RMS_PX,
+        "max_position_spread_m": MAX_POSITION_SPREAD_M,
+        "max_rotation_spread_deg": MAX_ROTATION_SPREAD_DEG,
+        "arm_max_speed_rad_s": runtime.arm.homing.velocity_convergence_rad_s,
+        "arm_max_drift_rad": runtime.arm.homing.convergence_rad,
+        "arm_feedback_max_age_s": runtime.arm.feedback_max_age_s,
+        "camera_max_age_s": runtime.camera.max_frame_age_s,
+    }
     for name in ("arm_max_speed_rad_s", "arm_max_drift_rad", "arm_feedback_max_age_s"):
         if not np.isfinite(criteria[name]) or criteria[name] <= 0:
             raise ValueError(f"calibration {name} must be finite and positive")
@@ -107,14 +82,13 @@ def collect_samples(runtime, output_dir):
     count = 0
     try:
         camera.connect()
-        write_json(dict(
-            camera=dict(serial=camera.active_serial, color=camera.color_intrinsics.to_dict(),
-                        depth_scale_m=camera.depth_scale_m),
-            marker=dict(dictionary=ARUCO_DICT_NAME, id=MARKER_ID, size_m=MARKER_SIZE_M),
-            criteria=criteria, requested_config=asdict(runtime),
-        ), output / "capture.json", overwrite=False)
-        sampler = ArucoSampler(camera.color_intrinsics.matrix(),
-                               np.asarray(camera.color_intrinsics.distortion_coeffs))
+        sampler = ArucoSampler(camera.color_intrinsics)
+        write_json({
+            "camera": {"serial": camera.active_serial, "color": camera.color_intrinsics.to_dict(),
+                        "depth_scale_m": camera.depth_scale_m},
+            "marker": {"dictionary": ARUCO_DICT_NAME, "id": MARKER_ID, "size_m": MARKER_SIZE_M},
+            "criteria": criteria, "requested_config": asdict(runtime),
+        }, output / "capture.json", overwrite=False)
         print("标记须相对 EEF 刚性固定。用厂商示教或独立点动工具摆位，停止并退出控制连接。")
         print("相机保持连接；Enter 只读采样，完成后机械臂连接立即关闭；Q 结束。")
         while True:
@@ -129,32 +103,20 @@ def collect_samples(runtime, output_dir):
                 arm.connect(check_abort=lambda: None)
                 try:
                     sample = sampler.capture(
-                        camera.read, lambda: read_arm_feedback(arm, runtime.arm.feedback_max_age_s),
+                        camera.read, lambda arm=arm: read_arm_feedback(arm, runtime.arm.feedback_max_age_s),
                         camera_config=runtime.camera, arm_config=runtime.arm,
                     )
                 except (TimeoutError, ValueError, cv2.error) as exc:
                     print(f"采样拒绝：{exc}；未新增样本，请重新摆位。", flush=True)
                     continue
             finally:
-                original_error = sys.exc_info()[1]
-                try:
-                    arm.close()
-                except BaseException:
-                    if original_error is None:
-                        raise
-                    logger.exception("calibration arm close also failed")
+                arm.close()
             path = samples / f"{count:06d}.npz"
-            save_sample(path, count, sample, fk.forward(sample["arm_after"]["qpos"]))
+            save_sample(path, count, sample, fk.forward(sample["arm_after_qpos"]))
             print(f"已保存 sample {count}：{path}", flush=True)
             count += 1
     finally:
-        original_error = sys.exc_info()[1]
-        try:
-            camera.disconnect()
-        except BaseException:
-            if original_error is None:
-                raise
-            logger.exception("calibration camera disconnect also failed")
+        camera.disconnect()
     return count
 
 
@@ -168,6 +130,8 @@ def solve_samples(sample_dir, output_path, *, exclude=()) -> HandEyeResult:
     sample_paths = sorted((source / "samples").glob("*.npz"))
     inputs = {(source / "capture.json").resolve(), *(path.resolve() for path in sample_paths)}
     report_path = output.with_suffix(".result.json")
+    if report_path.resolve() == output:
+        raise ValueError("calibration output and report must be different paths")
     if output in inputs or report_path.resolve() in inputs:
         raise ValueError("calibration outputs must not overwrite capture inputs")
     excluded = set(exclude)
@@ -193,15 +157,15 @@ def solve_samples(sample_dir, output_path, *, exclude=()) -> HandEyeResult:
     used_ids = sorted(samples)
     eef, markers = (np.stack(poses) for poses in zip(*(samples[identity] for identity in used_ids)))
     result = solve_hand_eye(eef, markers)
-    report = dict(
-        sample_directory=str(source), used_sample_ids=used_ids, excluded_sample_ids=sorted(excluded),
-        sample_count=len(used_ids), method=result.method,
-        position_errors_mm=result.position_errors_mm.tolist(),
-        rotation_errors_deg=result.rotation_errors_deg.tolist(),
-        position_rms_mm=result.position_rms_mm, rotation_rms_deg=result.rotation_rms_deg,
-        worst_sample_id=used_ids[result.worst_sample], quality_ok=result.quality_ok,
-        calibrated_at_utc=datetime.now(timezone.utc).isoformat(),
-    )
+    report = {
+        "sample_directory": str(source), "used_sample_ids": used_ids, "excluded_sample_ids": sorted(excluded),
+        "sample_count": len(used_ids), "method": result.method,
+        "position_errors_mm": result.position_errors_mm.tolist(),
+        "rotation_errors_deg": result.rotation_errors_deg.tolist(),
+        "position_rms_mm": result.position_rms_mm, "rotation_rms_deg": result.rotation_rms_deg,
+        "worst_sample_id": used_ids[result.worst_sample], "quality_ok": result.quality_ok,
+        "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
     write_json(dict(camera_serial=camera["serial"], T_base_from_camera=result.T_base_from_camera.tolist(),
                     **report), report_path)
     if not result.quality_ok:
