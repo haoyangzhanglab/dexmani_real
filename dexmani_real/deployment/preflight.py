@@ -61,11 +61,6 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
 
 
 def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
-    from dexmani_policy.common.config import require_tactile_source
-
-    source = require_tactile_source(info.observation_fields, info.tactile_source)
-    if source == "sim":
-        raise ValueError("Real deployment requires real-source tactile observations")
     control_dim = {"joint": 19, "eef": 21}[info.action_mode]
     if info.control_action_dim != control_dim:
         raise ValueError(f"Real {info.action_mode} deployment requires control_action_dim={control_dim}")

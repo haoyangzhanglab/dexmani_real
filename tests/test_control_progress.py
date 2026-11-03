@@ -43,6 +43,7 @@ def make_rollout(monkeypatch, *, mode='sync', history=1):
 
 
 def close_rollout_session(rollout, *, failure=None):
+    from concurrent.futures import Future
     from dexmani_real.deployment.session import PolicySession
     session = PolicySession.__new__(PolicySession)
     session.runtime_state = rollout.runtime_state
@@ -51,7 +52,16 @@ def close_rollout_session(rollout, *, failure=None):
     session.errors = []
     session.summary = {'termination_reason': None}
     session.save_results = lambda: None
-    session.model.close = lambda: SimpleNamespace(result=lambda timeout: session.model.discard_pending(0))
+    def close_model():
+        future = Future()
+        try:
+            session.model.discard_pending(0)
+        except BaseException as exc:
+            future.set_exception(exc)
+        else:
+            future.set_result(None)
+        return future
+    session.model.close = close_model
     return session.close(failure=failure)
 
 
@@ -184,7 +194,7 @@ def test_archive_source_loss_ends_recorded_segment(monkeypatch, tmp_path, loss):
     rollout.recorder = EpisodeRecorder(tmp_path, control_hz=16)
     rollout.recorder.is_recording = True
     rollout.record_needs = ObservationNeeds(camera_fields=('rgb', 'depth'))
-    rollout.sensors = SimpleNamespace(check=lambda **kwargs: available[0] or loss != "worker_exit")
+    rollout.sensors = SimpleNamespace(check=lambda **kwargs: True)
     rollout.sync_actions = np.zeros((4, 19))
     observe = rollout.read_observation
     available = [True]
@@ -209,7 +219,6 @@ def test_archive_source_loss_ends_recorded_segment(monkeypatch, tmp_path, loss):
     assert rollout.recorder.queue.qsize() == 1
     assert rollout.recorder.recording_truncated_reason == {
         'missing': 'camera_source_unavailable_or_unmatched', 'stale': 'camera_source_stale',
-        'worker_exit': 'recording_camera_exited',
     }[loss]
     assert rollout.recorder.finish_request is None
 

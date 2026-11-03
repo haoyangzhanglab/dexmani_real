@@ -5,6 +5,7 @@ import multiprocessing as mp
 import sys
 import time
 from collections.abc import Sequence
+from concurrent.futures import wait
 from dataclasses import asdict
 
 from dexmani_real.config.control import HomeConfigurationError
@@ -256,7 +257,10 @@ class PolicySession:
                 self.errors.append(error_detail("recorder_finalize", exc))
         if self.model is not None:
             try:
-                self.model.close().result(timeout=MODEL_SHUTDOWN_TIMEOUT_S)
+                closed = self.model.close()
+                if closed not in wait((closed,), timeout=MODEL_SHUTDOWN_TIMEOUT_S).done:
+                    raise TimeoutError("model close still pending; task handle retained")
+                closed.result()
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
@@ -315,7 +319,7 @@ class PolicySession:
         issues = check_observation(row, self.runtime, self.control_needs)
         if issues:
             raise ValueError("warmup observation: " + "; ".join(issues))
-        # 仅预热重复一个快照；features 缓存此后由唯一模型线程独占。
+        # 仅预热重复一个快照；正式预测使用实际采样历史。
         rows = (self.observations.project(row),) * self.info.n_obs_steps
         kwargs = {}
         if self.runtime.execution.mode == "rtc":

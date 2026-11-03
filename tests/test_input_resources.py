@@ -1,5 +1,5 @@
 import signal
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError, wait
 from types import SimpleNamespace
 
 import pytest
@@ -76,18 +76,28 @@ def test_model_close_waits_for_prediction_on_its_thread(prediction_fails):
             raise ValueError('prediction failed')
     def load():
         record('load')
-        return SimpleNamespace(predict=predict, close=lambda: record('close'))
+        return SimpleNamespace(predict=predict, close=lambda: record('close'),
+                               warmup=lambda rows: record('warmup'),
+                               reset_episode=lambda: record('reset'))
     worker = PolicyWorker(load, build_observation=lambda rows: rows)
     try:
         worker.load()
         worker.future.result(timeout=1)
         worker.poll().result()
-        worker.predict([])
+        worker.warmup([])
+        worker.future.result(timeout=1)
+        worker.poll().result()
+        worker.predict([], reset_episode=True)
         assert started.wait(1)
         with pytest.raises(TimeoutError):
             worker.discard_pending(0)
+        with pytest.raises(RuntimeError, match='unreclaimed task'):
+            worker.predict([])
         closed = worker.close()
-        with pytest.raises(TimeoutError):
+        assert worker.close() is closed
+        with pytest.raises(RuntimeError, match='closing'):
+            worker.predict([])
+        with pytest.raises(FutureTimeoutError):
             closed.result(timeout=0)
         release.set()
         if prediction_fails:
@@ -95,7 +105,7 @@ def test_model_close_waits_for_prediction_on_its_thread(prediction_fails):
                 closed.result(timeout=1)
         else:
             closed.result(timeout=1)
-        assert [stage for stage, _ in calls] == ['load', 'predict', 'close']
+        assert [stage for stage, _ in calls] == ['load', 'warmup', 'reset', 'predict', 'close']
         assert len({thread for _, thread in calls}) == 1
         assert calls[0][1] != get_ident()
     finally:
@@ -103,15 +113,154 @@ def test_model_close_waits_for_prediction_on_its_thread(prediction_fails):
         worker.executor.shutdown(wait=False)
 
 
-def test_cloud_recipe_can_use_defaults_but_rejects_invalid_values():
+@pytest.fixture
+def model_session():
+    from dexmani_real.deployment.session import PolicySession
+    session = PolicySession.__new__(PolicySession)
+    session.runtime_state = SessionState()
+    session.robot = session.sensors = session.keyboard = session.episode = session.audio = None
+    session.errors = []
+    session.summary = {'termination_reason': None}
+    session.save_results = lambda: None
+    return session
+
+
+@pytest.mark.parametrize('task_type,close_type', [
+    (ValueError, None), (None, OSError), (ValueError, OSError),
+    (KeyboardInterrupt, None), (KeyboardInterrupt, OSError), (ValueError, KeyboardInterrupt),
+    (TimeoutError, None), (None, TimeoutError),
+])
+def test_model_close_preserves_failures_and_interrupts(model_session, task_type, close_type, caplog):
+    task_error = task_type('task failed') if task_type else None
+    close_error = close_type('close failed') if close_type else None
+    closes = []
+    def predict(rows):
+        if task_error is not None:
+            raise task_error
+    def close():
+        closes.append(True)
+        if close_error is not None:
+            raise close_error
+    worker = PolicyWorker(lambda: None, build_observation=lambda rows: rows)
+    worker.model = SimpleNamespace(predict=predict, close=close)
+    model_session.model = worker
+    try:
+        worker.predict([])
+        closed = worker.close()
+        assert closed in wait((closed,), timeout=2).done
+        assert model_session.close() == 1
+        assert closes == [True]
+        expected = task_error if task_type is KeyboardInterrupt else close_error or task_error
+        assert closed.exception() is expected
+        assert model_session.runtime_state.estop_request == (
+            task_type is KeyboardInterrupt or close_type is KeyboardInterrupt
+        )
+        assert model_session.errors == [dict(stage='model_close',
+                                             exception_type=type(expected).__name__, message=str(expected))]
+        for error in (task_error, close_error):
+            if error is not None:
+                assert str(error) in caplog.text
+        if task_error is not None and close_error is not None:
+            if task_type is KeyboardInterrupt:
+                assert task_error.__cause__ is close_error
+            else:
+                assert close_error.__context__ is task_error
+    finally:
+        worker.executor.shutdown(wait=True)
+
+
+def test_session_close_timeout_retains_running_task(model_session, monkeypatch):
+    from threading import Event
+    started, release = Event(), Event()
+    closes = []
+    def predict(rows):
+        started.set()
+        assert release.wait(5)
+    worker = PolicyWorker(lambda: None, build_observation=lambda rows: rows)
+    worker.model = SimpleNamespace(predict=predict, close=lambda: closes.append(True))
+    model_session.model = worker
+    monkeypatch.setattr('dexmani_real.deployment.session.MODEL_SHUTDOWN_TIMEOUT_S', 0)
+    try:
+        worker.predict([])
+        assert started.wait(1)
+        assert model_session.close() == 1
+        assert model_session.errors == [dict(stage='model_close', exception_type='TimeoutError',
+                                             message='model close still pending; task handle retained')]
+        assert not worker.close_future.done() and not closes
+        with pytest.raises(RuntimeError, match='closing'):
+            worker.predict([])
+        release.set()
+        worker.close_future.result(timeout=2)
+        assert closes == [True]
+    finally:
+        release.set()
+        worker.executor.shutdown(wait=True)
+
+
+@pytest.fixture
+def policy_info(tmp_path):
+    from dexmani_policy.deployment import PolicyInfo
+    return PolicyInfo(
+        experiment_dir=tmp_path, checkpoint_path=tmp_path / 'policy.pt',
+        weights='ema', inference_steps=1, policy_name='test', task_name='test',
+        observation_fields=('joint_state',), n_obs_steps=2, n_action_steps=4,
+        horizon=9, action_start_index=1, action_dim=19, control_action_dim=19,
+        action_mode='joint', rgb_preprocessing={}, pc_dim=None,
+        supported_execution_modes=('sync',), control_dt_s=.0625, depth_config=None,
+        pointcloud_config=None, hand_pointcloud_config=None, fingertip_link_names=None,
+    )
+
+
+@pytest.mark.parametrize('field', ['joint_state', 'finger_tactile_force', 'taxel_tactile_force'])
+def test_current_policy_metadata_to_live_observation(policy_info, field):
+    from dataclasses import replace
+    import numpy as np
+    import torch
+    from dexmani_policy.deployment import PolicyRuntime
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.deployment.observation import ObservationBuilder
+    from dexmani_real.deployment.preflight import resolve_deployment_config
+    from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
+    from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
+    from dexmani_real.runtime.observation import Observation
+
+    info = replace(policy_info, observation_fields=(field,))
+    runtime = resolve_deployment_config(info, RealConfig())
+    assert runtime.execution.action_steps == info.n_action_steps
+    builder = ObservationBuilder(info, runtime)
+    arm, hand = np.zeros(1, dtype=ARM_STATE_DTYPE), np.zeros(1, dtype=HAND_STATE_DTYPE)
+    arm['qpos'], hand['qpos'] = .1, .2
+    hand['tactile_aggregate'], hand['tactile_dense'] = .3, .4
+    row = builder.project(Observation(arm, hand, None, None, None, 1))
+    observation = builder.build([row, row])
+    policy = PolicyRuntime(torch.nn.Linear(1, 1), info, seed=0)
+    values = policy.prepare_observations(observation)[field]
+    np.testing.assert_array_equal(values[0].numpy(), observation[field])
+    assert values.dtype == torch.float32
+    observation[field] = observation[field][:, :4]
+    with pytest.raises(ValueError, match='trailing shape'):
+        policy.prepare_observations(observation)
+
+
+def test_cloud_recipe_can_use_defaults_but_rejects_invalid_values(policy_info):
+    from dataclasses import replace
     from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
-    from dexmani_real.deployment.preflight import _restore_cloud_config
-    for config_type in (PointCloudConfig, HandCloudConfig):
-        assert _restore_cloud_config({'num_points': 128}, config_type) == config_type(num_points=128)
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.deployment.preflight import resolve_deployment_config
+    runtime = RealConfig()
+    for field, attribute, config_type in (
+        ('point_cloud', 'pointcloud', PointCloudConfig),
+        ('hand_pointcloud', 'hand_pointcloud', HandCloudConfig),
+    ):
+        info = replace(policy_info, observation_fields=(field,),
+                       **{f'{attribute}_config': {'num_points': 128}})
+        resolved = resolve_deployment_config(info, runtime)
+        assert getattr(resolved, attribute) == config_type(num_points=128)
+        assert getattr(runtime, attribute) == config_type()
         with pytest.raises(TypeError):
-            _restore_cloud_config({'num_ponts': 128}, config_type)
+            resolve_deployment_config(replace(info, **{f'{attribute}_config': {'num_ponts': 128}}), runtime)
         with pytest.raises(ValueError, match='positive integer'):
-            _restore_cloud_config({'num_points': 0}, config_type)
+            resolve_deployment_config(replace(info, **{f'{attribute}_config': {'num_points': 0}}), runtime)
 
 
 def test_busy_admission_and_cancellation_preserve_operator_intent():

@@ -1,5 +1,6 @@
 """模型生命周期与预测在同一个工作线程串行执行。"""
 
+import sys
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, cast
 
@@ -71,8 +72,15 @@ class PolicyWorker:
                 if retired is not None:
                     retired.result()
             finally:
-                if self.model is not None:
-                    self.model.close()
+                task_error = sys.exc_info()[1]
+                try:
+                    if self.model is not None:
+                        self.model.close()
+                except BaseException as close_error:
+                    # 会话通过最外层中断锁存急停；关闭失败不能遮蔽它。
+                    if isinstance(task_error, KeyboardInterrupt):
+                        raise task_error from close_error
+                    raise
 
         self.close_future = self.executor.submit(close_model)
         self.future = None
