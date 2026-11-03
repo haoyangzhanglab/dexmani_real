@@ -311,9 +311,9 @@ class Rollout:
                     self.run_id, self.history.maxlen)
 
     def poll_model(self):
-        item = self.model.poll()
-        if item is not None:
-            _, result = item
+        future = self.model.poll()
+        if future is not None:
+            result = future.result()
             actions = np.asarray(result, dtype=np.float64)
             expected = (self.policy_info.future_steps, self.policy_info.control_action_dim)
             if actions.shape != expected or not np.isfinite(actions).all():

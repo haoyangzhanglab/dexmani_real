@@ -149,8 +149,6 @@ class Robot:
         self._read_initial_state(
             required_tactile=required_tactile, cancel_requested=cancelled,
         )
-        if cancelled():
-            raise OperationCancelled("tactile reset cancelled")
 
     def read_hand(self):
         if self.hand is None:

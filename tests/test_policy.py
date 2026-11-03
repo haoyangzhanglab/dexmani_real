@@ -1,5 +1,7 @@
 """调用真实 rollout/worker/session，替换模型、设备与键盘 I/O。"""
 
+from concurrent.futures import Future
+
 import json
 import threading
 import time
@@ -49,7 +51,9 @@ class Model:
         if self.result is None:
             return None
         result, self.result = self.result, None
-        return "predict", result
+        future = Future()
+        future.set_result(result)
+        return future
 
     def discard_pending(self, timeout_s):
         self.result = None
@@ -295,7 +299,7 @@ def test_worker_pending_blocks_reuse_and_consumes_late_error():
     worker = PolicyWorker(NativeModel, build_observation=lambda rows: rows)
     worker.load()
     worker.future.result(timeout=2)
-    worker.poll()
+    worker.poll().result()
     try:
         worker.predict(())
         assert started.wait(2)
@@ -329,7 +333,7 @@ def make_session(tmp_path):
     events = []
     session.robot = SimpleNamespace(arm=None, hand=None, close=lambda: events.append("robot_close"))
     session.keyboard = SimpleNamespace(listener=None, stop=lambda: events.append("keyboard_stop"))
-    session.sensors = SimpleNamespace(started=[], shutdown=lambda state: events.append("sensor_shutdown"))
+    session.sensors = SimpleNamespace(processes=[], shutdown=lambda state: events.append("sensor_shutdown"))
     session.model = SimpleNamespace(close=lambda state: events.append("model_close"),
                                     wait_closed=lambda timeout: True)
     session.audio = Audio(events)
@@ -915,3 +919,129 @@ def test_rollout_preparation_entry_polls_once(tmp_path):
     poll.assert_called_once_with()
     episode.robot.prepare_streaming.assert_not_called()
     assert result.termination_reason == 'start_cancelled'
+
+
+@pytest.mark.parametrize('stage', ['load', 'warmup', 'predict'])
+@pytest.mark.parametrize('failure', [None, ValueError, TimeoutError])
+def test_future_handoff_consumes_completion(stage, failure):
+    entered, release = threading.Event(), threading.Event()
+    error = failure('model failure') if failure else None
+    actions = np.ones((6, 19))
+    def operation():
+        entered.set()
+        assert release.wait(5)
+        if error is not None:
+            raise error
+        return actions if stage == 'predict' else None
+    model = SimpleNamespace(warmup=lambda rows: operation(), predict=lambda rows: operation(),
+                            close=Mock())
+    worker = PolicyWorker(operation, build_observation=lambda rows: rows)
+    worker.model = model
+    state = SessionState()
+    try:
+        getattr(worker, stage)(*(() if stage == 'load' else ((),)))
+        assert entered.wait(2)
+        assert worker.poll() is None
+        release.set()
+        worker.future.exception(2)
+        with pytest.raises(RuntimeError, match='unreclaimed'):
+            worker.load()
+        future = worker.poll()
+        assert future is not None and worker.future is None
+        if error:
+            with pytest.raises(failure) as caught:
+                future.result()
+            assert caught.value is error
+        elif stage == 'predict':
+            np.testing.assert_array_equal(future.result(), actions)
+        else:
+            assert future.result() is None
+        assert worker.poll() is None
+    finally:
+        release.set()
+        worker.close(state)
+        assert worker.wait_closed(2)
+
+
+@pytest.mark.parametrize('error', [None, TimeoutError('task timeout'), ValueError('load failure')])
+def test_wait_model_consumes_none_or_exception(error):
+    future = Future()
+    if error is None:
+        future.set_result(None)
+    else:
+        future.set_exception(error)
+    session = SimpleNamespace(check_startup=lambda: None, model=SimpleNamespace(poll=lambda: future))
+    if error is None:
+        assert PolicySession.wait_model(session, time.monotonic() + 5) is None
+    else:
+        with pytest.raises(type(error)) as caught:
+            PolicySession.wait_model(session, time.monotonic() + 5)
+        assert caught.value is error
+
+
+@pytest.mark.parametrize('names', [(), ('camera',), ('camera', 'pointcloud')])
+@pytest.mark.parametrize('healthy', [False, True])
+def test_policy_checks_actual_sensor_owners(names, healthy):
+    from dexmani_real.runtime.lifecycle import SensorWorkers
+    from dexmani_real.robot.commands import RobotError
+    sensors = SensorWorkers()
+    sensors.processes = [SimpleNamespace(name=name, is_alive=lambda: healthy, exitcode=1) for name in names]
+    session = SimpleNamespace(keyboard=SimpleNamespace(check_health=lambda: True), sensors=sensors,
+                              runtime_state=SessionState(), needs=ObservationNeeds())
+    if names and not healthy:
+        with pytest.raises(RobotError):
+            PolicySession.check_services(session)
+    else:
+        assert PolicySession.check_services(session)
+    session.keyboard.check_health = lambda: False
+    assert not PolicySession.check_services(session)
+    assert session.runtime_state.estop_request
+
+
+def test_warmup_repeated_row_builds_geometry_once(monkeypatch):
+    from dexmani_real.deployment.observation import ObservationBuilder, PolicyObservationRow
+    from dexmani_real.deployment import observation as module
+    builder = ObservationBuilder(SimpleNamespace(observation_fields=('eef_pose',)), RealConfig())
+    row = PolicyObservationRow({'arm_qpos': np.asarray(RealConfig().arm.home_qpos)})
+    compute = Mock(wraps=module.eef_poses)
+    monkeypatch.setattr(module, 'eef_poses', compute)
+    first = builder.build((row,) * 4)
+    assert compute.call_count == 1 and compute.call_args.args[0].shape == (1, 7)
+    np.testing.assert_array_equal(first['eef_pose'], np.repeat(first['eef_pose'][:1], 4, axis=0))
+    np.testing.assert_array_equal(builder.build((row,) * 4)['eef_pose'], first['eef_pose'])
+    assert compute.call_count == 1
+
+
+def test_static_camera_shutdown_leaves_no_health_dependency(tmp_path, monkeypatch):
+    from dexmani_real.runtime.lifecycle import SensorWorkers
+    from dexmani_real.deployment import session as module
+    session, _ = make_session(tmp_path)
+    session.runtime_state = SessionState()
+    session.needs = ObservationNeeds()
+    session.info.observation_fields = ('camera_intrinsic',)
+    session.observations.camera_static = True
+    session.observations.configure_camera = Mock()
+    process = SimpleNamespace(name='camera', pid=1, exitcode=None)
+    process.is_alive = lambda: process.exitcode is None
+    process.start = lambda: None
+    process.join = lambda **kw: setattr(process, 'exitcode', 0)
+    channels = SimpleNamespace(camera_ring=SimpleNamespace(latest_sequence=1),
+                               is_running=SimpleNamespace(value=True))
+    session.sensors = SensorWorkers(channels)
+    session.process_context = SimpleNamespace(Process=lambda **kw: process)
+    session.keyboard.check_health = lambda: True
+    session.robot.connect = lambda: None
+    session.robot.check = session.check_services
+    session.camera_snapshot = None
+    session.warmup_policy = Mock()
+    session.check_startup = Mock()
+    camera = object()
+    monkeypatch.setattr(module, 'snapshot_camera_parameters', lambda *a, **kw: camera)
+    monkeypatch.setattr(module, 'camera_metadata', lambda c: {})
+    monkeypatch.setattr(module, 'write_yaml', lambda *a: None)
+    monkeypatch.setattr(module, 'initialize_hand', lambda *a, **kw: None)
+    session.start_devices()
+    session.observations.configure_camera.assert_called_once_with(camera)
+    assert session.sensors.channels is None and session.sensors.processes == []
+    assert session.check_services()
+    assert not channels.is_running.value

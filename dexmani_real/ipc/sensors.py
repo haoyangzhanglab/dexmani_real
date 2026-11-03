@@ -28,7 +28,6 @@ def camera_dtype(height: int, width: int) -> np.dtype:
         [
             # 取 RGB 与深度中较早的首次接收时刻，重复帧不刷新时间。
             ("timestamp_ns", "<u8"),
-            ("color_frame_number", "<u8"),
             ("rgb", "u1", (height, width, 3)),
             ("depth", "<u2", (height, width)),
         ],
@@ -44,7 +43,6 @@ def pointcloud_dtype(num_points: int, camera=None, camera_fields=()) -> np.dtype
     ]
     if camera_fields:
         image_dtype = camera_dtype(camera.height, camera.width)
-        fields.append(("color_frame_number", "<u8"))
         fields.extend((name, image_dtype[name]) for name in camera_fields)
     return np.dtype(fields, align=True)
 
@@ -108,12 +106,11 @@ def read_vr_frame(channels):
 
 def read_camera_frame(channels, *, fields=("rgb", "depth")):
     result = channels.camera_ring.read(
-        fields=("timestamp_ns", "color_frame_number", *fields),
+        fields=("timestamp_ns", *fields),
     )
     if result is None:
         return None
     data, sequence = result
     data["ring_sequence"] = sequence
     data["timestamp_ns"] = int(data["timestamp_ns"])
-    data["color_frame_number"] = int(data["color_frame_number"])
     return data

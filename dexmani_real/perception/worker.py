@@ -45,7 +45,7 @@ def run_pointcloud_worker(
     camera_ring = cast("SharedRing", shared.camera_ring)
     pointcloud_ring = cast("SharedRing", shared.pointcloud_ring)
     image_fields = tuple(
-        name for name in ("color_frame_number", "rgb", "depth")
+        name for name in ("rgb", "depth")
         if name in pointcloud_ring.field_names
     )
 

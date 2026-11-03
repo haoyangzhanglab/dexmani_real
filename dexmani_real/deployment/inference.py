@@ -19,26 +19,25 @@ class PolicyWorker:
         self.build_observation = build_observation
         self.model = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-model")
-        self.future = self.operation = self.close_future = None
+        self.future = self.close_future = None
 
-    def _submit(self, operation, function, *args, **kwargs):
+    def _submit(self, function, *args, **kwargs):
         if self.close_future is not None or self.future is not None:
             raise RuntimeError("Policy worker already has an unreclaimed task or is closing")
         self.future = self.executor.submit(function, *args, **kwargs)
-        self.operation = operation
 
     def _load(self):
         self.model = self.factory()
 
     def load(self):
-        self._submit("load", self._load)
+        self._submit(self._load)
 
     def _warmup(self, rows, **kwargs):
         observation = self.build_observation(rows)
         cast("PolicyRuntime", self.model).warmup(observation, **kwargs)
 
     def warmup(self, rows, **kwargs):
-        self._submit("warmup", self._warmup, rows, **kwargs)
+        self._submit(self._warmup, rows, **kwargs)
 
     def _predict(self, rows, *, reset_episode, **kwargs):
         observation = self.build_observation(rows)
@@ -47,14 +46,14 @@ class PolicyWorker:
         return cast("PolicyRuntime", self.model).predict(observation, **kwargs)
 
     def predict(self, rows, *, reset_episode=False, **kwargs):
-        self._submit("predict", self._predict, rows, reset_episode=reset_episode, **kwargs)
+        self._submit(self._predict, rows, reset_episode=reset_episode, **kwargs)
 
-    def poll(self):
+    def poll(self) -> Future | None:
         if self.future is None or not self.future.done():
             return None
-        future, operation = self.future, self.operation
-        self.future = self.operation = None
-        return operation, future.result()
+        future = self.future
+        self.future = None
+        return future
 
     def discard_pending(self, timeout_s):
         """本段撤权后回收尚未消费的任务；超时保留归属，禁止下一段复用。"""
@@ -64,13 +63,13 @@ class PolicyWorker:
         # 超时瞬间可能刚好完成；未确认回收时保留归属，不能只凭 done 清掉异常。
         if future not in wait((future,), timeout=max(0.0, timeout_s)).done:
             raise TimeoutError("episode model task remains pending")
-        self.future = self.operation = None
+        self.future = None
         future.result()
 
     def close(self, runtime_state: "SessionState"):
         if self.close_future is not None:
             return self.close_future
-        retired, operation = self.future, self.operation
+        retired = self.future
 
         def close_model():
             failure = None
@@ -80,7 +79,7 @@ class PolicyWorker:
                 except BaseException as exc:
                     if isinstance(exc, KeyboardInterrupt):
                         runtime_state.request_emergency_stop()
-                    logger.exception("retired model task failed: %s", operation)
+                    logger.exception("retired model task failed")
                     failure = exc
             try:
                 if self.model is not None:
@@ -95,7 +94,7 @@ class PolicyWorker:
                 raise failure
 
         self.close_future = self.executor.submit(close_model)
-        self.future = self.operation = None
+        self.future = None
         self.executor.shutdown(wait=False, cancel_futures=False)
         return self.close_future
 

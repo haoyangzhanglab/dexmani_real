@@ -2,7 +2,7 @@
 import time
 from threading import Event, Thread
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, PropertyMock
 
 import numpy as np
 import pytest
@@ -170,7 +170,8 @@ def test_audio_pending_replacement_and_popen_close_race(monkeypatch):
 
 
 @pytest.mark.parametrize('fresh', [True, False])
-def test_home_arm_accepts_existing_fresh_hand_sample(monkeypatch, fresh):
+@pytest.mark.parametrize('arm_issue', [None, 'stale', 'fast'])
+def test_home_arm_accepts_existing_fresh_hand_sample(monkeypatch, fresh, arm_issue):
     from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
     from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
     from dexmani_real.runtime.home import home_arm
@@ -183,7 +184,9 @@ def test_home_arm_accepts_existing_fresh_hand_sample(monkeypatch, fresh):
     monkeypatch.setattr(time, 'sleep', lambda _: clock.__setitem__(0, clock[0] + 10**9))
     arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
     hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
-    arm['timestamp_ns'] = clock[0] + 1
+    arm['timestamp_ns'] = clock[0] - (500_000_000 if arm_issue == 'stale' else 1)
+    if arm_issue == 'fast':
+        arm['qvel'] = 10
     hand['timestamp_ns'] = clock[0] - (1 if fresh else 500_000_000)
     arm['qpos'] = config.arm.home_qpos
     def feedback():
@@ -193,7 +196,7 @@ def test_home_arm_accepts_existing_fresh_hand_sample(monkeypatch, fresh):
                             stop=Mock(), home_arm=Mock())
     planner = Mock()
     planner.plan.return_value = np.array([config.arm.home_qpos])
-    if fresh:
+    if fresh and arm_issue is None:
         home_arm(state, robot, planner, run_id=run_id, cancel_requested=lambda: False)
         planner.set_hand_qpos.assert_called_once()
         robot.home_arm.assert_called_once()
@@ -1096,3 +1099,192 @@ def test_process_start_interrupt_preserves_handle_and_signals(monkeypatch):
     finally:
         arm.pipe.close()
         arm.child_pipe.close()
+
+
+@pytest.mark.parametrize('failure', [None, OSError, KeyboardInterrupt])
+def test_sensor_start_owns_real_spawn_before_return(monkeypatch, failure):
+    import multiprocessing as mp
+    from dexmani_real.runtime.lifecycle import SensorWorkers
+    ctx = mp.get_context('spawn')
+    release = ctx.Event()
+    process = ctx.Process(target=release.wait, args=(10,), name='sensor-test')
+    sensors = SensorWorkers()
+    state = SessionState()
+    start = type(process).start
+    def interrupted_start(self):
+        start(self)
+        assert process.pid is not None
+        assert sensors.processes == [process]
+        if failure:
+            raise failure('start interrupted')
+    monkeypatch.setattr(type(process), 'start', interrupted_start)
+    try:
+        if failure:
+            with pytest.raises(failure):
+                sensors.start(process, ring=None, may_start=lambda: True)
+        else:
+            sensors.start(process, ring=None, may_start=lambda: True)
+        release.set()
+        sensors.shutdown(state)
+        assert sensors.processes == []
+        assert not process.is_alive()
+    finally:
+        release.set()
+        if process.pid is not None:
+            process.join(5)
+            if process.is_alive():
+                process.kill()
+                process.join()
+            process.close()
+
+
+def test_sensor_failed_start_without_pid_does_not_join(monkeypatch):
+    import multiprocessing as mp
+    from dexmani_real.runtime.lifecycle import SensorWorkers
+    sensors = SensorWorkers()
+    process = mp.get_context('spawn').Process()
+    failure = OSError('spawn failed')
+    monkeypatch.setattr(process, 'start', Mock(side_effect=failure))
+    monkeypatch.setattr(process, 'join', Mock(side_effect=AssertionError('unstarted join')))
+    with pytest.raises(OSError) as caught:
+        sensors.start(process, ring=None, may_start=lambda: True)
+    assert caught.value is failure
+    assert sensors.processes == [process]
+    sensors.shutdown(SessionState())
+    assert not sensors.processes
+    process.join.assert_not_called()
+    process.close()
+
+
+@pytest.mark.parametrize('status_failure', [False, True])
+def test_sensor_shutdown_keeps_unresolved_and_closes_others(monkeypatch, status_failure):
+    from dexmani_real.runtime.lifecycle import SensorWorkers
+    state = SessionState()
+    failure = KeyboardInterrupt()
+    bad = Mock(name='bad', pid=1, exitcode=None)
+    bad.join.side_effect = failure
+    if status_failure:
+        monkeypatch.setattr(type(bad), 'exitcode', PropertyMock(side_effect=OSError('status unavailable')), raising=False)
+    bad.is_alive.return_value = True
+    good = Mock(name='good', pid=2, exitcode=0)
+    good.is_alive.return_value = False
+    sensors = SensorWorkers()
+    sensors.processes = [bad, good]
+    with pytest.raises(KeyboardInterrupt) as caught:
+        sensors.shutdown(state)
+    assert caught.value is failure
+    assert state.estop_request
+    assert sensors.processes == [bad]
+    good.join.assert_called_once()
+
+
+@pytest.mark.parametrize('ending', ['success', 'pending_timeout', 'owner_timeout', 'fault', 'cancel', 'exit'])
+def test_arm_reply_consumption_boundary(monkeypatch, ending):
+    from dexmani_real.robot.commands import RobotError
+    state = SessionState()
+    arm = ArmProcess(RealConfig().arm, runtime_state=state)
+    original_pipe = arm.pipe
+    clock = [1_000_000_000]
+    deadline = clock[0] + 1_000_000_000
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: clock[0])
+    arm.process = Mock(pid=123, exitcode=1)
+    arm.process.is_alive.return_value = True
+    arm.io.connected.set()
+    arm.wait_stopped = Mock()
+    arm.pipe = Mock()
+    def poll(*args):
+        clock[0] = deadline + 500_000
+        return ending != 'pending_timeout' or arm.pipe.poll.call_count > 1
+    arm.pipe.poll.side_effect = poll
+    owner_error = TimeoutError('SDK timeout')
+    def recv():
+        if ending == 'fault':
+            arm.io.fault.value = b'late device fault'
+        if ending == 'exit':
+            arm.process.is_alive.return_value = False
+        if ending == 'cancel':
+            state.request_stop()
+        return owner_error if ending == 'owner_timeout' else None
+    arm.pipe.recv.side_effect = recv
+    expected = {'pending_timeout': TimeoutError, 'owner_timeout': TimeoutError,
+                'fault': RobotError, 'exit': RobotError, 'cancel': OperationCancelled}
+    try:
+        def request():
+            arm.request_operation(PrepareRequest(state.run_id, deadline), service=lambda: None,
+                                  abort=lambda: state.stop_signal.is_set())
+        if ending == 'success':
+            request()
+        else:
+            with pytest.raises(expected[ending]) as caught:
+                request()
+            if ending == 'owner_timeout':
+                assert caught.value is owner_error
+        if ending == 'pending_timeout':
+            assert arm.pipe.recv.call_count == 1  # 收尾成功回复不逆转超时。
+    finally:
+        original_pipe.close()
+        arm.child_pipe.close()
+
+
+def test_camera_duplicate_hardware_frames_keep_first_receive_time(monkeypatch):
+    from dexmani_real.config.sensor import CameraConfig
+    from dexmani_real.sensor.realsense import RealSenseCamera
+    camera = RealSenseCamera(CameraConfig())
+    clock = [100]
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: clock[0])
+    depth, color = Mock(), Mock()
+    depth.get_frame_number.return_value = 10
+    color.get_frame_number.return_value = 20
+    frames = Mock(get_depth_frame=lambda: depth, get_color_frame=lambda: color)
+    queued = Mock(as_frameset=lambda: frames)
+    camera.receive_frame(queued)
+    first = camera.pending_frame
+    clock[0] = 200
+    camera.receive_frame(queued)
+    assert camera.pending_frame is first
+    assert camera.received_ns == [100, 100]
+    color.get_frame_number.return_value = 21
+    camera.receive_frame(queued)
+    assert camera.pending_frame[1:] == ((10, 21), (100, 200))
+    assert camera.callback_error is None
+
+
+def test_sensor_second_start_failure_reclaims_first(monkeypatch):
+    import multiprocessing as mp
+    from dexmani_real.runtime.lifecycle import SensorWorkers
+    ctx = mp.get_context('spawn')
+    release = ctx.Event()
+    first = ctx.Process(target=release.wait, args=(10,), name='first')
+    second = ctx.Process(name='second')
+    monkeypatch.setattr(second, 'start', Mock(side_effect=OSError('second start failed')))
+    sensors = SensorWorkers()
+    try:
+        sensors.start(first, ring=None, may_start=lambda: True)
+        with pytest.raises(OSError, match='second start'):
+            sensors.start(second, ring=None, may_start=lambda: True)
+        assert sensors.processes == [first, second]
+        release.set()
+        sensors.shutdown(SessionState())
+        assert not sensors.processes and not first.is_alive()
+    finally:
+        release.set()
+        if first.pid is not None:
+            first.join(5)
+            if first.is_alive():
+                first.kill()
+                first.join()
+            first.close()
+        second.close()
+
+
+def test_sensor_surviving_escalation_remains_owned():
+    from dexmani_real.runtime.lifecycle import SensorWorkers
+    process = Mock(pid=123, exitcode=None)
+    process.is_alive.return_value = True
+    sensors = SensorWorkers()
+    sensors.processes = [process]
+    with pytest.raises(RuntimeError, match='could not be confirmed stopped'):
+        sensors.shutdown(SessionState())
+    process.terminate.assert_called_once()
+    process.kill.assert_called_once()
+    assert sensors.processes == [process]

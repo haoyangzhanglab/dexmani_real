@@ -274,10 +274,10 @@ def test_successful_rollout_returns_idle_only_after_reclaim(tmp_path, monkeypatc
     worker = episode.model = PolicyWorker(load, build_observation=lambda rows: rows)
     worker.load()
     worker.future.result(2)
-    worker.poll()
+    worker.poll().result()
     worker.warmup(())
     worker.future.result(2)
-    worker.poll()
+    worker.poll().result()
     session, _ = make_session(tmp_path)
     session.runtime_state = state
     session.model = worker

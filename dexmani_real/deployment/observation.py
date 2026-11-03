@@ -118,7 +118,8 @@ class ObservationBuilder:
                 arrays[name] = np.stack([r.values[name] for r in rows])
 
         if self.arm_fk is not None:
-            new_rows = [row for row in rows if not row.features]
+            # warmup 会重复引用同一行；缓存按行身份计算，不按窗口位置重复计算。
+            new_rows = list({id(row): row for row in rows if not row.features}.values())
             features = {}
             if new_rows:
                 arm = np.stack([r.values["arm_qpos"] for r in new_rows])

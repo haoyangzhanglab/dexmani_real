@@ -232,7 +232,6 @@ def run_camera(shared, config: CameraConfig):
                 continue
             shared.camera_ring.write(
                 timestamp_ns=frame.timestamp_ns,
-                color_frame_number=frame.color_frame_number,
                 rgb=frame.rgb,
                 depth=frame.depth,
             )

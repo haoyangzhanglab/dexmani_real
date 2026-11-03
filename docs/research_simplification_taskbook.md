@@ -1,8 +1,49 @@
 # DexMani Real：轻量研究运行时减法重构任务书
 
-状态：**待实施**。本次只更新任务书，不代表产品代码已经修改或通过新一轮验收。
+状态：**T1–T4 已实施；T5 待验证，保留现有唯一点云生产路径**。本轮未连接或驱动真机。
 
 日期：2026-11-03。审查基线：[`6e91424c9de968bd8d42d8fc57671cdf0f209e4a`](https://github.com/haoyangzhanglab/dexmani_real/commit/6e91424c9de968bd8d42d8fc57671cdf0f209e4a)。本文合并基于该版本的最近两轮审查，替换已完成的历史任务；[旧任务书](https://github.com/haoyangzhanglab/dexmani_real/blob/6e91424c9de968bd8d42d8fc57671cdf0f209e4a/docs/research_simplification_taskbook.md) 留在 Git 历史中。
+
+## 本轮实施与验收（2026-11-03）
+
+- T1：资源列表改为 `processes`，先登记后 start；无 PID 不 join，关闭失败继续处理其他资源，无法确认退出的对象保留归属。真实 spawn 返回后注入 OSError/KeyboardInterrupt 的测试覆盖可观察句柄窗口，不宣称能覆盖不可观察的 native 副作用。
+- T2：删除成功 ARM 回复的父层迟到判罚，成功消费前检查真实故障并保留撤权；删除 arm HOME 入口相位与触觉 reset 尾部重复检查。owner 期限、起点复核、手部提交后新样本及授权边界保留。
+- T3：删除模型 operation 标签与结果二元组，直接交接完成 Future；正式消费者均调用 result。None 成功、任务自身 TimeoutError、退休失败和关闭语义保持明确。
+- T4：Policy 检查实际受管进程；删除运行时 color_frame_number 搬运，保留接收端与标定硬件身份、Raw 序列及点云配对。
+- T5：保留现有唯一生产路径，待真实 checkpoint 验收。sandbox 外已确认 NVIDIA GeForce RTX 4090、PyTorch 2.4.1+cu124 可用，实际 CUDA 分配、计算、同步和回读通过；此前 CUDA 不可用是 sandbox 限制造成，不再作为阻碍。重新检查 Policy 权重仍只有预训练组件，用户也确认暂无部署 checkpoint。已在 `/tmp/dexmani_t5/` 实现隔离候选并完成下述真实 Raw 观测构建试验；未把候选、开关或额外线程合入生产路径。
+
+验证环境为 `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`（Python 3.10）。本轮修改后运行 `PYTHONDONTWRITEBYTECODE=1 /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B -m pytest -p no:cacheprovider tests/`；T1–T4 首次验收结果为 **415 passed in 4.06s**（相对修改前新增 39 个参数化用例）。测试使用实际 Ruckig、HDF5/MP4/Zarr，以及 OpenCV/SciPy/fpsample 点云处理依赖。新增点云测试在合成 RGB-D 上执行实际 worker 函数、SharedRing 和观测读取，并验证图像配对、数值、dtype 与来源时间；它不是代表性模型性能测试。设备 SDK I/O 使用替身；真机、实际策略 checkpoint 推理及 T5 完整性能验收均未运行。修改前的 376 项通过不计作新增需求验收。
+
+### 全链路复审与清理
+
+- 核对传感启动/关闭、Policy 与 Teleop 健康检查、ARM/HOME 授权、Future 消费、相机 worker→IPC→观测/Raw、标定及 CLI 调用链，未发现仍使用旧模型标签或已删除运行时帧号的消费者；相关链路没有 SHA-256/哈希准入机制可删。
+- 已取得 PID 的传感进程通过 exitcode 确认退出，删除重复 is_alive 查询；无 PID、状态查询失败及关闭中断的归属语义保留。观测读取删除空字段元组的多余分支，Future 消费统一命名，启动等待只消费结果而不再向调用方传递无用返回值。
+- 修复现有手部几何预热对同一行重复计算：同一次构建按行身份去重，沿用原 features 缓存，无额外持久状态。修正 run_policy 的 checkpoint 帮助文本，删除实际解析器不支持的 best/80pct 简写说明。
+- 补充真实相机 worker 载荷发布（仅替换设备 I/O）、静态相机关闭后健康检查、重复行几何缓存测试。最新完整回归 **418 passed in 3.98s**，pytest 禁用缓存；Ruff E9/F、12 个相关源文件的默认 mypy、两个 CLI 的 print-config/Policy help 及 wheel 构建通过。构建不安装依赖，wheel 写入 `/tmp/dexmani_review_wheels/`。
+- 默认 mypy 不检查未标注函数体；额外开启 check-untyped-defs 后，session.py 的 30 项资源初始化 Optional 告警与 HEAD 基线一致，本轮未新增。没有通过新增运行时空值检查或忽略规则掩盖这些既有类型问题。未执行真机或 checkpoint 推理验收，T5 结论不变；下方性能数据保留为复审前的隔离试验记录。
+
+### T5：sandbox 外补充试验
+
+输入为 `episodes/pnp_apple_banana/` 的五段 Raw（20261101_165909、173701、173916、174250、174738），每段沿全段均匀选取 50 帧，640×480 RGB-D、1024 场景点、1024 手点。相机内外参和真实深度比例来自 Raw，点云配置来自 Raw 的 runtime_config_json，桌面平面使用当前 2026-10-29 标定。历史长度 2/4、模态组合是探索性选择，**不是 checkpoint 恢复的实验配置**。
+
+临时候选把同一个 PointCloudProcessor 放入已有 PolicyWorker 单线程，在 PolicyObservationRow.features 中提交完整派生特征；重复引用按行去重，空云直接抛错。与原观测构建器比较点云单模态、RGB-D 和手部几何混合输入的数值、形状与 dtype；重复行不重算、空云不提交部分缓存、五段之间退休任务和行释放检查均通过。未更换点云算法或参数，未增加生产线程。
+
+下表只测 **提交观测构建任务至 Future 结果被取回**，不含模型推理、Raw 解码、相机/点云 IPC 等待或实际控制循环的轮询延迟。基线的点云已在计时外预计算；候选在计时内构建。因此它衡量计算迁入模型线程的局部成本，不能视为两个完整生产架构的端到端比较。五段各自的首行重复引用查询单独记录；下表包含随后首次完整历史窗口的填充成本，尤其历史 4 会一次计算三个尚未缓存的行。
+
+| 输入 | 历史 | 查询数 | 预计算观测端 p50/p95/p99（ms） | 候选观测端 p50/p95/p99（ms） | 试验进程峰值 RSS 基线/候选（MiB） |
+| --- | --- | --- | --- | --- | --- |
+| 点云 | 2 | 245 | 0.08 / 0.12 / 0.13 | 7.83 / 9.05 / 10.65 | 169.8 / 192.0 |
+| RGB-D＋点云 | 2 | 245 | 0.24 / 0.31 / 0.55 | 7.79 / 8.98 / 9.50 | 184.3 / 194.2 |
+| RGB-D＋点云＋手部几何 | 2 | 245 | 0.42 / 0.54 / 0.69 | 7.97 / 9.17 / 9.95 | 225.3 / 234.8 |
+| 点云 | 4 | 235 | 0.07 / 0.09 / 0.12 | 7.48 / 8.66 / 21.07 | 174.2 / 197.7 |
+| RGB-D＋点云 | 4 | 235 | 0.35 / 0.40 / 0.43 | 7.86 / 8.96 / 21.66 | 189.2 / 203.4 |
+| RGB-D＋点云＋手部几何 | 4 | 235 | 0.55 / 0.62 / 0.74 | 8.24 / 10.31 / 21.96 | 228.0 / 246.2 |
+
+单独记录的首行重复引用查询耗时范围：基线 0.06–2.98 ms，候选 7.19–19.87 ms；这不是模型预热测量。峰值 RSS 包含 Raw 解码、参考点云和数值对照对象，不包含独立点云进程、共享环或模型，因此不能推导生产总内存收益。仅点云输入的历史 RGB-D 保留量额外增加约 2.93 MiB（历史 2）/5.86 MiB（历史 4）；RGB-D 混合输入本来就保留这些图像。
+
+完整构建＋真实模型推理＋调度交接、GPU 峰值内存、checkpoint 预算余量，以及同调度 sync/async/RTC 回放仍未测量。没有用随机权重或无操作模型替代真实推理，也不从 16 Hz Raw 周期推定 RTC 剩余预算。结论仍为 **T5 待验证，保留独立点云进程及 IPC**。
+
+补充试验时在 sandbox 外重新执行完整 pytest（禁用缓存）：**415 passed in 3.90s**。CUDA 运算通过不等于策略模型推理通过；全程未连接或驱动真机。临时试验脚本和各组 JSON 位于 `/tmp/dexmani_t5/`，未新增仓库 benchmark 框架。
 
 ## 1. 目标与取舍
 

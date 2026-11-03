@@ -97,7 +97,6 @@ def home_arm(state, robot, planner, *, run_id, cancel_requested):
     target = np.asarray(config.home_qpos, dtype=np.float64)
     if state.safety_state != SafetyState.ARMED:
         raise OperationCancelled("home requires ARMED")
-    boundary_ns = time.monotonic_ns()
 
     def cancelled():
         return cancel_requested() or not state.can_move(
@@ -116,8 +115,7 @@ def home_arm(state, robot, planner, *, run_id, cancel_requested):
             now_ns = time.monotonic_ns()
             feedback_issue = "fresh stationary arm state unavailable"
             if (
-                int(arm_state["timestamp_ns"][0]) > boundary_ns
-                and sample_is_fresh(arm_state["timestamp_ns"][0], config.feedback_max_age_s, now_ns)
+                sample_is_fresh(arm_state["timestamp_ns"][0], config.feedback_max_age_s, now_ns)
                 and np.max(np.abs(arm_state["qvel"][0])) <= config.homing.velocity_convergence_rad_s
             ):
                 if not hand.enabled:

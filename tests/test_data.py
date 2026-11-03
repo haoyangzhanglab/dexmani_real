@@ -274,7 +274,7 @@ def test_rollout_writer_finishes_independently_of_model(
     try:
         worker.load()
         worker.future.result(timeout=2)
-        worker.poll()
+        worker.poll().result()
         expected = RecordingError if writer_failure else TimeoutError if model_failure == "pending" else RuntimeError
         with pytest.raises(expected) as caught:
             session.run_control_loop()
@@ -646,3 +646,71 @@ def test_rollout_reclaims_partially_opened_writer(tmp_path, capture, monkeypatch
     assert episode.result.raw['status'] == 'failed'
     assert recorder.staging_path.is_dir() and recorder.published_path is None
     episode.start_observation.assert_not_called()
+
+
+@pytest.mark.parametrize('cloud', [False, True])
+def test_camera_ipc_pairing_with_real_pointcloud(monkeypatch, cloud):
+    import multiprocessing as mp
+    from dexmani_real.config.sensor import CameraConfig
+    from dexmani_real.ipc.sensors import SensorChannels
+    from dexmani_real.perception.pointcloud import PointCloudProcessor
+    from dexmani_real.perception.worker import run_pointcloud_worker
+    from dexmani_real.runtime.observation import ObservationNeeds, read_observation
+    cfg = CameraConfig(width=32, height=32)
+    camera = CameraSnapshot('test', CameraIntrinsics(32, 32, 200., 200., 15.5, 15.5, 'none', (0.,) * 5),
+                            .001, np.eye(4))
+    recipe = PointCloudConfig(remove_table=False, num_points=64, workspace=(-1., -1., 0., 1., 1., 1.))
+    channels = SensorChannels(mp.get_context('spawn'), camera=cfg,
+                              pointcloud_num_points=64 if cloud else None,
+                              pointcloud_camera_fields=('rgb', 'depth') if cloud else ())
+    rgb = np.full((32, 32, 3), 80, np.uint8)
+    depth = np.full((32, 32), 500, np.uint16)
+    sequence = channels.camera_ring.write(timestamp_ns=1234, rgb=rgb, depth=depth)
+    if cloud:
+        read = channels.camera_ring.read
+        def one_frame():
+            channels.is_running.value = False
+            return read()
+        monkeypatch.setattr(channels.camera_ring, 'read', one_frame)
+        run_pointcloud_worker(channels, recipe, camera, None)
+        expected = PointCloudProcessor(depth_scale_m=.001, intrinsics=camera.color,
+                                       T_xarm_base_from_color=np.eye(4), table_plane_abcd=None,
+                                       config=recipe).process(depth, rgb)
+        assert expected.shape == (64, 6) and expected.dtype == np.float32
+        # 新相机帧不得替换点云载荷中已经配对的图像。
+        channels.camera_ring.write(timestamp_ns=9999, rgb=rgb + 1, depth=depth + 1)
+    robot = SimpleNamespace(read_state=lambda: SimpleNamespace(arm=np.zeros(1, dtype=ARM_STATE_DTYPE), hand=None))
+    row = read_observation(channels, robot, needs=ObservationNeeds(camera_fields=('rgb', 'depth'), point_cloud=cloud))
+    assert row.camera['timestamp_ns'] == 1234 and row.camera['ring_sequence'] == sequence
+    np.testing.assert_array_equal(row.camera['rgb'], rgb)
+    np.testing.assert_array_equal(row.camera['depth'], depth)
+    if cloud:
+        np.testing.assert_array_equal(row.point_cloud, expected)
+        assert row.pointcloud_timestamp_ns == 1234
+
+
+def test_camera_worker_publishes_current_payload(monkeypatch):
+    import multiprocessing as mp
+    from dexmani_real.config.sensor import CameraConfig
+    from dexmani_real.ipc.sensors import SensorChannels, read_camera_frame, snapshot_camera_parameters
+    from dexmani_real.sensor import realsense
+    config = CameraConfig(width=2, height=2)
+    channels = SensorChannels(mp.get_context('spawn'), camera=config)
+    intrinsics = CameraIntrinsics(2, 2, 200., 200., .5, .5, 'none', (0.,) * 5)
+    rgb = np.full((2, 2, 3), 80, np.uint8)
+    depth = np.full((2, 2), 500, np.uint16)
+    def read():
+        channels.is_running.value = False
+        return realsense.RGBDFrame(rgb, depth, 41, 42, 1234)
+    camera = SimpleNamespace(connect=Mock(), disconnect=Mock(), read=read, depth_scale_m=.001,
+                             active_serial='test', color_intrinsics=intrinsics)
+    monkeypatch.setattr(realsense, 'RealSenseCamera', lambda cfg: camera)
+    realsense.run_camera(channels, config)
+    camera.disconnect.assert_called_once_with()
+    frame = read_camera_frame(channels)
+    np.testing.assert_array_equal(frame['rgb'], rgb)
+    np.testing.assert_array_equal(frame['depth'], depth)
+    assert frame['timestamp_ns'] == 1234 and frame['ring_sequence'] == 1
+    snapshot = snapshot_camera_parameters(channels, config, None, include_extrinsics=False)
+    assert snapshot.serial == 'test' and snapshot.color == intrinsics
+    assert snapshot.depth_scale_m == .001

@@ -164,9 +164,8 @@ class PolicySession:
         if not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
             return False
-        for name, needed in (("camera", self.needs.camera_worker), ("pointcloud", self.needs.point_cloud)):
-            if needed and not self.sensors.check(names=(name,)):
-                raise RobotError(f"required {name} process exited")
+        if not self.sensors.check():
+            raise RobotError("required sensor process exited")
         return True
 
     def start_devices(self):
@@ -262,7 +261,7 @@ class PolicySession:
         robot_pending = self.robot is not None and (
             self.robot.arm is not None or self.robot.hand is not None
         )
-        sensor_pending = self.sensors is not None and bool(self.sensors.started)
+        sensor_pending = self.sensors is not None and bool(self.sensors.processes)
         keyboard_pending = (
             self.keyboard is not None and self.keyboard.listener is not None
             and self.keyboard.listener.is_alive()
@@ -332,9 +331,10 @@ class PolicySession:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("model load/warmup deadline expired")
-            completion = self.model.poll()
-            if completion is not None:
-                return completion
+            future = self.model.poll()
+            if future is not None:
+                future.result()
+                return
             time.sleep(min(0.005, remaining))
 
     def warmup_policy(self):

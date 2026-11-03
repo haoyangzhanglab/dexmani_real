@@ -215,10 +215,9 @@ class ArmProcess:
                 if isinstance(error, Exception) and self.fault:
                     raise self._read_fault() from error
                 raise error
+            self.check_error()
             if abort():
                 raise OperationCancelled("arm operation cancelled")
-            if time.monotonic_ns() >= deadline_ns:
-                raise TimeoutError("arm operation completed after deadline")
         except BaseException as failure:
             if isinstance(failure, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()

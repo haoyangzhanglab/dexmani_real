@@ -19,7 +19,7 @@ WORKER_STOP_TIMEOUT_S = 1.0
 class SensorWorkers:
     def __init__(self, channels=None):
         self.channels = channels
-        self.started = []
+        self.processes = []
 
     def start(self, process, *, ring, timeout_s=None, may_start) -> None:
         """传入超时时等待就绪，否则仅启动；失败后仍由本对象回收进程。"""
@@ -28,8 +28,8 @@ class SensorWorkers:
             raise RuntimeError("required sensor worker exited before startup")
         if not allowed:
             raise OperationCancelled("sensor startup cancelled")
+        self.processes.append(process)
         process.start()
-        self.started.append(process)
         if timeout_s is not None:
             deadline = time.monotonic() + timeout_s
             while time.monotonic() < deadline:
@@ -46,7 +46,7 @@ class SensorWorkers:
 
     def check(self, *, names=None) -> bool:
         healthy = True
-        for process in self.started:
+        for process in self.processes:
             if (names is None or process.name in names) and not process.is_alive():
                 logger.error("required worker %s exited: %s", process.name, process.exitcode)
                 healthy = False
@@ -59,8 +59,10 @@ class SensorWorkers:
         deadline = time.monotonic() + SENSOR_SHUTDOWN_TIMEOUT_S
         errors: list[tuple[str, BaseException]] = []
         unresolved = []
-        for process in self.started:
+        for process in self.processes:
             try:
+                if process.pid is None:
+                    continue
                 process.join(timeout=max(0.0, deadline - time.monotonic()))
                 escalation = "graceful"
                 if process.is_alive():
@@ -71,7 +73,7 @@ class SensorWorkers:
                     escalation = "kill"
                     process.kill()
                     process.join(timeout=WORKER_STOP_TIMEOUT_S)
-                if process.is_alive() or process.exitcode is None:
+                if process.exitcode is None:
                     raise RuntimeError(f"process {process.name} could not be confirmed stopped")
                 if process.exitcode != 0 or escalation != "graceful":
                     errors.append((process.name, RuntimeError(f"worker {process.name}: exitcode={process.exitcode}, {escalation}")))
@@ -85,9 +87,16 @@ class SensorWorkers:
                 if isinstance(exc, KeyboardInterrupt):
                     runtime_state.request_emergency_stop()
                 errors.append((process.name, exc))
-                if process.is_alive() or process.exitcode is None:
+                try:
+                    pending = process.pid is not None and process.exitcode is None
+                except BaseException as status_error:
+                    if isinstance(status_error, KeyboardInterrupt):
+                        runtime_state.request_emergency_stop()
+                    errors.append((process.name, status_error))
+                    pending = True
+                if pending:
                     unresolved.append(process)
-        self.started = unresolved
+        self.processes = unresolved
         if errors:
             for stage, error in errors[1:]:
                 logger.error("worker %s shutdown failed", stage, exc_info=(type(error), error, error.__traceback__))
