@@ -5,11 +5,10 @@ import time
 
 from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.control.constraints import MotionConstraints
-from dexmani_real.control.homing import HomePathRejected
 from dexmani_real.control.ik import IKSolver
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import build_home_planner, home_robot
+from dexmani_real.runtime.home import home_arm, home_hand
 from dexmani_real.runtime.jog import CartesianJog
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime
@@ -32,7 +31,8 @@ class KeyboardTeleop:
         configure_logging()
         validate_robot_config(self.runtime)
         self.runtime.environment.validate()
-        self.home_planner = None
+        if not self.runtime.hand.enabled:
+            self.runtime.hand.validate_home_pose()
         self.bounds = jog_bounds(self.runtime)
         self.runtime_state = SessionState()
         self.robot = Robot(
@@ -91,7 +91,7 @@ class KeyboardTeleop:
         if not (self.runtime_state.cancel_epoch == startup_epoch and self.runtime_state.requests_allow_motion()):
             raise OperationCancelled("startup cancelled")
         self.prepare_jog(startup_epoch)
-        print("WASD/arrows and IJKL: jog; R: planned home; Q: exit; ESC: emergency stop")
+        print("WASD/arrows and IJKL: jog; R: hand then direct arm HOME; Q: exit; ESC: emergency stop")
         print(
             "Jog is ready. Release jog keys to brake and hold. "
             "Rejected targets brake and hold; valid targets resume motion."
@@ -151,20 +151,20 @@ class KeyboardTeleop:
             return not self.runtime_state.requests_allow_motion()
 
         try:
-            home_robot(
-                self.runtime_state, self.robot, self.get_home_planner,
+            home_hand(
+                self.runtime_state, self.robot,
                 cancel_epoch=cancel_epoch,
                 cancel_requested=cancelled,
             )
-        except (HomeConfigurationError, HomePathRejected) as exc:
+            home_arm(
+                self.runtime_state, self.robot,
+                cancel_epoch=cancel_epoch,
+                cancel_requested=cancelled,
+            )
+        except HomeConfigurationError as exc:
             self.robot.check()
             logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
         else:
             logger.info("HOME completed")
         self.prepare_jog(cancel_epoch)
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
-
-    def get_home_planner(self):
-        if self.home_planner is None:
-            self.home_planner = build_home_planner(self.runtime.environment, self.runtime.arm)
-        return self.home_planner

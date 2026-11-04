@@ -1,6 +1,18 @@
 # xArm 轻量化改造任务书
 
-状态：方案已完成，代码尚未实施，尚未进行真机验收。
+状态：四批必做改造及调用链清理已实施，离线回归通过；类型检查仍有下述既有诊断，尚未进行真机验收。
+
+实施基线：`main@52bc7878`，初始工作区干净。删除 Owner 双错误通道、重复停止/连接准备、公开轨迹 commit、HOME 路径协议与专属几何；joint 映射独立于几何系统。无在途健康取消允许回待命，在途不明仍结束设备会话。
+
+实际调用链差异：相机标定直接使用 `XArm7.connect()`，因此连接保留只读用途，运动参数集中于运动准备；独立 arm HOME 不调用会写手部的 `Robot.stop()`。H/R 在运行入口显式先 hand、后 arm。XHand 驱动、首帧重定向及数据格式未修改。
+
+离线验证使用现有 `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`：`PYTHONDONTWRITEBYTECODE=1 ... -m pytest -p no:cacheprovider tests -q`，713 项通过；`... -B -m ruff check --no-cache --select F dexmani_real scripts tests` 与 `git diff --check` 通过。包含真实 Ruckig 极值、Fake SDK 停止与错误、受控时钟 HOME、joint 缺几何依赖，以及 XHand、录制导出、replay 和标定回归。
+
+调用链清理：整机重复停止标记收敛为 `hand_stop_required`，arm 停止结果以 Owner 为准；独立 arm HOME 不清除已有手部停止责任。首个流式目标使用当时新鲜反馈建立参考，并拒绝仍在运动的起点，后续周期不重置轨迹。Mapper 必须取得关节限位，EEF 约束只由 solver 持有；删除桌面接触豁免残留及重复环境校验，取消只保留局部在途事实。
+
+补充验证：Mypy 对 18 个核心模块使用 `--check-untyped-defs --no-incremental --cache-dir=/dev/null --follow-imports=silent --ignore-missing-imports`，无诊断。PolicySession 扩展检查仍有 28 项可空资源诊断；在 `/tmp` 以 HEAD 完整源码检查有 30 项，逐条按源码及诊断内容对照无新增，未增加 ignore 或运行时兜底。使用现有 setuptools 在 `/tmp` 构建 wheel 成功，80 个 Python 模块逐个与源码一致，3 份标定 JSON 齐全，已删除的 HOME planner 不在产物中。构建不证明可选依赖、仓库机器人资产或真机运行环境可用。
+
+未执行设备连接、运动、HOME 或实际发送时序测量；直接 HOME 路径/加速度、硬件性能和物理停止仍未验证。后置事项未实施。
 
 日期：2026-11-04。两轮审查基于 `c4ded28b1078adefbd017f4c546b6a132a91d29b`；本任务书已对照最新 `main@88b8f2a11f0765335c4da46b69e33952706fe8fd` 修订。实施时从最新工作区继续，先核对变化，不回退到审查快照。
 

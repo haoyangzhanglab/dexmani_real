@@ -41,11 +41,10 @@ class ArmProcess:
         )
         self.pipe, self.child_pipe = self.ctx.Pipe()
         self.process: BaseProcess | None = None
-        self.reply_pending = False
 
     @property
     def is_connected(self) -> bool:
-        # ready 也用于失败唤醒；操作入口仍须先 check_error。
+        # ready 只表示连接初始化成功；不代表已准备运动。
         return (
             self.process is not None and self.process.is_alive()
             and self.io.ready.is_set() and not self.io.closing.is_set()
@@ -116,12 +115,8 @@ class ArmProcess:
                 issue = "arm owner exited without confirming stop"
         return RobotError(f"xArm controller fault: {issue}") if issue else None
 
-    def _read_close_error(self):
-        message = self.io.close_error.value.decode(errors="replace")
-        return RobotError(message) if message else None
-
     def check_error(self):
-        error = self._read_fault() or self._read_close_error()
+        error = self._read_fault()
         if error is not None:
             raise error
 
@@ -145,8 +140,6 @@ class ArmProcess:
         self.check_error()
         if not self.is_connected:
             raise RuntimeError("arm unavailable for lifecycle operation")
-        if self.reply_pending:
-            raise RuntimeError("previous arm reply remains pending")
         self.request_stop()
         self.wait_stopped(deadline=min(
             time.monotonic() + EXECUTOR_TIMEOUT_S, deadline_ns / 1e9,
@@ -165,6 +158,8 @@ class ArmProcess:
 
     def request_operation(self, request: PrepareRequest | HomeRequest, *, service, abort, cancel_epoch):
         deadline_ns = request.deadline_ns
+        # 生命周期仅由一个父控制流程顺序调用；局部事实只决定异常收尾。
+        in_flight = False
         try:
             self.resume(cancel_epoch, deadline_ns=deadline_ns)
             service()
@@ -172,8 +167,8 @@ class ArmProcess:
                 raise OperationCancelled("arm operation cancelled before submission")
             if time.monotonic_ns() >= deadline_ns:
                 raise TimeoutError("arm operation deadline expired before submission")
+            in_flight = True
             self.pipe.send(request)
-            self.reply_pending = True
             while not self.pipe.poll(0.005):
                 service()
                 if abort():
@@ -181,11 +176,11 @@ class ArmProcess:
                 if time.monotonic_ns() >= deadline_ns or not self.is_connected:
                     raise TimeoutError("arm operation unresolved before deadline")
             error = self.pipe.recv()
-            self.reply_pending = False
             if error is not None:
                 if isinstance(error, Exception) and self.fault:
                     raise self._read_fault() from error
                 raise error
+            in_flight = False
             self.check_error()
             if abort():
                 raise OperationCancelled("arm operation cancelled")
@@ -193,6 +188,17 @@ class ArmProcess:
             if isinstance(failure, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()
             self.request_stop()
+            if isinstance(failure, OperationCancelled) and not in_flight:
+                try:
+                    self.wait_stopped()
+                    if not self.is_connected:
+                        raise RobotError("arm owner unavailable after cancellation")
+                except BaseException as cleanup:
+                    if isinstance(cleanup, KeyboardInterrupt):
+                        self.runtime_state.request_emergency_stop()
+                    self.io.closing.set()
+                    raise
+                raise
             self.io.closing.set()
             # 异常请求不再恢复；最终 close 读取 owner 的晚到故障。
             self.check_error()
@@ -208,9 +214,9 @@ class ArmProcess:
             cancel_epoch=cancel_epoch,
         )
 
-    def home(self, waypoints, cancel_epoch, *, service, abort, deadline_ns):
+    def home(self, cancel_epoch, *, service, abort, deadline_ns):
         self.request_operation(
-            HomeRequest(waypoints, deadline_ns),
+            HomeRequest(deadline_ns),
             service=service,
             abort=abort,
             cancel_epoch=cancel_epoch,
@@ -238,11 +244,9 @@ class ArmProcess:
                     self.runtime_state.request_emergency_stop()
                 errors.append(exc)
         # join 后重新读取故障，包含关闭期间晚到的错误。
-        fault, close_error = self._read_fault(), self._read_close_error()
+        fault = self._read_fault()
         if fault is not None:
             errors.insert(0, fault)
-        if close_error is not None:
-            errors.append(close_error)
         alive = self.process is not None and self.process.is_alive()
         if alive:
             errors.append(TimeoutError("arm owner process still active; stop/disconnect unresolved"))

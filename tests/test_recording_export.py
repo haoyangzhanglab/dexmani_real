@@ -1215,7 +1215,7 @@ def test_preparation_keeps_robot_stopped_through_writer_and_refreshes_inputs(
     writer_started = [False]
     dropped = [False]
     robot = Robot(runtime.arm, runtime.hand, runtime_state=state)
-    robot.connected = robot.stop_required = True
+    robot.connected = robot.hand_stop_required = True
 
     def arm_snapshot():
         frame = full.arm.copy()
@@ -1273,7 +1273,7 @@ def test_preparation_keeps_robot_stopped_through_writer_and_refreshes_inputs(
     open_writer = recording.RawWriter.open
 
     def delayed_open(writer, metadata):
-        assert state.stop_signal.is_set() and not robot.stop_required
+        assert state.stop_signal.is_set() and not robot.hand_stop_required
         assert 'streaming' not in events and not submitted
         writer_started[0] = True
         events.append('writer')

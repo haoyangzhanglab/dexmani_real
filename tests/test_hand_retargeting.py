@@ -38,14 +38,15 @@ def make_hand_loop(monkeypatch, *, smoothing_tau_s=.02, custom_limits=False):
     measurements = hand_lengths(prepare_landmarks(landmarks))
     retargeter.calibrate([measurements] * config.calibration_samples)
     solver = SimpleNamespace(
+        constraints=SimpleNamespace(workspace=np.array([[-1., 1.]] * 3)),
         compute_eef_pose_base=lambda q: Pose(np.zeros(3), np.array([1., 0., 0., 0.])),
         solve=lambda pose, current, previous, **kwargs: SimpleNamespace(qpos=current.copy()),
     )
     mapper = ActionMapper(
-        SimpleNamespace(workspace=np.array([[-1., 1.]] * 3)), solver=solver,
+        joint_limits=np.column_stack((runtime.arm.joint_limit_lower, runtime.arm.joint_limit_upper)),
+        solver=solver,
         hand_enabled=True, hand_lower_rad=runtime.hand.qpos_min_rad,
         hand_upper_rad=runtime.hand.qpos_max_rad,
-        home_hand_qpos=np.deg2rad(runtime.hand.home_qpos_deg),
     )
     controller = VRController(mapper, retargeter, runtime.teleop, np.eye(3))
     state = SessionState()
@@ -55,7 +56,7 @@ def make_hand_loop(monkeypatch, *, smoothing_tau_s=.02, custom_limits=False):
     robot.arm = SimpleNamespace(
         is_connected=True, check_error=lambda: None,
         submit=lambda command, **kwargs: commands.append(command),
-        request_stop=lambda: None, wait_stopped=lambda: None,
+        wait_stopped=lambda: None,
     )
 
     def send_hand(target):

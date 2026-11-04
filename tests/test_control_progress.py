@@ -23,11 +23,11 @@ def make_rollout(monkeypatch, *, mode='sync', history=1):
     runtime = replace(runtime, execution=replace(runtime.execution, mode=mode, action_steps=4, prefetch_steps=1))
     rollout = Rollout(SessionState(), runtime,
                       SimpleNamespace(control_dt_s=.0625, n_obs_steps=history), cancel_epoch=1,
-                      robot=SimpleNamespace(stop=lambda: None, check=lambda: None, send_action=lambda *a, **kw: sends.append(clock[0])),
+                      robot=SimpleNamespace(arm=SimpleNamespace(is_connected=True), stop=lambda: None, check=lambda: None, send_action=lambda *a, **kw: sends.append(clock[0])),
                       observations=SimpleNamespace(project=lambda row: row),
                       control_needs=ObservationNeeds(), record_needs=ObservationNeeds(),
                       sensors=None, action_mapper=None,
-                      model=SimpleNamespace(future=None, poll=lambda: None, predict=lambda *a, **kw: None),
+                      model=SimpleNamespace(discard_pending=lambda timeout: None, future=None, poll=lambda: None, predict=lambda *a, **kw: None),
                       max_running_s=None, index=1, output_dir='/tmp', record_raw=False,
                       audio=SimpleNamespace(play=lambda sound: None))
     rollout.started_ns = rollout.next_step_ns = clock[0]
@@ -261,7 +261,7 @@ def test_teleop_slow_tick_commits_then_quits_through_episode_cleanup(monkeypatch
                                wrist_quat_wxyz=np.array([1., 0, 0, 0])))
     monkeypatch.setattr('dexmani_real.teleop.loop.read_observation', lambda *a, **kw: row)
     order = []
-    robot = SimpleNamespace(check=lambda: None, service_feedback=lambda: None,
+    robot = SimpleNamespace(arm=SimpleNamespace(is_connected=True),check=lambda: None, service_feedback=lambda: None,
                             service_idle=lambda: None,
                             prepare_streaming=lambda epoch: state.stop_signal.clear(),
                             stop=lambda: order.append('stop'), close=lambda: order.append('close'),
@@ -548,7 +548,7 @@ def test_teleop_esc_arriving_in_poll_records_estop():
     keyboard.poll = interrupted_poll
     loop = TeleopLoop.__new__(TeleopLoop)
     loop.runtime_state, loop.keyboard = state, keyboard
-    loop.robot = SimpleNamespace(service_feedback=lambda: None, service_idle=lambda: None)
+    loop.robot = SimpleNamespace(arm=SimpleNamespace(is_connected=True),service_feedback=lambda: None, service_idle=lambda: None)
     loop.phase, loop.next_tick_ns = TeleopPhase.ACTIVE, None
     loop.recorder = loop.pending_termination_reason = None
     loop.audio = SimpleNamespace(play=lambda sound: None)
@@ -671,7 +671,7 @@ def test_policy_prepare_only_accepts_current_operator_cancellation(monkeypatch, 
     rollout.prepare = prepare
     if cancelled:
         rollout.run(poll_operator=lambda: None)
-        assert rollout.runtime_state.quit_requested
+        assert not rollout.runtime_state.quit_requested
         assert rollout.result.termination_reason == 'start_cancelled'
     else:
         with pytest.raises(OperationCancelled, match='prepare interrupted'):
@@ -689,18 +689,18 @@ def test_policy_home_only_accepts_current_operator_cancellation(monkeypatch, can
     state.request_stop()  # 之前正常结束过一段，不能据此吞掉这次意外中断。
     epoch = state.cancel_epoch
     session.episode = None
-    session.robot = SimpleNamespace(check=lambda: None)
+    session.robot = SimpleNamespace(arm=SimpleNamespace(is_connected=True), stop=lambda: None, check=lambda: None)
     session.audio = SimpleNamespace(play=lambda sound: None)
-    session.get_home_planner = lambda: None
     session.home_abort_requested = lambda: False
     def home(*args, **kwargs):
         if cancelled:
             state.request_stop()
         raise OperationCancelled('home interrupted')
-    monkeypatch.setattr('dexmani_real.deployment.session.home_robot', home)
+    monkeypatch.setattr('dexmani_real.deployment.session.home_arm', home)
+    monkeypatch.setattr('dexmani_real.deployment.session.home_hand', lambda *a, **kw: None)
     if cancelled:
         assert session.run_home(epoch)
-        assert state.quit_requested
+        assert not state.quit_requested
     else:
         with pytest.raises(OperationCancelled, match='home interrupted'):
             session.run_home(epoch)
@@ -755,7 +755,7 @@ def test_teleop_prepare_only_accepts_current_operator_cancellation(monkeypatch, 
     rollout.robot.prepare_streaming = prepare
     if cancelled:
         loop.start_episode(epoch)
-        assert state.quit_requested
+        assert not state.quit_requested
     else:
         with pytest.raises(OperationCancelled, match='prepare interrupted'):
             loop.start_episode(epoch)
@@ -889,7 +889,7 @@ def test_hand_sync_send_has_no_arm_target_lease(monkeypatch):
 def test_active_feedback_service_detects_loss_without_another_send(monkeypatch):
     from dexmani_real.robot.commands import RobotError
     robot, now, submitted = make_coordinated_robot(monkeypatch)
-    robot.stop_required = True
+    robot.hand_stop_required = True
     now[0] += 490_000_000
     robot.service_feedback()
     assert int(robot.hand_feedback.snapshot()['timestamp_ns'][0]) == 1_000_000_000
@@ -932,7 +932,7 @@ def test_hand_home_callback_cannot_extend_operation_deadline(monkeypatch):
     with pytest.raises(TimeoutError, match='HOME budget exhausted'):
         robot.send_hand_home(RobotCommand(hand_qpos=np.zeros(12)), deadline_ns=now[0] + 100_000_000,
                              cancel_requested=cancelled)
-    assert not robot.stop_required
+    assert not robot.hand_stop_required
 
 
 def test_tactile_reset_clears_only_tactile_before_driver_requests(monkeypatch):
@@ -953,3 +953,36 @@ def test_tactile_reset_clears_only_tactile_before_driver_requests(monkeypatch):
     for channel in ('aggregate', 'dense'):
         assert int(frame[f'tactile_{channel}_timestamp_ns'][0]) == 0
         assert np.isnan(frame[f'tactile_{channel}']).all()
+
+
+def test_joint_mapper_needs_no_geometry(monkeypatch):
+    import builtins
+    from dexmani_real.control.actions import ActionMapper
+    from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
+    original = builtins.__import__
+    def guarded(name, *args, **kwargs):
+        if name.split('.')[0] in {'pinocchio', 'hppfcl', 'mplib', 'trimesh'}:
+            raise ModuleNotFoundError(name)
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', guarded)
+    cfg = RealConfig()
+    hand = replace(cfg.hand, enabled=False, home_qpos_deg=(float('nan'),)*12)
+    environment = replace(cfg.environment, workspace=replace(cfg.environment.workspace, x_min=10))
+    runtime = replace(cfg, hand=hand, environment=environment)
+    validate_robot_config(runtime)
+    validate_control_rate(runtime, cfg.arm.servo_hz * 2)
+    mapper = ActionMapper.for_mode('joint', arm=cfg.arm, hand=hand, motion=cfg.motion, environment=environment)
+    result = mapper.map_joint(np.asarray(cfg.arm.home_qpos), None, cfg.arm.home_qpos)
+    assert result.rejection_reason is None
+    np.testing.assert_allclose(result.arm_qpos, cfg.arm.home_qpos)
+    from dexmani_real.robot.system import Robot
+    from dexmani_real.robot.commands import RobotCommand
+    submitted = []
+    robot = Robot(cfg.arm, hand, runtime_state=SessionState())
+    robot.connected = True
+    robot.arm = SimpleNamespace(is_connected=True, check_error=lambda: None,
+                                submit=lambda cmd, **kw: submitted.append(cmd))
+    robot.send_action(RobotCommand(arm_qpos=result.arm_qpos), expires_ns=2_000_000_000)
+    assert len(submitted) == 1
+    with pytest.raises(ModuleNotFoundError):
+        ActionMapper.for_mode('eef', arm=cfg.arm, hand=cfg.hand, motion=cfg.motion, environment=cfg.environment)

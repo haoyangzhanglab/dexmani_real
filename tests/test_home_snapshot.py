@@ -7,7 +7,7 @@ import pytest
 
 from dexmani_real.config.real import RealConfig
 from dexmani_real.ipc.ring import SharedRing
-from dexmani_real.runtime.home import home_robot
+from dexmani_real.runtime.home import home_arm
 from dexmani_real.runtime.state import SessionState
 
 
@@ -30,101 +30,6 @@ def test_snapshot_contention_reuses_complete_snapshot_without_renewal():
     assert stale[0]['timestamp_ns'] == 123 and stale[0]['value'] == 7
     assert ring.read(fields=('timestamp_ns',)) is None
 
-
-def test_home_planner_construction_uses_same_total_deadline(monkeypatch):
-    now = [1_000_000_000]
-    monkeypatch.setattr('dexmani_real.runtime.home.time.monotonic_ns', lambda: now[0])
-    monkeypatch.setattr('dexmani_real.runtime.home.time.monotonic', lambda: now[0] / 1e9)
-    runtime = RealConfig()
-    state = SessionState()
-    robot = SimpleNamespace(arm_config=runtime.arm, hand_config=replace(runtime.hand, enabled=False),
-                            stop=lambda: None)
-    def planner():
-        now[0] += 61_000_000_000
-        return SimpleNamespace()
-    with pytest.raises(TimeoutError):
-        home_robot(state, robot, planner, cancel_epoch=state.cancel_epoch, cancel_requested=lambda: False)
-
-
-def test_home_sdk_return_does_not_mean_measured_arrival():
-    import threading
-    import time
-
-    from dexmani_real.robot.xarm7.worker import ArmController
-    config = RealConfig().arm
-    target = np.asarray(config.home_qpos)
-    measured = target + .01
-    moves = []
-    io = SimpleNamespace(stop=threading.Event(), publish_status=lambda status: None)
-    driver = SimpleNamespace(enter_mode=lambda *a, **kw: None,
-                             move_home=moves.append,
-                             read=lambda: (measured, np.zeros(7)))
-    owner = ArmController(config, io, None, driver)
-    with pytest.raises(TimeoutError, match='not confirmed'):
-        owner.home(np.stack((measured, target)),
-                   check_abort=lambda: None, deadline_ns=time.monotonic_ns() + 20_000_000)
-    assert len(moves) == 1
-
-
-@pytest.mark.parametrize('moving', [False, True], ids=['empty_path', 'moving_path'])
-@pytest.mark.parametrize('tolerance_deg, final_error_deg, converged', [
-    (2., 1., True), (2., 3., False),
-    (None, .1, True), (None, .2, False),
-])
-def test_home_paths_use_configured_arrival_tolerance(
-    monkeypatch, moving, tolerance_deg, final_error_deg, converged,
-):
-    from dexmani_real.config.xarm7 import HOME_DWELL_S
-    from dexmani_real.control.homing import HomePlanner
-    from dexmani_real.robot.xarm7.worker import ArmController
-
-    config = RealConfig().arm
-    if tolerance_deg is not None:
-        config = replace(config, homing=replace(
-            config.homing, convergence_rad=np.deg2rad(tolerance_deg),
-        ))
-    config.validate_home()
-    target = np.asarray(config.home_qpos)
-    start, final = target.copy(), target.copy()
-    start[0] += np.deg2rad(5. if moving else .1)
-    final[0] += np.deg2rad(final_error_deg)
-    planner = HomePlanner.__new__(HomePlanner)
-    planner.arm = config
-    planner.limits = np.column_stack((config.joint_limit_lower, config.joint_limit_upper))
-    planner._check_state = lambda q: (.1, .1)
-    path = planner.plan(start, target)
-    assert len(path) == (2 if moving else 0)
-
-    now = [1_000_000_000]
-    monkeypatch.setattr('dexmani_real.robot.xarm7.worker.time.monotonic_ns', lambda: now[0])
-    samples, moves = [], []
-    def read():
-        q = start if not samples else final
-        # 移动后先收到仍运动的反馈，不能从这帧开始计算停稳。
-        v = np.full(7, 1. if moving and len(samples) == 1 else 0.)
-        samples.append((now[0], v.copy()))
-        now[0] += 1_000_000
-        return q, v
-    def wait(delay):
-        now[0] += round(delay * 1e9)
-    driver = SimpleNamespace(enter_mode=lambda *a, **kw: None,
-                             move_home=moves.append, read=read)
-    io = SimpleNamespace(stop=SimpleNamespace(wait=wait), publish_status=lambda row: None)
-    owner = ArmController(config, io, None, driver)
-    deadline_ns = now[0] + 1_000_000_000
-    if converged:
-        owner.home(path, check_abort=lambda: None, deadline_ns=deadline_ns)
-        stationary = [stamp for stamp, v in samples[1:] if not np.any(v)]
-        assert stationary[-1] - stationary[0] >= HOME_DWELL_S * 1e9
-        assert now[0] - owner.status['timestamp_ns'] <= config.feedback_max_age_s * 1e9
-        np.testing.assert_array_equal(owner.status['qpos'], final)
-    else:
-        error = TimeoutError if moving else RuntimeError
-        with pytest.raises(error, match='not confirmed|interrupted by position/velocity'):
-            owner.home(path, check_abort=lambda: None, deadline_ns=deadline_ns)
-    assert len(moves) == int(moving)
-
-
 def test_home_cancellation_after_submission_stops_confirmation():
     import threading
     import time
@@ -143,11 +48,11 @@ def test_home_cancellation_after_submission_stops_confirmation():
         if cancelled.is_set():
             raise OperationCancelled('operator stop')
     io = SimpleNamespace(stop=threading.Event(), publish_status=lambda status: None)
-    driver = SimpleNamespace(enter_mode=lambda *a, **kw: None,
+    driver = SimpleNamespace(prepare_motion=lambda *a, **kw: None,
                              move_home=move, read=lambda: (measured, np.zeros(7)))
     owner = ArmController(config, io, None, driver)
     with pytest.raises(OperationCancelled, match='operator stop'):
-        owner.home(np.stack((measured, target)),
+        owner.home(
                    check_abort=check_abort, deadline_ns=time.monotonic_ns() + 1_000_000_000)
     assert len(moves) == 1
 
@@ -209,79 +114,20 @@ def test_unused_home_config_does_not_gate_streaming_but_home_rejects(part):
     # invalid HOME 必须在请求规划或发送任何目标前失败。
     with pytest.raises(HomeConfigurationError):
         if part.startswith('arm'):
-            home_robot(state, robot, lambda: pytest.fail('invalid HOME reached planner'),
+            home_arm(state, robot,
                        cancel_epoch=state.cancel_epoch, cancel_requested=lambda: False)
         else:
             home_hand(state, robot, cancel_epoch=state.cancel_epoch, cancel_requested=lambda: False)
 
 
-def test_streaming_keeps_standstill_thresholds_and_disabled_hand_geometry_checks():
+def test_streaming_validates_standstill_without_unused_hand_home():
     from dexmani_real.runtime.preflight import validate_robot_config
     runtime = RealConfig()
     bad_arm = replace(runtime.arm, homing=replace(runtime.arm.homing, velocity_convergence_rad_s=0))
     with pytest.raises(ValueError, match='standstill'):
         validate_robot_config(replace(runtime, arm=bad_arm))
     fixed_hand = replace(runtime.hand, enabled=False, home_qpos_deg=(float('nan'),) * 12)
-    with pytest.raises(ValueError, match='finite'):
-        validate_robot_config(replace(runtime, hand=fixed_hand))
-
-
-@pytest.mark.parametrize('bad_sample', [None, 'middle', 'start'])
-def test_home_checks_only_direct_path_without_soft_escape(bad_sample):
-    from dexmani_real.control.homing import HomePlanner, HomePathRejected
-    planner = HomePlanner.__new__(HomePlanner)
-    planner.arm = RealConfig().arm
-    planner.limits = np.tile((-4., 4.), (7, 1))
-    current, target = np.zeros(7), np.full(7, .1)
-    visited = []
-    def check(q):
-        visited.append(np.array(q))
-        if bad_sample == 'middle' and .04 < q[0] < .06:
-            raise HomePathRejected('collision')
-        return (-.01 if bad_sample == 'start' and q[0] == 0 else .01), .1
-    planner._check_state = check
-    if bad_sample:
-        with pytest.raises(HomePathRejected):
-            planner.plan(current, target)
-    else:
-        np.testing.assert_array_equal(planner.plan(current, target), [current, target])
-        assert len(visited) > 2
-    assert all(np.allclose(q, q[0]) for q in visited)
-
-
-def test_owner_rejects_obsolete_multi_waypoint_home_before_motion():
-    from dexmani_real.robot.xarm7.worker import ArmController
-    config = RealConfig().arm
-    target = np.asarray(config.home_qpos)
-    owner = ArmController(config, None, None, SimpleNamespace())
-    with pytest.raises(ValueError, match='endpoints'):
-        owner.home(np.stack((target + .02, target + .01, target)),
-                   check_abort=lambda: None, deadline_ns=1)
-
-
-@pytest.mark.parametrize('changed', ['position', 'velocity'])
-def test_home_rechecks_measured_start_after_mode_change(changed):
-    import time
-    from dexmani_real.robot.xarm7.worker import ArmController
-    config = RealConfig().arm
-    target = np.asarray(config.home_qpos)
-    planned_start = target + .02
-    measured = [planned_start.copy()]
-    velocity = np.zeros(7)
-    def enter_mode(*args, **kwargs):
-        if changed == 'position':
-            measured[0] = planned_start + .01
-        else:
-            velocity[:] = 1
-    driver = SimpleNamespace(
-        enter_mode=enter_mode,
-        read=lambda: (measured[0], velocity),
-        move_home=lambda q: pytest.fail('moved from an unchecked start'),
-    )
-    owner = ArmController(config, SimpleNamespace(publish_status=lambda row: None), None, driver)
-    with pytest.raises(RuntimeError, match='planned path start|HOME preparation'):
-        owner.home(np.stack((planned_start, target)), check_abort=lambda: None,
-                   deadline_ns=time.monotonic_ns() + 1_000_000_000)
+    validate_robot_config(replace(runtime, hand=fixed_hand))
 
 
 @pytest.mark.parametrize('outcome', ['arrived', 'timeout', 'cancelled'])
@@ -303,7 +149,7 @@ def test_hand_home_keeps_arm_stopped_and_confirms_new_samples(monkeypatch, outco
     robot.connected = True
     stops, sends = [], []
     robot.arm = SimpleNamespace(is_connected=True, check_error=lambda: None,
-                                request_stop=lambda: stops.append('arm'), wait_stopped=lambda: None,
+                                wait_stopped=lambda: None,
                                 resume=lambda *a, **kw: pytest.fail('arm resumed for hand HOME'))
     target = np.deg2rad(hand_cfg.home_qpos_deg)
     initial = target + .15
@@ -320,7 +166,7 @@ def test_hand_home_keeps_arm_stopped_and_confirms_new_samples(monkeypatch, outco
     robot.hand = SimpleNamespace(is_connected=True, _send_position=send, get_state=sample,
                                 stop=lambda *a, **kw: stops.append('hand'))
     robot.hand_feedback.consume(XHandState(initial, None, None, now[0]))
-    robot.stop_required = True
+    robot.hand_stop_required = True
     epoch = state.cancel_epoch
     run = lambda: home_hand(state, robot, cancel_epoch=epoch, cancel_requested=lambda: False)
     if outcome == 'arrived':
@@ -333,5 +179,67 @@ def test_hand_home_keeps_arm_stopped_and_confirms_new_samples(monkeypatch, outco
         with pytest.raises(OperationCancelled):
             run()
     assert len(sends) == (2 if crc and outcome != 'cancelled' else 1)
-    assert stops.count('arm') == 2 and stops.count('hand') == 2
-    assert state.stop_signal.is_set() and not robot.stop_required
+    assert state.stop_signal.is_set() and stops.count('hand') == 2
+    assert state.stop_signal.is_set() and not robot.hand_stop_required
+
+
+@pytest.mark.parametrize('already_home', [False, True])
+@pytest.mark.parametrize('arrives', [False, True])
+def test_home_sdk_return_does_not_mean_measured_arrival(monkeypatch, already_home, arrives):
+    from dexmani_real.robot.xarm7.worker import ArmController
+    now = [1_000_000_000]
+    monkeypatch.setattr('dexmani_real.robot.xarm7.worker.time.monotonic_ns', lambda: now[0])
+    cfg = RealConfig().arm
+    target = np.asarray(cfg.home_qpos)
+    moves, samples = [], []
+    def read():
+        # First settling interval determines whether a move is necessary;
+        # a later transient must reset dwell for either path.
+        elapsed = now[0] - 1_000_000_000
+        q = target if already_home or moves else target + .01
+        if elapsed >= 400_000_000 and (not arrives or elapsed < 500_000_000):
+            q = target + .01
+        if not already_home and not arrives:
+            q = target + .01
+        samples.append((now[0], q.copy()))
+        now[0] += 1_000_000
+        return q, np.zeros(7)
+    io = SimpleNamespace(publish_status=lambda row: None,
+                         stop=SimpleNamespace(wait=lambda dt: now.__setitem__(0, now[0]+round(dt*1e9))))
+    owner = ArmController(cfg, io, None, SimpleNamespace(
+        read=read, prepare_motion=lambda *a, **kw: None, move_home=lambda q: moves.append(q.copy())))
+    if arrives:
+        owner.home(check_abort=lambda: None, deadline_ns=now[0]+2_000_000_000)
+        np.testing.assert_allclose(owner.status['qpos'], target)
+    else:
+        with pytest.raises(TimeoutError):
+            owner.home(check_abort=lambda: None, deadline_ns=now[0]+2_000_000_000)
+    assert len(moves) == int(not already_home)
+    assert now[0] >= 1_600_000_000
+
+
+@pytest.mark.parametrize('hand_pending', [False, True])
+def test_arm_home_does_not_touch_hand_or_geometry(hand_pending):
+    from dexmani_real.robot.system import Robot
+    cfg, state = RealConfig(), SessionState()
+    robot = Robot(cfg.arm, replace(cfg.hand, home_qpos_deg=(float('nan'),)*12), runtime_state=state)
+    calls = []
+    def arm_home(epoch, *, service, abort, deadline_ns):
+        service()
+        assert not abort()
+        assert deadline_ns > 0
+        calls.append(epoch)
+        state.stop_signal.set()
+    robot.arm = SimpleNamespace(home=arm_home, check_error=lambda: None, wait_stopped=lambda: None)
+    robot.hand = SimpleNamespace(stop=lambda *a, **kw: pytest.fail('hand write'))
+    robot.hand_stop_required = hand_pending
+    home_arm(state, robot, cancel_epoch=state.cancel_epoch, cancel_requested=lambda: False)
+    assert calls == [state.cancel_epoch]
+    assert robot.hand_stop_required == hand_pending
+    # arm HOME 本身不写手；显式整机停止仍须完成此前手部命令的收尾。
+    stopped = []
+    robot.hand.stop = lambda *a, **kw: stopped.append(True)
+    robot.stop()
+    robot.service_idle()
+    assert stopped == ([True] if hand_pending else [])
+    assert not robot.hand_stop_required

@@ -52,8 +52,8 @@ class ArmController:
         self.io.stop.set()
         if not self.io.fault.value:
             self.io.fault.value = f"{type(reason).__name__}: {reason}".encode()[:1023]
-            # traceback 不能经共享字符串/普通 pickle 传递，在 SDK 所有者处保留。
-            logger.error("arm controller failed", exc_info=(type(reason), reason, reason.__traceback__))
+        # traceback 不能经共享字符串/普通 pickle 传递，在 SDK 所有者处保留。
+        logger.error("arm controller failed", exc_info=(type(reason), reason, reason.__traceback__))
 
     def read_feedback(self):
         started = time.monotonic_ns()
@@ -76,9 +76,8 @@ class ArmController:
         stage,
         deadline_ns,
         target=None,
-        strict=False,
     ):
-        """在绝对期限内确认连续停稳；strict 遇到位置或速度不合格立即失败。"""
+        """在绝对期限内确认连续停稳；不合格样本重新累计。"""
         tolerance = self.cfg.homing.convergence_rad
         interval_ns = round(1e9 / self.cfg.feedback_hz)
         stable = None
@@ -97,8 +96,6 @@ class ArmController:
             valid = np.max(np.abs(v)) <= self.cfg.homing.velocity_convergence_rad_s
             if target is not None:
                 valid = valid and np.max(np.abs(q - target)) <= tolerance
-            if strict and not valid:
-                raise RuntimeError(f"{stage} interrupted by position/velocity")
             if valid:
                 if target is None and (anchor is None or np.max(np.abs(q - anchor)) > tolerance):
                     stable, anchor = None, q.copy()
@@ -113,56 +110,17 @@ class ArmController:
             self.io.stop.wait(max(0, remaining_ns) / 1e9)
         raise TimeoutError(f"{stage}: measured position/velocity dwell not confirmed")
 
-    def home(self, waypoints, *, check_abort, deadline_ns):
-        waypoints = np.asarray(waypoints, dtype=np.float64)
-        lower, upper = (
-            np.asarray(self.cfg.joint_limit_lower),
-            np.asarray(self.cfg.joint_limit_upper),
-        )
-        if waypoints.shape not in {(0, 7), (2, 7)} or not np.isfinite(waypoints).all():
-            raise ValueError("HOME requires an empty path or current/home endpoints")
-        final_qpos = validate_arm_target(self.cfg.home_qpos, lower, upper)
-        if np.any(waypoints < lower) or np.any(waypoints > upper):
-            raise ValueError("home waypoint violates joint limits")
-        if len(waypoints) and np.max(np.abs(waypoints[-1] - final_qpos)) > 1e-6:
-            raise ValueError("home path endpoint does not match canonical home")
-        check_abort()
-        if len(waypoints):
-            self.driver.enter_mode(0, check_abort=check_abort)
-        # 模式操作可能阻塞；紧接着才取得并裁决真正用于起点检查的反馈。
-        self.read_feedback()
-        check_abort()
-        now = time.monotonic_ns()
-        stamp = int(self.status["timestamp_ns"])
-        if not sample_is_fresh(stamp, self.cfg.feedback_max_age_s, now):
-            raise TimeoutError("HOME start feedback unavailable/stale")
-        current = self.status["qpos"]
-        velocity = self.status["qvel"]
-        if np.max(np.abs(velocity)) > self.cfg.homing.velocity_convergence_rad_s:
-            raise RuntimeError("arm moved during HOME preparation")
-        if len(waypoints) == 0:
-            if np.max(np.abs(current - final_qpos)) > self.cfg.homing.convergence_rad:
-                raise RuntimeError("empty home path while away from canonical home")
-        elif np.max(np.abs(current - waypoints[0])) > self.cfg.homing.convergence_rad:
-            raise RuntimeError("current state moved too far from planned path start")
-        if len(waypoints):
+    def home(self, *, check_abort, deadline_ns):
+        target = validate_arm_target(self.cfg.home_qpos, self.cfg.joint_limit_lower,
+                                     self.cfg.joint_limit_upper)
+        self.wait_settled(check_abort, stage="HOME standstill", deadline_ns=deadline_ns)
+        if np.max(np.abs(self.status["qpos"] - target)) > self.cfg.homing.convergence_rad:
+            self.driver.prepare_motion(0, check_abort=check_abort)
+            self.wait_settled(check_abort, stage="HOME mode standstill", deadline_ns=deadline_ns)
             check_abort()
-            self.driver.move_home(final_qpos)
+            self.driver.move_home(target)
             check_abort()
-            self.wait_settled(
-                check_abort,
-                stage="arm HOME",
-                deadline_ns=deadline_ns,
-                target=final_qpos,
-            )
-        else:
-            self.wait_settled(
-                check_abort,
-                stage="home dwell",
-                strict=True,
-                target=final_qpos,
-                deadline_ns=deadline_ns,
-            )
+        self.wait_settled(check_abort, stage="arm HOME", deadline_ns=deadline_ns, target=target)
         check_abort()
 
     def stop(self):
@@ -171,16 +129,10 @@ class ArmController:
         try:
             self.driver.stop()
         except BaseException as exc:
-            if isinstance(exc, KeyboardInterrupt):
-                self.io.emergency.set()
-                self.io.stop.set()
-            if self.io.fault.value:
-                self.io.close_error.value = f"stop SDK failure: {exc}".encode()[:1023]
-                logger.exception("arm stop also failed")
             self.fault(exc)
         finally:
             self.io.publish_status(self.status)
-            self.io.stopped.set()  # 处理结束；停止失败仍保存在 fault/close_error。
+            self.io.stopped.set()  # 处理结束；停止失败仍保存在 fault。
 
     def operation(self, message: PrepareRequest | HomeRequest):
         self.io.stopped.clear()
@@ -194,16 +146,10 @@ class ArmController:
             check_abort()
             # request_operation 已等待本 owner 的停止确认，目标和伺服参考已清除。
             if isinstance(message, HomeRequest):
-                if len(message.waypoints) > 1:
-                    self.wait_settled(
-                        check_abort, stage="arm standstill", deadline_ns=message.deadline_ns,
-                    )
-                self.home(
-                    message.waypoints,
-                    check_abort=check_abort, deadline_ns=message.deadline_ns,
-                )
+                self.home(check_abort=check_abort, deadline_ns=message.deadline_ns)
+                self.stop()
             else:
-                self.driver.enter_mode(1, check_abort=check_abort)
+                self.driver.prepare_motion(1, check_abort=check_abort)
                 settled_deadline_ns = min(
                     message.deadline_ns,
                     time.monotonic_ns() + int(HOME_CONVERGENCE_TIMEOUT_S * 1e9),
@@ -215,6 +161,7 @@ class ArmController:
                     stage="arm standstill", deadline_ns=settled_deadline_ns,
                 )
                 check_abort()
+                self.reference = ArmTrajectory(self.cfg, self.status["qpos"], self.status["qvel"])
         except BaseException as exc:
             error = exc
             if not isinstance(exc, OperationCancelled):
@@ -247,16 +194,21 @@ class ArmController:
         goal = pending if pending is not None else self.active
         if goal is None:
             return None
-        self.active = goal
         issue = self.command_issue(goal, time.monotonic_ns())
         if issue:
+            logger.warning("arm stopped: %s", issue)
+            self.active = self.reference = None
             self.io.stop.set()
             return None
         if self.reference is None:
+            raise RuntimeError("arm streaming has not been prepared")
+        if self.active is None:
+            # prepare 后可能还要等待观测或推理；首个目标使用当前实测起点。
             q, v = self.status["qpos"], self.status["qvel"]
             if np.max(np.abs(v)) > self.cfg.homing.velocity_convergence_rad_s:
                 raise RuntimeError("arm moved after standstill preparation")
             self.reference = ArmTrajectory(self.cfg, q, v)
+        self.active = goal
         q = self.reference.step(
             goal["q_goal"] if not goal["hold"] else None,
             hold=bool(goal["hold"]),
@@ -264,11 +216,12 @@ class ArmController:
         # 计算结束后、进入 SDK 前统一检查期限、反馈和最新控制器上报。
         issue = self.command_issue(goal, time.monotonic_ns())
         if issue:
+            logger.warning("arm stopped: %s", issue)
+            self.active = self.reference = None
             self.io.stop.set()
             return None
         started = time.monotonic_ns()
         self.driver.servo(q)
-        self.reference.commit(q)
         return started
 
     def run(self, startup_deadline_ns):
@@ -278,17 +231,6 @@ class ArmController:
 
             startup_abort()
             self.driver.connect(check_abort=startup_abort)
-            settled_deadline_ns = min(
-                startup_deadline_ns,
-                time.monotonic_ns() + int(HOME_CONVERGENCE_TIMEOUT_S * 1e9),
-            )
-            self.wait_settled(
-                lambda: self.check_lifecycle(
-                    deadline_ns=settled_deadline_ns, stage="startup standstill",
-                ),
-                stage="arm standstill", deadline_ns=settled_deadline_ns,
-            )
-            self.driver.initialize(check_abort=startup_abort)
             self.read_feedback()
             startup_abort()
             self.io.ready.set()
@@ -301,7 +243,12 @@ class ArmController:
                     self.stop()
                     continue
                 if self.pipe.poll():
-                    self.operation(self.pipe.recv())
+                    try:
+                        message = self.pipe.recv()
+                    except EOFError:
+                        self.io.closing.set()
+                        break
+                    self.operation(message)
                     tick = time.monotonic_ns() + period
                     feedback_due = time.monotonic_ns()
                     continue
@@ -329,21 +276,12 @@ class ArmController:
                 self.io.closing.set()
                 self.io.stop.set()
         finally:
-            self.io.ready.set()
             if not self.io.stopped.is_set():
                 self.stop()
             try:
                 self.driver.close()
             except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    self.io.emergency.set()
-                    self.io.stop.set()
-                logger.exception("arm disconnect failed")
-                previous = self.io.close_error.value.decode(errors="replace")
-                detail = f"disconnect failure: {exc}"
-                self.io.close_error.value = (
-                    f"{previous}; {detail}" if previous else detail
-                ).encode()[:1023]
+                self.fault(exc)
             self.pipe.close()
 
 

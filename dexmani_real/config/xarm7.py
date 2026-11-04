@@ -22,13 +22,21 @@ class HomingConfig:
     timeout_s: float = 60.0
     convergence_rad: float = 0.002618
     max_speed_deg_s: float = 45.0
+    max_acceleration_deg_per_s2: float = 900.0
     velocity_convergence_rad_s: float = 0.03
 
     @property
     def max_speed_rad_per_s(self) -> float:
         return radians(self.max_speed_deg_s)
 
+    @property
+    def max_acceleration_rad_per_s2(self) -> float:
+        return radians(self.max_acceleration_deg_per_s2)
+
     def validate(self) -> None:
+        acceleration = self.max_acceleration_rad_per_s2
+        if not isfinite(acceleration) or not 0.01 <= acceleration <= 20:
+            raise ValueError("homing acceleration must be in [0.01, 20] rad/s²")
         for name in ("timeout_s", "convergence_rad", "velocity_convergence_rad_s"):
             value = getattr(self, name)
             if not isfinite(value) or value <= 0:

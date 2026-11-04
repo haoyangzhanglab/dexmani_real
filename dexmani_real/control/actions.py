@@ -25,26 +25,34 @@ class ActionResult:
 class ActionMapper:
     def __init__(
         self,
-        constraints,
         *,
+        joint_limits,
         hand_enabled,
         hand_lower_rad,
         hand_upper_rad,
-        home_hand_qpos,
+        fixed_hand_qpos=None,
         solver=None,
     ):
-        self.constraints, self.solver = constraints, solver
+        self.solver = solver
+        self.joint_limits = joint_limits
         self.hand_enabled = hand_enabled
         self.hand_lower = np.array(hand_lower_rad, dtype=np.float64, copy=True)
         self.hand_upper = np.array(hand_upper_rad, dtype=np.float64, copy=True)
-        self.home_hand_qpos = np.array(home_hand_qpos, dtype=np.float64, copy=True)
+        self.fixed_hand_qpos = (
+            None if fixed_hand_qpos is None
+            else np.array(fixed_hand_qpos, dtype=np.float64, copy=True)
+        )
 
     @classmethod
     def for_mode(cls, mode, *, arm, hand, motion, environment):
-        """在线允许桌面接触，HOME 使用独立场景。"""
+        """joint 只投影关节意图；EEF 使用几何约束。"""
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
-        constraints = MotionConstraints(arm, environment)
+        constraints = None
+        if mode == "eef":
+            if not hand.enabled:
+                hand.validate_home_pose()
+            constraints = MotionConstraints(arm, environment)
         solver = (
             IKSolver(
                 constraints,
@@ -55,12 +63,12 @@ class ActionMapper:
             else None
         )
         return cls(
-            constraints,
+            joint_limits=np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper)),
             solver=solver,
             hand_enabled=hand.enabled,
             hand_lower_rad=hand.qpos_min_rad,
             hand_upper_rad=hand.qpos_max_rad,
-            home_hand_qpos=np.deg2rad(hand.home_qpos_deg),
+            fixed_hand_qpos=(np.deg2rad(hand.home_qpos_deg) if mode == "eef" and not hand.enabled else None),
         )
 
     def prepare_hand(self, hand):
@@ -76,7 +84,7 @@ class ActionMapper:
         return hand
 
     def map_joint(self, arm, hand, current_arm_qpos):
-        """保留投影候选，调用方必须在发送前处理拒绝原因。"""
+        """将关节意图投影到运行范围，不执行几何筛选。"""
         arm = np.asarray(arm, dtype=np.float64)
         if arm.shape != (7,) or not np.isfinite(arm).all():
             raise ValueError("joint intent must be a finite (7,) vector")
@@ -85,13 +93,10 @@ class ActionMapper:
         target = project_arm_command(
             arm,
             current,
-            joint_lower_rad=self.constraints.limits[:, 0],
-            joint_upper_rad=self.constraints.limits[:, 1],
+            joint_lower_rad=self.joint_limits[:, 0],
+            joint_upper_rad=self.joint_limits[:, 1],
         )
-        self.constraints.collision_model.set_hand_qpos(
-            hand if hand is not None else self.home_hand_qpos
-        )
-        return ActionResult(target, hand, self.constraints.endpoint_rejection(target))
+        return ActionResult(target, hand)
 
     def map_eef(self, pose: Pose, hand, current_arm_qpos, previous_arm_command_qpos=None):
         current = np.asarray(current_arm_qpos, dtype=np.float64)
@@ -100,13 +105,13 @@ class ActionMapper:
         if self.solver is None:
             raise ValueError("EEF mapping requires an online IK solver")
         # 两个调用方均交出刚构造的临时 Pose；位置与四元数已在构造时检查。
-        workspace = self.constraints.workspace
+        workspace = self.solver.constraints.workspace
         pose.p = np.clip(pose.p, workspace[:, 0], workspace[:, 1])
         result = self.solver.solve(
             pose,
             current,
             previous,
-            hand_qpos=hand if hand is not None else self.home_hand_qpos,
+            hand_qpos=hand if hand is not None else self.fixed_hand_qpos,
         )
         reason = None if result.qpos is not None else result.reason
         return ActionResult(
@@ -122,7 +127,7 @@ class ActionMapper:
         hand_start = 7 if mode == "joint" else 9
         values[:, hand_start:] = np.clip(values[:, hand_start:], self.hand_lower, self.hand_upper)
         if mode == "eef":
-            workspace = self.constraints.workspace
+            workspace = self.solver.constraints.workspace
             values[:, :3] = np.clip(values[:, :3], workspace[:, 0], workspace[:, 1])
             rotation = rot6d_to_rotmat(values[:, 3:9])
             values[:, 3:9] = np.concatenate((rotation[:, :, 0], rotation[:, :, 1]), axis=1)

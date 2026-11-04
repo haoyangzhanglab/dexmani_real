@@ -99,7 +99,7 @@ def collect_samples(runtime, output_dir):
                 continue
             arm = XArm7(runtime.arm)
             try:
-                # XArm7.connect 仅建立 SDK/读取连接，不调用 initialize 或任何运动配置。
+                # XArm7.connect 仅建立 SDK/读取连接，不执行运动准备或运动配置。
                 arm.connect(check_abort=lambda: None)
                 try:
                     sample = sampler.capture(

@@ -472,7 +472,6 @@ def test_robot_crc_continues_latest_submission_then_faults_and_stops(clock):
         events.append('arm')
         submitted.append(command)
     robot.arm = SimpleNamespace(is_connected=True, check_error=lambda: None, submit=submit,
-                                request_stop=lambda: events.append('arm_stop_request'),
                                 wait_stopped=lambda: events.append('arm_stopped'))
     robot.hand, robot.connected = hand, True
     robot.read_hand()
@@ -497,7 +496,8 @@ def test_robot_crc_continues_latest_submission_then_faults_and_stops(clock):
     assert state.stop_signal.is_set()
     assert events == ['arm', 'hand'] * 7
     robot.stop()
-    assert events[-4:] == ['arm_stop_request', 'hand', 'hand', 'arm_stopped']
+    assert state.stop_signal.is_set()
+    assert events[-3:] == ['hand', 'hand', 'arm_stopped']
     assert len(hand.control.sent) == 9
-    assert not robot.stop_required
+    assert not robot.hand_stop_required
     assert hand.consecutive_write_crc == 0

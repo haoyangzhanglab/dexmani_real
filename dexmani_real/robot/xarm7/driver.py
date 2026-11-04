@@ -26,7 +26,7 @@ CONTROLLER_ERROR_HELP: dict[int, str] = {
 
 
 def check_sdk_return_code(code: Any, operation: str) -> None:
-    if isinstance(code, bool) or not isinstance(code, (int, np.integer)) or int(code) != 0:
+    if code != 0:
         raise RuntimeError(f"{operation} failed with SDK code {code!r}")
 
 
@@ -58,14 +58,7 @@ class XArm7:
                 f"device reports {self.api.axis} axes, expected {ARM_JOINT_SHAPE[0]}"
             )
 
-    def initialize(self, *, check_abort):
-        check_abort()
         self.check_controller_error()
-        check_abort()
-        check_sdk_return_code(self.api.motion_enable(True), "startup motion_enable")
-        self.enter_mode(1, check_abort=check_abort)
-        check_abort()
-        self.apply_config()
 
     def stop(self) -> None:
         """SDK 接受停止请求不代表物理停稳。"""
@@ -90,10 +83,7 @@ class XArm7:
         finally:
             self.api.set_timeout(SDK_TIMEOUT_S)
         check_sdk_return_code(code, "get_joint_states")
-        if not isinstance(states, (list, tuple)) or len(states) != 2:
-            raise RuntimeError("get_joint_states(num=2) must return position and velocity")
-        qpos = np.asarray(states[0], dtype=np.float64).copy()
-        qvel = np.asarray(states[1], dtype=np.float64).copy()
+        qpos, qvel = (np.asarray(value, dtype=np.float64).copy() for value in states)
         if any(v.shape != ARM_JOINT_SHAPE or not np.all(np.isfinite(v)) for v in (qpos, qvel)):
             raise RuntimeError(
                 "get_joint_states returned invalid qpos/qvel shape or non-finite values"
@@ -116,18 +106,30 @@ class XArm7:
             angle=target,
             is_radian=True,
             speed=self.cfg.homing.max_speed_rad_per_s,
-            mvacc=self.cfg.max_joint_acceleration_rad_per_s2,
+            mvacc=self.cfg.homing.max_acceleration_rad_per_s2,
             wait=False,
             radius=None,
         )
         check_sdk_return_code(code, "home move")
 
-    def enter_mode(self, mode, *, check_abort):
+    def prepare_motion(self, mode, *, check_abort):
+        check_abort()
+        self.check_controller_error()
+        check_abort()
+        check_sdk_return_code(self.api.motion_enable(True), "motion_enable")
         check_abort()
         if self.api.mode != mode:
             check_sdk_return_code(self.api.set_mode(mode), f"set_mode({mode})")
         check_abort()
         check_sdk_return_code(self.api.set_state(0), f"set_state(0) after Mode {mode}")
+        check_abort()
+        self.apply_config(check_abort=check_abort)
+        check_abort()
+        acceleration = (self.cfg.homing.max_acceleration_rad_per_s2 if mode == 0
+                        else self.cfg.max_joint_acceleration_rad_per_s2)
+        check_sdk_return_code(self.api.set_joint_maxacc(acceleration, is_radian=True), "set_joint_maxacc")
+        check_abort()
+        check_sdk_return_code(self.api.set_state(0), "final preparation set_state(0)")
         check_abort()
 
     def check_controller_error(self) -> None:
@@ -140,22 +142,16 @@ class XArm7:
                 f"{describe_controller_error(error)}"
             )
 
-    def apply_config(self) -> None:
+    def apply_config(self, *, check_abort) -> None:
         check_sdk_return_code(
             self.api.set_collision_sensitivity(self.cfg.collision_sensitivity),
             "set_collision_sensitivity",
         )
+        check_abort()
         check_sdk_return_code(
             self.api.set_tcp_load(
                 weight=self.cfg.tcp_load_mass_kg,
                 center_of_gravity=list(self.cfg.tcp_load_cog_mm),
             ),
             "set_tcp_load",
-        )
-        check_sdk_return_code(
-            self.api.set_joint_maxacc(
-                self.cfg.max_joint_acceleration_rad_per_s2,
-                is_radian=True,
-            ),
-            "set_joint_maxacc",
         )

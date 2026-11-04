@@ -388,7 +388,7 @@ def test_close_timeout_retains_pending_arm(monkeypatch, tmp_path):
     monkeypatch.setattr(Robot, "connect", pending_connect)
     with pytest.raises(TimeoutError, match="owner still active"):
         run.run_replay(path, cfg)
-    assert robots[0].arm is not None and robots[0].stop_required
+    assert robots[0].arm is not None and not robots[0].arm.is_closed
     assert closed == ["arm", "hand", "keyboard"]
 
 

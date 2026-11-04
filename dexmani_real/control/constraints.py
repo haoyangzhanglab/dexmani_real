@@ -31,7 +31,7 @@ def wrap_nearest_equivalent(qpos, reference, joint_limit_lower, joint_limit_uppe
 
 
 class MotionConstraints:
-    """检查目标端点；HOME 路径由 HomePlanner 单独检查。"""
+    """EEF/jog 目标端点的几何检查。"""
 
     def __init__(self, arm, environment):
         self.collision_model = CollisionModel(static_boxes=environment.static_boxes)

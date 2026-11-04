@@ -1,5 +1,6 @@
 # DexMani Real 第二阶段减法重构任务书
 
+> xArm 的 HOME、准备、轨迹接口和取消契约以 [xArm 轻量化任务书](xarm_simplification_taskbook.md) 为准；下文冲突约定仅为历史记录。
 > **历史记录：** 本文记录截至 `7ac6114` 的第二阶段实施事实，代码与离线回归已实施，真机验收未执行；实施范围与当时验证见第 9 节。当前行为以源码和 [README](../README.md) 为准。
 > XHand 的写 CRC、触觉保持、启动 HOME 与清零约定已由 [XHand 收敛任务书](xhand_simplification_taskbook.md) 替代；下文旧验证事实保留。
 >

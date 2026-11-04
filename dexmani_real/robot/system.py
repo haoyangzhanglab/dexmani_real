@@ -56,7 +56,7 @@ class Robot:
         self.arm: ArmProcess | None = None
         self.hand: XHand | None = None
         self.connected = False
-        self.stop_required = False
+        self.hand_stop_required = False
         self.hand_feedback = XHandFeedback()
         self.feedback_next_ns = 0
 
@@ -91,7 +91,6 @@ class Robot:
             self.arm_config,
             runtime_state=self.runtime_state,
         )
-        self.stop_required = True  # 连接后仍需完成首次整机停止确认。
         self.arm.connect(check_services=self.check_services)
         if cancelled():
             raise OperationCancelled("robot startup cancelled before hand connection")
@@ -99,6 +98,7 @@ class Robot:
             from dexmani_real.robot.xhand.driver import XHand
 
             self.hand = XHand(self.hand_config)
+            self.hand_stop_required = True
             initial = self.hand.connect(cancel_requested=cancelled)
             self.hand_feedback.consume(initial)
             self.feedback_next_ns = initial.timestamp_ns + FEEDBACK_PERIOD_NS
@@ -150,7 +150,7 @@ class Robot:
                 self.feedback_next_ns = next_tick_ns(
                     self.feedback_next_ns or now, FEEDBACK_PERIOD_NS, time.monotonic_ns(),
                 )
-            if self.stop_required and not self.runtime_state.stop_signal.is_set():
+            if not self.runtime_state.stop_signal.is_set():
                 self._check_hand_feedback()
             return sampled
         except BaseException:
@@ -196,7 +196,6 @@ class Robot:
             self.service_feedback()
 
     def prepare_streaming(self, cancel_epoch):
-        self.stop_required = True
         cast("ArmProcess", self.arm).prepare(cancel_epoch, service=self.service_feedback)
         self.check_run()
 
@@ -208,13 +207,12 @@ class Robot:
             if command.arm_qpos is not None or command.arm_hold:
                 if command.hand_qpos is not None:
                     self._check_hand_feedback()
-                self.stop_required = True
                 cast("ArmProcess", self.arm).submit(command, expires_ns=expires_ns)
             if command.hand_qpos is not None:
                 self.check_run()
                 # arm 发布可能等待邮箱锁；真正发送 hand 前仍须复核当前反馈。
                 self._check_hand_feedback()
-                self.stop_required = True
+                self.hand_stop_required = True
                 cast("XHand", self.hand)._send_action(command.hand_qpos)
             self.check_run()
         except BaseException:
@@ -244,20 +242,18 @@ class Robot:
         self._check_hand_feedback()
         if time.monotonic_ns() >= deadline_ns:
             raise TimeoutError("hand HOME budget exhausted before submission")
-        self.stop_required = True
+        self.hand_stop_required = True
         from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE
 
         return cast("XHand", self.hand)._send_position(command.hand_qpos) != COMMUNICATION_CRC_ERROR_CODE
 
-    def home_arm(self, waypoints, cancel_epoch, abort_check, *, deadline_ns):
+    def home_arm(self, cancel_epoch, abort_check, *, deadline_ns):
         if abort_check():
             raise OperationCancelled("arm HOME cancelled before submission")
-        self.stop_required = True
         cast("ArmProcess", self.arm).home(
-            waypoints,
             cancel_epoch,
             abort=abort_check,
-            service=self.service_feedback,
+            service=self.check,
             deadline_ns=deadline_ns,
         )
         if abort_check():
@@ -273,24 +269,19 @@ class Robot:
             self.hand.stop()
 
     def stop(self):
-        """停止确认成功后可重复调用；准备和目标提交会重新置 stop_required。"""
+        """arm 停止结果由 Owner 持有；仅未完成的手部停止需要再次发送。"""
         self.runtime_state.stop_signal.set()
-        if not self.stop_required:
-            return
         errors = []
-        if self.arm is not None:
+        if self.hand_stop_required:
             try:
-                self.arm.request_stop()
+                if self.hand is None:
+                    raise RobotError("hand stop unresolved after disconnect")
+                self.stop_hand()
+                self.hand_stop_required = False
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
-                errors.append(("arm_stop_request", exc))
-        try:
-            self.stop_hand()
-        except BaseException as exc:
-            if isinstance(exc, KeyboardInterrupt):
-                self.runtime_state.request_emergency_stop()
-            errors.append(("hand_stop", exc))
+                errors.append(("hand_stop", exc))
         if self.arm is not None:
             try:
                 self.arm.wait_stopped()
@@ -298,16 +289,13 @@ class Robot:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
                 errors.append(("arm_stop_confirm", exc))
-        if self.arm is None and self.hand is None:
-            errors.append(("stop", RobotError("motion remains unresolved after disconnect")))
         if errors:
             for stage, error in errors[1:]:
                 logger.error("%s failed", stage, exc_info=(type(error), error, error.__traceback__))
             raise errors[0][1]
-        self.stop_required = False
 
     def service_idle(self):
-        if self.stop_required and (
+        if (
             self.runtime_state.stop_signal.is_set() or self.runtime_state.emergency_signal.is_set()
         ):
             self.stop()
@@ -350,7 +338,7 @@ class Robot:
                     self.hand = None
 
         self.connected = False
-        self.stop_required = self.arm is not None or self.hand is not None
+        self.hand_stop_required = self.hand is not None
         if errors:
             for stage, error in errors[1:]:
                 logger.error("%s failed", stage, exc_info=(type(error), error, error.__traceback__))

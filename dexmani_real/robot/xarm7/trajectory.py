@@ -38,7 +38,7 @@ class ArmTrajectory:
         self.input.target_position = self.input.current_position
 
     def step(self, goal: np.ndarray | None = None, *, hold: bool = False) -> np.ndarray:
-        """计算候选；input.current_* 始终保留最近一次成功发送的参考。"""
+        """计算并推进参考；未发送或发送失败后必须丢弃本轨迹。"""
         # 保持请求只制动；各关节独立停稳，不继续追赶此前积累的位置目标。
         if hold:
             self.input.control_interface = ControlInterface.Velocity
@@ -83,11 +83,7 @@ class ArmTrajectory:
         ):
             raise ValueError("reference position outside joint limits")
         # 完整轨迹已通过极值检查；只归一采样点的舍入越界。
-        return np.clip(q, self.lower, self.upper)
-
-    def commit(self, q: np.ndarray) -> None:
-        """SDK 发送成功后，提交 step 返回的位置及对应速度、加速度。"""
-        # update 只推进 output 和库内比较缓存。未 commit 时，下次 update
-        # 会因 input 与缓存不同而从已提交参考重算，无需回滚或重置轨迹。
+        q = np.clip(q, self.lower, self.upper)
         self.output.pass_to_input(self.input)
         self.input.current_position = q.tolist()
+        return q

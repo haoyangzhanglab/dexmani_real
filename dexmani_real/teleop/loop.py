@@ -11,14 +11,13 @@ from typing import cast
 from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S
 from dexmani_real.control.actions import HandStartRejected
-from dexmani_real.control.homing import HomePathRejected
 from dexmani_real.data.raw import snapshot_recording_metadata
 from dexmani_real.data.recorder import (
     EpisodeRecorder,
     RecordingError,
 )
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
-from dexmani_real.runtime.home import build_home_planner, home_robot
+from dexmani_real.runtime.home import home_arm, home_hand
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
@@ -68,7 +67,6 @@ class TeleopLoop:
         self.record_needs = record_needs
         self.capture_needs = self.control_needs.union(record_needs)
         self.controller = controller
-        self.home_planner = None
         self.recording_dir = recording_dir
         self.max_duration_s = max_duration_s
         self.runtime_config_json = runtime_config_json
@@ -182,15 +180,11 @@ class TeleopLoop:
             and self.runtime_state.requests_allow_motion()
         )
 
-    def get_home_planner(self):
-        if self.home_planner is None:
-            self.home_planner = build_home_planner(self.runtime.environment, self.runtime.arm)
-        return self.home_planner
-
     def preparation_interrupted(self):
         if (self.poll_blocking_commands() or self.pending_termination_reason is not None
                 or not self.preparation_valid()):
-            self.runtime_state.request_quit()
+            if self.pending_termination_reason is None:
+                self.request_episode_end("preparation_cancelled")
             return True
         return False
 
@@ -287,7 +281,10 @@ class TeleopLoop:
                     and self.runtime_state.requests_allow_motion()):
                 raise
             self.poll_blocking_commands()
-            self.runtime_state.request_quit()
+            if self.pending_termination_reason is None:
+                self.request_episode_end("preparation_cancelled")
+            if not self.robot.arm.is_connected:
+                self.runtime_state.request_quit()
 
     def handle_operator_command(self, cmd: str):
         expected_cancel_epoch = None
@@ -353,19 +350,26 @@ class TeleopLoop:
                 logger.info("正在回初始位…")
                 self.audio.play("home")
                 try:
-                    home_robot(
-                        self.runtime_state, self.robot, self.get_home_planner,
+                    home_hand(
+                        self.runtime_state, self.robot,
+                        cancel_epoch=expected_cancel_epoch,
+                        cancel_requested=self.poll_blocking_commands,
+                    )
+                    home_arm(
+                        self.runtime_state, self.robot,
                         cancel_epoch=expected_cancel_epoch,
                         cancel_requested=self.poll_blocking_commands,
                     )
                 except OperationCancelled as exc:
+                    self.robot.stop()
                     self.robot.check()
                     if (self.runtime_state.cancel_epoch == expected_cancel_epoch
                             and self.runtime_state.requests_allow_motion()):
                         raise
-                    self.runtime_state.request_quit()
+                    if not self.robot.arm.is_connected:
+                        self.runtime_state.request_quit()
                     logger.info("HOME cancelled: %s", exc)
-                except (HomeConfigurationError, HomePathRejected) as exc:
+                except HomeConfigurationError as exc:
                     self.robot.check()
                     logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
                 else:

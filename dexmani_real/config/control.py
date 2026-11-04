@@ -57,43 +57,18 @@ class StaticCollisionBox:
 
 
 class HomeConfigurationError(ValueError):
-    """HOME 专用标定或配置无效，本次操作不能执行。"""
-
-
-@dataclass(frozen=True)
-class TableCollisionConfig:
-    """HOME 桌面碰撞盒与软间隙；标定平面由环境单独提供。"""
-
-    size_xy_m: tuple[float, float] = (2.0, 2.0)
-    thickness_m: float = 0.04
-    # 包含标定得到的法兰模型残差。
-    soft_clearance_m: float = 0.02
-    allowed_contact_links: tuple[str, ...] = ("link_base",)
-
-    def validate(self) -> None:
-        size = np.asarray(self.size_xy_m, dtype=np.float64)
-        if size.shape != (2,) or not np.isfinite(size).all() or np.any(size <= 0.0):
-            raise ValueError("table size_xy_m must contain two finite positive lengths")
-        if not isfinite(self.thickness_m) or self.thickness_m <= 0.0:
-            raise ValueError("table thickness_m must be finite and positive")
-        if not isfinite(self.soft_clearance_m) or self.soft_clearance_m < 0.0:
-            raise ValueError("table soft_clearance_m must be finite and non-negative")
-        if any(
-            not isinstance(name, str) or not name.strip() for name in self.allowed_contact_links
-        ):
-            raise TypeError("table allowed_contact_links must contain non-empty link names")
+    """HOME 配置无效，本次操作不能执行。"""
 
 
 @dataclass(frozen=True)
 class EnvironmentConfig:
     workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
     eef_workspace_margin_m: float = 0.005
-    # HOME 与在线目标检查共用的静态障碍物。
+    # EEF/jog 使用的静态障碍物。
     static_boxes: tuple[StaticCollisionBox, ...] = ()
 
-    # HOME 和点云直接使用同一份标定事实。
+    # 点云去桌面所用的标定事实。
     table_plane_path: str | None = TABLE_PLANE_RELATIVE_PATH
-    table: TableCollisionConfig = field(default_factory=TableCollisionConfig)
 
     def validate(self) -> None:
         self.workspace.as_array()

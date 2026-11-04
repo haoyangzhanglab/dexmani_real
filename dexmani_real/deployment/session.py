@@ -7,18 +7,18 @@ import time
 from collections.abc import Sequence
 from concurrent.futures import wait
 from dataclasses import asdict
+from typing import cast
 
 from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S
 from dexmani_real.control.actions import ActionMapper
-from dexmani_real.control.homing import HomePathRejected
 from dexmani_real.data.raw import camera_metadata
 from dexmani_real.deployment.inference import MODEL_SHUTDOWN_TIMEOUT_S, PolicyWorker
 from dexmani_real.deployment.rollout import Rollout, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import build_home_planner, home_robot
+from dexmani_real.runtime.home import home_arm, home_hand
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
@@ -51,7 +51,6 @@ class PolicySession:
         self.run_config = run_config
         self.runtime, self.info = runtime, info
         self.table_plane_abcd = None
-        self.home_planner = None
         self.device, self.seed = device, seed
         self.max_running_s, self.num_episodes = max_running_s, num_episodes
         self.record_raw = record_raw
@@ -109,7 +108,7 @@ class PolicySession:
                 self.runtime_state.request_quit()
                 self.summary["termination_reason"] = "startup_cancelled"
             else:
-                print("就绪：B 新段 | S/C 保存结束 | D 丢弃 | Q 保存退出 | Esc 急停退出 | 空闲 H 回初始位、T 复位触觉。", flush=True)
+                print("就绪：B 新段 | S/C 保存结束 | D 丢弃 | Q 保存退出 | Esc 急停退出 | 空闲 H 先手后臂回位、T 复位触觉。", flush=True)
                 self.run_control_loop()
                 self.robot.check()
         except KeyboardInterrupt as exc:
@@ -400,38 +399,37 @@ class PolicySession:
         if not home_allowed:
             logger.warning("H 仅限空闲时使用；活动段请先按 S。")
             return False
+        # HOME 只由已完成设备初始化的待命循环调用。
+        robot = cast(Robot, self.robot)
         logger.info("正在回初始位…")
         self.audio.play("home")
         try:
-            home_robot(
-                self.runtime_state, self.robot, self.get_home_planner,
+            home_hand(
+                self.runtime_state, robot,
+                cancel_epoch=cancel_epoch,
+                cancel_requested=self.home_abort_requested,
+            )
+            home_arm(
+                self.runtime_state, robot,
                 cancel_epoch=cancel_epoch,
                 cancel_requested=self.home_abort_requested,
             )
         except OperationCancelled as exc:
-            self.robot.check()
+            robot.stop()
+            robot.check()
             if (self.runtime_state.cancel_epoch == cancel_epoch
                     and self.runtime_state.requests_allow_motion()):
                 raise
-            self.runtime_state.request_quit()
+            if robot.arm is None or not robot.arm.is_connected:
+                self.runtime_state.request_quit()
             logger.info("回初始位已中断：%s", exc)
-        except (HomeConfigurationError, HomePathRejected) as exc:
-            self.robot.check()
+        except HomeConfigurationError as exc:
+            robot.check()
             logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
         else:
             self.audio.play("home_done")
             logger.info("已回初始位，按 B 开始。")
         return True
-
-    def get_home_planner(self):
-        if self.home_planner is None:
-            self.home_planner = build_home_planner(
-                self.runtime.environment, self.runtime.arm, table_plane_abcd=self.table_plane_abcd,
-            )
-            if self.table_plane_abcd is None:
-                self.table_plane_abcd = self.home_planner.table_plane_abcd
-                self.record_table_plane()
-        return self.home_planner
 
     def record_table_plane(self):
         self.run_config.update(
