@@ -1,6 +1,7 @@
 # DexMani Real 第二阶段减法重构任务书
 
 > **历史记录：** 本文记录截至 `7ac6114` 的第二阶段实施事实，代码与离线回归已实施，真机验收未执行；实施范围与当时验证见第 9 节。当前行为以源码和 [README](../README.md) 为准。
+> XHand 的写 CRC、触觉保持、启动 HOME 与清零约定已由 [XHand 轻量化任务及实施记录](xhand_simplification_taskbook.md) 替代；下文旧验证事实保留。
 >
 > **审查基线：** [025451cc5ae3e1c77be221f50273c296dbf26769](https://github.com/haoyangzhanglab/dexmani_real/commit/025451cc5ae3e1c77be221f50273c296dbf26769)。
 >

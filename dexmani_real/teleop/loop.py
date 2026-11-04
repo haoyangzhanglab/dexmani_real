@@ -21,6 +21,7 @@ from dexmani_real.runtime.home import build_home_planner, home_robot
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
+    missing_tactile_channels,
     read_observation,
     sources_available,
 )
@@ -216,11 +217,33 @@ class TeleopLoop:
             self.robot.prepare_streaming(self.cancel_epoch)
             if self.preparation_interrupted():
                 return
+            until = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
+            while True:
+                if self.preparation_interrupted():
+                    return
+                self.robot.service_feedback()
+                row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
+                missing = missing_tactile_channels(row, self.record_needs.required_tactile)
+                if sources_available(row, self.capture_needs) and not missing:
+                    break
+                if time.monotonic_ns() >= until:
+                    if missing:
+                        logger.warning("本段未开始：触觉初值缺失 %s；可稍后再次按 B。", ", ".join(missing))
+                        self.request_episode_end("initial_tactile_unavailable: " + ", ".join(missing))
+                        return
+                    raise TimeoutError("initial observation unavailable")
+                time.sleep(0.005)
+            issues = self.admit_observation(row)
+            if issues:
+                self.request_episode_end("preparation_sources: " + "; ".join(issues))
+                return
+            if self.recording_dir is not None and (issue := self.recording_issue(row)) is not None:
+                self.request_episode_end(issue)
+                return
             if self.recording_dir is not None:
                 metadata = snapshot_recording_metadata(
                     self.camera_snapshot,
                     tactile_reset_metadata=self.robot.hand.get_tactile_reset_metadata(),
-                    tactile_hold_max_age_s=self.runtime.hand.feedback_max_age_s,
                 )
                 metadata["vr_to_robot_rotation"] = self.controller.rotation.as_matrix().tolist()
                 if self.runtime_config_json is not None:
@@ -236,27 +259,17 @@ class TeleopLoop:
                     task_label=self.task_label, collection_source="teleop",
                     metadata=metadata,
                 )
-            if self.preparation_interrupted():
-                return
-            until = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
-            while True:
+            if self.recorder is not None:
                 if self.preparation_interrupted():
                     return
+                # writer 启动可能阻塞；首个锚点仍取启动完成后的实测快照。
                 self.robot.service_feedback()
                 row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
-                if sources_available(row, self.capture_needs):
-                    break
-                if time.monotonic_ns() >= until:
-                    raise TimeoutError("initial observation unavailable")
-                time.sleep(0.005)
-            issues = self.admit_observation(row)
-            if issues:
-                self.request_episode_end("preparation_sources: " + "; ".join(issues))
-                return
-            if (issue := self.recording_issue(row)) is not None:
-                self.recorder.append(row, quality_issue=issue)
-                self.request_episode_end(issue)
-                return
+                issues = self.admit_observation(row)
+                issue = self.recording_issue(row)
+                if issues or issue:
+                    self.request_episode_end(issue or "preparation_sources: " + "; ".join(issues))
+                    return
             self.try_begin(row)
         except OperationCancelled:
             self.robot.check()
@@ -310,7 +323,6 @@ class TeleopLoop:
                 self.robot.reset_tactile_sensors(
                     cancel_epoch=expected_cancel_epoch,
                     cancel_requested=self.poll_blocking_commands,
-                    required_tactile=self.capture_needs.required_tactile,
                 )
             except OperationCancelled as exc:
                 self.robot.check()
@@ -459,11 +471,10 @@ class TeleopLoop:
                     logger.exception("teleop recording append also failed")
 
     def recording_issue(self, row):
-        if self.recorder is None or not self.recorder.is_recording:
-            return None
         if not self.sensors.check(names=("camera",)):
             raise RuntimeError("recording camera worker exited")
-        issues = check_observation(row, self.runtime, self.record_needs, now_ns=row.observation_timestamp_ns)
+        issues = check_observation(row, self.runtime, self.record_needs,
+                                   now_ns=row.observation_timestamp_ns, allow_tactile_hold=True)
         return "; ".join(issues) if issues else None
 
     def admit_observation(self, row):

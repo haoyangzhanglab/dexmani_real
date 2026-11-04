@@ -23,12 +23,13 @@ logger = logging.getLogger(__name__)
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
 TACTILE_UNITS = "sdk_native_unknown_physical_scale"
 TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
+TACTILE_AGE_WARNING_NS = 500_000_000
 
 
 ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
     "arm_qpos": ((7,), np.dtype(np.float64)),
     "hand_qpos": ((12,), np.dtype(np.float64)),
-    # 触觉保留 SDK 单位和限时保持语义。
+    # 触觉保留 SDK 单位、最近有效值及其原来源时间。
     "hand_contact": ((5, 3), np.dtype(np.float32)),
     "hand_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
     # 记录最终提交的绝对目标，包括失败的提交尝试。
@@ -150,14 +151,14 @@ def decode_camera_metadata(meta) -> CameraSnapshot:
     return CameraSnapshot(meta["camera_serial"], color, float(meta["depth_scale"]), transform)
 
 
-def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata, tactile_hold_max_age_s):
-    """记录实际相机、触觉语义与采集时的 hold 配置。"""
+def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata):
+    """记录实际相机与触觉保持语义，不将旧值解释为当前接触。"""
     metadata = camera_metadata(camera_snapshot)
     metadata.update(tactile_reset_metadata)
     metadata.update(
         hand_tactile_units=TACTILE_UNITS,
         hand_tactile_finger_order=TACTILE_FINGER_ORDER,
-        hand_tactile_hold_max_age_s=float(tactile_hold_max_age_s),
+        hand_tactile_hold_policy="last_valid_until_recovery",
     )
     return metadata
 

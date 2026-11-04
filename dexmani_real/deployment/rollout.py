@@ -29,6 +29,7 @@ from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.runtime.observation import (
     check_observation,
+    missing_tactile_channels,
     read_observation,
     sources_available,
 )
@@ -102,11 +103,10 @@ class Rollout:
         return self.result.termination_reason is not None
 
     def recording_issue(self, row):
-        if self.recorder is None or not self.recorder.is_recording:
-            return None
         if not self.sensors.check(names=("camera",)):
             raise RuntimeError("recording camera worker exited")
-        issues = check_observation(row, self.runtime, self.record_needs, now_ns=row.observation_timestamp_ns)
+        issues = check_observation(row, self.runtime, self.record_needs,
+                                   now_ns=row.observation_timestamp_ns, allow_tactile_hold=True)
         return "; ".join(issues) if issues else None
 
     def read_observation(self):
@@ -218,16 +218,22 @@ class Rollout:
             self.robot.check()
         return valid
 
-    def start_observation(self):
+    def start_observation(self, poll_operator=lambda: None):
         until = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
         while True:
+            poll_operator()
             if not self.preparation_valid():
                 raise OperationCancelled("initial observation cancelled")
             self.robot.service_feedback()
             row, self.preparation_issue = self.read_observation()
-            if sources_available(row, self.capture_needs):
+            missing = missing_tactile_channels(row, self.capture_needs.required_tactile)
+            if sources_available(row, self.capture_needs) and not missing:
                 break
             if time.monotonic_ns() >= until:
+                if missing:
+                    self.preparation_issue = "initial_tactile_unavailable: " + ", ".join(missing)
+                    logger.warning("本轮未开始：触觉初值缺失 %s；可稍后再次按 B。", ", ".join(missing))
+                    return None
                 raise TimeoutError("initial observation unavailable")
             time.sleep(0.005)
         if self.preparation_issue is not None:
@@ -248,28 +254,33 @@ class Rollout:
         poll_operator()
         if not self.preparation_valid():
             raise OperationCancelled("cancelled during streaming preparation")
+        # 全模态初值先于 writer 和本段第一条动作；失败只结束本次准备。
+        row = self.start_observation(poll_operator)
+        if row is None:
+            self.stop(self.preparation_issue)
+            return
+        if self.record_raw and (issue := self.recording_issue(row)) is not None:
+            self.preparation_issue = issue
+            self.stop(issue)
+            return
         if self.record_raw:
             self.recorder = EpisodeRecorder(self.output_dir, control_hz=1 / self.policy_info.control_dt_s)
             metadata = snapshot_recording_metadata(
                 self.camera_snapshot,
                 tactile_reset_metadata=self.robot.hand.get_tactile_reset_metadata(),
-                tactile_hold_max_age_s=self.runtime.hand.feedback_max_age_s,
             )
             self.recorder.start(
                 task_label=self.policy_info.task_name,
                 episode_name=f"episode_{self.result.index:03d}", collection_source="policy_rollout", metadata=metadata,
             )
-        poll_operator()
-        if not self.preparation_valid():
-            raise OperationCancelled("cancelled during recorder start")
-        # 设备准备和 writer 启动后重新取得最终快照。
-        row = self.start_observation()
-        if row is None:
-            self.stop(self.preparation_issue)
-            return
-        if self.recorder is not None:
-            if (issue := self.recording_issue(row)) is not None:
-                self.recorder.append(row, quality_issue=issue)
+            poll_operator()
+            if not self.preparation_valid():
+                raise OperationCancelled("cancelled during recorder start")
+            self.robot.service_feedback()
+            row, self.preparation_issue = self.read_observation()
+            issue = self.preparation_issue or self.recording_issue(row)
+            if issue is not None:
+                self.preparation_issue = issue
                 self.stop(issue)
                 return
         with self.runtime_state.motion_lock:

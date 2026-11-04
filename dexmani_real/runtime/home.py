@@ -69,24 +69,6 @@ def home_robot(state, robot, get_planner, *, cancel_epoch, cancel_requested):
     home_arm(state, robot, planner, cancel_epoch=cancel_epoch, cancel_requested=cancel_requested, deadline_ns=deadline_ns)
 
 
-def initialize_hand(state, robot, *, cancel_epoch, required_tactile, cancel_requested):
-    """确认手部 HOME；只有实际消费者需要触觉时才 reset 并等待对应通道。"""
-    if not robot.hand_config.enabled:
-        return
-    home_hand(state, robot, cancel_epoch=cancel_epoch, cancel_requested=cancel_requested)
-    if not required_tactile:
-        return
-    logger.info("手部 HOME 已到位，正在请求触觉复位，请保持手部无接触。")
-
-    def cancelled():
-        return cancel_requested() or not (state.cancel_epoch == cancel_epoch and state.requests_allow_motion())
-
-    robot.reset_tactile_sensors(
-        cancel_epoch=cancel_epoch, cancel_requested=cancelled, required_tactile=required_tactile,
-    )
-    logger.info("触觉复位请求已完成，所需通道反馈已就绪。")
-
-
 def home_arm(state, robot, planner, *, cancel_epoch, cancel_requested, deadline_ns):
     config, hand = robot.arm_config, robot.hand_config
     target = np.asarray(config.home_qpos, dtype=np.float64)
@@ -157,7 +139,10 @@ def home_hand(state, robot, *, cancel_epoch, cancel_requested):
     if cancelled():
         raise OperationCancelled("home interrupted")
     with _home_motion(state, robot):
-        robot.send_hand_home(RobotCommand(hand_qpos=target), expires_ns=deadline, cancel_epoch=cancel_epoch)
+        robot.stop()
+        robot.service_feedback()
+        command = RobotCommand(hand_qpos=target)
+        retry_pending = not robot.send_hand_home(command, deadline_ns=deadline, cancel_requested=cancelled)
 
         # 只有提交完成之后的新样本才能确认到达。
         last_sample_ns = time.monotonic_ns()
@@ -165,7 +150,11 @@ def home_hand(state, robot, *, cancel_epoch, cancel_requested):
         while time.monotonic_ns() < deadline:
             if cancelled():
                 raise OperationCancelled("home interrupted")
-            robot.service_feedback()
+            sampled = robot.service_feedback()
+            if retry_pending and sampled:
+                robot.send_hand_home(command, deadline_ns=deadline, cancel_requested=cancelled)
+                retry_pending = False
+                last_sample_ns = time.monotonic_ns()
             feedback = robot.hand_feedback.snapshot()
             if feedback is not None:
                 sample = feedback[0]

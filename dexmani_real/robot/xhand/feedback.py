@@ -40,8 +40,16 @@ class XHandFeedback:
     def __init__(self):
         self.latest: np.ndarray | None = None
 
-    def reset(self) -> None:
-        self.latest = None
+    def clear_tactile(self) -> None:
+        """显式清零开始后旧触觉不再可用；保留独立关节反馈。"""
+        if self.latest is None:
+            return
+        frame = self.latest.copy()
+        for name in ("aggregate", "dense"):
+            frame[f"tactile_{name}"] = np.nan
+            frame[f"tactile_{name}_timestamp_ns"] = 0
+        frame.flags.writeable = False
+        self.latest = frame
 
     def consume(self, state: XHandState | None) -> np.ndarray | None:
         if state is None:

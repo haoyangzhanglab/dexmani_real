@@ -9,6 +9,7 @@ from concurrent.futures import wait
 from dataclasses import asdict
 
 from dexmani_real.config.control import HomeConfigurationError
+from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.control.homing import HomePathRejected
 from dexmani_real.data.raw import camera_metadata
@@ -17,7 +18,7 @@ from dexmani_real.deployment.rollout import Rollout, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import build_home_planner, home_robot, initialize_hand
+from dexmani_real.runtime.home import build_home_planner, home_robot
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
@@ -226,11 +227,6 @@ class PolicySession:
             self.sensors.shutdown(self.runtime_state)
             self.sensors.channels = None
         self.check_startup()
-        initialize_hand(
-            self.runtime_state, self.robot, cancel_epoch=self.startup_cancel_epoch,
-            required_tactile=needs.required_tactile,
-            cancel_requested=self.home_abort_requested,
-        )
         self.warmup_policy()
         self.check_startup()
         self.runtime_state.stop_signal.set()
@@ -319,10 +315,16 @@ class PolicySession:
         deadline = time.monotonic() + MODEL_STARTUP_TIMEOUT_S
         self.wait_model(deadline)
         self.check_startup()
-        row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
-        issues = check_observation(row, self.runtime, self.control_needs)
-        if issues:
-            raise ValueError("warmup observation: " + "; ".join(issues))
+        observation_deadline = time.monotonic() + INITIAL_STATE_TIMEOUT_S
+        while True:
+            self.check_startup()
+            row = read_observation(self.sensors.channels, self.robot, needs=self.control_needs)
+            issues = check_observation(row, self.runtime, self.control_needs)
+            if not issues:
+                break
+            if time.monotonic() >= observation_deadline:
+                raise ValueError("warmup observation: " + "; ".join(issues))
+            time.sleep(0.005)
         # 仅预热重复一个快照；正式预测使用实际采样历史。
         rows = (self.observations.project(row),) * self.info.n_obs_steps
         kwargs = {}
@@ -382,7 +384,6 @@ class PolicySession:
                     self.robot.reset_tactile_sensors(
                         cancel_epoch=cancel_epoch,
                         cancel_requested=self.home_abort_requested,
-                        required_tactile=self.capture_needs.required_tactile,
                     )
                 except OperationCancelled as exc:
                     self.robot.check()

@@ -177,7 +177,7 @@ def raw_metadata(scale=.001):
     from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
     camera = CameraSnapshot('fake', CameraIntrinsics(16, 16, 100., 100., 8., 8., 'none', (0.,) * 5),
                             scale, np.eye(4))
-    return dict(snapshot_recording_metadata(camera, tactile_reset_metadata={}, tactile_hold_max_age_s=.2),
+    return dict(snapshot_recording_metadata(camera, tactile_reset_metadata={}),
                 task_label='test', collection_source='teleop')
 
 
@@ -591,14 +591,14 @@ def test_export_rejects_nonincreasing_primary_clocks(field, delta):
         validate_export_episode(reader)
 
 
-def test_old_tactile_sources_export_with_age_statistics(caplog):
+def test_held_tactile_sources_export_with_age_statistics(caplog):
     reader = reader_with_intervals([62_500_000] * 2)
     for field in ('tactile_aggregate_ns', 'tactile_dense_ns'):
         reader['timing/rows'][field] = 1
     _, quality = validate_export_episode(reader)
     for channel in ('aggregate', 'dense'):
         assert quality[f'max_tactile_{channel}_age_ns'] == 1_125_999_999
-    assert 'stale source' not in caplog.text
+    assert 'tactile held beyond 0.5 s' in caplog.text
 
 
 def export_processing():
@@ -642,36 +642,6 @@ def test_real_export_depth_scale_merge(raw_episode, tmp_path, first, second, acc
     assert before == [p.read_bytes() for p in files]
 
 
-@pytest.mark.parametrize('ttl', [None, 'invalid', 0., -1., np.nan, np.inf])
-def test_real_tactile_read_and_export_ignore_ttl(raw_episode, tmp_path, ttl, caplog):
-    import h5py
-    import zarr
-    from dexmani_real.data.raw import RawReader
-    from dexmani_real.data.export import export_zarr
-    path = raw_episode()
-    with h5py.File(path / 'data.h5', 'r+') as data:
-        del data['meta'].attrs['hand_tactile_hold_max_age_s']
-        if ttl is not None:
-            data['meta'].attrs['hand_tactile_hold_max_age_s'] = ttl
-        rows = data['timing/rows'][:]
-        rows['tactile_aggregate_ns'] = 1
-        rows['tactile_dense_ns'] = 2
-        data['timing/rows'][:] = rows
-    with RawReader(path) as reader:
-        assert reader['hand_contact'].shape == (3, 5, 3)
-        assert reader['hand_tactile_force'].shape == (3, 5, 120, 3)
-    target = tmp_path / 'result.zarr'
-    result = export_zarr(path, target, processing=export_processing())
-    quality = result['episode_quality'][0]
-    assert quality['max_tactile_aggregate_age_ns'] == 1_132_999_999
-    assert quality['max_tactile_dense_age_ns'] == 1_132_999_998
-    with zarr.DirectoryStore(str(target)) as store:
-        root = zarr.open_group(store, mode='r')
-        assert root.attrs['episode_quality'] == [quality]
-        assert len(root['data']) == 13
-    assert 'stale source' not in caplog.text
-
-
 @pytest.mark.parametrize('field,value', [
     ('hand_tactile_units', 'newton'),
     ('hand_tactile_finger_order', 'pinky,ring,middle,index,thumb'),
@@ -682,7 +652,6 @@ def test_real_tactile_semantics_still_rejected(raw_episode, tmp_path, field, val
     from dexmani_real.data.export import export_zarr
     path = raw_episode()
     with h5py.File(path / 'data.h5', 'r+') as data:
-        del data['meta'].attrs['hand_tactile_hold_max_age_s']
         data['meta'].attrs[field] = value
     with RawReader(path) as reader, pytest.raises(ValueError, match=field):
         reader['hand_contact']
@@ -691,19 +660,22 @@ def test_real_tactile_semantics_still_rejected(raw_episode, tmp_path, field, val
 
 
 @pytest.mark.parametrize('channel', ['aggregate', 'dense'])
-@pytest.mark.parametrize('damage', ['zero', 'negative', 'future', 'regression', 'shape'])
+@pytest.mark.parametrize('damage', ['zero', 'negative', 'future', 'regression', 'shape', 'nan', 'missing'])
 def test_real_tactile_damage_still_rejected(raw_episode, tmp_path, channel, damage):
     import h5py
     from dexmani_real.data.export import export_zarr
     path = raw_episode()
     with h5py.File(path / 'data.h5', 'r+') as data:
-        del data['meta'].attrs['hand_tactile_hold_max_age_s']
+        name = 'hand_contact' if channel == 'aggregate' else 'hand_tactile_force'
         if damage == 'shape':
-            name = 'hand_contact' if channel == 'aggregate' else 'hand_tactile_force'
             shape = list(data[name].shape)
             shape[-1] = 2
             del data[name]
             data.create_dataset(name, shape=shape, dtype=np.float32)
+        elif damage == 'nan':
+            data[name][1] = np.nan
+        elif damage == 'missing':
+            del data[name]
         else:
             rows = data['timing/rows'][:]
             name = f'tactile_{channel}_ns'
@@ -711,7 +683,7 @@ def test_real_tactile_damage_still_rejected(raw_episode, tmp_path, channel, dama
                                  future=rows['observation_ns'][1] + 1,
                                  regression=rows[name][0] - 1)[damage]
             data['timing/rows'][:] = rows
-    with pytest.raises(ValueError, match='invalid_source_clock|source_clock_regressed|shape/dtype'):
+    with pytest.raises(ValueError, match='invalid_source_clock|source_clock_regressed|shape/dtype|nonfinite|missing fields'):
         export_zarr(path, tmp_path / 'bad.zarr', processing=export_processing())
     assert not (tmp_path / 'bad.zarr').exists()
 
@@ -896,3 +868,279 @@ def test_teleop_writer_error_retains_staging(teleop_recording, monkeypatch):
     with pytest.raises(recording.RecordingError, match='writer close failed'):
         loop.finish_recording()
     assert 'emergency' in sounds and 'save' not in sounds and 'discard' not in sounds
+
+
+def test_feedback_holds_flow_through_real_recorder_to_full_zarr(tmp_path, caplog):
+    from dataclasses import replace
+    import zarr
+    from dexmani_real.data.export import canonical_array_specs, export_zarr
+    from dexmani_real.data.raw import RawReader
+    from dexmani_real.robot.commands import RobotCommand
+    from dexmani_real.robot.xhand.feedback import XHandFeedback, XHandState
+
+    feedback = XHandFeedback()
+    recorder = recording.EpisodeRecorder(tmp_path / 'raw', control_hz=4)
+    recorder.start(task_label='test', collection_source='teleop', metadata=raw_metadata())
+    template, _ = next(raw_frames())
+    expected_aggregate, expected_dense, expected_arm, expected_actions = [], [], [], []
+    expected_times = []
+    # 两通道分别丢帧；关节继续更新，最后 dense 恢复，aggregate 继续保持。
+    channel_values = [(2, 3), (None, 4), (5, None), (None, None), (None, None), (None, 6)]
+    try:
+        for i, (aggregate, dense) in enumerate(channel_values):
+            stamp = 1_000_000_000 + i * 250_000_000
+            sample = XHandState(
+                qpos=np.full(12, i / 100),
+                tactile_aggregate=None if aggregate is None else np.full((5, 3), aggregate, dtype=np.float32),
+                tactile_dense=None if dense is None else np.full((5, 120, 3), dense, dtype=np.float32),
+                timestamp_ns=stamp,
+            )
+            feedback.consume(sample)
+            hand = feedback.snapshot()
+            arm = template.arm.copy()
+            arm['timestamp_ns'] = stamp
+            arm['qpos'] = i / 100
+            row = replace(template, arm=arm, hand=hand,
+                          camera=dict(template.camera, timestamp_ns=stamp, ring_sequence=i),
+                          observation_timestamp_ns=stamp + 1_000_000, control_timestamp_ns=stamp)
+            command = RobotCommand(np.full(7, i / 50), np.full(12, i / 50))
+            assert recorder.append(row, command) is None
+            expected_arm.append(arm['qpos'][0].copy())
+            expected_actions.append(np.full(19, i / 50))
+            expected_aggregate.append(hand['tactile_aggregate'][0].copy())
+            expected_dense.append(hand['tactile_dense'][0].copy())
+            expected_times.append((int(hand['tactile_aggregate_timestamp_ns'][0]),
+                                   int(hand['tactile_dense_timestamp_ns'][0])))
+        path = recorder.finish(save=True, reason='operator')
+    finally:
+        if recorder.writer_pending:
+            recorder.finish(save=False, reason='test_cleanup')
+    with RawReader(path) as reader:
+        assert reader.meta['hand_tactile_hold_policy'] == 'last_valid_until_recovery'
+        assert len(list(reader.iter_rgb_frames())) == len(channel_values)
+        rows = reader['timing/rows'][:]
+        np.testing.assert_array_equal(rows['tactile_aggregate_ns'], np.asarray(expected_times)[:, 0])
+        np.testing.assert_array_equal(rows['tactile_dense_ns'], np.asarray(expected_times)[:, 1])
+        np.testing.assert_array_equal(reader['hand_contact'][:], expected_aggregate)
+        np.testing.assert_array_equal(reader['hand_tactile_force'][:], expected_dense)
+    target = tmp_path / 'held.zarr'
+    processing = export_processing()
+    result = export_zarr(path, target, processing=processing)
+    assert result['total_frames'] == len(channel_values)
+    quality = result['episode_quality'][0]
+    assert quality['max_tactile_aggregate_age_ns'] == 751_000_000
+    assert quality['max_tactile_dense_age_ns'] == 751_000_000
+    with zarr.DirectoryStore(str(target)) as store:
+        root = zarr.open_group(store, mode='r')
+        arrays = root['data']
+        specs = canonical_array_specs(processing.pointcloud.num_points, 16, 16,
+                                      processing.hand_pointcloud.num_points)
+        assert set(arrays) == set(specs) and len(arrays) == 13
+        for name, (shape, dtype) in specs.items():
+            assert arrays[name].shape == (len(channel_values), *shape)
+            assert arrays[name].dtype == dtype
+        np.testing.assert_array_equal(arrays['joint_state'][:, :7], np.asarray(expected_arm, dtype=np.float32))
+        np.testing.assert_array_equal(arrays['action'][:], np.asarray(expected_actions, dtype=np.float32))
+        np.testing.assert_array_equal(arrays['finger_tactile_force'][:], expected_aggregate)
+        np.testing.assert_array_equal(arrays['taxel_tactile_force'][:], expected_dense)
+        assert root['meta/episode_ends'][:].tolist() == [len(channel_values)]
+        assert root.attrs['dt'] == .25
+    assert '继续记录最近有效值及原来源时间' in caplog.text
+    assert 'tactile held beyond 0.5 s' in caplog.text
+
+
+@pytest.mark.parametrize('kind', ['teleop', 'policy'])
+def test_recording_hold_keeps_control_input_age_checks(kind):
+    from dataclasses import replace
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.runtime.observation import ObservationNeeds, check_observation
+    from dexmani_real.teleop.loop import TeleopLoop
+    from dexmani_real.deployment.rollout import Rollout
+
+    runtime = RealConfig()
+    row, _ = next(raw_frames())
+    hand = row.hand.copy()
+    hand['tactile_aggregate_timestamp_ns'] = 1
+    hand['tactile_dense_timestamp_ns'] = 2
+    hand['tactile_aggregate'] = 7
+    hand['tactile_dense'] = 8
+    row = replace(row, hand=hand)
+    needs = ObservationNeeds(camera_fields=('rgb', 'depth'), required_tactile=('aggregate', 'dense'))
+    owner = SimpleNamespace(sensors=SimpleNamespace(check=lambda **kw: True), runtime=runtime,
+                            record_needs=needs)
+    loop_class = TeleopLoop if kind == 'teleop' else Rollout
+    assert loop_class.recording_issue(owner, row) is None
+    for channel in ('aggregate', 'dense'):
+        issues = check_observation(row, runtime, ObservationNeeds(required_tactile=(channel,)),
+                                   now_ns=row.observation_timestamp_ns)
+        assert issues == [f'hand_tactile_{channel}_timestamp_ns_unavailable_or_stale']
+
+
+@pytest.mark.parametrize('kind', ['teleop', 'policy'])
+def test_missing_dense_prevents_writer_and_allows_later_start(monkeypatch, tmp_path, kind):
+    from dataclasses import replace
+    from scipy.spatial.transform import Rotation
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.data.raw import decode_camera_metadata
+    from dexmani_real.runtime.observation import ObservationNeeds
+    from dexmani_real.runtime.state import SessionState
+    from dexmani_real.teleop import loop as teleop
+    from dexmani_real.deployment import rollout as policy
+
+    state = SessionState()
+    runtime = RealConfig()
+    full, _ = next(raw_frames())
+    missing = full.hand.copy()
+    missing['tactile_dense'] = np.nan
+    missing['tactile_dense_timestamp_ns'] = 0
+    row = [replace(full, hand=missing)]
+    clock = [full.observation_timestamp_ns]
+    monkeypatch.setattr(teleop.time, 'monotonic_ns', lambda: clock[0])
+    monkeypatch.setattr(teleop.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + 1_000_000_000))
+    robot = SimpleNamespace(prepare_streaming=lambda epoch: state.stop_signal.clear(),
+                            service_feedback=lambda: None, stop=lambda: state.stop_signal.set(),
+                            hand=SimpleNamespace(get_tactile_reset_metadata=lambda: {}))
+    sensors = SimpleNamespace(channels=None, check=lambda **kw: True)
+    needs = ObservationNeeds(camera_fields=('rgb', 'depth'), required_tactile=('aggregate', 'dense'))
+    polls = []
+    if kind == 'teleop':
+        owner = teleop.TeleopLoop(
+            state, runtime, robot, task_label='test', sensors=sensors,
+            controller=SimpleNamespace(rotation=Rotation.identity(), hand_retargeter=None),
+            recording_dir=tmp_path, max_duration_s=60, runtime_config_json=None,
+            keyboard=None, audio=SimpleNamespace(play=lambda sound: None),
+            camera_snapshot=decode_camera_metadata(raw_metadata()),
+        )
+        monkeypatch.setattr(teleop, 'read_observation', lambda *a, **kw: row[0])
+        monkeypatch.setattr(owner, 'preparation_interrupted', lambda: polls.append(True) or False)
+        monkeypatch.setattr(owner, 'admit_observation', lambda row: [])
+        monkeypatch.setattr(owner, 'try_begin', lambda row: None)
+        start = lambda: owner.start_episode(state.cancel_epoch)
+    else:
+        owner = policy.Rollout(
+            state, runtime, SimpleNamespace(control_dt_s=.0625, n_obs_steps=1, task_name='test'),
+            cancel_epoch=state.cancel_epoch, robot=robot, observations=None,
+            control_needs=ObservationNeeds(), record_needs=needs, sensors=sensors,
+            action_mapper=None, model=None, max_running_s=None, index=1, output_dir=tmp_path,
+            record_raw=True, audio=SimpleNamespace(play=lambda sound: None),
+            camera_snapshot=decode_camera_metadata(raw_metadata()),
+        )
+        owner.read_observation = lambda: (row[0], None)
+        start = lambda: owner.prepare(lambda: polls.append(True))
+    start()
+    assert owner.recorder is None and not list(tmp_path.iterdir())
+    assert not state.quit_requested and not state.estop_request and len(polls) >= 2
+    # 模拟结束准备回待命；新 B 接纳后，不需重新连接或重新加载模型。
+    if kind == 'policy':
+        owner.result.termination_reason = None
+        owner.preparation_issue = None
+    row[0] = full
+    clock[0] = full.observation_timestamp_ns
+    try:
+        start()
+        assert owner.recorder is not None and owner.recorder.is_recording
+    finally:
+        if owner.recorder is not None:
+            owner.recorder.finish(save=False, reason='test_cleanup')
+
+
+@pytest.mark.parametrize('kind', ['teleop', 'policy'])
+def test_recording_old_tactile_still_submits_and_writes_every_tick(monkeypatch, tmp_path, kind):
+    from dataclasses import replace
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.data.raw import RawReader
+    from dexmani_real.deployment.rollout import Rollout
+    from dexmani_real.robot.commands import RobotCommand
+    from dexmani_real.runtime.observation import ObservationNeeds
+    from dexmani_real.runtime.state import SessionState
+    from dexmani_real.teleop import loop as teleop
+
+    clock = [1_000_000_000]
+    monkeypatch.setattr(teleop.time, 'monotonic_ns', lambda: clock[0])
+    state, runtime, sends = SessionState(), RealConfig(), []
+    robot = SimpleNamespace(send_action=lambda command, **kw: sends.append(command), check=lambda: None)
+    sensors = SimpleNamespace(channels=None, check=lambda **kw: True)
+    audio = SimpleNamespace(play=lambda sound: None)
+    recorder = recording.EpisodeRecorder(tmp_path, control_hz=16)
+    source = 'teleop' if kind == 'teleop' else 'policy_rollout'
+    recorder.start(task_label='test', collection_source=source, metadata=raw_metadata())
+    current = [None]
+    if kind == 'teleop':
+        controller = SimpleNamespace(
+            compute_target=lambda row, **kw: SimpleNamespace(
+                arm_qpos=np.zeros(7), hand_qpos=np.zeros(12), rejection_reason=None, eef_pose=None),
+            commit=lambda *a, **kw: None,
+        )
+        owner = teleop.TeleopLoop(state, runtime, robot, task_label='test', sensors=sensors,
+                                  controller=controller, recording_dir=tmp_path, max_duration_s=60,
+                                  runtime_config_json=None, keyboard=None, audio=audio)
+        owner.capture_deadline_ns = clock[0] + 10_000_000_000
+        owner.first_target_pending = True
+        owner.cancel_epoch = state.cancel_epoch
+        monkeypatch.setattr(teleop, 'read_observation', lambda *a, **kw: current[0])
+        tick = owner.run_control_tick
+    else:
+        needs = ObservationNeeds(camera_fields=('rgb', 'depth'), required_tactile=('aggregate', 'dense'))
+        owner = Rollout(state, runtime, SimpleNamespace(control_dt_s=.0625, n_obs_steps=1),
+                        cancel_epoch=state.cancel_epoch, robot=robot, observations=SimpleNamespace(project=lambda row: {}),
+                        control_needs=ObservationNeeds(), record_needs=needs, sensors=sensors,
+                        action_mapper=None, model=SimpleNamespace(poll=lambda: None, future=None),
+                        max_running_s=None, index=1, output_dir=tmp_path, record_raw=True, audio=audio)
+        owner.execution = replace(runtime.execution, action_steps=4)
+        owner.started_ns = owner.next_step_ns = clock[0]
+        owner.sync_actions = np.zeros((4, 19))
+        owner.read_observation = lambda: (current[0], None)
+        owner.map_command = lambda *args: (RobotCommand(np.zeros(7), np.zeros(12)), None)
+        tick = owner.step
+    owner.recorder = recorder
+    try:
+        for row, _ in raw_frames():
+            hand = row.hand.copy()
+            hand['tactile_aggregate_timestamp_ns'] = 1
+            hand['tactile_dense_timestamp_ns'] = 2
+            hand['tactile_aggregate'] = 7
+            hand['tactile_dense'] = 8
+            current[0] = replace(row, hand=hand)
+            clock[0] = row.observation_timestamp_ns
+            tick()
+        assert len(sends) == 3 and not state.stop_signal.is_set()
+        assert recorder.recording_truncated_reason is None
+        path = recorder.finish(save=True, reason='operator')
+        with RawReader(path) as reader:
+            assert reader.num_frames == 3
+            np.testing.assert_array_equal(reader['timing/rows'][:]['tactile_aggregate_ns'], [1] * 3)
+            np.testing.assert_array_equal(reader['timing/rows'][:]['tactile_dense_ns'], [2] * 3)
+            assert np.all(reader['hand_contact'][:] == 7)
+            assert np.all(reader['hand_tactile_force'][:] == 8)
+    finally:
+        if recorder.writer_pending:
+            recorder.finish(save=False, reason='test_cleanup')
+
+
+def test_unrecorded_tactile_policy_waits_for_initial_value_after_reset(monkeypatch):
+    from dataclasses import replace
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.deployment import rollout as policy
+    from dexmani_real.runtime.observation import ObservationNeeds
+    from dexmani_real.runtime.state import SessionState
+
+    full, _ = next(raw_frames())
+    hand = full.hand.copy()
+    hand['tactile_dense_timestamp_ns'] = 0
+    hand['tactile_dense'] = np.nan
+    samples = iter(((replace(full, hand=hand), 'control_input_dense_unavailable'), (full, None)))
+    clock = [full.observation_timestamp_ns]
+    monkeypatch.setattr(policy.time, 'monotonic_ns', lambda: clock[0])
+    monkeypatch.setattr(policy.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + 5_000_000))
+    state = SessionState()
+    owner = policy.Rollout(
+        state, RealConfig(), SimpleNamespace(control_dt_s=.0625, n_obs_steps=1),
+        cancel_epoch=state.cancel_epoch, robot=SimpleNamespace(service_feedback=lambda: None),
+        observations=None, control_needs=ObservationNeeds(required_tactile=('dense',)),
+        record_needs=ObservationNeeds(), sensors=None, action_mapper=None, model=None,
+        max_running_s=None, index=1, output_dir=None, record_raw=False, audio=None,
+    )
+    owner.read_observation = lambda: next(samples)
+    polls = []
+    assert owner.start_observation(lambda: polls.append(True)) is full
+    assert len(polls) == 2 and owner.recorder is None and owner.preparation_issue is None

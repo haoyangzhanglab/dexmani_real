@@ -24,7 +24,7 @@ from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID,
 )
-from dexmani_real.robot.xhand.driver import XHand
+from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE, XHand
 from dexmani_real.robot.xhand.feedback import XHandState
 from dexmani_real.utils.log import configure_logging
 
@@ -151,15 +151,27 @@ class XHandControlExample(XHand):
         self.check_cancelled()
         deadline_ns = time.monotonic_ns() + int(self.cfg.home_timeout_s * 1e9)
         self.motion_pending = True  # SDK exceptions do not establish non-delivery.
-        self.send_action(target)
-        print("  Position command accepted by SDK; checking measured convergence")
+        retry_pending = self._send_position(target) == COMMUNICATION_CRC_ERROR_CODE
+        last_sample_ns = time.monotonic_ns()
+        print("  Position submission attempted; checking measured convergence")
         tolerance_rad = np.deg2rad(self.cfg.home_tolerance_deg)
         consecutive = 0
         while time.monotonic_ns() < deadline_ns:
             # Freshness belongs to each newly received sample, independently of previous read/send latency.
-            measured = self.read_fresh_state(action_deadline_ns=deadline_ns).qpos
+            state = self.read_fresh_state(action_deadline_ns=deadline_ns)
             if time.monotonic_ns() >= deadline_ns:
                 break
+            if retry_pending:
+                self.check_cancelled()
+                self._send_position(target)
+                retry_pending = False
+                last_sample_ns = time.monotonic_ns()
+                continue
+            if state.timestamp_ns <= last_sample_ns:
+                time.sleep(FEEDBACK_POLL_INTERVAL_S)
+                continue
+            last_sample_ns = state.timestamp_ns
+            measured = state.qpos
             error_rad = float(np.max(np.abs(measured - target)))
             consecutive = consecutive + 1 if error_rad <= tolerance_rad else 0
             if consecutive >= CONVERGENCE_SAMPLES:
@@ -323,6 +335,8 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(args.config).hand
         if not args.print_config:
             config.validate()
+            if not args.read_only:
+                config.validate_home()
         if not 0 <= args.finger_id < HAND_DOF:
             raise ValueError(f"finger-id must be in 0..{HAND_DOF - 1}")
     except (OSError, TypeError, ValueError) as exc:

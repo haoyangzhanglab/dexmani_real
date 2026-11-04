@@ -85,7 +85,7 @@ class KeyboardTeleop:
         self.keys.start()
         if not self.keys.check_health():
             raise RuntimeError("keyboard stop listener unavailable")
-        self.robot.check_services = lambda: self.keys.check_health()
+        self.robot.check_services = self.keys.check_health
         self.robot.connect()
         self.robot.check()
         if not (self.runtime_state.cancel_epoch == startup_epoch and self.runtime_state.requests_allow_motion()):

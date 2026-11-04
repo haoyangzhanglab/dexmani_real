@@ -99,13 +99,13 @@ class Robot:
             from dexmani_real.robot.xhand.driver import XHand
 
             self.hand = XHand(self.hand_config)
-            initial = self.hand.connect(cancel_requested=cancelled, runtime_state=self.runtime_state)
+            initial = self.hand.connect(cancel_requested=cancelled)
             self.hand_feedback.consume(initial)
             self.feedback_next_ns = initial.timestamp_ns + FEEDBACK_PERIOD_NS
         self.connected = True
         self._read_initial_state(cancel_requested=cancelled)
 
-    def reset_tactile_sensors(self, *, cancel_epoch, cancel_requested, required_tactile=()) -> None:
+    def reset_tactile_sensors(self, *, cancel_epoch, cancel_requested) -> dict[int, int]:
         self.check()
         if self.hand is None:
             raise RobotError("XHand unavailable for tactile reset")
@@ -121,13 +121,8 @@ class Robot:
         if cancelled():
             raise OperationCancelled("tactile reset cancelled before stopping")
         self.stop()
-        try:
-            self.hand.reset_tactile_sensors(cancel_requested=cancelled)
-        finally:
-            self.hand_feedback.reset()
-            self.feedback_next_ns = 0
-        self._read_initial_state(
-            required_tactile=required_tactile, cancel_requested=cancelled,
+        return self.hand.reset_tactile_sensors(
+            cancel_requested=cancelled, on_start=self.hand_feedback.clear_tactile,
         )
 
     def read_hand(self):
@@ -144,21 +139,33 @@ class Robot:
             self.hand_feedback.snapshot() if self.hand is not None else None,
         )
 
-    def service_feedback(self) -> None:
-        """服务手部采样与已有故障；arm 观测由消费方显式读取。"""
+    def service_feedback(self) -> bool:
+        """服务反馈与故障；返回本次是否到采样机会，供一次性目标有限补发。"""
         self.check()
         try:
             now = time.monotonic_ns()
-            if now >= self.feedback_next_ns:
+            sampled = now >= self.feedback_next_ns
+            if sampled:
                 self.read_hand()
                 self.feedback_next_ns = next_tick_ns(
                     self.feedback_next_ns or now, FEEDBACK_PERIOD_NS, time.monotonic_ns(),
                 )
+            if self.stop_required and not self.runtime_state.stop_signal.is_set():
+                self._check_hand_feedback()
+            return sampled
         except BaseException:
             self.runtime_state.stop_signal.set()
             raise
 
-    def _read_initial_state(self, *, cancel_requested, required_tactile=()):
+    def _check_hand_feedback(self) -> None:
+        if self.hand is None:
+            return
+        frame = self.hand_feedback.snapshot()
+        stamp = int(frame["timestamp_ns"][0]) if frame is not None else 0
+        if not sample_is_fresh(stamp, self.hand_config.feedback_max_age_s, time.monotonic_ns()):
+            raise RobotError("current hand feedback unavailable/stale")
+
+    def _read_initial_state(self, *, cancel_requested):
         """回调负责完整故障检查及当前操作的取消语义，异常原样传播。"""
         deadline_ns = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
 
@@ -166,10 +173,7 @@ class Robot:
             if cancel_requested():
                 raise OperationCancelled("robot initial feedback acquisition cancelled")
             if time.monotonic_ns() >= deadline_ns:
-                raise RobotError(
-                    "robot initial feedback acquisition timed out; "
-                    f"required tactile={required_tactile}"
-                )
+                raise RobotError("robot initial feedback acquisition timed out")
 
         while True:
             check_wait()
@@ -180,11 +184,8 @@ class Robot:
             arm_ready = sample_is_fresh(arm_stamp, self.arm_config.feedback_max_age_s, now_ns)
             hand_ready = self.hand is None
             if self.hand is not None and state.hand is not None:
-                fields = ("timestamp_ns", *(f"tactile_{c}_timestamp_ns" for c in required_tactile))
-                stamps = (int(state.hand[name][0]) for name in fields)
-                hand_ready = all(
-                    sample_is_fresh(stamp, self.hand_config.feedback_max_age_s, now_ns)
-                    for stamp in stamps
+                hand_ready = sample_is_fresh(
+                    int(state.hand["timestamp_ns"][0]), self.hand_config.feedback_max_age_s, now_ns,
                 )
             if arm_ready and hand_ready:
                 return state
@@ -202,7 +203,23 @@ class Robot:
     def send_action(self, command, *, expires_ns):
         """顺序发布 arm、发送 hand；返回不表示原子执行、SDK 回执或到位。"""
         self.validate_command(command)
-        self._send_action(command, expires_ns=expires_ns)
+        try:
+            self.check_run()
+            if command.arm_qpos is not None or command.arm_hold:
+                if command.hand_qpos is not None:
+                    self._check_hand_feedback()
+                self.stop_required = True
+                cast("ArmProcess", self.arm).submit(command, expires_ns=expires_ns)
+            if command.hand_qpos is not None:
+                self.check_run()
+                # arm 发布可能等待邮箱锁；真正发送 hand 前仍须复核当前反馈。
+                self._check_hand_feedback()
+                self.stop_required = True
+                cast("XHand", self.hand)._send_action(command.hand_qpos)
+            self.check_run()
+        except BaseException:
+            self.runtime_state.stop_signal.set()
+            raise
 
     def validate_command(self, command):
         """组合命令格式与绝对限位必须先于任一设备副作用。"""
@@ -216,35 +233,21 @@ class Robot:
                 raise RobotError("hand device unavailable")
             validate_hand_target(command.hand_qpos, self.hand_lower, self.hand_upper)
 
-    def _send_action(self, command, *, expires_ns):
-        try:
-            if command.arm_qpos is not None or command.arm_hold:
-                self.stop_required = True
-                cast("ArmProcess", self.arm).submit(command, expires_ns=expires_ns)
-            if command.hand_qpos is not None:
-                self.check_run()
-                frame = self.hand_feedback.snapshot()
-                now = time.monotonic_ns()
-                if now >= expires_ns:
-                    raise OperationCancelled("target expired before device submission")
-                self.stop_required = True
-                stamp = int(frame["timestamp_ns"][0]) if frame is not None else 0
-                if not sample_is_fresh(stamp, self.hand_config.feedback_max_age_s, now):
-                    raise OperationCancelled("current hand feedback unavailable/stale at send")
-                cast("XHand", self.hand)._send_action(command.hand_qpos)
-            self.check_run()
-        except BaseException:
-            self.runtime_state.stop_signal.set()
-            raise
-
-    def send_hand_home(self, command, *, expires_ns, cancel_epoch):
+    def send_hand_home(self, command, *, deadline_ns, cancel_requested) -> bool:
+        """一次性绝对目标；arm 保持停止，由 HOME 期限及新反馈确认结果。"""
         if command.arm_qpos is not None or command.arm_hold:
             raise ValueError("hand HOME cannot carry an arm streaming target")
         self.validate_command(command)
-        self.stop()
-        self.service_feedback()
-        cast("ArmProcess", self.arm).resume(cancel_epoch, deadline_ns=expires_ns)
-        self._send_action(command, expires_ns=expires_ns)
+        if cancel_requested():
+            raise OperationCancelled("hand HOME cancelled before submission")
+        self.check()
+        self._check_hand_feedback()
+        if time.monotonic_ns() >= deadline_ns:
+            raise TimeoutError("hand HOME budget exhausted before submission")
+        self.stop_required = True
+        from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE
+
+        return cast("XHand", self.hand)._send_position(command.hand_qpos) != COMMUNICATION_CRC_ERROR_CODE
 
     def home_arm(self, waypoints, cancel_epoch, abort_check, *, deadline_ns):
         if abort_check():
@@ -337,7 +340,7 @@ class Robot:
 
         if self.hand is not None:
             try:
-                self.hand.disconnect(runtime_state=self.runtime_state)
+                self.hand.disconnect()
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()

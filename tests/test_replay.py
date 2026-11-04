@@ -109,6 +109,7 @@ def fake_devices(monkeypatch, cfg, delay, *, failure=None, close_failure=False):
 
         def send(q):
             now[0] += delay
+            return True
 
         self.hand = SimpleNamespace(
             is_connected=True,
@@ -118,7 +119,7 @@ def fake_devices(monkeypatch, cfg, delay, *, failure=None, close_failure=False):
             stop=lambda: None,
         )
 
-        def disconnect(**kwargs):
+        def disconnect():
             closed.append("hand")
             self.hand.control = None
 
@@ -477,7 +478,7 @@ def test_interrupt_latches_emergency_before_close(monkeypatch, tmp_path, stage):
 
 
 @pytest.mark.parametrize("fault", [False, True])
-def test_tail_without_hand_sample_only_fails_on_io_error(monkeypatch, tmp_path, fault):
+def test_tail_tolerates_short_hand_gap_and_propagates_io_error(monkeypatch, tmp_path, fault):
     path = tmp_path / "demo"
     cfg = demo(path, 1)
     now, sent, closed, _, _ = fake_devices(monkeypatch, cfg, 0)
@@ -486,7 +487,7 @@ def test_tail_without_hand_sample_only_fails_on_io_error(monkeypatch, tmp_path, 
         connect(self)
         get = self.hand.get_state
         def sample():
-            if not sent:
+            if not sent or now[0] >= 1_400_000_000:
                 return get()
             if fault:
                 raise OSError("hand I/O failed")
@@ -535,9 +536,9 @@ def test_file_limits_normalize_then_pass_public_send(monkeypatch, tmp_path, dtyp
 
 
 def test_hand_feedback_still_checked_at_public_send(monkeypatch, tmp_path):
-    from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.robot.commands import RobotError
     path = tmp_path / "demo"
-    cfg = demo(path, 5)
+    cfg = demo(path, 12)
     _, sent, closed, _, _ = fake_devices(monkeypatch, cfg, 0)
     connect = Robot.connect
     def setup(self):
@@ -545,8 +546,8 @@ def test_hand_feedback_still_checked_at_public_send(monkeypatch, tmp_path):
         get = self.hand.get_state
         self.hand.get_state = lambda: None if sent else get()
     monkeypatch.setattr(Robot, "connect", setup)
-    with pytest.raises(OperationCancelled, match="hand feedback unavailable/stale"):
+    with pytest.raises(RobotError, match="hand feedback unavailable/stale"):
         run.run_replay(path, cfg)
-    # arm 发布在 hand 检查之前；整体失败仍不能继续提交第五行。
-    assert len(sent) == 4
+    # 活动期反馈服务或发送边界会在 0.5 s 后发现失联。
+    assert 7 <= len(sent) <= 9
     assert closed == ["arm", "hand", "keyboard"]

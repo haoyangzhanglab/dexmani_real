@@ -1,4 +1,5 @@
 import signal
+import threading
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError, wait
 from types import SimpleNamespace
 
@@ -25,7 +26,7 @@ def resource_logs(monkeypatch, caplog):
 @pytest.mark.parametrize('alive', [False, True])
 def test_keyboard_stop_attempts_join_and_restore_after_failures(monkeypatch, resource_logs, error_types, alive):
     from dexmani_real.runtime import keyboard as keyboard_module
-    state = SessionState()
+    state = SessionState(stop_signal=threading.Event(), emergency_signal=threading.Event())
     keyboard = Keyboard(estop_callback=state.request_emergency_stop)
     keyboard.active = True
     keyboard.events.append('b')
@@ -58,9 +59,45 @@ def test_keyboard_stop_attempts_join_and_restore_after_failures(monkeypatch, res
     assert keyboard.saved_termios is (saved if errors[2] else None)
     assert keyboard.listener is listener
     assert state.estop_request == (KeyboardInterrupt in error_types)
-    reported = [record.exc_info[1] for record in resource_logs.records if record.exc_info]
-    assert reported == failures[1:]
+    reported = [record for record in resource_logs.records if record.exc_info]
+    assert [record.exc_info[1] for record in reported] == failures[1:]
+    for record in reported:
+        assert record.exc_info[2] is not None
+        stage = 'listener join' if record.exc_info[1] is errors[1] else 'terminal restore'
+        assert stage in record.getMessage()
     assert ('listener remains active' in resource_logs.text) == alive
+
+
+def test_keyboard_stop_attempts_cleanup_when_emergency_callback_fails(monkeypatch, resource_logs):
+    calls = []
+    interrupted = KeyboardInterrupt('stop interrupted')
+    callback_error = RuntimeError('emergency callback failed')
+    join_error = OSError('join failed')
+    latched = threading.Event()
+    def emergency_stop():
+        latched.set()
+        raise callback_error
+    keyboard = Keyboard(estop_callback=emergency_stop)
+    saved = keyboard.saved_termios = object()
+    def stop():
+        calls.append('stop')
+        raise interrupted
+    def join(timeout):
+        assert latched.is_set()
+        calls.append('join')
+        raise join_error
+    def restore(value):
+        assert latched.is_set() and value is saved
+        calls.append('restore')
+    keyboard.listener = SimpleNamespace(ident=1, stop=stop, join=join, is_alive=lambda: False)
+    monkeypatch.setattr('dexmani_real.runtime.keyboard.restore_terminal_echo', restore)
+    with pytest.raises(RuntimeError) as caught:
+        keyboard.stop()
+    assert caught.value is callback_error and callback_error.__context__ is interrupted
+    assert calls == ['stop', 'join', 'restore'] and keyboard.saved_termios is None
+    reported = [record for record in resource_logs.records if record.exc_info]
+    assert len(reported) == 1 and reported[0].exc_info[1] is join_error
+    assert reported[0].exc_info[2] is not None and 'listener join' in reported[0].getMessage()
 
 
 def test_keyboard_stop_without_started_listener_restores_terminal(monkeypatch):
@@ -859,7 +896,6 @@ def test_teleop_startup_cancel_has_one_exit_path(
         if stage in {'recording_cleanup', 'recording_audio_cleanup'}:
             raise OSError('recording finish failed')
     monkeypatch.setattr(run.TeleopLoop, 'finish_recording', finish_recording)
-    monkeypatch.setattr(run, 'initialize_hand', lambda *args, **kwargs: None)
     run_loop_idle = run.TeleopLoop.run
     def run_loop(self):
         if stage == 'idle':
@@ -1189,7 +1225,6 @@ def test_policy_camera_startup_uses_snapshot_interface(
         start=lambda process, **kw: started.append(process.name))
     session.process_context = SimpleNamespace(Process=lambda **kw: SimpleNamespace(**kw))
     session.run_config, session.output_dir = {}, tmp_path
-    monkeypatch.setattr(deployment, 'initialize_hand', lambda *a, **kw: None)
     if extrinsics and calibration_state != 'valid':
         with pytest.raises(FileNotFoundError if calibration_state == 'missing_file' else KeyError):
             session.start_devices()
@@ -1202,6 +1237,61 @@ def test_policy_camera_startup_uses_snapshot_interface(
     assert (session.camera_snapshot.T_xarm_base_from_color is not None) == (
         calibration_state == 'valid' and (extrinsics or record_raw)
     )
+
+
+@pytest.mark.parametrize('outcome', ['ready', 'cancel', 'timeout'])
+def test_policy_warmup_waits_for_its_real_inputs_without_home(monkeypatch, outcome):
+    import numpy as np
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.deployment.session import PolicySession
+    from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.robot.system import RobotState
+    from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
+    from dexmani_real.robot.xhand.feedback import XHandFeedback, XHandState
+    from dexmani_real.runtime.observation import ObservationNeeds
+
+    now = [1_000_000_000]
+    monkeypatch.setattr('time.monotonic_ns', lambda: now[0])
+    monkeypatch.setattr('time.monotonic', lambda: now[0] / 1e9)
+    monkeypatch.setattr('time.sleep', lambda delay: now.__setitem__(0, now[0] + round(delay * 1e9)))
+    session = PolicySession.__new__(PolicySession)
+    session.runtime = RealConfig()
+    session.runtime_state = SessionState()
+    session.startup_cancel_epoch = session.runtime_state.cancel_epoch
+    session.control_needs = ObservationNeeds(required_tactile=('aggregate',))
+    session.info = SimpleNamespace(n_obs_steps=2)
+    session.keyboard = SimpleNamespace(check_health=lambda: True)
+    session.sensors = SimpleNamespace(channels=None)
+    session.wait_model = lambda deadline: None
+    feedback = XHandFeedback()
+    measured_hand = np.deg2rad(session.runtime.hand.home_qpos_deg) + .02
+    arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+    measured_arm = np.asarray(session.runtime.arm.home_qpos) + .03
+    def service():
+        if outcome == 'cancel' and now[0] > 1_000_000_000:
+            session.runtime_state.request_quit()
+        arm['qpos'], arm['timestamp_ns'] = measured_arm, now[0]
+        aggregate = np.ones((5, 3)) if outcome == 'ready' and now[0] > 1_000_000_000 else None
+        feedback.consume(XHandState(measured_hand, aggregate, None, now[0]))
+    session.robot = SimpleNamespace(
+        service_feedback=service,
+        read_state=lambda: RobotState(arm.copy(), feedback.snapshot()),
+    )
+    session.observations = SimpleNamespace(project=lambda row: row)
+    warmups = []
+    session.model = SimpleNamespace(warmup=lambda rows, **kw: warmups.append(rows))
+    if outcome == 'ready':
+        session.warmup_policy()
+        assert len(warmups) == 1
+        row = warmups[0][0]
+        np.testing.assert_array_equal(row.arm['qpos'][0], measured_arm)
+        np.testing.assert_array_equal(row.hand['qpos'][0], measured_hand)
+        np.testing.assert_array_equal(row.hand['tactile_aggregate'][0], np.ones((5, 3)))
+    else:
+        error = OperationCancelled if outcome == 'cancel' else ValueError
+        with pytest.raises(error, match='startup cancelled' if outcome == 'cancel' else 'tactile_aggregate'):
+            session.warmup_policy()
+        assert not warmups
 
 
 @pytest.mark.parametrize('commands,selected', [

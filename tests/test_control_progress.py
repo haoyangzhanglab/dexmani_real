@@ -844,3 +844,111 @@ def test_jog_cancel_during_ik_reaches_publication_guard(monkeypatch, key):
     finally:
         arm.pipe.close()
         arm.child_pipe.close()
+
+
+def make_coordinated_robot(monkeypatch):
+    from dexmani_real.robot.system import Robot
+    from dexmani_real.robot.xhand.feedback import XHandState
+    now = [1_000_000_000]
+    monkeypatch.setattr('dexmani_real.robot.system.time.monotonic_ns', lambda: now[0])
+    cfg, state = RealConfig(), SessionState()
+    robot = Robot(cfg.arm, cfg.hand, runtime_state=state)
+    robot.connected = True
+    submitted = []
+    robot.arm = SimpleNamespace(is_connected=True, check_error=lambda: None,
+                                submit=lambda command, **kw: submitted.append(command))
+    robot.hand = SimpleNamespace(is_connected=True, get_state=lambda: None)
+    robot.hand_feedback.consume(XHandState(np.zeros(12), np.ones((5, 3)),
+                                          np.ones((5, 120, 3)), now[0]))
+    return robot, now, submitted
+
+
+def test_unconfirmed_hand_submission_advances_to_latest_target(monkeypatch):
+    robot, now, submitted = make_coordinated_robot(monkeypatch)
+    hand_targets = []
+    def send(target):
+        hand_targets.append(target.copy())
+        return len(hand_targets) > 1
+    robot.hand._send_action = send
+    for value in (0., .1):
+        robot.send_action(RobotCommand(np.zeros(7), np.full(12, value)), expires_ns=now[0] + 1)
+        assert not robot.runtime_state.stop_signal.is_set()
+    assert len(submitted) == 2
+    np.testing.assert_array_equal(hand_targets[1], np.full(12, .1))
+
+
+def test_hand_sync_send_has_no_arm_target_lease(monkeypatch):
+    robot, now, _ = make_coordinated_robot(monkeypatch)
+    sent = []
+    robot.hand._send_action = lambda target: sent.append(target)
+    robot.send_action(RobotCommand(hand_qpos=np.zeros(12)), expires_ns=now[0] - 1)
+    assert len(sent) == 1
+
+
+def test_active_feedback_service_detects_loss_without_another_send(monkeypatch):
+    from dexmani_real.robot.commands import RobotError
+    robot, now, submitted = make_coordinated_robot(monkeypatch)
+    robot.stop_required = True
+    now[0] += 490_000_000
+    robot.service_feedback()
+    assert int(robot.hand_feedback.snapshot()['timestamp_ns'][0]) == 1_000_000_000
+    now[0] += 20_000_000
+    with pytest.raises(RobotError, match='hand feedback unavailable/stale'):
+        robot.service_feedback()
+    assert robot.runtime_state.stop_signal.is_set()
+    assert not submitted
+
+
+def test_expired_hand_feedback_rejects_before_arm_submission(monkeypatch):
+    from dexmani_real.robot.commands import RobotError
+    robot, now, submitted = make_coordinated_robot(monkeypatch)
+    now[0] += 510_000_000
+    robot.hand._send_action = lambda target: pytest.fail('stale hand sent')
+    with pytest.raises(RobotError, match='hand feedback unavailable/stale'):
+        robot.send_action(RobotCommand(np.zeros(7), np.zeros(12)), expires_ns=now[0] + 1_000_000_000)
+    assert not submitted and robot.runtime_state.stop_signal.is_set()
+
+
+def test_hand_feedback_expiring_during_arm_publication_rejects_hand_send(monkeypatch):
+    from dexmani_real.robot.commands import RobotError
+    robot, now, submitted = make_coordinated_robot(monkeypatch)
+    def submit(command, **kwargs):
+        submitted.append(command)
+        now[0] += 510_000_000
+    robot.arm.submit = submit
+    robot.hand._send_action = lambda target: pytest.fail('stale hand sent')
+    with pytest.raises(RobotError, match='hand feedback unavailable/stale'):
+        robot.send_action(RobotCommand(np.zeros(7), np.zeros(12)), expires_ns=now[0] + 1_000_000_000)
+    assert len(submitted) == 1 and robot.runtime_state.stop_signal.is_set()
+
+
+def test_hand_home_callback_cannot_extend_operation_deadline(monkeypatch):
+    robot, now, _ = make_coordinated_robot(monkeypatch)
+    robot.hand._send_position = lambda target: pytest.fail('expired HOME submitted')
+    def cancelled():
+        now[0] += 110_000_000
+        return False
+    with pytest.raises(TimeoutError, match='HOME budget exhausted'):
+        robot.send_hand_home(RobotCommand(hand_qpos=np.zeros(12)), deadline_ns=now[0] + 100_000_000,
+                             cancel_requested=cancelled)
+    assert not robot.stop_required
+
+
+def test_tactile_reset_clears_only_tactile_on_first_request(monkeypatch):
+    robot, now, _ = make_coordinated_robot(monkeypatch)
+    stopped = []
+    robot.stop = lambda: stopped.append(True)
+    def reset(*, cancel_requested, on_start):
+        assert not cancel_requested()
+        on_start()
+        return {0x11: 1501070}
+    robot.hand.reset_tactile_sensors = reset
+    result = robot.reset_tactile_sensors(cancel_epoch=robot.runtime_state.cancel_epoch,
+                                         cancel_requested=lambda: False)
+    assert stopped and result == {0x11: 1501070}
+    frame = robot.hand_feedback.snapshot()
+    assert int(frame['timestamp_ns'][0]) == now[0]
+    np.testing.assert_array_equal(frame['qpos'], np.zeros((1, 12)))
+    for channel in ('aggregate', 'dense'):
+        assert int(frame[f'tactile_{channel}_timestamp_ns'][0]) == 0
+        assert np.isnan(frame[f'tactile_{channel}']).all()

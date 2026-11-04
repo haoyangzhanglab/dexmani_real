@@ -17,6 +17,7 @@ def validate_robot_config(cfg: RealConfig) -> None:
     if cfg.hand.enabled:
         cfg.hand.validate()
     else:
+        cfg.hand.validate_limits()
         cfg.hand.validate_home_pose()
     if cfg.hand.enabled and FEEDBACK_PERIOD_NS >= int(cfg.hand.feedback_max_age_s * 1e9):
         raise ValueError("30 Hz feedback service must fit hand.feedback_max_age_s")

@@ -66,7 +66,7 @@ class HandConfig:
         300, 300,       # 小指
     )
 
-    feedback_max_age_s: float = 4 / 30
+    feedback_max_age_s: float = 0.5
     home_timeout_s: float = 2.0
     home_tolerance_deg: float = 5.0
 
@@ -116,7 +116,6 @@ class HandConfig:
             raise ValueError("hand command limits exceed the rated device envelope")
 
     def validate_home_pose(self) -> None:
-        self.validate_limits()
         validate_hand_target(np.deg2rad(self.home_qpos_deg), self.qpos_min_rad, self.qpos_max_rad)
 
     def validate_home(self) -> None:

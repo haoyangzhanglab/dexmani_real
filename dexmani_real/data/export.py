@@ -18,6 +18,7 @@ import zarr
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.data.raw import (
     ROBOT_DATASET_SPECS,
+    TACTILE_AGE_WARNING_NS,
     RawReader,
     require_published_raw,
     validate_task_label,
@@ -132,12 +133,23 @@ def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
     # 访问 dataset 触发 RawReader 的结构/dtype 校验，不读取数值切片。
     for name in ROBOT_DATASET_SPECS:
         reader[name]
+    tactile_ages = {
+        channel: int((observation - rows[f"tactile_{channel}_ns"]).max())
+        for channel in ("aggregate", "dense")
+    }
+    if any(age > TACTILE_AGE_WARNING_NS for age in tactile_ages.values()):
+        logger.warning(
+            "%s: tactile held beyond %.1f s (aggregate=%.3f s, dense=%.3f s); "
+            "保留全部行及原来源时间，使用前请检查触觉质量",
+            reader.path, TACTILE_AGE_WARNING_NS / 1e9,
+            tactile_ages["aggregate"] / 1e9, tactile_ages["dense"] / 1e9,
+        )
     return camera, dict(
         collection_source=reader.meta.get("collection_source"),
         max_control_grid_deviation_ns=int(np.abs(grid_error).max()),
         max_readout_ns=int(readout.max()),
-        max_tactile_aggregate_age_ns=int((observation - rows["tactile_aggregate_ns"]).max()),
-        max_tactile_dense_age_ns=int((observation - rows["tactile_dense_ns"]).max()),
+        max_tactile_aggregate_age_ns=tactile_ages["aggregate"],
+        max_tactile_dense_age_ns=tactile_ages["dense"],
         mean_control_period_ns=mean_period,
         max_control_interval_ns=int(np.diff(control).max()) if frames > 1 else None,
         termination_reason=reader.meta.get("termination_reason"),

@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty, Full, Queue
 
-from dexmani_real.data.raw import RawWriter, validate_task_label
+from dexmani_real.data.raw import TACTILE_AGE_WARNING_NS, RawWriter, validate_task_label
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.runtime.observation import Observation
 from dexmani_real.utils.io import publish
@@ -45,6 +45,7 @@ class EpisodeRecorder:
         self.is_recording = False
         self.recording_truncated_reason = None
         self.finish_request = None
+        self.warned_tactile_channels = set()
         self.staging_path: Path | None = None
         self.published_path: Path | None = None
         self.writer = None
@@ -150,6 +151,14 @@ class EpisodeRecorder:
         if quality_issue is not None:
             self.recording_truncated_reason = quality_issue
             return quality_issue
+        if row.hand is not None:
+            for channel in ("aggregate", "dense"):
+                stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0])
+                age_ns = row.observation_timestamp_ns - stamp
+                if stamp > 0 and age_ns > TACTILE_AGE_WARNING_NS and channel not in self.warned_tactile_channels:
+                    logger.warning("录制触觉 %s 已保持 %.3f s；继续记录最近有效值及原来源时间。",
+                                   channel, age_ns / 1e9)
+                    self.warned_tactile_channels.add(channel)
         # 数组已脱离共享缓冲，入队后生产者不再修改。
         snapshot = replace(row, point_cloud=None)
         try:

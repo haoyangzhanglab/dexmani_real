@@ -18,7 +18,6 @@ from dexmani_real.ipc.sensors import (
 )
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import initialize_hand
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
@@ -104,7 +103,6 @@ def run_teleop(
                 runtime.arm,
                 runtime.hand,
                 runtime_state=runtime_state,
-                check_services=sensors.check,
             )
             keyboard = Keyboard(
                 estop_callback=runtime_state.request_emergency_stop,
@@ -221,14 +219,6 @@ def initialize_teleop(loop, vr_process, *, cancel_epoch) -> None:
     loop.robot.check()
     if loop.runtime_state.cancel_epoch != cancel_epoch:
         raise OperationCancelled("teleop startup cancelled")
-    # 自动复位前，键盘停止回调已经生效。
-    initialize_hand(
-        loop.runtime_state,
-        loop.robot,
-        cancel_epoch=cancel_epoch,
-        required_tactile=loop.capture_needs.required_tactile,
-        cancel_requested=loop.poll_blocking_commands,
-    )
     if loop.poll_blocking_commands():
         raise OperationCancelled("teleop startup cancelled")
     loop.sensors.start(

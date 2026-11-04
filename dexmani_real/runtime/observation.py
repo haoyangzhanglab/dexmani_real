@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.ipc.sensors import read_camera_frame, read_vr_frame
+from dexmani_real.robot.model import HAND_TACTILE_FORCE_SHAPE, HAND_TACTILE_SUM_SHAPE
 from dexmani_real.utils.timing import sample_is_fresh
 
 
@@ -83,7 +84,23 @@ def sources_available(row, needs):
     ) and (not needs.point_cloud or row.point_cloud is not None)
 
 
-def check_observation(row, runtime, needs, *, require_hand=True, now_ns=None):
+def missing_tactile_channels(row, channels):
+    """初值等待只要求通道已有真实样本；使用时的年龄由消费者另行检查。"""
+    missing = []
+    for channel in channels:
+        if row.hand is None:
+            missing.append(channel)
+            continue
+        stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0])
+        values = row.hand[f"tactile_{channel}"][0]
+        shape = HAND_TACTILE_SUM_SHAPE if channel == "aggregate" else HAND_TACTILE_FORCE_SHAPE
+        if (stamp <= 0 or stamp > row.observation_timestamp_ns
+                or values.shape != shape or not np.isfinite(values).all()):
+            missing.append(channel)
+    return missing
+
+
+def check_observation(row, runtime, needs, *, require_hand=True, now_ns=None, allow_tactile_hold=False):
     """按消费者需求检查来源；发布前可重新检查长计算期间的年龄。"""
     now = time.monotonic_ns() if now_ns is None else now_ns
     issues = []
@@ -92,11 +109,17 @@ def check_observation(row, runtime, needs, *, require_hand=True, now_ns=None):
         issues.append("arm_feedback_stale")
     if require_hand and row.hand is None:
         issues.append("hand_feedback_unavailable")
-    if row.hand is not None:
-        for name in ("timestamp_ns", *(f"tactile_{c}_timestamp_ns" for c in needs.required_tactile)):
+    if require_hand and row.hand is not None:
+        names = ("timestamp_ns",) if allow_tactile_hold else (
+            "timestamp_ns", *(f"tactile_{c}_timestamp_ns" for c in needs.required_tactile)
+        )
+        for name in names:
             stamp = int(row.hand[name][0])
-            if require_hand and not sample_is_fresh(stamp, runtime.hand.feedback_max_age_s, now):
+            if not sample_is_fresh(stamp, runtime.hand.feedback_max_age_s, now):
                 issues.append(f"hand_{name}_unavailable_or_stale")
+    if require_hand and allow_tactile_hold:
+        issues.extend(f"hand_tactile_{channel}_unavailable"
+                      for channel in missing_tactile_channels(row, needs.required_tactile))
     if needs.camera_fields:
         if row.camera is None:
             issues.append("camera_source_unavailable_or_unmatched")

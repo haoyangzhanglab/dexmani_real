@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 
@@ -28,9 +29,6 @@ from dexmani_real.robot.model import (
 )
 from dexmani_real.robot.xhand.feedback import XHandState
 from dexmani_real.utils.timing import sample_is_fresh
-
-if TYPE_CHECKING:
-    from dexmani_real.runtime.state import SessionState
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +60,8 @@ PASSIVE_MODE = 0
 POSITION_MODE = 3
 STOP_RETRY_INTERVAL_S = 0.01
 STOP_RETRY_TIMEOUT_S = 0.25
+STOP_FEEDBACK_MAX_AGE_S = 4 / 30
+MAX_CONSECUTIVE_WRITE_CRC = 5
 
 
 def _tactile_validity(code: int, *, comm_type: str) -> tuple[bool, bool]:
@@ -152,33 +152,33 @@ class XHand:
         self.mechanical_lower = np.asarray(XHAND_RATED_QPOS_MIN_RAD, dtype=np.float64)
         self.mechanical_upper = np.asarray(XHAND_RATED_QPOS_MAX_RAD, dtype=np.float64)
         self.connected_flag = False
-        self.read_crc = False
-        self.tactile_unavailable: set[str] = set()
+        self.consecutive_write_crc = 0
+        self.counts = dict.fromkeys(("read_crc", "write_crc", "aggregate", "dense", "overcurrent"), 0)
+        self.next_warning_ns: dict[str, int] = {}
         self.control: Any = None
         self.command: Any = None
         self.tactile_reset_metadata: dict[str, object] = {}
-        self.next_overcurrent_warning_ns = 0
 
     @property
     def is_connected(self) -> bool:
         return self.connected_flag
 
-    def connect(self, *, cancel_requested=lambda: False, runtime_state: SessionState | None = None) -> XHandState:
+    def connect(self, *, cancel_requested=lambda: False) -> XHandState:
         """设备发现与首帧读取共用期限；命令与上层缓存使用同一份实测状态。"""
         if self.connected_flag:
             raise RuntimeError("XHand is already connected")
         from xhand_controller import xhand_control
 
         self.sdk = xhand_control
-        self.next_overcurrent_warning_ns = 0
         try:
             if cancel_requested():
                 raise OperationCancelled("XHand connection cancelled")
-            self.open_device()
             self.command = None
-            self.read_crc = False
-            self.tactile_unavailable.clear()
+            self.consecutive_write_crc = 0
+            self.counts = dict.fromkeys(self.counts, 0)
+            self.next_warning_ns.clear()
             self.tactile_reset_metadata = {}
+            self.open_device()
             self.connected_flag = True
             deadline_ns = time.monotonic_ns() + int(CONNECT_TIMEOUT_S * 1e9)
             hand_ids = []
@@ -203,12 +203,10 @@ class XHand:
                 f"discovered={hand_ids}",
             )
         except BaseException as failure:
-            if isinstance(failure, KeyboardInterrupt) and runtime_state is not None:
-                runtime_state.request_emergency_stop()
             try:
-                self.disconnect(runtime_state=runtime_state)
-            except BaseException:
-                if isinstance(failure, OperationCancelled):
+                self.disconnect()
+            except BaseException as cleanup:
+                if isinstance(cleanup, KeyboardInterrupt) or isinstance(failure, OperationCancelled):
                     raise
                 logger.exception("XHand connection cleanup failed")
             raise
@@ -231,8 +229,8 @@ class XHand:
         elif error.error_code != 0:
             raise XHandError("connect", error.error_code, error.error_message)
 
-    def disconnect(self, *, runtime_state: SessionState | None = None) -> None:
-        # 独立手部诊断没有 SessionState；会话调用必须在吞回首错前锁存中断。
+    def disconnect(self) -> None:
+        had_control = self.control is not None
         connected_ethercat = self.connected_flag and self.cfg.comm_type == "ethercat"
         errors = []
         try:
@@ -241,29 +239,27 @@ class XHand:
                     try:
                         self.request_ethercat_init()
                     except BaseException as exc:
-                        if isinstance(exc, KeyboardInterrupt) and runtime_state is not None:
-                            runtime_state.request_emergency_stop()
                         errors.append(exc)
                 try:
                     self.control.close_device()
                     self.control = None
                 except BaseException as exc:
-                    if isinstance(exc, KeyboardInterrupt) and runtime_state is not None:
-                        runtime_state.request_emergency_stop()
                     errors.append(exc)
                 if connected_ethercat:
                     try:
                         time.sleep(POST_EC_DISCONNECT_S)
                     except BaseException as exc:
-                        if isinstance(exc, KeyboardInterrupt) and runtime_state is not None:
-                            runtime_state.request_emergency_stop()
                         errors.append(exc)
         finally:
             self.connected_flag = False
+            if had_control:
+                logger.info("XHand event counts: %s", self.counts)
         if errors:
-            for error in errors[1:]:
-                logger.error("additional XHand disconnect failure", exc_info=(type(error), error, error.__traceback__))
-            raise errors[0]
+            failure = next((error for error in errors if isinstance(error, KeyboardInterrupt)), errors[0])
+            for error in errors:
+                if error is not failure:
+                    logger.error("additional XHand disconnect failure", exc_info=(type(error), error, error.__traceback__))
+            raise failure
 
     def request_ethercat_init(self) -> None:
         if self.cfg.ethercat_slave_position < 0:
@@ -281,65 +277,53 @@ class XHand:
             raise XHandError("ethercat INIT", int(error.error_code), "INIT request failed")
         time.sleep(0.2)
 
-    def reset_tactile_sensors(self, *, cancel_requested=lambda: False) -> None:
-        """仅在静止、卸载时复位；SDK 成功不等于固件零点已生效。"""
+    def reset_tactile_sensors(self, *, cancel_requested=lambda: False, on_start=lambda: None) -> dict[int, int]:
+        """一次五指请求；返回码不证明物理零点效果，操作者可显式重试。"""
         if self.control is None or not self.connected_flag:
             raise RobotError("XHand is not connected")
-        result = {
-            "hand_tactile_reset_time_ns": time.time_ns(),
-            "hand_tactile_reset_result": "incomplete (0/5)",
-        }
-        self.tactile_reset_metadata = result
-        for completed, sensor_id in enumerate(TACTILE_SENSOR_IDS):
+        results: dict[int, int] = {}
+        for sensor_id in TACTILE_SENSOR_IDS:
             if cancel_requested():
-                result["hand_tactile_reset_result"] = f"cancelled ({completed}/5)"
                 raise OperationCancelled(
-                    f"触觉复位请求已中断，已完成 {completed}/5 次 SDK 调用；已发送的请求不会撤销。"
+                    f"触觉复位请求已中断，已完成 {len(results)}/5 次 SDK 调用；已发送的请求不会撤销。"
                 )
-            result["hand_tactile_reset_result"] = (
-                f"incomplete ({completed}/5), sensor=0x{sensor_id:02x}"
-            )
-            try:
-                reply = self.control.reset_sensor(self.cfg.device_id, sensor_id)
-            except Exception as exc:
-                result["hand_tactile_reset_result"] = (
-                    f"exception ({completed}/5), sensor=0x{sensor_id:02x}: {exc}"
-                )
-                raise RobotError(f"XHand tactile reset SDK call failed: {type(exc).__name__}: {exc}") from exc
+            if not results:
+                on_start()
+                self.tactile_reset_metadata = {
+                    "hand_tactile_reset_time_ns": time.time_ns(),
+                    "hand_tactile_reset_result": results,
+                }
+            reply = self.control.reset_sensor(self.cfg.device_id, sensor_id)
             code = int(reply.error_code)
+            results[sensor_id] = code
             if code == OVERCURRENT_WARNING_CODE:
                 self.warn_overcurrent(f"tactile reset sensor=0x{sensor_id:02x}", reply.error_message)
+            elif code == COMMUNICATION_CRC_ERROR_CODE or code in NONFATAL_SDK_CODES - {0}:
+                logger.warning("XHand tactile reset sensor=0x%02x unconfirmed/unavailable: code=%d msg=%s",
+                               sensor_id, code, reply.error_message)
             elif code != 0:
-                result["hand_tactile_reset_result"] = (
-                    f"failed ({completed}/5), sensor=0x{sensor_id:02x}, code={code}"
-                )
-                raise XHandError(
-                    f"tactile reset sensor=0x{sensor_id:02x} ({completed}/5 completed)", code,
-                    reply.error_message,
-                )
-            result["hand_tactile_reset_result"] = f"sdk_completed ({completed + 1}/5)"
-        logger.info("五指触觉复位请求的 SDK 调用完成（5/5），未确认固件复位或零点效果。")
+                raise XHandError(f"tactile reset sensor=0x{sensor_id:02x}", code, reply.error_message)
+        logger.info("五指触觉复位请求结果：%s；未确认物理零点效果。", results)
+        return results
 
     def get_tactile_reset_metadata(self) -> dict[str, object]:
-        return {
-            "hand_tactile_reset_result": "not_requested",
-            **self.tactile_reset_metadata,
-        }
+        metadata = dict(self.tactile_reset_metadata)
+        if metadata:
+            # HDF5 属性不支持 dict；只在导出元数据边界编码一次操作结果。
+            metadata["hand_tactile_reset_result"] = json.dumps(metadata["hand_tactile_reset_result"])
+        return metadata
 
     def get_state(self) -> XHandState | None:
         """读 CRC 无可信新关节；触觉通道无完整有效新帧时对应字段为 None。"""
         if self.control is None or not self.connected_flag:
             raise RobotError("XHand is not connected")
         query_started_ns = time.monotonic_ns()
-        try:
-            error, raw_state = self.control.read_state(self.cfg.device_id, True)
-        except Exception as exc:
-            raise RobotError(f"XHand read SDK call failed: {type(exc).__name__}: {exc}") from exc
+        # 本机 SDK 1.5.2 没有缓存帧序号/来源时间，保留主动读取以免旧缓存续期。
+        error, raw_state = self.control.read_state(self.cfg.device_id, True)
         code = int(error.error_code)
         if code == COMMUNICATION_CRC_ERROR_CODE:
-            if not self.read_crc:
-                logger.warning("XHand read CRC; payload discarded")
-            self.read_crc = True
+            self.counts["read_crc"] += 1
+            self.warn_limited("read_crc", "XHand read CRC; payload discarded")
             return None
         if code not in NONFATAL_SDK_CODES:
             raise XHandError("read", code, error.error_message)
@@ -388,16 +372,9 @@ class XHand:
                 except (AttributeError, TypeError, ValueError, OverflowError) as exc:
                     reason = f"invalid payload ({type(exc).__name__})"
             if values is None:
-                if name not in self.tactile_unavailable:
-                    logger.warning("XHand tactile %s unavailable: %s", name, reason)
-                    self.tactile_unavailable.add(name)
-            elif name in self.tactile_unavailable:
-                logger.info("XHand tactile %s recovered", name)
-                self.tactile_unavailable.remove(name)
+                self.counts[name] += 1
+                self.warn_limited(name, "XHand tactile %s unavailable: %s", name, reason)
             tactile[name] = values
-        if self.read_crc:
-            logger.info("XHand trustworthy reads recovered")
-        self.read_crc = False
 
         return XHandState(
             qpos=qpos,
@@ -406,17 +383,19 @@ class XHand:
             timestamp_ns=query_started_ns,
         )
 
-    def send_action(self, action: np.ndarray) -> None:
+    def send_action(self, action: np.ndarray) -> bool:
         target = validate_hand_target(action, self.mechanical_lower, self.mechanical_upper)
-        self._send_action(target)
+        return self._send_action(target)
 
-    def _send_action(self, target: np.ndarray) -> None:
+    def _send_action(self, target: np.ndarray) -> bool:
         """Robot 的组合预检或本驱动的公开入口已验证目标。"""
-        if self._send_position(target) == COMMUNICATION_CRC_ERROR_CODE:
+        confirmed = self._send_position(target) != COMMUNICATION_CRC_ERROR_CODE
+        if not confirmed and self.consecutive_write_crc >= MAX_CONSECUTIVE_WRITE_CRC:
             raise XHandError(
                 "send", COMMUNICATION_CRC_ERROR_CODE,
-                "CRC reply; target delivery unconfirmed",
+                f"{self.consecutive_write_crc} consecutive position write CRC replies; delivery unconfirmed",
             )
+        return confirmed
 
     def _send_position(self, target: np.ndarray) -> int:
         if self.control is None or self.command is None or not self.connected_flag:
@@ -451,7 +430,7 @@ class XHand:
         deadline = time.monotonic() + STOP_RETRY_TIMEOUT_S
         while time.monotonic() < deadline:
             now_ns = time.monotonic_ns()
-            fresh = sample_is_fresh(timestamp_ns, self.cfg.feedback_max_age_s, now_ns)
+            fresh = sample_is_fresh(timestamp_ns, STOP_FEEDBACK_MAX_AGE_S, now_ns)
             status = self.hold_current(qpos) if qpos is not None and fresh else self.set_passive()
             if status != COMMUNICATION_CRC_ERROR_CODE:
                 return
@@ -463,26 +442,30 @@ class XHand:
                          "stop timed out: CRC replies remain unconfirmed")
 
     def send_command(self) -> int:
-        try:
-            error = self.control.send_command(self.cfg.device_id, self.command)
-        except Exception as exc:
-            raise RobotError(f"XHand send SDK call failed: {type(exc).__name__}: {exc}") from exc
-
+        error = self.control.send_command(self.cfg.device_id, self.command)
         code = int(error.error_code)
         if code not in NONFATAL_SDK_CODES and code != COMMUNICATION_CRC_ERROR_CODE:
             raise XHandError("send", code, error.error_message)
+        if code == COMMUNICATION_CRC_ERROR_CODE:
+            self.consecutive_write_crc += 1
+            self.counts["write_crc"] += 1
+            self.warn_limited("write_crc", "XHand write CRC; target delivery unconfirmed")
+        else:
+            self.consecutive_write_crc = 0
         if code == OVERCURRENT_WARNING_CODE:
             self.warn_overcurrent("send", error.error_message)
         return code
 
-    def warn_overcurrent(self, operation: str, message: str) -> None:
+    def warn_limited(self, key: str, message: str, *args) -> None:
         now_ns = time.monotonic_ns()
-        if now_ns >= self.next_overcurrent_warning_ns:
-            logger.warning(
-                "XHand 过流告警（继续运行）：%s code=%d msg=%s",
-                operation, OVERCURRENT_WARNING_CODE, message,
-            )
-            self.next_overcurrent_warning_ns = now_ns + 1_000_000_000
+        if now_ns >= self.next_warning_ns.get(key, 0):
+            logger.warning(message, *args)
+            self.next_warning_ns[key] = now_ns + 1_000_000_000
+
+    def warn_overcurrent(self, operation: str, message: str) -> None:
+        self.counts["overcurrent"] += 1
+        self.warn_limited("overcurrent", "XHand 过流告警（继续运行）：%s code=%d msg=%s",
+                          operation, OVERCURRENT_WARNING_CODE, message)
 
     def make_command(self, qpos: np.ndarray) -> Any:
         command = self.sdk.HandCommand_t()

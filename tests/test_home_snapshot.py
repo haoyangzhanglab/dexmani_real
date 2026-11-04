@@ -282,3 +282,56 @@ def test_home_rechecks_measured_start_after_mode_change(changed):
     with pytest.raises(RuntimeError, match='planned path start|HOME preparation'):
         owner.home(np.stack((planned_start, target)), check_abort=lambda: None,
                    deadline_ns=time.monotonic_ns() + 1_000_000_000)
+
+
+@pytest.mark.parametrize('outcome', ['arrived', 'timeout', 'cancelled'])
+@pytest.mark.parametrize('crc', [False, True])
+def test_hand_home_keeps_arm_stopped_and_confirms_new_samples(monkeypatch, outcome, crc):
+    from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.robot.system import Robot
+    from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE
+    from dexmani_real.robot.xhand.feedback import XHandState
+    from dexmani_real.runtime.home import home_hand
+
+    now = [1_000_000_000]
+    monkeypatch.setattr('dexmani_real.runtime.home.time.monotonic_ns', lambda: now[0])
+    monkeypatch.setattr('dexmani_real.runtime.home.time.sleep',
+                        lambda delay: now.__setitem__(0, now[0] + round(delay * 1e9)))
+    cfg, state = RealConfig(), SessionState()
+    hand_cfg = replace(cfg.hand, home_timeout_s=.2)
+    robot = Robot(cfg.arm, hand_cfg, runtime_state=state)
+    robot.connected = True
+    stops, sends = [], []
+    robot.arm = SimpleNamespace(is_connected=True, check_error=lambda: None,
+                                request_stop=lambda: stops.append('arm'), wait_stopped=lambda: None,
+                                resume=lambda *a, **kw: pytest.fail('arm resumed for hand HOME'))
+    target = np.deg2rad(hand_cfg.home_qpos_deg)
+    initial = target + .15
+    def send(qpos):
+        assert state.stop_signal.is_set()
+        sends.append(qpos.copy())
+        if outcome == 'cancelled':
+            state.request_stop()
+        return COMMUNICATION_CRC_ERROR_CODE if crc else 0
+    def sample():
+        assert state.stop_signal.is_set()
+        qpos = target if outcome == 'arrived' else initial
+        return XHandState(qpos, None, None, now[0])
+    robot.hand = SimpleNamespace(is_connected=True, _send_position=send, get_state=sample,
+                                stop=lambda *a, **kw: stops.append('hand'))
+    robot.hand_feedback.consume(XHandState(initial, None, None, now[0]))
+    robot.stop_required = True
+    epoch = state.cancel_epoch
+    run = lambda: home_hand(state, robot, cancel_epoch=epoch, cancel_requested=lambda: False)
+    if outcome == 'arrived':
+        run()
+        assert now[0] > 1_000_000_000
+    elif outcome == 'timeout':
+        with pytest.raises(TimeoutError, match='convergence'):
+            run()
+    else:
+        with pytest.raises(OperationCancelled):
+            run()
+    assert len(sends) == (2 if crc and outcome != 'cancelled' else 1)
+    assert stops.count('arm') == 2 and stops.count('hand') == 2
+    assert state.stop_signal.is_set() and not robot.stop_required

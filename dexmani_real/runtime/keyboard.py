@@ -162,35 +162,34 @@ class Keyboard:
             self.held_keys.clear()
             self.condition.notify_all()
         failure = None
+
+        def remember_failure(stage, exc):
+            nonlocal failure
+            first_failure = failure is None
+            if first_failure:
+                failure = exc
+            if isinstance(exc, KeyboardInterrupt) and self.estop_callback is not None:
+                self.estop_callback()
+            if not first_failure:
+                logger.exception("keyboard %s also failed", stage)
+
         try:
             if self.listener is not None:
                 try:
                     self.listener.stop()
                 except BaseException as exc:
-                    failure = exc
-                    if isinstance(exc, KeyboardInterrupt) and self.estop_callback is not None:
-                        self.estop_callback()
+                    remember_failure("listener stop", exc)
                 finally:
                     try:
                         if self.listener.ident is not None:
                             self.listener.join(timeout=LISTENER_STOP_TIMEOUT_S)
                     except BaseException as exc:
-                        if isinstance(exc, KeyboardInterrupt) and self.estop_callback is not None:
-                            self.estop_callback()
-                        if failure is None:
-                            failure = exc
-                        else:
-                            logger.exception("keyboard listener join also failed")
+                        remember_failure("listener join", exc)
         finally:
             try:
                 restore_terminal_echo(self.saved_termios)
             except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt) and self.estop_callback is not None:
-                    self.estop_callback()
-                if failure is None:
-                    failure = exc
-                else:
-                    logger.exception("keyboard terminal restore also failed")
+                remember_failure("terminal restore", exc)
             else:
                 self.saved_termios = None
         if self.listener is not None and self.listener.is_alive():
