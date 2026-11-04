@@ -181,6 +181,39 @@ def raw_metadata(scale=.001):
                 task_label='test', collection_source='teleop')
 
 
+def test_tactile_reset_results_are_json_encoded_at_raw_boundary(tmp_path):
+    import json
+    from dexmani_real.config.xhand import HandConfig
+    from dexmani_real.data.raw import RawReader, decode_camera_metadata, snapshot_recording_metadata
+    from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE, XHand
+
+    hand = XHand(HandConfig())
+    codes = iter([0, COMMUNICATION_CRC_ERROR_CODE, 0, 0, 0])
+    hand.control = SimpleNamespace(reset_sensor=lambda *args: SimpleNamespace(
+        error_code=next(codes), error_message=''))
+    hand.connected_flag = True
+    results = hand.reset_tactile_sensors()
+    device_metadata = hand.tactile_reset_metadata
+    metadata = snapshot_recording_metadata(
+        decode_camera_metadata(raw_metadata()), tactile_reset_metadata=device_metadata,
+    )
+    assert device_metadata['hand_tactile_reset_result'] is results
+    assert isinstance(metadata['hand_tactile_reset_result'], str)
+    recorder = recording.EpisodeRecorder(tmp_path, control_hz=16)
+    try:
+        recorder.start(task_label='test', collection_source='teleop', metadata=metadata)
+        for row, command in raw_frames():
+            recorder.append(row, command)
+        path = recorder.finish(save=True, reason='operator')
+    finally:
+        if recorder.writer_pending:
+            recorder.finish(save=False, reason='test_cleanup')
+    with RawReader(path) as reader:
+        assert reader.meta['hand_tactile_reset_time_ns'] == device_metadata['hand_tactile_reset_time_ns']
+        assert json.loads(reader.meta['hand_tactile_reset_result']) == {str(k): v for k, v in results.items()}
+        assert reader.num_frames == 3
+
+
 @pytest.fixture
 def raw_episode(tmp_path):
     from dexmani_real.data.raw import RawWriter
@@ -724,7 +757,8 @@ def test_teleop_start_archives_optional_config_in_real_hdf5(monkeypatch, tmp_pat
     loop = teleop.TeleopLoop(
         SessionState(), RealConfig(),
         SimpleNamespace(prepare_streaming=lambda epoch: None, service_feedback=lambda: None,
-                        hand=SimpleNamespace(get_tactile_reset_metadata=lambda: {})),
+                        stop=lambda: None,
+                        hand=SimpleNamespace(tactile_reset_metadata={})),
         task_label='test', sensors=SimpleNamespace(channels=None),
         controller=SimpleNamespace(rotation=Rotation.identity(), hand_retargeter=None),
         recording_dir=tmp_path, max_duration_s=60, runtime_config_json=runtime_config_json,
@@ -732,7 +766,13 @@ def test_teleop_start_archives_optional_config_in_real_hdf5(monkeypatch, tmp_pat
         camera_snapshot=decode_camera_metadata(metadata),
     )
     frames = list(raw_frames())
-    monkeypatch.setattr(teleop, 'read_observation', lambda *a, **kw: frames[0][0])
+    def observe(*args, **kwargs):
+        from dataclasses import replace
+        row = frames[0][0]
+        arm, hand = row.arm.copy(), row.hand.copy()
+        arm['timestamp_ns'] = hand['timestamp_ns'] = teleop.time.monotonic_ns()
+        return replace(row, arm=arm, hand=hand)
+    monkeypatch.setattr(teleop, 'read_observation', observe)
     monkeypatch.setattr(loop, 'preparation_interrupted', lambda: False)
     monkeypatch.setattr(loop, 'admit_observation', lambda row: [])
     monkeypatch.setattr(loop, 'recording_issue', lambda row: None)
@@ -999,7 +1039,7 @@ def test_missing_dense_prevents_writer_and_allows_later_start(monkeypatch, tmp_p
     monkeypatch.setattr(teleop.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + 1_000_000_000))
     robot = SimpleNamespace(prepare_streaming=lambda epoch: state.stop_signal.clear(),
                             service_feedback=lambda: None, stop=lambda: state.stop_signal.set(),
-                            hand=SimpleNamespace(get_tactile_reset_metadata=lambda: {}))
+                            hand=SimpleNamespace(tactile_reset_metadata={}))
     sensors = SimpleNamespace(channels=None, check=lambda **kw: True)
     needs = ObservationNeeds(camera_fields=('rgb', 'depth'), required_tactile=('aggregate', 'dense'))
     polls = []
@@ -1144,3 +1184,168 @@ def test_unrecorded_tactile_policy_waits_for_initial_value_after_reset(monkeypat
     polls = []
     assert owner.start_observation(lambda: polls.append(True)) is full
     assert len(polls) == 2 and owner.recorder is None and owner.preparation_issue is None
+
+
+@pytest.mark.parametrize('kind', ['teleop', 'policy'])
+@pytest.mark.parametrize('outcome', ['recover', 'stop', 'quit', 'estop', 'writer_failure',
+                                   'camera_failure', 'no_feedback'])
+@pytest.mark.parametrize('writer_delay_ns', [10_000_000, 600_000_000])
+def test_preparation_keeps_robot_stopped_through_writer_and_refreshes_inputs(
+    monkeypatch, tmp_path, kind, outcome, writer_delay_ns,
+):
+    from dataclasses import replace
+    from scipy.spatial.transform import Rotation
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.data.raw import decode_camera_metadata
+    from dexmani_real.deployment import rollout as policy
+    from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.robot.system import Robot
+    from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE, XHand
+    from dexmani_real.runtime.observation import ObservationNeeds
+    from dexmani_real.runtime.state import SessionState
+    from dexmani_real.teleop import loop as teleop
+
+    full, _ = next(raw_frames())
+    clock = [full.observation_timestamp_ns]
+    monkeypatch.setattr(teleop.time, 'monotonic_ns', lambda: clock[0])
+    monkeypatch.setattr(teleop.time, 'sleep', lambda seconds: clock.__setitem__(
+        0, clock[0] + int(seconds * 1e9)))
+    state, runtime = SessionState(), RealConfig()
+    events, anchors, submitted = [], [], []
+    writer_started = [False]
+    dropped = [False]
+    robot = Robot(runtime.arm, runtime.hand, runtime_state=state)
+    robot.connected = robot.stop_required = True
+
+    def arm_snapshot():
+        frame = full.arm.copy()
+        frame['timestamp_ns'] = clock[0]
+        return frame
+
+    def prepare(epoch, *, service):
+        assert writer_started[0] and not submitted
+        assert not state.estop_request and not state.quit_requested
+        events.append('streaming')
+        state.stop_signal.clear()
+        service()
+
+    robot.arm = SimpleNamespace(
+        check_error=lambda: None, snapshot=arm_snapshot,
+        request_stop=lambda: events.append('stop'), wait_stopped=lambda: None,
+        prepare=prepare, submit=lambda *a, **kw: submitted.append(a),
+    )
+
+    def read_sdk_state(*args):
+        if writer_started[0]:
+            events.append(('sample', state.stop_signal.is_set()))
+            if not dropped[0] or outcome == 'no_feedback':
+                dropped[0] = True
+                return SimpleNamespace(error_code=COMMUNICATION_CRC_ERROR_CODE), None
+        force = SimpleNamespace(fx=1., fy=1., fz=1.)
+        payload = SimpleNamespace(
+            finger_state=[SimpleNamespace(id=i, position=.2 if writer_started[0] else .1,
+                                           commboard_err=0, jonitboard_err=0, tipboard_err=0)
+                          for i in range(12)],
+            sensor_data=[SimpleNamespace(calc_force=force, raw_force=[force] * 120)
+                         for _ in range(5)],
+        )
+        return SimpleNamespace(error_code=0, error_message=''), payload
+
+    robot.hand = XHand(runtime.hand)
+    robot.hand.control = SimpleNamespace(read_state=read_sdk_state)
+    robot.hand.connected_flag = True
+    robot.hand.stop = lambda *a, **kw: None
+    robot.hand._send_action = lambda *a: submitted.append(a)
+    robot.hand_feedback.consume(robot.hand.get_state())
+    sensors = SimpleNamespace(
+        channels=None, check=lambda **kw: not (writer_started[0] and outcome == 'camera_failure'),
+    )
+
+    def observe(*args, **kwargs):
+        latest = robot.read_state()
+        return replace(full, arm=latest.arm, hand=latest.hand,
+                       camera=dict(full.camera, timestamp_ns=clock[0]),
+                       vr=dict(full.vr, recv_ts_ns=clock[0]),
+                       observation_timestamp_ns=clock[0], control_timestamp_ns=clock[0])
+
+    monkeypatch.setattr(teleop, 'read_observation', observe)
+    monkeypatch.setattr(policy, 'read_observation', observe)
+    open_writer = recording.RawWriter.open
+
+    def delayed_open(writer, metadata):
+        assert state.stop_signal.is_set() and not robot.stop_required
+        assert 'streaming' not in events and not submitted
+        writer_started[0] = True
+        events.append('writer')
+        clock[0] += writer_delay_ns  # include a wait exceeding the unchanged 0.5 s active TTL
+        if outcome == 'writer_failure':
+            raise OSError('writer setup failed')
+        open_writer(writer, metadata)
+        if outcome in ('stop', 'quit', 'estop'):
+            getattr(state, {'stop': 'request_stop', 'quit': 'request_quit',
+                            'estop': 'request_emergency_stop'}[outcome])()
+
+    monkeypatch.setattr(recording.RawWriter, 'open', delayed_open)
+    audio = SimpleNamespace(play=lambda sound: None)
+    if kind == 'teleop':
+        owner = teleop.TeleopLoop(
+            state, runtime, robot, task_label='test', sensors=sensors,
+            controller=SimpleNamespace(rotation=Rotation.identity(), hand_retargeter=None,
+                                       reset=lambda row: anchors.append(row), clear=lambda: None),
+            recording_dir=tmp_path, max_duration_s=60, runtime_config_json=None,
+            keyboard=None, audio=audio, camera_snapshot=decode_camera_metadata(raw_metadata()),
+        )
+        owner.poll_blocking_commands = lambda: False
+        start = lambda: owner.start_episode(state.cancel_epoch)
+    else:
+        owner = policy.Rollout(
+            state, runtime, SimpleNamespace(control_dt_s=.0625, n_obs_steps=1, task_name='test'),
+            cancel_epoch=state.cancel_epoch, robot=robot, observations=None,
+            control_needs=ObservationNeeds(),
+            record_needs=ObservationNeeds(camera_fields=('rgb', 'depth'),
+                                           required_tactile=('aggregate', 'dense')),
+            sensors=sensors, action_mapper=None, model=None, max_running_s=None,
+            index=1, output_dir=tmp_path, record_raw=True, audio=audio,
+            camera_snapshot=decode_camera_metadata(raw_metadata()),
+        )
+        start = lambda: owner.prepare(lambda: None)
+    try:
+        if outcome == 'writer_failure':
+            with pytest.raises(recording.RecordingError, match='writer setup failed'):
+                start()
+        elif outcome == 'camera_failure':
+            with pytest.raises(RuntimeError, match='recording camera worker exited'):
+                start()
+        elif kind == 'policy' and outcome in ('stop', 'quit', 'estop'):
+            with pytest.raises(OperationCancelled):
+                start()
+        else:
+            start()
+        assert not submitted
+        active = owner.phase is teleop.TeleopPhase.ACTIVE if kind == 'teleop' else bool(owner.started_ns)
+        assert active == (outcome == 'recover')
+        if outcome == 'recover':
+            streaming = events.index('streaming')
+            assert events.index('writer') < streaming
+            assert events[:streaming].count(('sample', True)) >= 2
+            assert robot.hand.counts['read_crc'] == 1
+            assert int(robot.hand_feedback.snapshot()['timestamp_ns'][0]) > full.observation_timestamp_ns
+            if kind == 'teleop':
+                assert len(anchors) == 1
+                np.testing.assert_allclose(anchors[0].hand['qpos'][0], .2)
+        else:
+            assert 'streaming' not in events and not anchors
+        if outcome == 'no_feedback':
+            assert not state.quit_requested and not state.estop_request
+    finally:
+        robot.stop()
+        recorder = owner.recorder
+        if recorder is not None:
+            if outcome == 'writer_failure':
+                with pytest.raises(recording.RecordingError, match='writer setup failed'):
+                    recorder.finish(save=False, reason='preparation_failed')
+            else:
+                assert recorder.finish(save=True, reason='start_cancelled') is None
+            assert not recorder.writer_pending and recorder.written_frames == 0
+            assert recorder.published_path is None
+    assert not list(tmp_path.glob('episode_*'))

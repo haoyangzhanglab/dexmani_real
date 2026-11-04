@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from typing import Any
@@ -277,7 +276,7 @@ class XHand:
             raise XHandError("ethercat INIT", int(error.error_code), "INIT request failed")
         time.sleep(0.2)
 
-    def reset_tactile_sensors(self, *, cancel_requested=lambda: False, on_start=lambda: None) -> dict[int, int]:
+    def reset_tactile_sensors(self, *, cancel_requested=lambda: False) -> dict[int, int]:
         """一次五指请求；返回码不证明物理零点效果，操作者可显式重试。"""
         if self.control is None or not self.connected_flag:
             raise RobotError("XHand is not connected")
@@ -288,7 +287,6 @@ class XHand:
                     f"触觉复位请求已中断，已完成 {len(results)}/5 次 SDK 调用；已发送的请求不会撤销。"
                 )
             if not results:
-                on_start()
                 self.tactile_reset_metadata = {
                     "hand_tactile_reset_time_ns": time.time_ns(),
                     "hand_tactile_reset_result": results,
@@ -305,13 +303,6 @@ class XHand:
                 raise XHandError(f"tactile reset sensor=0x{sensor_id:02x}", code, reply.error_message)
         logger.info("五指触觉复位请求结果：%s；未确认物理零点效果。", results)
         return results
-
-    def get_tactile_reset_metadata(self) -> dict[str, object]:
-        metadata = dict(self.tactile_reset_metadata)
-        if metadata:
-            # HDF5 属性不支持 dict；只在导出元数据边界编码一次操作结果。
-            metadata["hand_tactile_reset_result"] = json.dumps(metadata["hand_tactile_reset_result"])
-        return metadata
 
     def get_state(self) -> XHandState | None:
         """读 CRC 无可信新关节；触觉通道无完整有效新帧时对应字段为 None。"""

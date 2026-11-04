@@ -282,7 +282,7 @@ def test_teleop_slow_tick_commits_then_quits_through_episode_cleanup(monkeypatch
     keyboard.allow_start()
     keyboard.handle_key('b', True)
     loop.handle_commands(keyboard.poll(state, timeout=0)[0])
-    assert order == ['send', 'commit', 'stop', 'clear']  # 设备关闭归会话入口。
+    assert order == ['stop', 'send', 'commit', 'stop', 'clear']  # 设备关闭归会话入口。
     assert state.quit_requested and loop.phase is TeleopPhase.IDLE
 
 
@@ -747,6 +747,7 @@ def test_teleop_prepare_only_accepts_current_operator_cancellation(monkeypatch, 
         runtime_config_json=None, keyboard=keyboard, audio=rollout.audio,
     )
     loop.poll_blocking_commands = lambda: False
+    loop.start_observation = lambda: object()
     def prepare(epoch):
         if cancelled:
             state.request_stop()
@@ -934,13 +935,13 @@ def test_hand_home_callback_cannot_extend_operation_deadline(monkeypatch):
     assert not robot.stop_required
 
 
-def test_tactile_reset_clears_only_tactile_on_first_request(monkeypatch):
+def test_tactile_reset_clears_only_tactile_before_driver_requests(monkeypatch):
     robot, now, _ = make_coordinated_robot(monkeypatch)
     stopped = []
     robot.stop = lambda: stopped.append(True)
-    def reset(*, cancel_requested, on_start):
+    def reset(*, cancel_requested):
         assert not cancel_requested()
-        on_start()
+        assert int(robot.hand_feedback.snapshot()['tactile_dense_timestamp_ns'][0]) == 0
         return {0x11: 1501070}
     robot.hand.reset_tactile_sensors = reset
     result = robot.reset_tactile_sensors(cancel_epoch=robot.runtime_state.cancel_epoch,

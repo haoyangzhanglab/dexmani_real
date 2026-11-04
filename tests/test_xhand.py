@@ -2,7 +2,7 @@
 
 import json
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from itertools import repeat
 from types import SimpleNamespace
 
@@ -95,6 +95,83 @@ def clock(monkeypatch):
     return now
 
 
+@pytest.mark.parametrize('integer', [int, np.int32, np.int64, np.uint64])
+def test_hand_config_accepts_python_and_numpy_integer_scalars(integer, tmp_path):
+    import yaml
+
+    from dexmani_real.utils.io import write_yaml
+
+    config = replace(HandConfig(), baudrate=integer(3_000_000), device_id=integer(0),
+                     ki=integer(0), kd=integer(1), kp=(integer(100),) * 12,
+                     tor_max=(integer(400),) * 12)
+    config.validate()
+    ethercat = replace(config, comm_type='ethercat', device_name=None,
+                       ethercat_slave_position=integer(0))
+    ethercat.validate()
+    # 接纳配置之后，CLI JSON、Policy YAML 和原生 SDK 都消费同一原生整数。
+    values = asdict(ethercat)
+    serialized = json.loads(json.dumps(values))
+    assert serialized['kp'] == [100] * 12
+    write_yaml({'runtime': {'hand': values}}, tmp_path / 'run_config.yaml')
+    assert yaml.safe_load((tmp_path / 'run_config.yaml').read_text())['runtime']['hand'] == serialized
+    assert all(type(getattr(ethercat, name)) is int for name in (
+        'baudrate', 'device_id', 'ethercat_slave_position', 'ki', 'kd',
+    ))
+    hand = XHand(config)
+    hand.sdk = SimpleNamespace(HandCommand_t=lambda: SimpleNamespace(
+        finger_command=[SimpleNamespace() for _ in range(12)]))
+    command = hand.make_command(target())
+    assert all(type(joint.kp) is int and type(joint.tor_max) is int
+               for joint in command.finger_command)
+
+
+@pytest.mark.parametrize('entrypoint', ['scripts.collect_teleop', 'scripts.run_policy',
+                                      'scripts.tools.control_xhand'])
+def test_numpy_integer_config_prints_through_real_cli(entrypoint, tmp_path, capsys):
+    import importlib
+
+    path = tmp_path / 'config.py'
+    path.write_text(
+        'from dataclasses import replace\n'
+        'import numpy as np\n'
+        'from dexmani_real.config.real import RealConfig\n'
+        'base = RealConfig()\n'
+        'CONFIG = replace(base, hand=replace(base.hand, device_id=np.int64(0), '
+        'kp=(np.int64(100),) * 12, tor_max=(np.uint64(300),) * 12))\n'
+    )
+    assert importlib.import_module(entrypoint).main(['--config', str(path), '--print-config']) == 0
+    hand = json.loads(capsys.readouterr().out)['hand']
+    assert hand['device_id'] == 0 and hand['kp'] == [100] * 12 and hand['tor_max'] == [300] * 12
+
+
+@pytest.mark.parametrize('field', ['baudrate', 'device_id', 'ki', 'kd', 'kp', 'tor_max',
+                                  'ethercat_slave_position'])
+@pytest.mark.parametrize('value', [True, np.bool_(True), 1.5, np.float64(1.5), 2.0])
+def test_hand_config_rejects_booleans_and_floats(field, value):
+    update = {field: (value,) * 12 if field in ('kp', 'tor_max') else value}
+    if field == 'ethercat_slave_position':
+        update.update(comm_type='ethercat', device_name=None)
+    with pytest.raises(ValueError, match='integer'):
+        replace(HandConfig(), **update).validate()
+
+
+@pytest.mark.parametrize('field,value', [('baudrate', 0), ('device_id', -1), ('ki', -1),
+                                       ('kd', -1), ('kp', 0), ('tor_max', -1),
+                                       ('tor_max', 401), ('ethercat_slave_position', -2)])
+def test_hand_config_keeps_integer_value_ranges(field, value):
+    update = {field: (np.int64(value),) * 12 if field in ('kp', 'tor_max') else np.int64(value)}
+    if field == 'ethercat_slave_position':
+        update.update(comm_type='ethercat', device_name=None)
+    with pytest.raises(ValueError):
+        replace(HandConfig(), **update).validate()
+
+
+@pytest.mark.parametrize('field', ['kp', 'tor_max'])
+def test_hand_config_keeps_twelve_joint_gain_lengths(field):
+    with pytest.raises(ValueError, match='twelve'):
+        replace(HandConfig(), **{field: (np.int64(100),) * 11}).validate()
+
+
 def test_periodic_crc_moves_on_to_latest_target_and_resets_only_on_write(clock, caplog):
     hand = make_hand(writes=[CRC, CRC, 0, CRC, 0], reads=[(0, payload())])
     for i, confirmed in enumerate((False, False, True, False)):
@@ -158,6 +235,47 @@ def test_crc_does_not_refresh_any_source_and_channels_hold_independently(clock):
     assert hand.control.read_args == [(0, True)] * 5
 
 
+def test_internal_tactile_presence_hold_and_policy_freshness_follow_sdk_sources(clock):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.runtime.observation import (
+        Observation, ObservationNeeds, check_observation, missing_tactile_channels,
+    )
+
+    hand = make_hand(reads=[(DISTRIBUTED_FORCE_UNAVAILABLE_CODE, payload()), (0, payload()),
+                            (COMBINED_FORCE_UNAVAILABLE_CODE, payload()), (0, payload())])
+    cache = XHandFeedback()
+    needs = ObservationNeeds(required_tactile=('aggregate', 'dense'))
+    def observation(frame):
+        arm = np.array([(clock[0],)], dtype=[('timestamp_ns', '<u8')])
+        return Observation(arm=arm, hand=frame, camera=None, vr=None, point_cloud=None,
+                           observation_timestamp_ns=clock[0])
+
+    first = observation(cache.consume(hand.get_state()))
+    assert missing_tactile_channels(first, needs.required_tactile) == ['dense']
+    clock[0] += 10_000_000
+    ready = observation(cache.consume(hand.get_state()))
+    assert not missing_tactile_channels(ready, needs.required_tactile)
+    assert missing_tactile_channels(replace(ready, observation_timestamp_ns=clock[0] - 1),
+                                    needs.required_tactile) == ['aggregate', 'dense']
+    clock[0] += 600_000_000
+    held = observation(cache.consume(hand.get_state()))
+    assert not missing_tactile_channels(held, needs.required_tactile)
+    np.testing.assert_array_equal(held.hand['tactile_dense_timestamp_ns'],
+                                  ready.hand['tactile_dense_timestamp_ns'])
+    assert not check_observation(held, RealConfig(), needs, allow_tactile_hold=True)
+    assert check_observation(held, RealConfig(), needs) == [
+        'hand_tactile_aggregate_timestamp_ns_unavailable_or_stale',
+        'hand_tactile_dense_timestamp_ns_unavailable_or_stale',
+    ]
+    cache.clear_tactile()
+    assert missing_tactile_channels(observation(cache.snapshot()), needs.required_tactile) == [
+        'aggregate', 'dense',
+    ]
+    clock[0] += 10_000_000
+    recovered = observation(cache.consume(hand.get_state()))
+    assert not check_observation(recovered, RealConfig(), needs)
+
+
 @pytest.mark.parametrize('code,board', [(OVERCURRENT_WARNING_CODE, 0), (0, 110)])
 def test_overcurrent_keeps_valid_joints_and_tactile(code, board, clock):
     hand = make_hand(reads=[(code, payload(board=board))], writes=[OVERCURRENT_WARNING_CODE])
@@ -166,33 +284,20 @@ def test_overcurrent_keeps_valid_joints_and_tactile(code, board, clock):
     assert hand.send_action(target()) is True
 
 
-def test_reset_one_pass_keeps_per_finger_results_and_invalidates_only_tactile(clock):
+def test_reset_one_pass_keeps_per_finger_results(clock):
     codes = [CRC, COMBINED_FORCE_UNAVAILABLE_CODE, DISTRIBUTED_FORCE_UNAVAILABLE_CODE,
              OVERCURRENT_WARNING_CODE, 0]
-    hand = make_hand(reads=[(0, payload()), (0, payload())], resets=codes)
-    cache = XHandFeedback()
-    first = cache.consume(hand.get_state())
-    assert hand.reset_tactile_sensors(on_start=cache.clear_tactile) == dict(zip(TACTILE_SENSOR_IDS, codes))
-    cleared = cache.snapshot()
-    np.testing.assert_array_equal(cleared['qpos'], first['qpos'])
-    assert cleared['timestamp_ns'][0] == first['timestamp_ns'][0]
-    assert cleared['tactile_aggregate_timestamp_ns'][0] == 0
-    assert cleared['tactile_dense_timestamp_ns'][0] == 0
-    assert np.isnan(cleared['tactile_dense']).all()
+    hand = make_hand(resets=codes)
+    assert hand.reset_tactile_sensors() == dict(zip(TACTILE_SENSOR_IDS, codes))
     assert hand.control.reset_ids == list(TACTILE_SENSOR_IDS)
-    assert json.loads(hand.get_tactile_reset_metadata()['hand_tactile_reset_result']) == {str(k): v for k, v in zip(TACTILE_SENSOR_IDS, codes)}
-    clock[0] += 1_000_000
-    assert np.isfinite(cache.consume(hand.get_state())['tactile_dense']).all()
+    assert hand.tactile_reset_metadata['hand_tactile_reset_result'] == dict(zip(TACTILE_SENSOR_IDS, codes))
 
 
 def test_reset_cancellation_preserves_completed_results_and_can_retry(clock):
     hand = make_hand(resets=[0] * 7)
-    starts = []
     with pytest.raises(OperationCancelled, match='2/5'):
-        hand.reset_tactile_sensors(cancel_requested=lambda: len(hand.control.reset_ids) == 2,
-                                   on_start=lambda: starts.append(True))
-    assert json.loads(hand.get_tactile_reset_metadata()['hand_tactile_reset_result']) == {'17': 0, '18': 0}
-    assert len(starts) == 1
+        hand.reset_tactile_sensors(cancel_requested=lambda: len(hand.control.reset_ids) == 2)
+    assert hand.tactile_reset_metadata['hand_tactile_reset_result'] == {0x11: 0, 0x12: 0}
     assert len(hand.reset_tactile_sensors()) == 5
     assert hand.control.reset_ids == [0x11, 0x12, *TACTILE_SENSOR_IDS]
 
@@ -291,14 +396,36 @@ def test_diagnostic_one_shot_crc_retries_once_and_checks_measured_arrival(clock)
     assert hand.motion_pending
 
 
-def test_reset_cancelled_before_first_request_keeps_tactile(clock):
-    hand = make_hand(reads=[(0, payload())])
-    cache = XHandFeedback()
-    first = cache.consume(hand.get_state())
-    with pytest.raises(OperationCancelled, match='0/5'):
-        hand.reset_tactile_sensors(cancel_requested=lambda: True, on_start=cache.clear_tactile)
-    assert cache.snapshot() is first
-    assert not hand.control.reset_ids
+@pytest.mark.parametrize('cancel_check', [1, 2, 3])
+def test_robot_reset_cancellation_checks_stop_and_preserves_joint_feedback(clock, cancel_check):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.robot.system import Robot
+    from dexmani_real.runtime.state import SessionState
+
+    config = RealConfig()
+    robot = Robot(config.arm, config.hand, runtime_state=SessionState())
+    robot.hand = make_hand(reads=[(0, payload())])
+    first = robot.read_hand()
+    stopped = []
+    robot.stop = lambda: stopped.append(True)
+    checks = []
+    def cancelled():
+        checks.append(True)
+        return len(checks) == cancel_check
+    with pytest.raises(OperationCancelled):
+        robot.reset_tactile_sensors(cancel_epoch=robot.runtime_state.cancel_epoch,
+                                    cancel_requested=cancelled)
+    assert bool(stopped) == (cancel_check > 1)
+    assert not robot.hand.control.reset_ids
+    current = robot.hand_feedback.snapshot()
+    np.testing.assert_array_equal(current['qpos'], first['qpos'])
+    assert current['timestamp_ns'][0] == first['timestamp_ns'][0]
+    if cancel_check < 3:
+        assert current is first
+    else:
+        # 清缓存之后取消无需回调恢复；下次开始重新等待真实触觉。
+        assert current['tactile_aggregate_timestamp_ns'][0] == 0
+        assert current['tactile_dense_timestamp_ns'][0] == 0
 
 
 def test_connect_failure_closes_partial_resource(monkeypatch, clock):

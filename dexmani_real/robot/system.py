@@ -106,7 +106,6 @@ class Robot:
         self._read_initial_state(cancel_requested=cancelled)
 
     def reset_tactile_sensors(self, *, cancel_epoch, cancel_requested) -> dict[int, int]:
-        self.check()
         if self.hand is None:
             raise RobotError("XHand unavailable for tactile reset")
 
@@ -121,9 +120,10 @@ class Robot:
         if cancelled():
             raise OperationCancelled("tactile reset cancelled before stopping")
         self.stop()
-        return self.hand.reset_tactile_sensors(
-            cancel_requested=cancelled, on_start=self.hand_feedback.clear_tactile,
-        )
+        if cancelled():
+            raise OperationCancelled("tactile reset cancelled after stopping")
+        self.hand_feedback.clear_tactile()
+        return self.hand.reset_tactile_sensors(cancel_requested=cancelled)
 
     def read_hand(self):
         if self.hand is None:

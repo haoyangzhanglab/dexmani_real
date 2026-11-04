@@ -1,5 +1,5 @@
 > **历史记录：** 本文及[第二阶段任务书](research_simplification_v2_taskbook.md)保存各自阶段的实施事实，不作为当前行为约定；当前行为以源码和 [README](../README.md) 为准。
-> XHand 的写 CRC、触觉保持、启动 HOME 与清零约定已由 [XHand 轻量化任务及实施记录](xhand_simplification_taskbook.md) 替代；下文旧验证事实保留。
+> XHand 的写 CRC、触觉保持、启动 HOME 与清零约定已由 [XHand 收敛任务书](xhand_simplification_taskbook.md) 替代；下文旧验证事实保留。
 
 # DexMani Real：验收修复与 demo 回放减法任务书
 

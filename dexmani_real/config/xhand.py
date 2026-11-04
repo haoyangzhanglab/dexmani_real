@@ -30,12 +30,13 @@ class HandConfig:
     ethercat_slave_position: int = -1
 
     # SDK 顺序：拇指 3 轴、食指 3 轴，其余每指 2 轴。
+    # 显式 HOME 在操作范围内部留出余量，5° 到位误差不会跨过默认边界。
     home_qpos_deg: tuple[float, ...] = (
-        30.0, 55.33, 10.0,  # 拇指
-        0.17, 1.08, 5.0,    # 食指
-        1.25, 5.0,          # 中指
-        1.33, 5.0,          # 无名指
-        1.33, 5.0,          # 小指
+        30.0, 55.33, 20.0,  # 拇指
+        0.17, 10.0, 15.0,   # 食指
+        10.0, 15.0,         # 中指
+        10.0, 15.0,         # 无名指
+        10.0, 15.0,         # 小指
     )
 
     qpos_min_rad: tuple[float, ...] = (
@@ -70,6 +71,18 @@ class HandConfig:
     home_timeout_s: float = 2.0
     home_tolerance_deg: float = 5.0
 
+    def __post_init__(self) -> None:
+        # 配置保留原生整数表示，SDK 参数及 JSON/YAML 归档无需各自适配 NumPy。
+        for name in ("baudrate", "device_id", "ethercat_slave_position", "ki", "kd"):
+            value = getattr(self, name)
+            if isinstance(value, np.integer):
+                object.__setattr__(self, name, int(value))
+        for name in ("kp", "tor_max"):
+            object.__setattr__(self, name, tuple(
+                int(value) if isinstance(value, np.integer) else value
+                for value in getattr(self, name)
+            ))
+
     def validate(self) -> None:
         if self.comm_type not in ("ethercat", "serial"):
             raise ValueError("hand comm_type must be 'ethercat' or 'serial'")
@@ -88,15 +101,17 @@ class HandConfig:
             communication_field, ("device_id", 0), ("ki", 0), ("kd", 0),
         ):
             value = getattr(self, name)
-            if type(value) is not int or value < minimum:
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
                 raise ValueError(f"hand {name} must be an integer >= {minimum}")
         self.validate_limits()
         if len(self.kp) != HAND_DOF or any(
-            type(value) is not int or value <= 0 for value in self.kp
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in self.kp
         ):
             raise ValueError("hand kp must contain twelve positive integer gains")
         if len(self.tor_max) != HAND_DOF or any(
-            type(value) is not int or not 0 <= value <= 400 for value in self.tor_max
+            not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 400
+            for value in self.tor_max
         ):
             raise ValueError(
                 "hand tor_max must contain twelve integers in [0, 400] (Mode 3 output scale)"

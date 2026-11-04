@@ -218,27 +218,34 @@ class Rollout:
             self.robot.check()
         return valid
 
-    def start_observation(self, poll_operator=lambda: None):
+    def start_observation(self, poll_operator=lambda: None, *, after_ns=None):
         until = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
         while True:
             poll_operator()
             if not self.preparation_valid():
                 raise OperationCancelled("initial observation cancelled")
             self.robot.service_feedback()
-            row, self.preparation_issue = self.read_observation()
-            missing = missing_tactile_channels(row, self.capture_needs.required_tactile)
-            if sources_available(row, self.capture_needs) and not missing:
+            row, issue = self.read_observation()
+            if self.record_raw:
+                recording_issue = self.recording_issue(row)
+                issue = issue or recording_issue
+            joints_ready = after_ns is None or (
+                int(row.arm["timestamp_ns"][0]) >= after_ns
+                and (not self.runtime.hand.enabled or row.hand is not None
+                     and int(row.hand["timestamp_ns"][0]) >= after_ns)
+            )
+            if issue is None and joints_ready:
+                self.preparation_issue = None
                 break
             if time.monotonic_ns() >= until:
+                missing = missing_tactile_channels(row, self.capture_needs.required_tactile)
                 if missing:
                     self.preparation_issue = "initial_tactile_unavailable: " + ", ".join(missing)
-                    logger.warning("本轮未开始：触觉初值缺失 %s；可稍后再次按 B。", ", ".join(missing))
-                    return None
-                raise TimeoutError("initial observation unavailable")
+                else:
+                    self.preparation_issue = issue or "initial_joint_feedback_unavailable"
+                logger.warning("本轮未开始：%s；可稍后再次按 B。", self.preparation_issue)
+                return None
             time.sleep(0.005)
-        if self.preparation_issue is not None:
-            logger.warning("本轮未开始：%s", self.preparation_issue)
-            return None
         current = row.arm["qpos"][0]
         if (np.any(current < self.runtime.arm.joint_limit_lower)
                 or np.any(current > self.runtime.arm.joint_limit_upper)):
@@ -250,39 +257,35 @@ class Rollout:
         poll_operator()
         if not self.preparation_valid():
             raise OperationCancelled("cancelled before preparation")
-        self.robot.prepare_streaming(self.cancel_epoch)
-        poll_operator()
-        if not self.preparation_valid():
-            raise OperationCancelled("cancelled during streaming preparation")
-        # 全模态初值先于 writer 和本段第一条动作；失败只结束本次准备。
-        row = self.start_observation(poll_operator)
-        if row is None:
+        self.robot.stop()
+        # 全模态初值先于 writer；等待与资源初始化期间设备保持停止。
+        if self.start_observation(poll_operator) is None:
             self.stop(self.preparation_issue)
             return
-        if self.record_raw and (issue := self.recording_issue(row)) is not None:
-            self.preparation_issue = issue
-            self.stop(issue)
-            return
+        poll_operator()
+        if not self.preparation_valid():
+            raise OperationCancelled("cancelled before recorder start")
         if self.record_raw:
             self.recorder = EpisodeRecorder(self.output_dir, control_hz=1 / self.policy_info.control_dt_s)
             metadata = snapshot_recording_metadata(
                 self.camera_snapshot,
-                tactile_reset_metadata=self.robot.hand.get_tactile_reset_metadata(),
+                tactile_reset_metadata=self.robot.hand.tactile_reset_metadata,
             )
             self.recorder.start(
                 task_label=self.policy_info.task_name,
                 episode_name=f"episode_{self.result.index:03d}", collection_source="policy_rollout", metadata=metadata,
             )
-            poll_operator()
-            if not self.preparation_valid():
-                raise OperationCancelled("cancelled during recorder start")
-            self.robot.service_feedback()
-            row, self.preparation_issue = self.read_observation()
-            issue = self.preparation_issue or self.recording_issue(row)
-            if issue is not None:
-                self.preparation_issue = issue
-                self.stop(issue)
+            # writer 可能阻塞超过反馈 TTL；仍停止采样，允许一次 CRC 后恢复。
+            if self.start_observation(poll_operator, after_ns=time.monotonic_ns()) is None:
+                self.stop(self.preparation_issue)
                 return
+        poll_operator()
+        if not self.preparation_valid():
+            raise OperationCancelled("cancelled before streaming preparation")
+        self.robot.prepare_streaming(self.cancel_epoch)
+        if self.start_observation(poll_operator) is None:
+            self.stop(self.preparation_issue)
+            return
         with self.runtime_state.motion_lock:
             started_ns = (
                 time.monotonic_ns()

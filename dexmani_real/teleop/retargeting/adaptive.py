@@ -1,14 +1,16 @@
-"""有界、可诊断的 XHand 在线重定向；只有提交成功才推进命令状态。"""
+"""有界 XHand 重定向；实测起点建立参考，提交尝试正常返回后推进参考。"""
 
 from math import expm1
 
 import nlopt
 import numpy as np
 
+from dexmani_real.control.actions import HandStartRejected
 from dexmani_real.geometry.kinematics import HandFK
 from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
     XHAND_FINGERTIP_LINK_NAMES,
+    XHAND_SDK_JOINT_NAMES,
 )
 from dexmani_real.teleop.retargeting.landmarks import HandCalibration, prepare_landmarks
 from dexmani_real.teleop.retargeting.objective import HandObjective
@@ -55,8 +57,8 @@ class AdaptiveHandRetargeter:
         # 同一 loss 容差用于优化收敛和下方 seed 改善判据。
         self.optimizer.set_ftol_abs(config.ftol_abs)
         self.calibration = None
-        self.previous_command = None
-        self.command_timestamp_ns = None
+        self.reference_qpos = None
+        self.reference_timestamp_ns = None
         self.rejection_reason = None
 
     def calibrate(self, measurements):
@@ -75,19 +77,29 @@ class AdaptiveHandRetargeter:
         qpos = np.asarray(initial_qpos, dtype=np.float64)
         if timestamp_ns <= 0:
             raise ValueError("hand reset timestamp must be positive")
-        self.previous_command = np.clip(qpos, self.limits[:, 0], self.limits[:, 1])
-        self.command_timestamp_ns = int(timestamp_ns)
+        outside = (qpos < self.limits[:, 0]) | (qpos > self.limits[:, 1])
+        if np.any(outside):
+            joints = "; ".join(
+                f"{XHAND_SDK_JOINT_NAMES[i]}={np.rad2deg(qpos[i]):.2f}° "
+                f"(要求 {np.rad2deg(self.limits[i, 0]):.2f}–"
+                f"{np.rad2deg(self.limits[i, 1]):.2f}°)"
+                for i in np.flatnonzero(outside)
+            )
+            raise HandStartRejected(f"本段未开始：手部起点超出操作范围：{joints}；请先就位后再次按 B。")
+        # 首次参考是真实实测值，并非已经发送的目标；不裁剪，也不与快照共享数组。
+        self.reference_qpos = qpos.copy()
+        self.reference_timestamp_ns = int(timestamp_ns)
         self.rejection_reason = None
 
     def retarget(self, landmarks, *, timestamp_ns):
-        if self.calibration is None or self.previous_command is None:
+        if self.calibration is None or self.reference_qpos is None:
             raise RuntimeError("hand retargeting requires calibration and a measured reset pose")
-        if timestamp_ns < self.command_timestamp_ns:
+        if timestamp_ns < self.reference_timestamp_ns:
             raise ValueError("hand computation time moved backwards")
-        dt_s = (timestamp_ns - self.command_timestamp_ns) * 1e-9
+        dt_s = (timestamp_ns - self.reference_timestamp_ns) * 1e-9
         self.rejection_reason = None
         if dt_s == 0:
-            return self.previous_command.copy()
+            return self.reference_qpos.copy()
         try:
             points = prepare_landmarks(landmarks)
             targets = self.calibration.targets(
@@ -101,17 +113,17 @@ class AdaptiveHandRetargeter:
         tau = self.config.smoothing_tau_s
         alpha = 1.0 if tau == 0 else -expm1(-dt_s / tau)
         objective = HandObjective(
-            self.fk, self.frame_ids, targets, self.previous_command, dt_s, self.config,
+            self.fk, self.frame_ids, targets, self.reference_qpos, dt_s, self.config,
         )
         # 搜索的是滤波前候选；补偿 alpha 后，最终命令仍可达到 v_max。
         # 若候选先限为 v_max*dt 再滤波，高频时实际速率上限会降为 alpha*v_max。
         step = self.config.max_joint_speed_rad_s * dt_s / alpha
-        lower = np.maximum(self.limits[:, 0], self.previous_command - step)
-        upper = np.minimum(self.limits[:, 1], self.previous_command + step)
+        lower = np.maximum(self.limits[:, 0], self.reference_qpos - step)
+        upper = np.minimum(self.limits[:, 1], self.reference_qpos + step)
         self.optimizer.set_lower_bounds(lower)
         self.optimizer.set_upper_bounds(upper)
         self.optimizer.set_min_objective(objective)
-        seed = self.previous_command.copy()
+        seed = self.reference_qpos.copy()
         initial_loss = objective(seed, np.empty(0))
         if not np.isfinite(initial_loss):
             self.rejection_reason = "hand solver seed loss is non-finite"
@@ -132,17 +144,17 @@ class AdaptiveHandRetargeter:
         solution = np.clip(solution, lower, upper)
         final_loss = objective(solution, np.empty(0))
         if not np.isfinite(final_loss) or final_loss > initial_loss + self.config.ftol_abs:
-            self.rejection_reason = "hand solver did not improve the committed-command seed"
+            self.rejection_reason = "hand solver did not improve the reference seed"
             return None
-        # 同一个已提交目标同时作为 warm start、阻尼中心和唯一滤波状态。
-        command = self.previous_command + alpha * (solution - self.previous_command)
+        # 实测起点或最后提交参考同时作为 warm start、阻尼中心和唯一滤波状态。
+        command = self.reference_qpos + alpha * (solution - self.reference_qpos)
         # 凸组合理论上不越限，但浮点减加可在限位上产生舍入量级的越界。
         # 消除舍入误差，不放宽关节或最终速率限值。
         return np.clip(command, self.limits[:, 0], self.limits[:, 1])
 
     def commit(self, qpos, *, timestamp_ns):
         # 控制线程仅在发送正常返回后更新最后提交参考。
-        if self.command_timestamp_ns is None or timestamp_ns < self.command_timestamp_ns:
+        if self.reference_timestamp_ns is None or timestamp_ns < self.reference_timestamp_ns:
             raise ValueError("committed hand time moved backwards or reset is missing")
-        self.previous_command = qpos.copy()
-        self.command_timestamp_ns = int(timestamp_ns)
+        self.reference_qpos = qpos.copy()
+        self.reference_timestamp_ns = int(timestamp_ns)

@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.ipc.sensors import read_camera_frame, read_vr_frame
-from dexmani_real.robot.model import HAND_TACTILE_FORCE_SHAPE, HAND_TACTILE_SUM_SHAPE
 from dexmani_real.utils.timing import sample_is_fresh
 
 
@@ -85,17 +84,14 @@ def sources_available(row, needs):
 
 
 def missing_tactile_channels(row, channels):
-    """初值等待只要求通道已有真实样本；使用时的年龄由消费者另行检查。"""
+    """SDK 已校验内部快照的形状和数值；这里只检查真实来源，年龄由消费者检查。"""
     missing = []
     for channel in channels:
         if row.hand is None:
             missing.append(channel)
             continue
         stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0])
-        values = row.hand[f"tactile_{channel}"][0]
-        shape = HAND_TACTILE_SUM_SHAPE if channel == "aggregate" else HAND_TACTILE_FORCE_SHAPE
-        if (stamp <= 0 or stamp > row.observation_timestamp_ns
-                or values.shape != shape or not np.isfinite(values).all()):
+        if stamp <= 0 or stamp > row.observation_timestamp_ns:
             missing.append(channel)
     return missing
 

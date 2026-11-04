@@ -155,6 +155,9 @@ def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata):
     """记录实际相机与触觉保持语义，不将旧值解释为当前接触。"""
     metadata = camera_metadata(camera_snapshot)
     metadata.update(tactile_reset_metadata)
+    if tactile_reset_metadata:
+        # HDF5 属性不支持 dict，设备结果只在录制边界编码。
+        metadata["hand_tactile_reset_result"] = json.dumps(metadata["hand_tactile_reset_result"])
     metadata.update(
         hand_tactile_units=TACTILE_UNITS,
         hand_tactile_finger_order=TACTILE_FINGER_ORDER,
