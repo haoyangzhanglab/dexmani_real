@@ -11,7 +11,7 @@ from ruckig import (
 )
 
 from dexmani_real.config.xarm7 import ArmConfig
-from dexmani_real.robot.commands import validate_arm_target
+from dexmani_real.robot.commands import arm_reference_from_feedback
 
 
 # 仅容纳轨迹计算的浮点舍入误差（rad），不是运动或到位容差。
@@ -29,7 +29,7 @@ class ArmTrajectory:
         self.input.max_acceleration = [cfg.max_joint_acceleration_rad_per_s2] * 7
         self.input.max_jerk = [cfg.max_joint_jerk_rad_per_s3] * 7
         self.input.target_velocity = [0.0] * 7
-        self.input.current_position = validate_arm_target(q, self.lower, self.upper).tolist()
+        self.input.current_position = arm_reference_from_feedback(q, self.lower, self.upper).tolist()
         if np.any(np.abs(v) > cfg.max_joint_velocity_rad_per_s + 1e-8):
             raise ValueError("initial arm velocity exceeds limit")
         # SDK 停稳反馈仍有浮点残差；仅初始化时清理 <1e-12 rad/s 的噪声，

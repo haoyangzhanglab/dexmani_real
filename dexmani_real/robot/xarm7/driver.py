@@ -94,8 +94,9 @@ class XArm7:
 
     def servo(self, qpos: np.ndarray) -> None:
         """Mode 1 只发送采样参考，SDK 速度参数不负责轨迹规划。"""
-        if self.api.mode != 1 or self.api.state not in (0, 1, 2):
-            raise RuntimeError("xArm is not in streaming mode/state")
+        # Owner 仅在准备成功后建立参考，停止或失败时清除；mode 是异步报告缓存。
+        if self.api.state not in (0, 1, 2):
+            raise RuntimeError("xArm is not in streaming state")
         self.api.set_timeout(SDK_STREAM_TIMEOUT_S)
         try:
             code = self.api.set_servo_angle_j(angles=qpos.tolist(), is_radian=True)
@@ -120,8 +121,8 @@ class XArm7:
         check_abort()
         check_sdk_return_code(self.api.motion_enable(True), "motion_enable")
         check_abort()
-        if self.api.mode != mode:
-            check_sdk_return_code(self.api.set_mode(mode), f"set_mode({mode})")
+        # 明确发送模式命令并检查应答；api.mode 不能同步确认模式切换。
+        check_sdk_return_code(self.api.set_mode(mode), f"set_mode({mode})")
         check_abort()
         check_sdk_return_code(self.api.set_state(0), f"set_state(0) after Mode {mode}")
         check_abort()

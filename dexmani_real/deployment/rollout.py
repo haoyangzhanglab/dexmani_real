@@ -26,7 +26,7 @@ from dexmani_real.deployment.schedule import (
     prefetch_handoff,
 )
 from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand
+from dexmani_real.robot.commands import OperationCancelled, RobotCommand, arm_reference_from_feedback
 from dexmani_real.runtime.observation import (
     check_observation,
     missing_tactile_channels,
@@ -247,10 +247,9 @@ class Rollout:
                 logger.warning("本轮未开始：%s；可稍后再次按 B。", self.preparation_issue)
                 return None
             time.sleep(0.005)
-        current = row.arm["qpos"][0]
-        if (np.any(current < self.runtime.arm.joint_limit_lower)
-                or np.any(current > self.runtime.arm.joint_limit_upper)):
-            raise ValueError("initial arm posture violates operational joint limits")
+        arm_reference_from_feedback(
+            row.arm["qpos"][0], self.runtime.arm.joint_limit_lower, self.runtime.arm.joint_limit_upper,
+        )
         return row
 
     def prepare(self, poll_operator):

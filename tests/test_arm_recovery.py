@@ -9,7 +9,12 @@ import numpy as np
 import pytest
 
 from dexmani_real.config.xarm7 import EXECUTOR_TIMEOUT_S, ArmConfig
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand, validate_arm_target
+from dexmani_real.robot.commands import (
+    OperationCancelled,
+    RobotCommand,
+    arm_reference_from_feedback,
+    validate_arm_target,
+)
 from dexmani_real.robot.xarm7.process import ArmProcess
 from dexmani_real.robot.xarm7.protocol import (
     GOAL_DTYPE,
@@ -33,6 +38,59 @@ def in_process_sync(monkeypatch):
 def channels(state):
     return ArmChannels(mp.get_context('spawn'), stop_signal=state.stop_signal,
                        emergency_signal=state.emergency_signal)
+
+
+@pytest.mark.parametrize('boundary', ['lower', 'upper'])
+@pytest.mark.parametrize('dtype', [np.float32, np.float64])
+def test_arm_feedback_roundoff_creates_new_reference_without_changing_feedback(boundary, dtype):
+    cfg = ArmConfig()
+    lower, upper = np.asarray(cfg.joint_limit_lower), np.asarray(cfg.joint_limit_upper)
+    bound = lower if boundary == 'lower' else upper
+    feedback = bound.astype(np.float32).astype(dtype)
+    original = feedback.copy()
+    feedback.flags.writeable = False
+    outside = feedback < lower if boundary == 'lower' else feedback > upper
+    assert np.any(outside)
+    reference = arm_reference_from_feedback(feedback, lower, upper)
+    np.testing.assert_array_equal(reference, np.clip(original, lower, upper))
+    np.testing.assert_array_equal(feedback, original)
+    assert not np.shares_memory(reference, feedback)
+
+
+@pytest.mark.parametrize('invalid', ['short', 'matrix', 'nan', 'inf', 'negative_inf', 'below', 'above'])
+def test_arm_reference_rejects_invalid_feedback(invalid):
+    cfg = ArmConfig()
+    feedback = np.asarray(cfg.home_qpos).copy()
+    if invalid == 'short':
+        feedback = feedback[:-1]
+    elif invalid == 'matrix':
+        feedback = feedback[None, :]
+    else:
+        feedback[1] = dict(nan=np.nan, inf=np.inf, negative_inf=-np.inf,
+                           below=cfg.joint_limit_lower[1] - 2e-6,
+                           above=cfg.joint_limit_upper[1] + 2e-6)[invalid]
+    original = feedback.copy()
+    with pytest.raises(ValueError, match='shape|finite|joint limits'):
+        arm_reference_from_feedback(feedback, cfg.joint_limit_lower, cfg.joint_limit_upper)
+    np.testing.assert_array_equal(feedback, original)
+
+
+@pytest.mark.parametrize('boundary', ['lower', 'upper'])
+def test_real_ruckig_starts_from_float32_feedback_at_limits(boundary):
+    cfg = ArmConfig()
+    lower, upper = np.asarray(cfg.joint_limit_lower), np.asarray(cfg.joint_limit_upper)
+    feedback = (lower if boundary == 'lower' else upper).astype(np.float32).astype(np.float64)
+    original = feedback.copy()
+    start = np.clip(feedback, lower, upper)
+    trajectory = ArmTrajectory(cfg, feedback, np.zeros(7))
+    np.testing.assert_array_equal(trajectory.input.current_position, start)
+    goal = start + (.02 if boundary == 'lower' else -.02)
+    # 使用真实 Ruckig 覆盖边界初始化、向内运动和到位后的持续计算。
+    for _ in range(200):
+        q = trajectory.step(goal)
+        validate_arm_target(q, lower, upper)
+    np.testing.assert_allclose(q, goal, rtol=0, atol=1e-12)
+    np.testing.assert_array_equal(feedback, original)
 
 
 @pytest.mark.parametrize('target', ['lower', 'upper', 'interior'])
@@ -645,16 +703,20 @@ def motion_driver():
         def record(*args, **kwargs):
             events.append((name, args, kwargs))
             if name == 'set_mode':
-                driver.api.mode = args[0]
+                driver.api.actual_mode = args[0]
             if name == 'set_state':
                 driver.api.state = args[0]
+            if name == 'set_servo_angle_j':
+                assert driver.api.actual_mode == 1
             return 0
         return record
-    driver.api = SimpleNamespace(axis=7, mode=0, state=4,
+    # 模式命令只改变设备实际模式；异步报告可一直保留旧值。
+    driver.api = SimpleNamespace(axis=7, actual_mode=0, mode=0, state=4,
         get_err_warn_code=lambda: (0, [0, 0]),
+        get_joint_states=lambda **kwargs: (0, [cfg.home_qpos, np.zeros(7)]),
         **{name: call(name) for name in ('motion_enable', 'set_mode', 'set_state',
            'set_joint_maxacc', 'set_collision_sensitivity', 'set_tcp_load', 'set_servo_angle',
-           'set_timeout', 'disconnect')})
+           'set_servo_angle_j', 'set_timeout', 'disconnect')})
     return driver, events
 
 
@@ -664,7 +726,7 @@ def test_motion_configuration_finishes_with_state_zero(motion_driver, mode):
     cfg = driver.cfg
     driver.prepare_motion(mode, check_abort=lambda: None)
     names = [name for name, args, kw in events]
-    assert names == (['motion_enable'] + (['set_mode'] if mode == 1 else [])
+    assert names == (['motion_enable', 'set_mode']
                      + ['set_state', 'set_collision_sensitivity', 'set_tcp_load',
                         'set_joint_maxacc', 'set_state'])
     assert events[-1] == ('set_state', (0,), {})
@@ -682,18 +744,78 @@ def test_motion_configuration_finishes_with_state_zero(motion_driver, mode):
 
 def test_repeated_motion_preparation_reuses_static_config_and_applies_mode_acceleration(motion_driver):
     driver, events = motion_driver
-    modes = [1, 1, 0, 0, 1]
+    driver.api.mode = 1
+    modes = [1, 0, 1]
     for mode in modes:
         driver.prepare_motion(mode, check_abort=lambda: None)
         assert events[-1] == ('set_state', (0,), {})
+        assert driver.api.actual_mode == mode
+        assert driver.api.mode == 1
     names = [name for name, args, kw in events]
     assert names.count('set_collision_sensitivity') == names.count('set_tcp_load') == 1
     assert names.count('motion_enable') == len(modes)
-    assert [args[0] for name, args, kw in events if name == 'set_mode'] == [1, 0, 1]
+    assert [args[0] for name, args, kw in events if name == 'set_mode'] == modes
     assert [args[0] for name, args, kw in events if name == 'set_joint_maxacc'] == [
         driver.cfg.homing.max_acceleration_rad_per_s2 if mode == 0
         else driver.cfg.max_joint_acceleration_rad_per_s2 for mode in modes
     ]
+
+
+def test_owner_streams_with_stale_mode_report_and_stop_discards_reference(motion_driver, monkeypatch):
+    driver, events = motion_driver
+    now = [1_000_000_000]
+    monkeypatch.setattr('dexmani_real.robot.xarm7.worker.time.monotonic_ns', lambda: now[0])
+    io = channels(SessionState())
+    def wait(delay):
+        now[0] += round(delay * 1e9)
+    monkeypatch.setattr(io.stop, 'wait', wait)
+    replies = []
+    owner = ArmController(driver.cfg, io, SimpleNamespace(poll=lambda: False, send=replies.append), driver)
+    owner.operation(PrepareRequest(now[0] + 5_000_000_000))
+    assert replies == [None]
+    assert driver.api.actual_mode == 1 and driver.api.mode == 0
+    assert owner.reference is not None
+    goal = np.asarray(driver.cfg.home_qpos).copy()
+    goal[0] += .1
+    io.publish_goal(RobotCommand(arm_qpos=goal), expires_ns=now[0] + 1_000_000_000)
+    owner.tick()
+    sent = [args for name, args, kw in events if name == 'set_servo_angle_j']
+    assert len(sent) == 1
+    owner.stop()
+    assert owner.active is None and owner.reference is None
+    owner.tick()
+    assert sum(name == 'set_servo_angle_j' for name, args, kw in events) == 1
+
+
+@pytest.mark.parametrize('interruption', ['sdk_error', 'cancel'])
+def test_owner_cannot_stream_after_mode_failure_or_cancel(motion_driver, monkeypatch, interruption):
+    driver, events = motion_driver
+    driver.api.mode = 1
+    state = SessionState()
+    io = channels(state)
+    replies = []
+    original = driver.api.set_mode
+
+    def set_mode(mode):
+        if interruption == 'sdk_error':
+            events.append(('set_mode', (mode,), {}))
+            return -7
+        code = original(mode)
+        state.request_stop()
+        return code
+
+    monkeypatch.setattr(driver.api, 'set_mode', set_mode)
+    owner = ArmController(driver.cfg, io, SimpleNamespace(poll=lambda: False, send=replies.append), driver)
+    io.publish_goal(RobotCommand(arm_qpos=np.asarray(driver.cfg.home_qpos)),
+                    expires_ns=time.monotonic_ns() + 1_000_000_000)
+    owner.operation(PrepareRequest(time.monotonic_ns() + 5_000_000_000))
+    assert len(replies) == 1
+    assert isinstance(replies[0], RuntimeError if interruption == 'sdk_error' else OperationCancelled)
+    assert [args[0] for name, args, kw in events if name == 'set_mode'] == [1]
+    assert io.stop.is_set() and io.closing.is_set()
+    assert owner.active is None and owner.reference is None
+    owner.tick()
+    assert not any(name == 'set_servo_angle_j' for name, args, kw in events)
 
 
 def test_connect_is_read_only_and_new_session_requires_motion_configuration(motion_driver, monkeypatch):

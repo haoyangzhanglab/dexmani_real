@@ -5,6 +5,10 @@ import numpy as np
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
 
+# 当前关节范围内 float32 反馈的位置舍入容差（rad），不适用于外部目标。
+_FEEDBACK_POSITION_ROUNDOFF_RAD = 1e-6
+
+
 @dataclass(frozen=True)
 class RobotCommand:
     arm_qpos: np.ndarray | None = None
@@ -41,6 +45,15 @@ def validate_arm_target(qpos, lower, upper) -> np.ndarray:
     if np.any(target < lower) or np.any(target > upper):
         raise ValueError("arm target violates joint limits")
     return target
+
+
+def arm_reference_from_feedback(qpos, lower, upper) -> np.ndarray:
+    """由实测反馈生成规划起点；仅归一边界附近的 float32 微小越界。"""
+    lower, upper = np.asarray(lower), np.asarray(upper)
+    feedback = validate_arm_target(
+        qpos, lower - _FEEDBACK_POSITION_ROUNDOFF_RAD, upper + _FEEDBACK_POSITION_ROUNDOFF_RAD,
+    )
+    return np.clip(feedback, lower, upper)
 
 
 def validate_hand_target(qpos, lower, upper) -> np.ndarray:

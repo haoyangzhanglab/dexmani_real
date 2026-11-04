@@ -1,22 +1,20 @@
 # xArm 轻量化改造任务书
 
-状态：三项修复及上下游清理已实施，完整离线回归通过，尚未进行真机验收。
+状态：模式准备、反馈起点、jog 频率及上下游清理已实施，离线验证通过，尚未进行真机验收。
 
-本轮基线：`main@bbbbe8965c2f0a7b5894ab3ecf824fc47dbff7ac`，已核对 GitHub 最新 main，初始工作区干净。保留已有单 Owner、latest-wins 邮箱、短锁、取消计数、停止确认、故障传播及 Ruckig 动态/极值约束。
+审查基线及实施起点：`a37d8fe11aa3d7116a85bcaa9fcc568efbb36e7e`。每次准备显式发送模式命令，不依赖异步 `api.mode` 缓存；共享函数处理实测起点的 float32 舍入；jog 频率只按有效采样周期准入。公共目标频率校验也复用 `sampling_clock_ns()`，无法转换为有限正整数周期的频率报 `ValueError`，实际发送手部目标仍限制 83 Hz。
 
-本轮修复：独立 arm HOME 等待复用 `service_feedback()`，持续读取已连接手部的真实反馈与故障，不写手部目标、不等待触觉或手部 HOME 姿态，保留 `hand_stop_required`；idle 收尾仍按原 TTL 决定 hold/passive。同一 SDK 会话仅在首次完整运动准备且取消检查通过后记录静态配置完成，后续省略碰撞灵敏度和 TCP 负载的重复写入；每次仍设置对应模式加速度及最终 State 0。hand 禁用时删除公共范围预检及 Mapper 的未用范围转换；EEF/jog 固定姿态入口通过 `validate_home_pose()` 统一校验范围和姿态。
+沿 driver、Owner、共享通道、Robot、运行入口和脚本检查生命周期；沿轨迹、Policy、Mapper、observation 和 Raw 检查数据含义；沿 jog、Teleop、Policy、replay、录制和导出检查采样工具调用。未发现相关 SHA-256、旧格式 reader 或兼容迁移分支。删除非法反馈测试的重复准入断言，保留真实 Ruckig、Policy 一致性及外部目标严格性覆盖。
 
-清理结果：首次静态配置原地收敛到 `prepare_motion()`，删除无独立消费者的 `apply_config()`；Mapper 在同一 EEF 分支内构造 solver 和固定姿态，公共预检合并重复 hand 开关判断。清除测试中的旧 HOME 规划注释、未用样本收集及重复断言，反馈替身不再依赖任意固定帧数。已核对 Teleop、jog、Policy、replay 和只读标定调用方；相关生产链未发现 SHA-256、旧格式 reader 或迁移分支。
+保留独立 arm HOME 等待时的手部真实反馈与故障服务，不写手部目标，继续承担已有手部停止责任；idle 按原 TTL 决定 hold/passive。静态碰撞参数和 TCP load 仅在本连接会话首次完整准备成功后复用；每次仍设置对应模式加速度及最终 State 0。hand 禁用时跳过无关预检，EEF/jog 使用固定手姿态时仍校验其范围。
 
-验证使用现有 `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`，设置 `PYTHONDONTWRITEBYTECODE=1`：`-m pytest -p no:cacheprovider tests -q`，741 项通过。包含真实 Ruckig 0.17.3、受控时钟 2 秒 arm HOME 后真实 XHand 停止分支、反馈过期/CRC/设备错误、SDK 配置失败/取消及新会话重配。Ruff `--no-cache --select F dexmani_real scripts tests` 与 `git diff --check` 通过。
+验证环境：现有 `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B`。针对性回归后，完整 `-m pytest -p no:cacheprovider tests -q`，782 项通过，包含真实 Ruckig 0.17.3 上下边界初始化和步进。全项目 Ruff F（`--no-cache`）、26 个相关实现及脚本的 Mypy（`--check-untyped-defs --no-incremental --cache-dir=/dev/null --follow-imports=silent --ignore-missing-imports`）、四个运行脚本的 `--help`、Policy `--print-config` 和 `git diff --check` 通过。
 
-Mypy 使用 `--check-untyped-defs --no-incremental --cache-dir=/dev/null --follow-imports=silent --ignore-missing-imports`：19 个核心模块无诊断；扩展 14 个调用方与脚本时，`PolicySession` 仍有 28 项可空资源诊断，与 HEAD 按文件、源码行和错误内容逐条对照，无新增。未新增类型忽略、额外运行时检查或兜底掩盖既有诊断。使用现有 setuptools 在 `/tmp` 构建 wheel 成功，80 个 Python 文件和 3 份标定 JSON 与当前源码逐个一致；构建不证明可选依赖或设备运行环境可用。
+将 Mypy 扩展到采样工具的 recorder、Raw、export 三个调用模块时，`data/raw.py` 有 7 项既有资源可空及赋值类型诊断；在 `/tmp` 中取 HEAD 源码，使用相同参数逐条对照，内容和行号完全一致，无新增。这部分扩展检查未通过，未添加类型忽略或额外运行时兜底。
 
-SDK 核对：实际环境安装 `xarm-python-sdk 1.18.4`，`xarm/x3/xarm.py` 的 `set_collision_sensitivity()` 无条件等待已有任务，传 `wait=False` 也不绕过；`wait_all_task_finish()` 的成功反馈路径包含 `sleep(0.5)`。这证明重复静态配置包含等待工作，不是实际设备耗时测量。相机标定直接连接仍只读，已到位 HOME 不为首次配置额外进入运动模式。
+使用现有 setuptools 在 `/tmp` 中构建 wheel，80 个 Python 文件与 3 份标定 JSON 均与当前源码逐字节一致。构建不证明可选依赖或设备环境可用；未连接设备，直接 HOME 路径/加速度、实际 100 Hz、运动跟随与物理停止仍未验证。
 
-未执行设备连接、运动、HOME 或实际发送时序测量；直接 HOME 路径/加速度、硬件性能和物理停止仍未验证。后置事项未实施。
-
-日期：2026-11-04。以下保留既有简化取舍，并同步本轮三项修复后的契约；后续工作仍从最新实现继续，不回退到审查快照。
+日期：2026-11-04。以下保留当前有效取舍，后置事项未实施。
 
 本文决定本轮 xArm 改造的目标和取舍，替代历史简化任务书中与本文冲突的 xArm 约定。其他模块以当前源码、最新任务要求及 [XHand 任务书](xhand_simplification_taskbook.md) 为准。历史测试、README 和旧任务书中的“必须”均可随本轮明确改变的行为修订，不能成为保留冗余机制的理由。
 
@@ -91,7 +89,7 @@ SDK 核对：实际环境安装 `xarm-python-sdk 1.18.4`，`xarm/x3/xarm.py` 的
 主要文件：`robot/xarm7/driver.py`、`worker.py`、`process.py` 及运行入口。
 
 - 连接阶段完成 SDK 创建、轴数/控制器错误检查及 Owner 的一次有效状态读取，直接连接保留只读用途。静态碰撞灵敏度和 TCP 负载放在本 SDK 会话首次实际运动准备；完整准备及最终取消检查成功后才记录完成，新连接清零该事实。删除为了连接而执行的完整 HOME_DWELL 停稳流程，以及马上又会被 prepare 撤销的 Mode 1 准备。
-- 进入流式控制时，集中完成停止/清目标、必要使能与 Mode 1 设置、最终 State 0、新鲜实测停稳及初始轨迹状态建立。配置与状态设置按 SDK 所需顺序执行，最后一次影响可运动状态的配置之后才完成 State 0。
+- 进入流式控制时，集中完成停止/清目标、必要使能与 Mode 1 设置、最终 State 0、新鲜实测停稳及初始轨迹状态建立。每次准备都发送 `set_mode(mode)` 并检查应答，后续准备和停稳检查仍须成功；`api.mode` 是异步报告缓存，不能跳过命令或作为 servo 门禁，成功应答也不是实测到位。配置与状态设置按 SDK 所需顺序执行，最后一次影响可运动状态的配置之后才完成 State 0。
 - 只取消对同一个准备阶段的重复证明。writer 初始化后重新取样、模式切换后确认状态、长 IK 之后重查来源年龄，不是可以机械删除的重复。
 - HOME 的到位与普通开始前停稳共用小型等待逻辑；不新增等待策略类。保留总期限、反馈来源时间、位置/速度条件和连续停稳，不将 SDK 返回当作实测完成。
 - `check_sdk_return_code` 使用已知 SDK 合约判断非零码；反馈可直接解包成 q/v，再检查 `(7,)` 和有限值，不维护容器类型白名单。
@@ -131,7 +129,7 @@ SDK 核对：实际环境安装 `xarm-python-sdk 1.18.4`，`xarm/x3/xarm.py` 的
 - 保留当前关节等价角选择和已定义的意图投影；基础设备发送仍拒绝非法命令。明确区分“Mapper 将意图投影成目标”和“设备 API 接受确定目标”，本轮不顺手改变 Policy 越界投影规则或 Raw 动作含义。
 - EEF/VR/jog 继续使用其需要的 IK、FK、workspace 和端点几何检查。`MotionConstraints.rejection()` 有 jog 调用方，不是死代码。几何能力留在这些上层用途，不新建约束插件体系或通用开关矩阵。
 - 无手部 I/O 不等于没有安装手。保留使用组合几何时对固定手姿态的明确约定，EEF/jog 入口用 `validate_home_pose()` 校验所需范围及姿态；hand 禁用时基础 joint 与 arm HOME 不依赖手部范围或 HOME 配置，启用手部时保留设备配置检查。
-- 去掉仅由软件结构造成的“目标发布频率必须小于等于 arm.servo_hz”硬错误，保留正频率及真实设备限制。手部直接发送的频率约束按当前实现保留；默认运行频率不变。文档说明邮箱可覆盖中间目标，提交次数不等于 SDK 执行次数。
+- 去掉仅由软件结构造成的“目标发布频率必须小于等于 arm.servo_hz”硬错误，保留正频率及真实设备限制。jog 周期只发送 arm 目标或 hold，以 `sampling_clock_ns()` 校验自身频率和有效周期；启用手部不限制 100 Hz jog。Teleop、Policy、replay 周期实际发送手部目标，仍限制 83 Hz；默认运行频率和独立 30 Hz 手部反馈不变。预检通过不保证实测频率。邮箱可覆盖中间目标，提交次数不等于 SDK 执行次数。
 
 验收：仅关节控制在未安装可选几何依赖时可以初始化、校验和提交 fake 目标；同一环境的 EEF 功能缺依赖时给出真实错误；joint 路径不再做 EEF workspace/碰撞筛选，README 明确说明失去的能力。
 
@@ -142,7 +140,7 @@ SDK 核对：实际环境安装 `xarm-python-sdk 1.18.4`，`xarm/x3/xarm.py` 的
 - 将 `step()` 计算与内部参考推进收敛到一个清楚的接口，删除公开 `commit(q)` 及“未提交恢复”解释。现有所有未发送分支都会锁存 stop 并丢弃 trajectory，SDK 失败也终止 Owner；不得同时新增跳过失败帧后复用该对象的行为。
 - 保留 `np.clip(q)` 对计算舍入的归一，并使下一步内部位置与返回位置一致。此处简化不扩展外部目标的数值容差，也不删除速度、加速度、jerk 连续性。
 - 保留完整轨迹与制动段的关节位置极值检查。当前固定的 Ruckig 0.17.3 官方极值实现遗漏一类恒加速度段内极值，不能直接用官方 extrema 或下一采样点检查替代。现有这段小型计算比新增边界监督框架更合适。
-- 保留初次轨迹从新鲜实测状态建立、hold 制动以及 SDK 模式/状态检查。不要每周期把规划状态重置成实测位置。
+- 初次轨迹从新鲜实测状态建立：`arm_reference_from_feedback()` 复用严格目标校验，用内部 `1e-6 rad` 反馈舍入容差准入并生成新的、归一到配置边界的规划起点；Policy 初始姿态用同一函数准入但返回原 observation。驱动、共享状态、observation、Raw 的原始反馈和时间戳不变，外部目标仍严格使用原限位；轨迹计算的 `1e-12 rad` 舍入容差保留独立语义。保留 hold 制动和 SDK state 检查；Owner 只在准备成功后建立参考，停止或失败时清除，不增加本地模式状态。不要每周期把规划状态重置成实测位置。
 - `VRController.commit()` 和手部参考时间更新另有控制含义，不能因同名而一起删除。
 
 ### F. 只放宽能低成本放宽的取消

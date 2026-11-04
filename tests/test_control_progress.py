@@ -722,14 +722,33 @@ def test_rollout_releases_completed_recorder_once(monkeypatch):
     assert rollout.recorder is None and rollout.result.raw['path'] == '/published'
 
 
-def test_policy_rejects_initial_arm_posture_outside_operational_limits(monkeypatch):
+@pytest.mark.parametrize('boundary', ['lower', 'upper'])
+@pytest.mark.parametrize('offset', [0, .5e-6, 2e-6, .1, np.nan, np.inf])
+def test_policy_and_trajectory_agree_on_feedback_admission(monkeypatch, boundary, offset):
+    from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
     rollout, _, _ = make_rollout(monkeypatch)
     row, _ = rollout.read_observation()
-    row.arm['qpos'][0, 0] = rollout.runtime.arm.joint_limit_upper[0] + .1
+    cfg = rollout.runtime.arm
+    bound = np.asarray(cfg.joint_limit_lower if boundary == 'lower' else cfg.joint_limit_upper)
+    # offset=0 模拟 SDK float32 传输后转回 float64 的反馈。
+    row.arm['qpos'][0] = (bound.astype(np.float32).astype(np.float64) if offset == 0
+                          else bound + (-offset if boundary == 'lower' else offset))
+    original = row.arm.copy()
     rollout.read_observation = lambda: (row, None)
     rollout.robot.service_feedback = lambda: None
-    with pytest.raises(ValueError, match='operational joint limits'):
-        rollout.start_observation()
+    if offset in (0, .5e-6):
+        assert rollout.start_observation() is row
+        trajectory = ArmTrajectory(cfg, row.arm['qpos'][0], np.zeros(7))
+        np.testing.assert_array_equal(
+            trajectory.input.current_position,
+            np.clip(row.arm['qpos'][0], cfg.joint_limit_lower, cfg.joint_limit_upper),
+        )
+    else:
+        with pytest.raises(ValueError, match='finite|joint limits'):
+            rollout.start_observation()
+        with pytest.raises(ValueError, match='finite|joint limits'):
+            ArmTrajectory(cfg, row.arm['qpos'][0], np.zeros(7))
+    assert row.arm.tobytes() == original.tobytes()  # 原反馈和来源时间戳都保留。
 
 
 @pytest.mark.parametrize('cancelled', [False, True])

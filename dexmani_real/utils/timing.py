@@ -14,7 +14,10 @@ def sampling_clock_ns(control_hz: float) -> int:
     """验证采样频率并返回整数纳秒周期。"""
     if not math.isfinite(control_hz) or control_hz <= 0:
         raise ValueError("control_hz must be finite and positive")
-    dt_ns = round(1e9 / control_hz)
+    period_ns = 1e9 / control_hz
+    if not math.isfinite(period_ns):
+        raise ValueError("control period must be finite")
+    dt_ns = round(period_ns)
     if dt_ns <= 0:
         raise ValueError("control period must be at least one nanosecond")
     return dt_ns

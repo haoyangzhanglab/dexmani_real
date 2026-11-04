@@ -460,6 +460,74 @@ def test_cloud_recipe_can_use_defaults_but_rejects_invalid_values(policy_info):
             resolve_deployment_config(replace(info, **{f'{attribute}_config': {'num_points': 0}}), runtime)
 
 
+@pytest.mark.parametrize('frequency', [100, .001])
+def test_jog_accepts_valid_clock_with_hand_enabled(frequency):
+    from dataclasses import replace
+    import numpy as np
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.runtime.preflight import jog_bounds
+
+    runtime = RealConfig()
+    assert runtime.hand.enabled
+    runtime = replace(runtime, keyboard_teleop=replace(runtime.keyboard_teleop, control_hz=frequency))
+    lower, upper = jog_bounds(runtime)
+    workspace = runtime.environment.workspace.as_array()
+    margin = runtime.keyboard_teleop.workspace_command_margin_m
+    np.testing.assert_array_equal(lower, workspace[:, 0] + margin)
+    np.testing.assert_array_equal(upper, workspace[:, 1] - margin)
+
+
+@pytest.mark.parametrize('frequency', [0, -1, float('nan'), float('inf'), -float('inf'), 3e9, 1e-310])
+def test_jog_rejects_invalid_clock_frequency(frequency):
+    from dataclasses import replace
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.runtime.preflight import jog_bounds
+
+    runtime = RealConfig()
+    runtime = replace(runtime, keyboard_teleop=replace(runtime.keyboard_teleop, control_hz=frequency))
+    with pytest.raises(ValueError, match='control_hz|control period'):
+        jog_bounds(runtime)
+
+
+def test_jog_still_rejects_empty_workspace():
+    from dataclasses import replace
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.runtime.preflight import jog_bounds
+
+    runtime = RealConfig()
+    runtime = replace(runtime, keyboard_teleop=replace(
+        runtime.keyboard_teleop, control_hz=100, workspace_command_margin_m=1,
+    ))
+    with pytest.raises(ValueError, match='no interior workspace'):
+        jog_bounds(runtime)
+
+
+@pytest.mark.parametrize('frequency,hand_enabled,message', [
+    (100, True, '83 Hz'), (3e9, False, 'control period'), (1e-310, False, 'control period'),
+])
+def test_teleop_rejects_invalid_target_rate_before_startup(monkeypatch, frequency, hand_enabled, message):
+    from dataclasses import replace
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.teleop import run
+
+    runtime = RealConfig()
+    runtime = replace(runtime, teleop=replace(runtime.teleop, control_hz=frequency),
+                      hand=replace(runtime.hand, enabled=hand_enabled))
+    monkeypatch.setattr(run, 'configure_logging', lambda: None)
+    with pytest.raises(ValueError, match=message):
+        run.run_teleop(runtime, record=False, episodes_dir='', max_duration_s=0,
+                       runtime_config_json=None)
+
+
+def test_policy_still_rejects_hand_targets_above_83_hz(policy_info):
+    from dataclasses import replace
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.deployment.preflight import resolve_deployment_config
+
+    with pytest.raises(ValueError, match='83 Hz'):
+        resolve_deployment_config(replace(policy_info, control_dt_s=.01), RealConfig())
+
+
 def test_busy_admission_and_cancellation_preserve_operator_intent():
     state = SessionState()
     keyboard = Keyboard(bindings={'s': state.request_stop})

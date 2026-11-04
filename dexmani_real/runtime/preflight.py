@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dexmani_real.robot.system import FEEDBACK_PERIOD_NS
+from dexmani_real.utils.timing import sampling_clock_ns
 
 if TYPE_CHECKING:
     from dexmani_real.config.real import RealConfig
@@ -21,8 +22,7 @@ def validate_robot_config(cfg: RealConfig) -> None:
 
 
 def validate_control_rate(cfg: RealConfig, control_hz: float) -> None:
-    if not np.isfinite(control_hz) or control_hz <= 0:
-        raise ValueError("target frequency must be finite and positive")
+    sampling_clock_ns(control_hz)
     if cfg.hand.enabled and control_hz > 83:
         raise ValueError("XHand targets exceed the documented 83 Hz upper bound")
 
@@ -30,7 +30,7 @@ def validate_control_rate(cfg: RealConfig, control_hz: float) -> None:
 def jog_bounds(runtime: RealConfig) -> tuple[np.ndarray, np.ndarray]:
     cfg = runtime.keyboard_teleop
     cfg.validate()
-    validate_control_rate(runtime, cfg.control_hz)
+    sampling_clock_ns(cfg.control_hz)
     workspace = runtime.environment.workspace.as_array()
     margin = cfg.workspace_command_margin_m
     lower, upper = workspace[:, 0] + margin, workspace[:, 1] - margin
