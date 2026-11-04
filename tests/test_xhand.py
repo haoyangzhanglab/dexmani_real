@@ -3,7 +3,7 @@
 import json
 import sys
 from dataclasses import asdict, replace
-from itertools import repeat
+from itertools import chain, repeat
 from types import SimpleNamespace
 
 import numpy as np
@@ -205,6 +205,80 @@ def test_stop_keeps_old_freshness_and_finite_crc_budget(clock):
     assert 1 <= len(hand.control.sent) <= 26
     assert all(mode == 0 for row in hand.control.sent for mode, _ in row)
     assert clock[0] == 1_250_000_000
+
+
+@pytest.mark.parametrize('feedback', ['healthy', 'crc', 'device_fault'])
+@pytest.mark.parametrize('idle_delay_s', [0, .2])
+def test_arm_home_services_hand_feedback_until_idle_stop(clock, feedback, idle_delay_s):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.robot.commands import RobotCommand, RobotError
+    from dexmani_real.robot.system import Robot
+    from dexmani_real.runtime.home import home_arm
+    from dexmani_real.runtime.state import SessionState
+
+    config, state = RealConfig(), SessionState()
+    # 独立 arm HOME 不消费手部 HOME 配置，也不等待触觉初值。
+    hand_config = replace(config.hand, home_qpos_deg=(float('nan'),) * 12)
+    robot = Robot(config.arm, hand_config, runtime_state=state)
+    hand = make_hand(writes=repeat(0), reads=[(COMBINED_FORCE_UNAVAILABLE_CODE, payload())])
+    robot.hand, robot.connected = hand, True
+    robot.read_hand()
+    initial_stamp = int(robot.hand_feedback.snapshot()['timestamp_ns'][0])
+    robot.send_action(RobotCommand(hand_qpos=target(.3)), expires_ns=clock[0] + 1_000_000_000)
+    assert robot.hand_stop_required and len(hand.control.sent) == 1
+    # 失败前仍提供新反馈，确保设备错误发生时的停止样本尚新鲜。
+    read_code = {'healthy': COMBINED_FORCE_UNAVAILABLE_CODE, 'crc': CRC, 'device_fault': 999}[feedback]
+    hand.control.reads = chain([(COMBINED_FORCE_UNAVAILABLE_CODE, payload(qpos=.4))],
+                               repeat((read_code, payload(qpos=.4))))
+    started_ns = clock[0]
+    confirmations = []
+
+    def arm_home(epoch, *, service, abort, deadline_ns):
+        assert epoch == state.cancel_epoch and deadline_ns > started_ns + 2_000_000_000
+        # 模拟父端等待 Owner 的轮询；期间只允许手部反馈读取。
+        while clock[0] < started_ns + 2_000_000_000:
+            service()
+            assert not abort()
+            assert robot.hand_stop_required and len(hand.control.sent) == 1
+            clock[0] += 5_000_000
+        state.stop_signal.set()
+
+    robot.arm = SimpleNamespace(home=arm_home, check_error=lambda: None,
+                                wait_stopped=lambda: confirmations.append(True))
+    run = lambda: home_arm(state, robot, cancel_epoch=state.cancel_epoch, cancel_requested=lambda: False)
+    if feedback == 'healthy':
+        run()
+        assert clock[0] == started_ns + 2_000_000_000
+        assert len(hand.control.read_args) > 50
+    elif feedback == 'crc':
+        with pytest.raises(RobotError, match='feedback unavailable/stale'):
+            run()
+    else:
+        with pytest.raises(XHandError, match='999'):
+            run()
+    assert state.stop_signal.is_set() and robot.hand_stop_required
+    assert len(hand.control.sent) == 1
+    final_frame = robot.hand_feedback.snapshot()
+    final_stamp = int(final_frame['timestamp_ns'][0])
+    if feedback == 'healthy':
+        assert final_stamp > initial_stamp
+        assert clock[0] - final_stamp < 40_000_000
+    else:
+        # 读 CRC 和设备错误均不能给最后一份可信样本续期。
+        assert final_stamp == initial_stamp == started_ns
+    assert np.isnan(final_frame['tactile_aggregate']).all()
+    assert np.isnan(final_frame['tactile_dense']).all()
+    clock[0] += round(idle_delay_s * 1e9)
+    # 收尾后的反馈正常，不能用这份晚到反馈反过来为停止续期。
+    hand.control.reads = repeat((COMBINED_FORCE_UNAVAILABLE_CODE, payload(qpos=.4)))
+    robot.service_idle()
+    assert confirmations == [True]
+    assert not robot.hand_stop_required and len(hand.control.sent) == 2
+    stop_command = hand.control.sent[-1]
+    expected_mode = 0 if feedback == 'crc' or idle_delay_s else 3
+    assert all(mode == expected_mode for mode, _ in stop_command)
+    if expected_mode == 3:
+        np.testing.assert_array_equal([qpos for _, qpos in stop_command], target(.4))
 
 
 def test_crc_does_not_refresh_any_source_and_channels_hold_independently(clock):

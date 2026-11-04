@@ -131,6 +131,7 @@ class HandConfig:
             raise ValueError("hand command limits exceed the rated device envelope")
 
     def validate_home_pose(self) -> None:
+        self.validate_limits()
         validate_hand_target(np.deg2rad(self.home_qpos_deg), self.qpos_min_rad, self.qpos_max_rad)
 
     def validate_home(self) -> None:

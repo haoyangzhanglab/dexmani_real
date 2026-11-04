@@ -58,7 +58,7 @@
 
 录制队列满后冻结有效前缀、finish 唤醒 writer 的行为已经用真实线程验证：队列容量 16，加上正在写的 1 行，保留 17 行后正常关闭发布。本轮删计数时必须保留这一行为。
 
-`HomePlanner.table_plane_abcd` 有真实消费者：Policy 将实际使用的桌面标定归档至运行配置。保留该成员；不要依据早期“看起来未使用”的判断删除。
+桌面平面仍由点云处理使用，Policy 归档实际使用的平面系数与路径；保留这些消费者，不再通过 HOME planner 持有标定。
 
 仓库旧实施记录写有 79 项测试通过；审查环境缺少 pytest、h5py、zarr、av 等完整依赖，未独立重跑该套件。本文不把历史测试数量当成本轮通过证明。
 
@@ -151,7 +151,7 @@
 - [x] 一次连接和公共 streaming prepare 后读取当前 arm/hand 新鲜反馈，只与**第一行目标**比较。沿用一个粗阈值：任一关节绝对差大于 10° 则报错并关闭，提示实验者先就位；不自动规划到第一帧。
 - [x] 删除 `prepare_hand`、历史实测起点、手部 ramp、三帧到位、arm 漂移重复检查及 `--hand-start-duration`。开始播放时的第一行目标就是第一条 demo 目标。
 - [x] 直接 `RobotCommand(arm_targets[i], hand_targets[i])` → `robot.send_action(..., expires_ns=now + COMMAND_LEASE_NS)`。不调用 replay 的 `ActionMapper`、IK、`MotionConstraints`、`project_*` 或 `wrap_nearest_equivalent`。公共设备校验和 arm Ruckig 执行仍在。
-- [x] **删除 replay 在线几何/碰撞预检是本方案的明确取舍。** replay 不需要 Pinocchio、hpp-fcl、碰撞 mesh、桌面标定或 HOME planner 才能加载/播放关节目标；不把任意新场景、任意人工轨迹宣称为已验证可执行。teleop / policy / HOME 的几何检查保持。
+- [x] **删除 replay 在线几何/碰撞预检是本方案的明确取舍。** replay 不需要 Pinocchio、hpp-fcl、碰撞 mesh、桌面标定或 HOME planner 才能加载/播放关节目标；不把任意新场景、任意人工轨迹宣称为已验证可执行。实际使用 EEF/jog 的入口保留所需几何检查；基础 arm HOME 不依赖几何。
 - [x] 每一行开始时记 `iteration_start`，服务反馈和用户终止，提交该行；只等待 `max(0, period - elapsed)`。下一行从新的实际时刻开始；无绝对原点、slot deadline、累计 lateness、missed slot、补发或丢行策略。
 - [x] 等待沿用短周期服务：继续检查设备/键盘健康并采集所需手反馈，不用一整段不可中断 sleep。公共 owner 负责 arm 反馈；replay 只保留起点快照，不逐行读取整份状态或重复判断反馈 TTL、旧目标期限。
 - [x] 成功提交后才增加显示用的 `sent_count`。公共 arm 邮箱仍是 latest-value；有序提交不等于每行都获得 SDK 回执或物理到位，不为 replay 改成 FIFO/ack 协议。
@@ -290,7 +290,7 @@
 
 ### 源码依据与局部调整
 
-- `ArmController.operation → wait_settled` 和 `tick` 实际使用 `homing.convergence_rad/velocity_convergence_rad_s`。这些名称下的停稳阈值仍属于公共 streaming 设备保障，保留校验。仅 HOME 使用的目标、超时和速度校验移到 HOME 使用边界；Policy 起点检查仍提前验证其 HOME 配置。
+- `ArmController.operation → wait_settled` 和 `tick` 实际使用 `homing.convergence_rad/velocity_convergence_rad_s`。这些名称下的停稳阈值仍属于公共 streaming 设备保障，保留校验。仅 HOME 使用的目标、超时和速度校验移到 HOME 使用边界。
 - `Robot.validate_command` 的 hand 上下界来自额定硬件常量；reader 另外整段检查当前配置范围，没有删去该保障，也没有改变公共命令接口或裁剪文件目标。
 - `XHandFeedback.snapshot` 直接返回只读缓存。冻结后的减法集中在观测字段选择，不新增触觉缓存状态、动态 worker 重启或按字段资源管理。
 - 保留独立的短 trajectory reader 和现有 runner，删除无职责的 joint_replay。reader 和 fake 播放不要求 Pinocchio/hpp-fcl/视频依赖。

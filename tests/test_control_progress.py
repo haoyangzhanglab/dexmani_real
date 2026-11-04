@@ -955,7 +955,14 @@ def test_tactile_reset_clears_only_tactile_before_driver_requests(monkeypatch):
         assert np.isnan(frame[f'tactile_{channel}']).all()
 
 
-def test_joint_mapper_needs_no_geometry(monkeypatch):
+@pytest.mark.parametrize('hand_limits', [
+    {'qpos_min_rad': (float('nan'),) * 12},
+    {'qpos_min_rad': (0.0,), 'qpos_max_rad': (1.0,)},
+    {'qpos_min_rad': (10.0,) * 12},
+    {'qpos_min_rad': (-10.0,) * 12},
+    {'qpos_min_rad': ('unused',) * 12},
+])
+def test_joint_mapper_needs_no_geometry_or_disabled_hand_limits(monkeypatch, hand_limits):
     import builtins
     from dexmani_real.control.actions import ActionMapper
     from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
@@ -966,7 +973,7 @@ def test_joint_mapper_needs_no_geometry(monkeypatch):
         return original(name, *args, **kwargs)
     monkeypatch.setattr(builtins, '__import__', guarded)
     cfg = RealConfig()
-    hand = replace(cfg.hand, enabled=False, home_qpos_deg=(float('nan'),)*12)
+    hand = replace(cfg.hand, enabled=False, home_qpos_deg=(float('nan'),)*12, **hand_limits)
     environment = replace(cfg.environment, workspace=replace(cfg.environment.workspace, x_min=10))
     runtime = replace(cfg, hand=hand, environment=environment)
     validate_robot_config(runtime)
@@ -977,12 +984,55 @@ def test_joint_mapper_needs_no_geometry(monkeypatch):
     np.testing.assert_allclose(result.arm_qpos, cfg.arm.home_qpos)
     from dexmani_real.robot.system import Robot
     from dexmani_real.robot.commands import RobotCommand
+    from dexmani_real.runtime.home import home_arm
     submitted = []
+    homed = []
+    def arm_home(*args, service, **kwargs):
+        service()
+        homed.append((args, kwargs))
     robot = Robot(cfg.arm, hand, runtime_state=SessionState())
     robot.connected = True
     robot.arm = SimpleNamespace(is_connected=True, check_error=lambda: None,
-                                submit=lambda cmd, **kw: submitted.append(cmd))
+                                submit=lambda cmd, **kw: submitted.append(cmd),
+                                home=arm_home)
     robot.send_action(RobotCommand(arm_qpos=result.arm_qpos), expires_ns=2_000_000_000)
     assert len(submitted) == 1
+    home_arm(robot.runtime_state, robot, cancel_epoch=robot.runtime_state.cancel_epoch,
+             cancel_requested=lambda: False)
+    assert len(homed) == 1
     with pytest.raises(ModuleNotFoundError):
         ActionMapper.for_mode('eef', arm=cfg.arm, hand=cfg.hand, motion=cfg.motion, environment=cfg.environment)
+
+
+@pytest.mark.parametrize('hand_changes, error', [
+    ({'qpos_min_rad': (float('nan'),) * 12}, 'hand command limits'),
+    ({'qpos_min_rad': (0.0,), 'qpos_max_rad': (1.0,)}, 'hand command limits'),
+    ({'qpos_min_rad': (10.0,) * 12}, 'hand command limits'),
+    ({'qpos_min_rad': (-10.0,) * 12}, 'hand command limits'),
+    ({'home_qpos_deg': (float('nan'),) * 12}, 'hand target must be finite'),
+    ({'home_qpos_deg': (0.0,)}, 'hand target must have shape'),
+    ({'home_qpos_deg': (180.0,) * 12}, 'hand target violates joint limits'),
+])
+def test_disabled_hand_geometry_requires_valid_limits_and_fixed_pose(monkeypatch, hand_changes, error):
+    from dexmani_real.control.actions import ActionMapper
+    from dexmani_real.runtime.preflight import validate_robot_config
+    from dexmani_real.teleop.keyboard import KeyboardTeleop
+
+    cfg = RealConfig()
+    runtime = replace(cfg, hand=replace(cfg.hand, enabled=False, **hand_changes))
+    validate_robot_config(runtime)
+    with pytest.raises(ValueError, match=error):
+        ActionMapper.for_mode('eef', arm=runtime.arm, hand=runtime.hand,
+                              motion=runtime.motion, environment=runtime.environment)
+    monkeypatch.setattr('dexmani_real.teleop.keyboard.configure_logging', lambda: None)
+    with pytest.raises(ValueError, match=error):
+        KeyboardTeleop(runtime).run()
+
+
+def test_enabled_hand_still_validates_device_limits():
+    from dexmani_real.runtime.preflight import validate_robot_config
+
+    cfg = RealConfig()
+    runtime = replace(cfg, hand=replace(cfg.hand, qpos_min_rad=(float('nan'),) * 12))
+    with pytest.raises(ValueError, match='hand command limits'):
+        validate_robot_config(runtime)

@@ -1,5 +1,6 @@
 """机械臂轨迹、停止复用与异常退出的离线回归；SDK 操作使用 fake driver。"""
 import multiprocessing as mp
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -632,29 +633,127 @@ def test_owner_cleanup_preserves_first_error_and_logs_later_failures(startup_fai
     assert 'EOFError' not in io.fault.value.decode()
 
 
-@pytest.mark.parametrize('mode', [0, 1])
-def test_motion_configuration_finishes_with_state_zero(mode):
+@pytest.fixture
+def motion_driver():
     from dataclasses import replace
     from dexmani_real.robot.xarm7.driver import XArm7
     cfg = ArmConfig()
     cfg = replace(cfg, homing=replace(cfg.homing, max_acceleration_deg_per_s2=300))
     events = []
+    driver = XArm7(cfg)
     def call(name):
         def record(*args, **kwargs):
             events.append((name, args, kwargs))
+            if name == 'set_mode':
+                driver.api.mode = args[0]
+            if name == 'set_state':
+                driver.api.state = args[0]
             return 0
         return record
-    driver = XArm7(cfg)
-    driver.api = SimpleNamespace(mode=1, get_err_warn_code=lambda: (0, [0, 0]),
+    driver.api = SimpleNamespace(axis=7, mode=0, state=4,
+        get_err_warn_code=lambda: (0, [0, 0]),
         **{name: call(name) for name in ('motion_enable', 'set_mode', 'set_state',
-           'set_joint_maxacc', 'set_collision_sensitivity', 'set_tcp_load', 'set_servo_angle')})
+           'set_joint_maxacc', 'set_collision_sensitivity', 'set_tcp_load', 'set_servo_angle',
+           'set_timeout', 'disconnect')})
+    return driver, events
+
+
+@pytest.mark.parametrize('mode', [0, 1])
+def test_motion_configuration_finishes_with_state_zero(motion_driver, mode):
+    driver, events = motion_driver
+    cfg = driver.cfg
     driver.prepare_motion(mode, check_abort=lambda: None)
+    names = [name for name, args, kw in events]
+    assert names == (['motion_enable'] + (['set_mode'] if mode == 1 else [])
+                     + ['set_state', 'set_collision_sensitivity', 'set_tcp_load',
+                        'set_joint_maxacc', 'set_state'])
     assert events[-1] == ('set_state', (0,), {})
+    assert next(args for name, args, kw in events if name == 'set_collision_sensitivity') == (
+        cfg.collision_sensitivity,)
+    assert next(kw for name, args, kw in events if name == 'set_tcp_load') == {
+        'weight': cfg.tcp_load_mass_kg, 'center_of_gravity': list(cfg.tcp_load_cog_mm),
+    }
     acceleration = next(args[0] for name, args, kw in events if name == 'set_joint_maxacc')
     assert acceleration == (cfg.homing.max_acceleration_rad_per_s2 if mode == 0
                             else cfg.max_joint_acceleration_rad_per_s2)
     driver.move_home(np.asarray(cfg.home_qpos))
     assert events[-1][2]['mvacc'] == cfg.homing.max_acceleration_rad_per_s2
+
+
+def test_repeated_motion_preparation_reuses_static_config_and_applies_mode_acceleration(motion_driver):
+    driver, events = motion_driver
+    modes = [1, 1, 0, 0, 1]
+    for mode in modes:
+        driver.prepare_motion(mode, check_abort=lambda: None)
+        assert events[-1] == ('set_state', (0,), {})
+    names = [name for name, args, kw in events]
+    assert names.count('set_collision_sensitivity') == names.count('set_tcp_load') == 1
+    assert names.count('motion_enable') == len(modes)
+    assert [args[0] for name, args, kw in events if name == 'set_mode'] == [1, 0, 1]
+    assert [args[0] for name, args, kw in events if name == 'set_joint_maxacc'] == [
+        driver.cfg.homing.max_acceleration_rad_per_s2 if mode == 0
+        else driver.cfg.max_joint_acceleration_rad_per_s2 for mode in modes
+    ]
+
+
+def test_connect_is_read_only_and_new_session_requires_motion_configuration(motion_driver, monkeypatch):
+    driver, events = motion_driver
+    first_api = driver.api
+    api_args = []
+    def create_api(*args, **kwargs):
+        api_args.append((args, kwargs))
+        # 每次连接都返回不同的 SDK 对象，记录器仍写入同一份测试事件。
+        return SimpleNamespace(**vars(first_api))
+    monkeypatch.setitem(sys.modules, 'xarm.wrapper', SimpleNamespace(XArmAPI=create_api))
+    for _ in range(2):
+        driver.connect(check_abort=lambda: None)
+        assert driver.api is not first_api
+        assert events == [('set_timeout', (1.0,), {})]
+        driver.prepare_motion(1, check_abort=lambda: None)
+        names = [name for name, args, kw in events]
+        assert names.count('set_collision_sensitivity') == names.count('set_tcp_load') == 1
+        driver.close()
+        assert driver.api is None
+        events.clear()
+    assert len(api_args) == 2
+    assert all(args == (driver.cfg.ip,) and kwargs == {'is_radian': True, 'report_type': 'real'}
+               for args, kwargs in api_args)
+
+
+@pytest.mark.parametrize('interruption', ['sdk_error', 'cancel'])
+@pytest.mark.parametrize('stage', [
+    'set_collision_sensitivity', 'set_tcp_load', 'set_joint_maxacc', 'final_state',
+])
+def test_incomplete_first_motion_preparation_does_not_cache_configuration(
+    motion_driver, monkeypatch, interruption, stage,
+):
+    driver, events = motion_driver
+    cancelled = False
+    method = 'set_state' if stage == 'final_state' else stage
+    original = getattr(driver.api, method)
+    def interrupt(*args, **kwargs):
+        nonlocal cancelled
+        code = original(*args, **kwargs)
+        if stage == 'final_state' and sum(name == 'set_state' for name, _, _ in events) != 2:
+            return code
+        if interruption == 'sdk_error':
+            return -7
+        cancelled = True
+        return code
+    def check_abort():
+        if cancelled:
+            raise OperationCancelled('test cancelled')
+    monkeypatch.setattr(driver.api, method, interrupt)
+    with pytest.raises(RuntimeError if interruption == 'sdk_error' else OperationCancelled,
+                       match='SDK code -7' if interruption == 'sdk_error' else 'test cancelled'):
+        driver.prepare_motion(1, check_abort=check_abort)
+    monkeypatch.setattr(driver.api, method, original)
+    cancelled = False
+    events.clear()
+    driver.prepare_motion(1, check_abort=check_abort)
+    names = [name for name, args, kw in events]
+    assert names.count('set_collision_sensitivity') == names.count('set_tcp_load') == 1
+    assert events[-1] == ('set_state', (0,), {})
 
 
 def test_cancel_before_submission_does_not_hide_unconfirmed_stop():

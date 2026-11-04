@@ -253,7 +253,7 @@ class Robot:
         cast("ArmProcess", self.arm).home(
             cancel_epoch,
             abort=abort_check,
-            service=self.check,
+            service=self.service_feedback,
             deadline_ns=deadline_ns,
         )
         if abort_check():

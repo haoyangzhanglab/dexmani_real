@@ -1,20 +1,22 @@
 # xArm 轻量化改造任务书
 
-状态：四批必做改造及调用链清理已实施，离线回归通过；类型检查仍有下述既有诊断，尚未进行真机验收。
+状态：三项修复及上下游清理已实施，完整离线回归通过，尚未进行真机验收。
 
-实施基线：`main@52bc7878`，初始工作区干净。删除 Owner 双错误通道、重复停止/连接准备、公开轨迹 commit、HOME 路径协议与专属几何；joint 映射独立于几何系统。无在途健康取消允许回待命，在途不明仍结束设备会话。
+本轮基线：`main@bbbbe8965c2f0a7b5894ab3ecf824fc47dbff7ac`，已核对 GitHub 最新 main，初始工作区干净。保留已有单 Owner、latest-wins 邮箱、短锁、取消计数、停止确认、故障传播及 Ruckig 动态/极值约束。
 
-实际调用链差异：相机标定直接使用 `XArm7.connect()`，因此连接保留只读用途，运动参数集中于运动准备；独立 arm HOME 不调用会写手部的 `Robot.stop()`。H/R 在运行入口显式先 hand、后 arm。XHand 驱动、首帧重定向及数据格式未修改。
+本轮修复：独立 arm HOME 等待复用 `service_feedback()`，持续读取已连接手部的真实反馈与故障，不写手部目标、不等待触觉或手部 HOME 姿态，保留 `hand_stop_required`；idle 收尾仍按原 TTL 决定 hold/passive。同一 SDK 会话仅在首次完整运动准备且取消检查通过后记录静态配置完成，后续省略碰撞灵敏度和 TCP 负载的重复写入；每次仍设置对应模式加速度及最终 State 0。hand 禁用时删除公共范围预检及 Mapper 的未用范围转换；EEF/jog 固定姿态入口通过 `validate_home_pose()` 统一校验范围和姿态。
 
-离线验证使用现有 `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`：`PYTHONDONTWRITEBYTECODE=1 ... -m pytest -p no:cacheprovider tests -q`，713 项通过；`... -B -m ruff check --no-cache --select F dexmani_real scripts tests` 与 `git diff --check` 通过。包含真实 Ruckig 极值、Fake SDK 停止与错误、受控时钟 HOME、joint 缺几何依赖，以及 XHand、录制导出、replay 和标定回归。
+清理结果：首次静态配置原地收敛到 `prepare_motion()`，删除无独立消费者的 `apply_config()`；Mapper 在同一 EEF 分支内构造 solver 和固定姿态，公共预检合并重复 hand 开关判断。清除测试中的旧 HOME 规划注释、未用样本收集及重复断言，反馈替身不再依赖任意固定帧数。已核对 Teleop、jog、Policy、replay 和只读标定调用方；相关生产链未发现 SHA-256、旧格式 reader 或迁移分支。
 
-调用链清理：整机重复停止标记收敛为 `hand_stop_required`，arm 停止结果以 Owner 为准；独立 arm HOME 不清除已有手部停止责任。首个流式目标使用当时新鲜反馈建立参考，并拒绝仍在运动的起点，后续周期不重置轨迹。Mapper 必须取得关节限位，EEF 约束只由 solver 持有；删除桌面接触豁免残留及重复环境校验，取消只保留局部在途事实。
+验证使用现有 `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`，设置 `PYTHONDONTWRITEBYTECODE=1`：`-m pytest -p no:cacheprovider tests -q`，741 项通过。包含真实 Ruckig 0.17.3、受控时钟 2 秒 arm HOME 后真实 XHand 停止分支、反馈过期/CRC/设备错误、SDK 配置失败/取消及新会话重配。Ruff `--no-cache --select F dexmani_real scripts tests` 与 `git diff --check` 通过。
 
-补充验证：Mypy 对 18 个核心模块使用 `--check-untyped-defs --no-incremental --cache-dir=/dev/null --follow-imports=silent --ignore-missing-imports`，无诊断。PolicySession 扩展检查仍有 28 项可空资源诊断；在 `/tmp` 以 HEAD 完整源码检查有 30 项，逐条按源码及诊断内容对照无新增，未增加 ignore 或运行时兜底。使用现有 setuptools 在 `/tmp` 构建 wheel 成功，80 个 Python 模块逐个与源码一致，3 份标定 JSON 齐全，已删除的 HOME planner 不在产物中。构建不证明可选依赖、仓库机器人资产或真机运行环境可用。
+Mypy 使用 `--check-untyped-defs --no-incremental --cache-dir=/dev/null --follow-imports=silent --ignore-missing-imports`：19 个核心模块无诊断；扩展 14 个调用方与脚本时，`PolicySession` 仍有 28 项可空资源诊断，与 HEAD 按文件、源码行和错误内容逐条对照，无新增。未新增类型忽略、额外运行时检查或兜底掩盖既有诊断。使用现有 setuptools 在 `/tmp` 构建 wheel 成功，80 个 Python 文件和 3 份标定 JSON 与当前源码逐个一致；构建不证明可选依赖或设备运行环境可用。
+
+SDK 核对：实际环境安装 `xarm-python-sdk 1.18.4`，`xarm/x3/xarm.py` 的 `set_collision_sensitivity()` 无条件等待已有任务，传 `wait=False` 也不绕过；`wait_all_task_finish()` 的成功反馈路径包含 `sleep(0.5)`。这证明重复静态配置包含等待工作，不是实际设备耗时测量。相机标定直接连接仍只读，已到位 HOME 不为首次配置额外进入运动模式。
 
 未执行设备连接、运动、HOME 或实际发送时序测量；直接 HOME 路径/加速度、硬件性能和物理停止仍未验证。后置事项未实施。
 
-日期：2026-11-04。两轮审查基于 `c4ded28b1078adefbd017f4c546b6a132a91d29b`；本任务书已对照最新 `main@88b8f2a11f0765335c4da46b69e33952706fe8fd` 修订。实施时从最新工作区继续，先核对变化，不回退到审查快照。
+日期：2026-11-04。以下保留既有简化取舍，并同步本轮三项修复后的契约；后续工作仍从最新实现继续，不回退到审查快照。
 
 本文决定本轮 xArm 改造的目标和取舍，替代历史简化任务书中与本文冲突的 xArm 约定。其他模块以当前源码、最新任务要求及 [XHand 任务书](xhand_simplification_taskbook.md) 为准。历史测试、README 和旧任务书中的“必须”均可随本轮明确改变的行为修订，不能成为保留冗余机制的理由。
 
@@ -44,7 +46,7 @@
 | `reply_pending` | 删除 | 当前只有一个父控制流程顺序调用；在途异常仍关闭 Owner，下一次请求已被 closing 拦截 |
 | 失败退出时 `ready.set()` | 删除 | ready 只表示连接初始化成功；失败由既有 fault、进程状态及取消检查发现 |
 | `Robot.stop()` 重复 `arm.request_stop()` | 删除重复调用及其异常编排 | 函数开头已经设置同一个共享停止 Event |
-| 连接时完整停稳并进入 Mode 1，prepare 再重复 | 合并到唯一运动准备入口 | 连接可完成参数配置和状态读取；运动前仍确认新鲜实测停稳 |
+| 连接时完整停稳并进入 Mode 1，prepare 再重复 | 合并到唯一运动准备入口 | 连接只读；静态参数仅在本 SDK 会话首次运动准备中配置，运动前仍确认新鲜实测停稳 |
 | arm HOME 的 planner、桌面间隙和任务 workspace 门禁 | 从基础回位链彻底移除 | 改为操作者确认空间后的直接关节回位，失去原离散几何预检 |
 | HOME 的空路径/两端点数组、`strict=True` | 删除 | 一个 HOME 请求和一个有界到位判断；已经到位时可省略移动调用 |
 | arm HOME 强制先 hand HOME | 解除底层耦合 | 整机回位可由运行入口显式组合，独立 arm HOME 不改变手姿态 |
@@ -88,7 +90,7 @@
 
 主要文件：`robot/xarm7/driver.py`、`worker.py`、`process.py` 及运行入口。
 
-- 连接阶段完成 SDK 创建、轴数/控制器错误检查、必要参数配置和一次有效状态读取。删除为了连接而执行的完整 HOME_DWELL 停稳流程，以及马上又会被 prepare 撤销的 Mode 1 准备。
+- 连接阶段完成 SDK 创建、轴数/控制器错误检查及 Owner 的一次有效状态读取，直接连接保留只读用途。静态碰撞灵敏度和 TCP 负载放在本 SDK 会话首次实际运动准备；完整准备及最终取消检查成功后才记录完成，新连接清零该事实。删除为了连接而执行的完整 HOME_DWELL 停稳流程，以及马上又会被 prepare 撤销的 Mode 1 准备。
 - 进入流式控制时，集中完成停止/清目标、必要使能与 Mode 1 设置、最终 State 0、新鲜实测停稳及初始轨迹状态建立。配置与状态设置按 SDK 所需顺序执行，最后一次影响可运动状态的配置之后才完成 State 0。
 - 只取消对同一个准备阶段的重复证明。writer 初始化后重新取样、模式切换后确认状态、长 IK 之后重查来源年龄，不是可以机械删除的重复。
 - HOME 的到位与普通开始前停稳共用小型等待逻辑；不新增等待策略类。保留总期限、反馈来源时间、位置/速度条件和连续停稳，不将 SDK 返回当作实测完成。
@@ -113,7 +115,7 @@
 
 这是主动改变默认回位契约：操作者负责确认直接回位空间；不提供自动绕障或碰撞保证。不要保留 strict/relaxed 两套 HOME，不要在预检失败后静默换成直线回位，也不新增每次 HOME 的软件确认弹窗。
 
-`home_arm()` 和 `home_hand()` 独立可调用。现有 H/R 若继续表示整机回位，在对应运行入口明确按实验既有顺序调用手部和机械臂函数，并在帮助中说明；持物回机械臂应调用 arm HOME，不能隐式改变手姿态。无需新增快捷键或工具脚本来完成这次解耦。
+`home_arm()` 和 `home_hand()` 独立可调用。arm HOME 等待期间复用现有 `service_feedback()` 服务已连接手部的真实反馈与故障，不写手部目标、不等待触觉初值；hand 禁用时不产生手部 I/O。保留已有手部停止责任，不通过改时间戳、TTL 或 hold/passive/CRC 规则维持抓持。现有 H/R 若继续表示整机回位，在对应运行入口明确按实验既有顺序调用手部和机械臂函数，并在帮助中说明；持物回机械臂应调用 arm HOME，不能隐式改变手姿态。无需新增快捷键或工具脚本来完成这次解耦。
 
 按引用清理仅服务 HOME 的桌面碰撞盒、软间隙和距离计算代码。`table_plane_path`、平面系数及其加载/归档若仍被点云处理使用，必须保留；不要连带删除共享标定能力。XHand 已实现的显式 HOME、有限 CRC 补发和到位判断按最新实现保留。
 
@@ -128,7 +130,7 @@
 - `ActionMapper.for_mode("joint")` 不创建 `MotionConstraints`/`CollisionModel`，不加载 URDF、mesh、Pinocchio 或 hppfcl。关节范围直接来自 ArmConfig；joint 模式不要求有效的 EEF workspace 或静态碰撞场景配置。
 - 保留当前关节等价角选择和已定义的意图投影；基础设备发送仍拒绝非法命令。明确区分“Mapper 将意图投影成目标”和“设备 API 接受确定目标”，本轮不顺手改变 Policy 越界投影规则或 Raw 动作含义。
 - EEF/VR/jog 继续使用其需要的 IK、FK、workspace 和端点几何检查。`MotionConstraints.rejection()` 有 jog 调用方，不是死代码。几何能力留在这些上层用途，不新建约束插件体系或通用开关矩阵。
-- 无手部 I/O 不等于没有安装手。保留使用组合几何时对固定手姿态的明确约定；基础 joint 与 arm HOME 不再因此需要手部 HOME 配置验证。
+- 无手部 I/O 不等于没有安装手。保留使用组合几何时对固定手姿态的明确约定，EEF/jog 入口用 `validate_home_pose()` 校验所需范围及姿态；hand 禁用时基础 joint 与 arm HOME 不依赖手部范围或 HOME 配置，启用手部时保留设备配置检查。
 - 去掉仅由软件结构造成的“目标发布频率必须小于等于 arm.servo_hz”硬错误，保留正频率及真实设备限制。手部直接发送的频率约束按当前实现保留；默认运行频率不变。文档说明邮箱可覆盖中间目标，提交次数不等于 SDK 执行次数。
 
 验收：仅关节控制在未安装可选几何依赖时可以初始化、校验和提交 fake 目标；同一环境的 EEF 功能缺依赖时给出真实错误；joint 路径不再做 EEF workspace/碰撞筛选，README 明确说明失去的能力。
@@ -219,7 +221,7 @@
 
 ## 8. 审查依据
 
-- [当前适配基线 88b8f2a](https://github.com/haoyangzhanglab/dexmani_real/tree/88b8f2a11f0765335c4da46b69e33952706fe8fd)；[两轮审查基线 c4ded28](https://github.com/haoyangzhanglab/dexmani_real/tree/c4ded28b1078adefbd017f4c546b6a132a91d29b)。
+- [本轮修复基线 bbbbe896](https://github.com/haoyangzhanglab/dexmani_real/tree/bbbbe8965c2f0a7b5894ab3ecf824fc47dbff7ac)；[两轮历史审查基线 c4ded28](https://github.com/haoyangzhanglab/dexmani_real/tree/c4ded28b1078adefbd017f4c546b6a132a91d29b)。
 - [PF-DAG 的 xArm 循环](https://github.com/XiaohanLei/PF-DAG/blob/b877129754267c3d9c564abcb19960bcf215e12f/pf_dag/robots/xarm_robot.py)：借鉴最新目标与直接循环，不照搬重复查询、自动清错或无界等待。
 - [PI-R2 的窄驱动](https://github.com/pi-r2-flow/pi-r2-flow/blob/3af52ca400a6ec7d141416879aa531a6f62f697a/deployment/mindex/robots/xarm_sdk.py)：借鉴简短接口，不照搬忽略返回码和吞错。
 - [UFACTORY LeRobot 实现](https://github.com/xArm-Developer/lerobot_robot_ufactory/blob/5fe6fb150bfa71ad3ca8a0b780c89ff8d4033a82/src/lerobot_robot_ufactory/robots/uf_robot/uf_robot.py)：参考控制器规划，不引入隐式首帧切模式或额外报告后端。

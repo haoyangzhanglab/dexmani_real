@@ -36,8 +36,8 @@ class ActionMapper:
         self.solver = solver
         self.joint_limits = joint_limits
         self.hand_enabled = hand_enabled
-        self.hand_lower = np.array(hand_lower_rad, dtype=np.float64, copy=True)
-        self.hand_upper = np.array(hand_upper_rad, dtype=np.float64, copy=True)
+        self.hand_lower = np.array(hand_lower_rad, dtype=np.float64, copy=True) if hand_enabled else None
+        self.hand_upper = np.array(hand_upper_rad, dtype=np.float64, copy=True) if hand_enabled else None
         self.fixed_hand_qpos = (
             None if fixed_hand_qpos is None
             else np.array(fixed_hand_qpos, dtype=np.float64, copy=True)
@@ -48,27 +48,24 @@ class ActionMapper:
         """joint 只投影关节意图；EEF 使用几何约束。"""
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
-        constraints = None
+        solver = None
+        fixed_hand_qpos = None
         if mode == "eef":
             if not hand.enabled:
                 hand.validate_home_pose()
-            constraints = MotionConstraints(arm, environment)
-        solver = (
-            IKSolver(
-                constraints,
+                fixed_hand_qpos = np.deg2rad(hand.home_qpos_deg)
+            solver = IKSolver(
+                MotionConstraints(arm, environment),
                 position_tolerance=motion.ik_max_pose_error_pos_m,
                 rotation_tolerance=motion.ik_max_pose_error_rot_rad,
             )
-            if mode == "eef"
-            else None
-        )
         return cls(
             joint_limits=np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper)),
             solver=solver,
             hand_enabled=hand.enabled,
             hand_lower_rad=hand.qpos_min_rad,
             hand_upper_rad=hand.qpos_max_rad,
-            fixed_hand_qpos=(np.deg2rad(hand.home_qpos_deg) if mode == "eef" and not hand.enabled else None),
+            fixed_hand_qpos=fixed_hand_qpos,
         )
 
     def prepare_hand(self, hand):
