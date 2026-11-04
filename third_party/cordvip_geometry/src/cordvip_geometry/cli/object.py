@@ -1,12 +1,10 @@
 """单图分割、重建与米制资产准备。"""
 
-import json
 import logging
 import multiprocessing as mp
 import shlex
 import shutil
 import sys
-from pathlib import Path
 
 from ..io import existing_file, output_path, write_json
 from .arguments import parse_object_args
@@ -86,7 +84,7 @@ def segment(args, *, output=None, list_only=False):
         print(f"候选已保存：{output / 'candidates.jpg'}；使用 object select 确认。")
         return
     index = choose(rgb, candidates, args.instance, headless=args.headless)
-    save_selection(output, rgb, candidates, index, provenance)
+    save_selection(output, rgb, candidates, index)
 
 
 def select(args):
@@ -95,43 +93,54 @@ def select(args):
 
     source = args.segmentation_dir.expanduser().resolve()
     output = output_path(args.output, protected=(source,))
-    provenance = json.loads(
-        existing_file(source / "segmentation_result.json").read_text()
-    )
     with Image.open(existing_file(source / "rgb.png")) as image:
         rgb = np.asarray(image.convert("RGB")).copy()
     with np.load(existing_file(source / "candidates.npz"), allow_pickle=False) as saved:
-        candidates = [
-            {
-                "mask": mask,
-                "box_xyxy": saved["boxes"][i],
-                "score": float(saved["scores"][i]),
-                "mask_score": float(saved["mask_scores"][i]),
-                "label": str(saved["labels"][i]),
-            }
-            for i, mask in enumerate(saved["masks"])
-        ]
-    if not candidates or any(
-        item["mask"].dtype != np.bool_ or item["mask"].shape != rgb.shape[:2]
-        for item in candidates
+        masks = saved["masks"]
+        boxes = saved["boxes"]
+        scores = saved["scores"]
+        mask_scores = saved["mask_scores"]
+        labels = saved["labels"]
+    if (
+        masks.dtype != np.bool_
+        or masks.ndim != 3
+        or masks.shape[1:] != rgb.shape[:2]
+        or len(masks) == 0
     ):
         raise ValueError("保存的候选 mask 与 RGB 不一致")
-    index = choose(rgb, candidates, args.instance, headless=args.headless)
-    source_name = provenance["saved_source"]
-    if Path(source_name).name != source_name:
-        raise ValueError("候选元数据不能引用输入目录以外的文件")
-    output.mkdir(parents=True, exist_ok=False)
-    for name in (
-        "rgb.png",
-        "candidates.npz",
-        "candidates.jpg",
-        "segmentation_request.json",
-        "segmentation_result.json",
-        source_name,
+    count = len(masks)
+    if boxes.shape != (count, 4) or any(
+        array.shape != (count,) for array in (scores, mask_scores, labels)
     ):
-        shutil.copyfile(existing_file(source / name), output / name)
-    provenance.update(headless=args.headless, selection_source=str(source))
-    save_selection(output, rgb, candidates, index, provenance)
+        raise ValueError("候选框、分数和标签必须与 mask 数量及数组形状一致")
+    if labels.dtype.kind != "U" or any(
+        array.dtype.kind not in "fiu" or not np.isfinite(array).all()
+        for array in (boxes, scores, mask_scores)
+    ):
+        raise ValueError("候选标签必须为字符串，框和分数必须为有限实数")
+    candidates = [
+        {
+            "mask": masks[i],
+            "box_xyxy": boxes[i],
+            "score": float(scores[i]),
+            "mask_score": float(mask_scores[i]),
+            "label": str(labels[i]),
+        }
+        for i in range(count)
+    ]
+    binding = source / "source_rgbd.npz"
+    has_binding = binding.exists() or binding.is_symlink()
+    if has_binding:
+        from ..rgbd import load_frame
+
+        frame = load_frame(existing_file(binding))
+        if not np.array_equal(frame.rgb, rgb):
+            raise ValueError("source_rgbd.npz 的 RGB 与候选目录的 rgb.png 不一致")
+    index = choose(rgb, candidates, args.instance, headless=args.headless)
+    output.mkdir(parents=True, exist_ok=False)
+    if has_binding:
+        shutil.copyfile(binding, output / binding.name)
+    save_selection(output, rgb, candidates, index)
 
 
 def generate(args, image=None, output=None):

@@ -52,11 +52,11 @@ def save_candidates(output, rgb, candidates):
     sheet.save(output / "candidates.jpg", quality=95)
 
 
-def choose(rgb, candidates, instance, *, headless):
+def choose(rgb, candidates, instance, *, headless, name="object"):
+    if not candidates:
+        raise RuntimeError(f"{name}: 没有检测到目标，请调整 prompt 后重试")
     if instance is not None and not 0 <= instance < len(candidates):
-        raise ValueError(
-            f"--instance 必须位于 0..{len(candidates) - 1}；索引参见 candidates.jpg"
-        )
+        raise ValueError(f"--instance 必须位于 0..{len(candidates) - 1}")
     if headless:
         return instance
     display_available()
@@ -64,10 +64,26 @@ def choose(rgb, candidates, instance, *, headless):
     import numpy as np
 
     index = 0 if instance is None else instance
-    title = "Grounded-SAM2: n/p candidate; Enter confirm; Esc cancel"
+    title = f"Select {name}: n/p, 1-9 or click; Enter confirm; Esc cancel"
+
+    def mouse(event, x, y, flags, param):
+        nonlocal index
+        if event == cv2.EVENT_LBUTTONDOWN and (
+            0 <= x < rgb.shape[1] and 0 <= y < rgb.shape[0]
+        ):
+            index = next(
+                (
+                    i
+                    for i, candidate in enumerate(candidates)
+                    if candidate["mask"][y, x]
+                ),
+                index,
+            )
+
     cv2.namedWindow(title, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(title, min(rgb.shape[1], 1280), min(rgb.shape[0], 850))
     try:
+        cv2.resizeWindow(title, min(rgb.shape[1], 1280), min(rgb.shape[0], 850))
+        cv2.setMouseCallback(title, mouse)
         while True:
             canvas = np.asarray(overlay(rgb, candidates[index], index))
             cv2.imshow(title, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
@@ -78,16 +94,18 @@ def choose(rgb, candidates, instance, *, headless):
                 key in (27, ord("q"))
                 or cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1
             ):
-                raise RuntimeError("已取消候选确认；候选文件保留，可通过 select 继续")
+                raise KeyboardInterrupt("已取消候选选择")
             if key in (ord("n"), ord(" "), ord("]")):
                 index = (index + 1) % len(candidates)
             elif key in (ord("p"), ord("[")):
                 index = (index - 1) % len(candidates)
+            elif ord("1") <= key <= ord("9") and key - ord("1") < len(candidates):
+                index = key - ord("1")
     finally:
         cv2.destroyWindow(title)
 
 
-def save_selection(output, rgb, candidates, index, provenance):
+def save_selection(output, rgb, candidates, index):
     candidate = candidates[index]
     mask = candidate["mask"]
     if not mask.any() or mask.all():
@@ -97,19 +115,11 @@ def save_selection(output, rgb, candidates, index, provenance):
         output,
         mask,
         {
-            **provenance,
             "selected_instance": index,
-            "selection": (
-                "explicit_headless_instance"
-                if provenance["headless"]
-                else "gui_confirmed"
-            ),
             "label": candidate["label"],
             "box_xyxy": candidate["box_xyxy"].tolist(),
             "detection_score": candidate["score"],
-            "score_kind": "grounding_dino",
             "mask_score": candidate["mask_score"],
-            "mask_score_kind": "sam2_predicted_iou",
         },
         mask_file="mask.png",
         foreground_rgb=rgb,

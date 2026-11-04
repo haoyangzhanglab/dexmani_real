@@ -157,7 +157,7 @@ class SAM2Client:
         if not masks:
             raise ValueError("Provide fixed named masks for the scene")
         for name, mask in masks.items():
-            if not isinstance(name, str) or not name.strip():
+            if not isinstance(name, str) or not name:
                 raise ValueError("Object IDs must be nonempty strings")
             mask = np.asarray(mask)
             if mask.dtype != np.bool_ or mask.shape != rgb.shape[:2] or not mask.any():

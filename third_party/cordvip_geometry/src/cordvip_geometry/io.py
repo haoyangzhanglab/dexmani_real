@@ -28,6 +28,8 @@ def load_mask(path, shape):
         from PIL import Image
 
         with Image.open(path) as image:
+            if image.mode == "P":
+                image = image.convert("L")
             mask = np.asarray(image).copy()
     else:
         raise ValueError("mask 文件必须为 PNG 或 NPY")
@@ -78,6 +80,10 @@ def write_selection(directory, mask, metadata, *, mask_file, foreground_rgb=None
         raise ValueError("mask must be a boolean image")
     if Path(mask_file).name != mask_file:
         raise ValueError("mask_file must name a file inside the selection directory")
+    if foreground_rgb is not None:
+        rgb = np.asarray(foreground_rgb)
+        if rgb.dtype != np.uint8 or rgb.shape != (*mask.shape, 3):
+            raise ValueError("foreground RGB must align with the mask")
     path = directory / mask_file
     if path.suffix == ".npy":
         np.save(path, mask, allow_pickle=False)
@@ -91,9 +97,6 @@ def write_selection(directory, mask, metadata, *, mask_file, foreground_rgb=None
     if foreground_rgb is not None:
         from PIL import Image
 
-        rgb = np.asarray(foreground_rgb)
-        if rgb.dtype != np.uint8 or rgb.shape != (*mask.shape, 3):
-            raise ValueError("foreground RGB must align with the mask")
         foreground = directory / "foreground_rgba.png"
         Image.fromarray(np.dstack((rgb, mask.astype(np.uint8) * 255))).save(foreground)
         result.update(foreground_file=foreground.name)

@@ -3,6 +3,7 @@
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
+from math import isfinite
 from numbers import Real
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,6 +17,17 @@ from .geometry import (
     validate_pose,
 )
 from .model_depth import ModelDepthRenderer, camera_rays
+
+
+def validate_object_name(name):
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or "\0" in name
+        or Path(name).name != name
+    ):
+        raise ValueError("Object names must be nonempty single directory names")
 
 
 @dataclass
@@ -105,20 +117,17 @@ class SceneTracker:
             if (
                 isinstance(value, bool)
                 or not isinstance(value, Real)
-                or not np.isfinite(value)
+                or not isfinite(value)
                 or value <= 0
             ):
                 raise ValueError(f"{name} must be finite and positive")
         if min_matched_fraction > 1:
             raise ValueError("min_matched_fraction must be in (0,1]")
         for name in assets:
-            if (
-                not isinstance(name, str)
-                or not name
-                or name in {".", ".."}
-                or Path(name).name != name
-            ):
-                raise ValueError("Asset names must be single directory names")
+            validate_object_name(name)
+        if initial_selections is not None:
+            for name in initial_selections:
+                validate_object_name(name)
         self.segmenter = segmenter
         self.assets = assets
         self.asset_metadata = {}
@@ -167,6 +176,11 @@ class SceneTracker:
         from .models import DEFAULT_MODELS_DIR, resolve_sam_model
         from .sam2 import SAM2Client
 
+        for name in assets:
+            validate_object_name(name)
+        if initial_selections is not None:
+            for name in initial_selections:
+                validate_object_name(name)
         workspace = Path(workspace or Path.cwd()).expanduser().resolve()
         models_dir = (
             Path(models_dir or workspace / DEFAULT_MODELS_DIR).expanduser().resolve()
@@ -235,6 +249,9 @@ class SceneTracker:
                 raise ValueError(
                     "The first frame requires initial_masks or initial_selections"
                 )
+            if self.initial_selections is None:
+                for name in initial_masks:
+                    validate_object_name(name)
         elif initial_masks is not None:
             raise ValueError("Create a new tracker to initialize another scene")
         if self._last_result is not None:

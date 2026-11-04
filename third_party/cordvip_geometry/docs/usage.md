@@ -34,7 +34,11 @@ SAM 默认 small、BF16、eager。large 先下载权重，再为相关命令传 
 
 ## 准备物体资产
 
-单图建模和已有 mesh 校准流程见[物体重建与点云](../../../docs/object_reconstruction.md)。阶段命令为 `object segment/select/generate/build/prepare/preview`，输出参数统一为 `--output`，文本参数为 `--prompt`。`object generate --image PATH` 直接接收含有效前景和透明背景的 RGBA 文件，不依赖分割目录或确认记录；`build` 直接使用分割阶段生成的 `foreground_rgba.png`。
+单图建模和已有 mesh 校准流程见[物体重建与点云](../../../docs/object_reconstruction.md)。阶段命令为 `object segment/select/generate/build/prepare/preview`，输出参数统一为 `--output`，文本参数为 `--prompt`。`object generate --image PATH` 直接接收含有效前景和透明背景的 RGBA 文件；`build` 直接使用分割阶段生成的 `foreground_rgba.png`。
+
+`object select --segmentation-dir DIR --instance 0 --headless --output NEW_DIR` 只要求 `DIR/rgb.png` 和原有数组结构的 `DIR/candidates.npz`。输出仅有所选的 `mask.png`、`foreground_rgba.png`、新生成的 `overlay.png` 和记录索引、标签、框及分数的 `selection.json`。目录中若有 `source_rgbd.npz`，须可读取且 RGB 像素与 `rgb.png` 相同，并复制到输出；没有时正常选择。分割日志、候选 JPG 和原始图片副本均不参与选择，原始分割过程仍可保留调试文件。再次选择须使用原候选目录。
+
+候选包中的 `masks` 为 bool `(N,H,W)`，`boxes` 为有限实数 `(N,4)`，`scores` 与 `mask_scores` 为有限实数 `(N,)`，`labels` 为 Unicode 字符串 `(N,)`；`N` 须为正数且各数组一致，mask 尺寸与 RGB 相同。损坏的候选直接报错。
 
 Hunyuan 在独立生成进程中运行；生成 mesh 导出前简化到最多 20,000 面，仍需显式指定米制尺度。`generation_result.json` 记录 `source_faces`、`mesh_simplification` 和实际导出的 `faces` / `vertices`。prepare 保留原点与朝向，在米制网格上按指定 seed / 点数采样固定点及三角面法向。
 
@@ -56,9 +60,13 @@ python scripts/cordvip/track_object.py \
   --with-hand --output /tmp/cordvip/scene_001
 ```
 
-首帧冻结后人工确认候选，或省略 prompt 手画 mask。选择保存为 `initial_selections/<id>/`。`--initial-selection PATH` 和 scene 的 `initial_selection` 都接受 PNG/NPY mask 文件，或含 `selection.json` 的目录；目录只需 `mask_file` 指向目录内的真实 mask。输入 mask 明确应用于当前首帧原始 RGB 网格，由 tracker 统一去畸变一次，不要求确认标签或候选索引。目录若提供 `source_rgbd.npz`，其中 RGB、米制深度、内参、畸变模型与系数必须与实际首帧逐项精确相等；没有绑定文件时不验证来源。`source_id`、时间戳、时钟和行号仅作说明，复用不改写已有输入。
+提供 `--prompt` 后，Grounding DINO 检测目标，SAM2 生成冻结首帧上的候选 mask，再人工选择实例。新选择保存为 `initial_selections/<id>/`，其中 `selection.json` 记录 mask 文件名、候选索引和两项分数；prompt 与模型来源分别记录在 `scene.json`、`models.json`。也可通过 `--initial-selection PATH` 或 scene 的 `initial_selection` 加载已有首帧 mask；未提供已有 mask 的对象必须提供非空 prompt，无候选时明确报错。PNG/NPY mask 文件可直接使用；选择目录只需 `selection.json` 的 `mask_file` 指向目录内的真实 mask。输入 mask 明确应用于当前首帧原始 RGB 网格，由 tracker 统一去畸变一次。目录若提供 `source_rgbd.npz`，其中 RGB、米制深度、内参、畸变模型与系数必须与实际首帧逐项精确相等；没有绑定文件时不验证来源。`source_id`、时间戳、时钟和行号仅作说明，复用不改写已有输入。
+
+mask 须与 RGB 同尺寸，支持 `1/L/P` PNG 和 bool/uint8 单通道 NPY；零为背景、非零为前景。`P` 模式先按实际调色板转换为灰度，不按调色板索引判断；不接受其他多通道或高位深输入，不自动反色或缩放。
 
 多物体通过场景文件声明，路径相对 workspace：
+
+对象 `id` 与 Python API 的对象名原样用作目录名及结果键，须为唯一、非空的合法单级目录名；允许大小写、数字开头、连字符、中文及双下划线，例如 `Object-1`、`1st_object`、`物体`、`A__B`。禁止 `.`、`..`、路径分隔符和绝对路径，不自动改名。
 
 ```json
 {"objects": [

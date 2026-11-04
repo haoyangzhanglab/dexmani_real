@@ -70,14 +70,21 @@ def parse_tracking_args(argv=None, *, workspace=None):
     parser.add_argument(
         "--episode", type=Path, required=True, help="只读已发布 Raw episode"
     )
-    parser.add_argument("--scene", type=Path, help="多物体 JSON")
+    parser.add_argument(
+        "--scene", type=Path, help="多物体 JSON；对象 id 使用唯一、非空的合法单级目录名"
+    )
     parser.add_argument(
         "--asset", type=Path, help="米制物体资产；省略时只处理 mask 和实测点"
     )
-    parser.add_argument("--prompt", help="首帧文本候选；省略时手画 mask")
+    parser.add_argument(
+        "--prompt", help="首帧目标文本；未提供 --initial-selection 时必需"
+    )
     parser.add_argument(
         "--initial-selection", type=Path,
-        help="当前首帧原始 RGB 网格的 PNG/NPY mask，或含 selection.json 的目录",
+        help=(
+            "当前首帧原始 RGB 网格的 1/L/P PNG（P 按调色板转灰度，非零为前景）、"
+            "bool/uint8 单通道 NPY，或含 selection.json 的目录"
+        ),
     )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
@@ -103,6 +110,8 @@ def parse_tracking_args(argv=None, *, workspace=None):
         parser.error("--headless 需要 --initial-selection 或 --scene")
     if args.prompt is not None and not args.prompt.strip():
         parser.error("--prompt 不能为空")
+    if args.scene is None and args.initial_selection is None and args.prompt is None:
+        parser.error("必须提供 --prompt、--initial-selection 或 --scene")
     try:
         return resolve_sam_arguments(args)
     except ValueError as error:
@@ -145,8 +154,21 @@ def parse_object_args(argv=None, *, workspace=None):
     segment.add_argument(
         "--list-only", action="store_true", help="保存候选，稍后 select"
     )
-    select = commands.add_parser("select", help="从已有候选确认物体")
-    select.add_argument("--segmentation-dir", type=Path, required=True)
+    select = commands.add_parser(
+        "select",
+        help="从已有候选确认物体",
+        description=(
+            "从 rgb.png 和 candidates.npz 选择物体，写出 mask.png、foreground_rgba.png、"
+            "overlay.png 和 selection.json；若有 source_rgbd.npz，校验 RGB 像素一致后保留绑定。"
+            "再次选择仍使用原候选目录。"
+        ),
+    )
+    select.add_argument(
+        "--segmentation-dir",
+        type=Path,
+        required=True,
+        help="含 rgb.png 和 candidates.npz 的候选目录；不要求分割日志或预览图",
+    )
     select.add_argument("--instance", type=int)
     select.add_argument("--headless", action="store_true")
     generate = commands.add_parser("generate", help="从 RGBA 生成未定尺度 mesh")

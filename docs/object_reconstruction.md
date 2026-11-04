@@ -124,7 +124,9 @@ python -m cordvip_geometry object generate \
   --output /tmp/cordvip/apple_headless/generation
 ```
 
-`object generate --image PATH` 也可直接使用自行准备的 RGBA 文件；图像必须包含有效前景和透明背景，不要求分割目录或确认记录。之后按第 3 步处理新的网格路径，并去掉 `--preview`。
+`object generate --image PATH` 也可直接使用自行准备的 RGBA 文件；图像必须包含有效前景和透明背景。之后按第 3 步处理新的网格路径，并去掉 `--preview`。
+
+`object select` 的必需输入只有候选目录中的 `rgb.png` 和 `candidates.npz`，不依赖分割日志、候选 JPG 或原始照片副本。选择目录仅保存 `mask.png`、`foreground_rgba.png`、当前候选生成的 `overlay.png` 和简洁的 `selection.json`；输入若含 `source_rgbd.npz`，须可读取且 RGB 像素与候选 RGB 相同，再一并保留以便复用时核对实际首帧。再次选择仍指向原候选目录，输出目录拒绝覆盖。
 
 现有苹果、香蕉、碗资产位于 [pnp_apple_banana](../assets/pointcloud_template/object/pnp_apple_banana)，分别按约 8 cm 直径、18 cm 两端直线距离、17 cm 碗口外径标定，每个物体 1024 点。具体尺度定义见各自的 `asset.json`；[预览图](../assets/pointcloud_template/object/pnp_apple_banana/preview.png)可用于快速检查。
 
