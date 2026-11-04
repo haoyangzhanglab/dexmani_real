@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from dataclasses import asdict
@@ -13,29 +14,16 @@ from dexmani_real.config.deployment import (
     DEFAULT_NUM_EPISODES,
     RUNTIME_SECTIONS,
 )
-from dexmani_real.data.raw import validate_task_label
 from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.deployment.session import PolicySession
-from dexmani_real.utils.io import write_yaml
 
 
-def session_directory(root: Path, info) -> Path:
-    validate_task_label(info.task_name)
-    parts = (info.policy_name, info.task_name, info.experiment_dir.name)
-    if any(
-        not isinstance(part, str)
-        or not part
-        or part in {".", ".."}
-        or "\\" in part
-        or Path(part).name != part
-        for part in parts
-    ):
-        raise ValueError("policy, task and experiment names must be single directory components")
-    root = root.expanduser().resolve()
-    base = root / Path(*parts)
-    if not base.resolve().is_relative_to(root):
-        raise ValueError("session output must remain inside its root")
+logger = logging.getLogger(__name__)
+
+
+def session_directory(root: Path) -> Path:
+    base = root.expanduser().resolve()
     stamp = time.strftime("%Y%m%d_%H%M%S")
     candidate = base / f"session_{stamp}"
     dedup = 1
@@ -84,8 +72,15 @@ def run_policy(
     observations = ObservationBuilder(info, runtime)
     if camera_calibration_path is not None:
         camera_calibration_path = Path(camera_calibration_path).expanduser().resolve()
-    root = output or Path(__file__).resolve().parents[2] / "rollouts"
-    session_dir = session_directory(Path(root), info)
+    session_dir = None
+    if output is not None or record_raw:
+        root = output if output is not None else Path(__file__).resolve().parents[2] / "rollouts"
+        try:
+            session_dir = session_directory(Path(root))
+        except Exception:
+            if record_raw:
+                raise
+            logger.exception("辅助输出目录创建失败：%s", root)
     payload = {
         "policy": info.to_dict(),
         "runtime": {name: asdict(getattr(runtime, name)) for name in RUNTIME_SECTIONS},
@@ -99,7 +94,6 @@ def run_policy(
         "max_duration_s": max_running_s,
         "record_raw": record_raw,
     }
-    write_yaml(payload, session_dir / "run_config.yaml")
 
     print(f"策略：{experiment}；数值表示 recipe 与控制 dt 来自训练 artifact，设备和标定来自 Real")
     duration = f"{max_running_s:g} s" if max_running_s is not None else "无限制"
@@ -107,7 +101,7 @@ def run_policy(
         f"评估：{num_episodes if num_episodes is not None else '不限'} 轮正式运行结束后退出 | "
         f"每轮预算 {duration} | 输入：{', '.join(info.observation_fields)}"
     )
-    print(f"输出：{session_dir}")
+    print(f"输出：{session_dir}" if session_dir is not None else "输出：仅终端")
     return PolicySession(
         runtime,
         info,

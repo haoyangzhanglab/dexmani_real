@@ -73,6 +73,8 @@ class ObservationBuilder:
                 values[name] = row.point_cloud
             elif name in {"rgb", "depth"}:
                 values[name] = row.camera[name]
+        for value in values.values():
+            value.flags.writeable = False
         return values
 
     def configure_camera(self, camera):

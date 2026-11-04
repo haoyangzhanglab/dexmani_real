@@ -1059,10 +1059,10 @@ def test_missing_dense_prevents_writer_and_allows_later_start(monkeypatch, tmp_p
     else:
         owner = policy.Rollout(
             state, runtime, SimpleNamespace(control_dt_s=.0625, n_obs_steps=1, task_name='test'),
-            cancel_epoch=state.cancel_epoch, robot=robot, observations=None,
-            control_needs=ObservationNeeds(), record_needs=needs, sensors=sensors,
+            cancel_epoch=state.cancel_epoch, robot=robot, observations=SimpleNamespace(needs=ObservationNeeds()),
+            record_needs=needs, sensors=sensors,
             action_mapper=None, model=None, max_running_s=None, index=1, output_dir=tmp_path,
-            record_raw=True, audio=SimpleNamespace(play=lambda sound: None),
+            record_raw=True,
             camera_snapshot=decode_camera_metadata(raw_metadata()),
         )
         owner.read_observation = lambda: (row[0], None)
@@ -1122,10 +1122,10 @@ def test_recording_old_tactile_still_submits_and_writes_every_tick(monkeypatch, 
     else:
         needs = ObservationNeeds(camera_fields=('rgb', 'depth'), required_tactile=('aggregate', 'dense'))
         owner = Rollout(state, runtime, SimpleNamespace(control_dt_s=.0625, n_obs_steps=1),
-                        cancel_epoch=state.cancel_epoch, robot=robot, observations=SimpleNamespace(project=lambda row: {}),
-                        control_needs=ObservationNeeds(), record_needs=needs, sensors=sensors,
+                        cancel_epoch=state.cancel_epoch, robot=robot, observations=SimpleNamespace(project=lambda row: {}, needs=ObservationNeeds()),
+                        record_needs=needs, sensors=sensors,
                         action_mapper=None, model=SimpleNamespace(poll=lambda: None, future=None),
-                        max_running_s=None, index=1, output_dir=tmp_path, record_raw=True, audio=audio)
+                        max_running_s=None, index=1, output_dir=tmp_path, record_raw=True)
         owner.execution = replace(runtime.execution, action_steps=4)
         owner.started_ns = owner.next_step_ns = clock[0]
         owner.sync_actions = np.zeros((4, 19))
@@ -1168,7 +1168,7 @@ def test_unrecorded_tactile_policy_waits_for_initial_value_after_reset(monkeypat
     hand = full.hand.copy()
     hand['tactile_dense_timestamp_ns'] = 0
     hand['tactile_dense'] = np.nan
-    samples = iter(((replace(full, hand=hand), 'control_input_dense_unavailable'), (full, None)))
+    samples = iter(((replace(full, hand=hand), 'model_input_dense_unavailable'), (full, None)))
     clock = [full.observation_timestamp_ns]
     monkeypatch.setattr(policy.time, 'monotonic_ns', lambda: clock[0])
     monkeypatch.setattr(policy.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + 5_000_000))
@@ -1176,9 +1176,9 @@ def test_unrecorded_tactile_policy_waits_for_initial_value_after_reset(monkeypat
     owner = policy.Rollout(
         state, RealConfig(), SimpleNamespace(control_dt_s=.0625, n_obs_steps=1),
         cancel_epoch=state.cancel_epoch, robot=SimpleNamespace(service_feedback=lambda: None),
-        observations=None, control_needs=ObservationNeeds(required_tactile=('dense',)),
+        observations=SimpleNamespace(needs=ObservationNeeds(required_tactile=('dense',))),
         record_needs=ObservationNeeds(), sensors=None, action_mapper=None, model=None,
-        max_running_s=None, index=1, output_dir=None, record_raw=False, audio=None,
+        max_running_s=None, index=1, output_dir=None, record_raw=False,
     )
     owner.read_observation = lambda: next(samples)
     polls = []
@@ -1300,12 +1300,11 @@ def test_preparation_keeps_robot_stopped_through_writer_and_refreshes_inputs(
     else:
         owner = policy.Rollout(
             state, runtime, SimpleNamespace(control_dt_s=.0625, n_obs_steps=1, task_name='test'),
-            cancel_epoch=state.cancel_epoch, robot=robot, observations=None,
-            control_needs=ObservationNeeds(),
+            cancel_epoch=state.cancel_epoch, robot=robot, observations=SimpleNamespace(needs=ObservationNeeds()),
             record_needs=ObservationNeeds(camera_fields=('rgb', 'depth'),
                                            required_tactile=('aggregate', 'dense')),
             sensors=sensors, action_mapper=None, model=None, max_running_s=None,
-            index=1, output_dir=tmp_path, record_raw=True, audio=audio,
+            index=1, output_dir=tmp_path, record_raw=True,
             camera_snapshot=decode_camera_metadata(raw_metadata()),
         )
         start = lambda: owner.prepare(lambda: None)

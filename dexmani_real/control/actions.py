@@ -119,7 +119,7 @@ class ActionMapper:
         )
 
     def normalize_policy_actions(self, actions, mode):
-        """RTC 承诺策略动作；关节等价分支和 IK 留到实际执行槽。"""
+        """RTC 前缀与消费共用规范化动作；关节等价分支和 IK 留到实际提交。"""
         values = np.array(actions, dtype=np.float64, copy=True)
         hand_start = 7 if mode == "joint" else 9
         values[:, hand_start:] = np.clip(values[:, hand_start:], self.hand_lower, self.hand_upper)

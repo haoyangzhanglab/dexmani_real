@@ -1,6 +1,6 @@
 # 策略部署推理轻量化实施任务书
 
-状态：方案已确定，待实施。本文的发布不代表源码改造、回归测试或真机验证已经完成。
+状态：T0–T7 及系统复审已完成，离线回归通过；代码、测试与文档一起提交到 main，未做真机验证。实际命令与限制见第 8 节。
 
 日期：2026-11-04。
 
@@ -98,7 +98,7 @@ Session 持有唯一 Worker 和设备；Rollout 借用它们。每段首次正�
 3. sync 等待预测期间仍按正常控制采样机会更新有效历史；结果完成不额外触发一次采样或提前发送。
 4. 发起推理时要求当前模型输入有效，并冻结 `tuple(history)`。后续 deque 更新不改变已提交请求，快照数组继续只读；FK、手点云构造及模型预处理继续在模型线程执行，不新增大数组 deepcopy 或缓存管理层。
 5. 相机/点云/模型用触觉暂时不可用时，不更新模型历史、不发起新请求；已有可用动作仍可依据有效关节反馈执行。传感进程真实死亡、SDK 错误和数值错误按现有技术故障传播，不伪装成可忽略的缺帧。
-6. 映射后、发送前只复查实际设备反馈和目标所需条件，以及操作取消、运行期限。删除对整套 `control_needs` 的再次门禁；真实接触保护若另有消费者，其检查仍属于该消费者。
+6. 映射后、发送前只复查实际设备反馈和目标所需条件，以及操作取消、运行期限。删除对整套模型输入需求的再次门禁；真实接触保护若另有消费者，其检查仍属于该消费者。
 7. 开启完整 Raw 时，另按完整录制要求检查本次行。相机等录制质量失败仍可结束本段；触觉保持值沿用当前允许规则。因此“模型输入缺帧时继续旧 chunk”不豁免显式 Raw 完整性要求。
 
 首帧填充依据本仓训练实现，而非只类比外部项目：[统一 pad_before](https://github.com/haoyangzhanglab/dexmani_policy/blob/52cbcb6fb7c37c8d0cb29ac63f6d00d85d353d0a/dexmani_policy/training/common/config.py#L62-L67)、[边界行重复采样](https://github.com/haoyangzhanglab/dexmani_policy/blob/52cbcb6fb7c37c8d0cb29ac63f6d00d85d353d0a/dexmani_policy/datasets/sampler.py#L81-L98)。本约定面向当前主训练链路，不声称所有外部自定义 checkpoint 都有相同历史分布。
@@ -304,4 +304,91 @@ git diff --check
 
 ## 8. 实施记录
 
-尚未实施。本节由后续执行 Codex 在完成实际代码修改和验证后填写，不预填“通过”。
+实施日期：2026-11-04。
+
+### 起点与交付状态
+
+- 开始时本地 main 为 `b53eac89c9cb28c08333e7af96680020e072c380`，工作区干净。只读核对远端后快进至仅发布本文的 `c2e5400d7dd2b0ce6f9ad2bb853218d52ac54576`。
+- 本轮改造以该 HEAD 为父提交，代码、测试与文档一起提交到 main；终点提交 ID 以 Git 记录为准。Policy 位于审查版本，其已有未提交改动未修改。未修改设备驱动、训练、checkpoint 或实验数据。
+
+### 实际完成
+
+- T0：核对入口、Session、Rollout、Worker、观测、动作映射、Robot、Raw 以及所有受影响调用方；保留最新 xArm 准入、模式准备与频率修复。
+- T1：部署输出默认关闭；显式输出使用简单 session 子目录。辅助保存失败记录路径和 traceback，不裁决控制；Raw 功能失败继续传播。删除 Policy 音频及调用参数，保留其他入口音频。
+- T2：模型加载完成后才构造并连接设备，取消复核贯穿等待；真实快照预热保留。停止意图立即置位，Rollout.run 的 finally 统一停止，正常段回收、Session 最终关闭保持原归属与预算。
+- T3：首帧重复填充；采样期间更新历史，sync 等待不例外；请求使用冻结元组和只读投影数组。模型模态、设备反馈、Raw 质量分别检查，设备故障先于 Raw 质量裁决。
+- T4–T5：Rollout 内使用 step_sync / step_async 两条流程。普通 async 保留时间锚点，RTC 使用名义窗口和实际提交游标；支持早到等待、迟到尾部、短窗口预取、耗尽结束。正常采样后接收此前结果，再判断耗尽；模型短轮询不制造采样行。映射耗尽普通 async 窗口时也先接收已有请求的可用结果。
+- T6：删除 RTC 严格槽分支、A+d 限制、完整模型输入发送门禁、无消费者结果属性和音频接口；同步与 RTC 复用一个消费游标。没有新增框架、兼容模式、重试或跨层清理预算。
+- T7：README、CLI help、历史任务书引用与测试同步更新。Raw writer/schema/导出实现保持原样，等待行与提交尝试语义保留。
+
+主要位置：`deployment/rollout.py` 的 step_sync、step_async、step、run；`deployment/session.py` 的 prepare_resources、save_auxiliary、close；`deployment/run.py` 输出路径；`deployment/schedule.py` 普通 async 时间窗口；`deployment/preflight.py` 配置校验；`deployment/observation.py` 只读投影。
+
+### 实际验证
+
+使用已有 `/home/zhanghaoyang/miniconda3/envs/real_robot/bin/python`（Python 3.10.20）。下列命令中的 python 均指该解释器。pytest 全程设置 `PYTHONDONTWRITEBYTECODE=1` 并使用 `-B -p no:cacheprovider`；Ruff 使用 `--no-cache`。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -B -m pytest -p no:cacheprovider tests/test_control_progress.py tests/test_input_resources.py
+# 修改前：276 passed；追加首批新测试后：280 passed。
+
+PYTHONDONTWRITEBYTECODE=1 python -B -m pytest -p no:cacheprovider tests/test_control_progress.py tests/test_input_resources.py tests/test_recording_export.py tests/test_arm_recovery.py tests/test_xhand.py tests/test_home_snapshot.py tests/test_replay.py
+# 关联回归：663 passed（后续又追加 9 个边界测试，由最终全套覆盖）。
+
+PYTHONDONTWRITEBYTECODE=1 python -B -m pytest -p no:cacheprovider tests/test_control_progress.py tests/test_recording_export.py
+# 最终审查的设备/Raw 优先级修复后：221 passed。
+
+PYTHONDONTWRITEBYTECODE=1 python -B -m pytest -p no:cacheprovider tests
+# 首次全套：786 passed；最终采样/接收顺序修复后复跑：788 passed，4.31 s。
+
+python -B -m ruff check --no-cache --select F dexmani_real scripts tests
+# All checks passed!
+python -B scripts/run_policy.py --help
+python -B scripts/run_policy.py --print-config
+# 均退出 0；未加载 checkpoint 或连接设备。
+git diff --check
+# 通过。
+```
+
+开发中旧音频参数、旧严格槽和旧历史断言导致的测试失败已随调用方和新行为测试修正；一次编辑缩进错误与一处未使用导入已修复。未将这些中间失败记录为通过。
+
+新增受控测试涵盖首帧和冻结请求、sync 完成不额外采样、RTC bootstrap/早到/迟到/跨周期/短窗口/完全裁空/零延迟、采样期间完成结果优先接收、提交失败不推进、模型输入缺帧继续旧动作、加载成功/失败/取消、双重异常、输出四种组合及辅助目录/文件失败。既有 Raw、设备、按键、Worker 线程与资源归属回归保留。
+
+### 限制
+
+没有连接真机、加载真实 checkpoint 做推理、执行实际 HOME/servo/手动作、训练或改写数据。首次实施未运行 Mypy，后续系统复审结果见下文。fake 设备、受控时钟和 Future 的通过不代表真实停止时延、RTC 策略效果或传感器性能已验收。未测量吞吐或延迟收益，不作性能提升声明；后台任务超时仍不代表已终止。
+
+### 系统复审与清理（2026-11-04）
+
+提交前，在上述改造上继续沿部署入口、观测/动作适配、Robot、Worker、Raw、CLI 和所有相关测试调用方复审。复审起点 HEAD 为 `c2e5400d7dd2b0ce6f9ad2bb853218d52ac54576`，不覆盖已有有效修改。
+
+- 修复可复现的取消遗漏：采样/投影以及映射过程中取消后，接收或新发推理前复核运行准入；已完成 Future 留给原有回收路径，不再接纳为动作。发送处保留设备最后检查。
+- 修复模型 Future 抛 `SystemExit` 时会话 summary 可能误记 `quit`：运行边界记录实际失败，完整关闭后返回非零。最终辅助结果保存被 KeyboardInterrupt 中断时锁存急停并继续传播。
+- 删除单用途 `record_table_plane()` 及其重复归档，将实际平面参数更新放在加载位置，参数齐全后只归档一次配置。
+- 简化普通 async 时间窗口：删除单调用 `window_end()`；`handoff_plan()` 直接返回待用 chunk 或 None，过期结果由空 chunk 进入统一耗尽判断；布尔函数准确命名为 `plan_exhausted()`，不保留旧错误 tuple 分支。
+- 模型需求统一命名 `model_needs`，从 ObservationBuilder.needs 取得；删除 Rollout 重复传入的 control_needs 参数并同步全部调用方。清理测试中残留 Policy 音频字段、无效引用和多余空行，统一模块日志与 CLI 排版。
+- 修复同步消费的 Optional 类型收窄遗漏，用局部动作引用及现有 cast 表达内部已确立的不变量，没有增加运行时空值兜底、ignore 或兼容参数。
+- README 区分首预测在途等待与普通 async 完成后耗尽，说明辅助保存的中断行为；合并历史任务书重复的替代声明，保留其历史验证事实。
+- 部署链路未发现 SHA-256、内容哈希或旧格式兼容机制可删除；设备 CRC、共享快照一致性、反馈时效、目标限位和实际资源收尾有真实用途，继续保留。
+
+实际验证使用同一 real_robot Python，全部缓存位于仓库外或禁用：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -B -m pytest -p no:cacheprovider tests/test_control_progress.py tests/test_input_resources.py tests/test_recording_export.py
+# 412 passed，2.12 s。
+PYTHONDONTWRITEBYTECODE=1 python -B -m pytest -p no:cacheprovider tests
+# 最终 804 passed，4.34 s；包括新增 16 个参数化边界场景。
+python -B -m ruff check --no-cache --select F dexmani_real scripts tests
+# All checks passed!
+python -B -m mypy --no-incremental --cache-dir=/tmp/dexmani-review-mypy --no-site-packages --follow-imports=skip --ignore-missing-imports --explicit-package-bases dexmani_real/deployment scripts/run_policy.py
+# 8 个文件通过；常规检查不覆盖未标注函数体和第三方库类型。
+# 同命令增加 --check-untyped-defs：仍有 24 项既有 Session 生命周期 Optional 诊断，未通过。
+# 审查起点该扩展检查 25 项，HEAD 同范围 28 项；本次新增同步消费诊断已消除。
+python -B scripts/run_policy.py --help
+python -B scripts/run_policy.py --print-config
+git diff --check
+# 均通过。
+```
+
+在 /tmp 临时目录复制当前 package 和 pyproject，运行 `python -B -m pip wheel --no-deps --no-build-isolation --no-cache-dir` 构建成功；核对 wheel 中 7 个部署源码与 3 个标定 JSON 均与当前源码一致，临时目录已删除，未在仓库生成构建产物。清理过程中一处误删的局部变量经 Ruff 发现后已恢复，最终静态检查通过。
+
+未连接真机、运行真实 checkpoint 推理、执行实际 HOME/servo/手动作或修改实验数据。没有将既有扩展类型诊断、真机时序、停止时延或策略效果写成已通过。

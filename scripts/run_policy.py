@@ -31,7 +31,7 @@ def nonnegative_int(raw: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run one policy-evaluation session with required results and optional Raw recording"
+            "Run one policy-evaluation session with optional results and full Raw recording"
         )
     )
     parser.add_argument(
@@ -82,13 +82,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print declared Real config without loading Policy or calibration",
     )
     parser.add_argument(
-        "--output", type=Path, default=None, help="Session root (default: checkout/rollouts)"
+        "--output", type=Path, default=None,
+        help="Optional output root; defaults to checkout/rollouts only with --record-raw",
     )
     parser.add_argument("--camera-calibration", type=Path, default=None)
     parser.add_argument(
         "--record-raw",
         action="store_true",
-        help="Enable full Raw recording; evaluation results are always saved",
+        help="Enable full Raw recording and evaluation results",
     )
     research = parser.add_argument_group("Policy inference")
     research.add_argument("--weights", choices=("ema", "raw"), default=None)

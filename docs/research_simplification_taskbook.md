@@ -1,4 +1,4 @@
-> **历史记录：** 本文及[第二阶段任务书](research_simplification_v2_taskbook.md)保存各自阶段的实施事实，不作为当前行为约定；当前行为以源码和 [README](../README.md) 为准。
+> **历史记录：** 本文及[第二阶段任务书](research_simplification_v2_taskbook.md)保存各自阶段的实施事实，不作为当前行为约定；当前行为以源码和 [README](../README.md) 为准；策略部署的历史窗口、RTC、输出和音频约定已由[策略部署轻量化任务书](../POLICY_DEPLOYMENT_SIMPLIFICATION_TASKBOOK.md)替代。
 > XHand 的写 CRC、触觉保持、启动 HOME 与清零约定已由 [XHand 收敛任务书](xhand_simplification_taskbook.md) 替代；下文旧验证事实保留。
 > xArm 的 HOME、准备、轨迹接口和取消契约以 [xArm 轻量化任务书](xarm_simplification_taskbook.md) 为准；下文冲突约定仅为历史记录。
 

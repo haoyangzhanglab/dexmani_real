@@ -15,7 +15,7 @@ RUNTIME_SECTIONS = (
 
 @dataclass(frozen=True)
 class ExecutionConfig:
-    # async 可继续使用旧预测的有效尾部，action_steps 是名义执行窗口。
+    # async/RTC 可继续旧预测尾部；action_steps 是名义窗口，RTC 按提交进度接续。
     action_steps: int | None = None
     mode: str = "sync"
     prefetch_steps: int | None = None

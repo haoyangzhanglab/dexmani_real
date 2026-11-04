@@ -220,58 +220,11 @@ def model_session():
     from dexmani_real.deployment.session import PolicySession
     session = PolicySession.__new__(PolicySession)
     session.runtime_state = SessionState()
-    session.robot = session.sensors = session.keyboard = session.episode = session.audio = None
+    session.robot = session.sensors = session.keyboard = session.episode = None
     session.errors = []
     session.summary = {'termination_reason': None}
     session.save_results = lambda: None
     return session
-
-
-@pytest.mark.parametrize('prior_failure', [None, 'robot', 'recording', 'model'])
-@pytest.mark.parametrize('audio_error_type', [OSError, KeyboardInterrupt, SystemExit])
-@pytest.mark.parametrize('initial_reason', [None, 'startup_cancelled'])
-def test_policy_audio_cleanup_only_ordinary_errors_are_optional(
-    model_session, resource_logs, prior_failure, audio_error_type, initial_reason,
-):
-    session = model_session
-    session.summary['termination_reason'] = initial_reason
-    session.model = None
-    primary = OSError('primary failure')
-    audio_error = audio_error_type('audio close failed')
-    calls = []
-    def fail():
-        raise primary
-    if prior_failure == 'robot':
-        session.robot = SimpleNamespace(close=fail)
-    elif prior_failure == 'recording':
-        session.episode = SimpleNamespace(finish_recording=fail)
-    elif prior_failure == 'model':
-        future = Future()
-        future.set_exception(primary)
-        session.model = SimpleNamespace(close=lambda: future)
-    def close_audio():
-        calls.append('audio')
-        raise audio_error
-    def save_results():
-        if audio_error_type is KeyboardInterrupt:
-            assert session.runtime_state.estop_request
-        calls.append('results')
-    session.audio = SimpleNamespace(close=close_audio)
-    session.save_results = save_results
-    fatal_audio = audio_error_type is not OSError
-    assert session.close() == int(prior_failure is not None or fatal_audio)
-    assert calls == ['audio', 'results']
-    assert len(session.errors) == int(prior_failure is not None) + int(fatal_audio)
-    if prior_failure is not None:
-        assert session.errors[0]['message'] == 'primary failure'
-    reports = [record for record in resource_logs.records if record.exc_info and record.exc_info[1] is audio_error]
-    assert len(reports) == 1
-    assert reports[0].levelname == ('ERROR' if fatal_audio else 'WARNING')
-    assert session.runtime_state.estop_request == (audio_error_type is KeyboardInterrupt)
-    assert session.summary['termination_reason'] == (
-        'estop' if audio_error_type is KeyboardInterrupt
-        else 'failed' if prior_failure is not None or fatal_audio else initial_reason or 'quit'
-    )
 
 
 def test_policy_clean_close_preserves_startup_cancellation(model_session):
@@ -746,7 +699,7 @@ def test_sensor_recovery_preserves_policy_failure(prior_result):
 
     session = PolicySession.__new__(PolicySession)
     session.runtime_state = SessionState()
-    session.robot = session.keyboard = session.episode = session.model = session.audio = None
+    session.robot = session.keyboard = session.episode = session.model = None
     session.summary = {'termination_reason': None}
     session.save_results = lambda: None
     session.errors = []
@@ -1160,14 +1113,17 @@ def test_policy_starts_only_sensors_requested_by_control_or_recording(monkeypatc
     from dexmani_real.deployment import session as deployment
     from dexmani_real.runtime.observation import ObservationNeeds
 
+    def completed_future():
+        result = Future()
+        result.set_result(None)
+        return result
     channels = []
     monkeypatch.setitem(sys.modules, 'dexmani_policy.deployment', SimpleNamespace(load_policy=lambda *a, **kw: None))
-    monkeypatch.setattr(deployment, 'AudioFeedback', lambda: None)
     monkeypatch.setattr(deployment.ActionMapper, 'for_mode', lambda *a, **kw: None)
     monkeypatch.setattr(deployment, 'Keyboard', lambda **kwargs: SimpleNamespace(
         start=lambda: None, check_health=lambda: True,
     ))
-    monkeypatch.setattr(deployment, 'PolicyWorker', lambda *a, **kw: SimpleNamespace(load=lambda: None))
+    monkeypatch.setattr(deployment, 'PolicyWorker', lambda *a, **kw: SimpleNamespace(load=lambda: None, poll=lambda: completed_future()))
     def sensor_channels(*args, **kwargs):
         channels.append(kwargs)
         return object()
@@ -1326,7 +1282,7 @@ def test_policy_warmup_waits_for_its_real_inputs_without_home(monkeypatch, outco
     session.runtime = RealConfig()
     session.runtime_state = SessionState()
     session.startup_cancel_epoch = session.runtime_state.cancel_epoch
-    session.control_needs = ObservationNeeds(required_tactile=('aggregate',))
+    session.model_needs = ObservationNeeds(required_tactile=('aggregate',))
     session.info = SimpleNamespace(n_obs_steps=2)
     session.keyboard = SimpleNamespace(check_health=lambda: True)
     session.sensors = SimpleNamespace(channels=None)
@@ -1379,3 +1335,202 @@ def test_teleop_string_commands_preserve_priority_and_discard(commands, selected
     loop.handle_commands(commands)
     assert handled == [selected]
     assert loop.discard_requested == ('d' in commands)
+
+
+@pytest.mark.parametrize('outcome', ['success', 'failure', 'cancel'])
+def test_policy_load_finishes_before_device_construction(monkeypatch, tmp_path, outcome):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.deployment import session as deployment
+    from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.runtime.observation import ObservationNeeds
+    order = []
+    done = Future()
+    if outcome == 'failure':
+        done.set_exception(ValueError('load failed'))
+    else:
+        done.set_result(None)
+    monkeypatch.setattr(deployment.ActionMapper, 'for_mode', lambda *a, **kw: None)
+    monkeypatch.setattr(deployment, 'Keyboard', lambda **kw: SimpleNamespace(
+        start=lambda: order.append('keyboard'), check_health=lambda: True))
+    def poll():
+        order.append('load_done')
+        if outcome == 'cancel':
+            session.runtime_state.request_stop()
+        return done
+    monkeypatch.setattr(deployment, 'PolicyWorker', lambda *a, **kw: SimpleNamespace(
+        load=lambda: order.append('load'), poll=poll))
+    monkeypatch.setattr(deployment, 'Robot', lambda *a, **kw: order.append('robot'))
+    session = deployment.PolicySession(RealConfig(), SimpleNamespace(action_mode='joint'),
+        output_dir=None, run_config={}, device='cpu', seed=0, max_running_s=60,
+        num_episodes=1, record_raw=False, camera_calibration_path=None,
+        observations=SimpleNamespace(needs=ObservationNeeds(), camera_static=False, build=lambda rows: rows))
+    if outcome == 'success':
+        session.prepare_resources()
+        assert order == ['keyboard', 'load', 'load_done', 'robot']
+    else:
+        with pytest.raises(ValueError if outcome == 'failure' else OperationCancelled):
+            session.prepare_resources()
+        assert 'robot' not in order and session.robot is None
+
+
+@pytest.mark.parametrize('error', [OSError, ValueError, KeyboardInterrupt])
+def test_auxiliary_output_failure_is_visible_and_interrupts_propagate(tmp_path, caplog, error):
+    from dexmani_real.deployment.session import PolicySession
+    session = PolicySession.__new__(PolicySession)
+    session.output_dir = tmp_path
+    def fail(*args):
+        raise error('write failed')
+    if error is KeyboardInterrupt:
+        with pytest.raises(KeyboardInterrupt):
+            session.save_auxiliary('session_result.json', fail, {})
+    else:
+        session.save_auxiliary('session_result.json', fail, {})
+        assert 'write failed' in caplog.text and str(tmp_path) in caplog.text
+    session.output_dir = None
+    session.save_auxiliary('session_result.json', fail, {})
+
+
+@pytest.mark.parametrize('raw,output', [(False, False), (False, True), (True, False), (True, True)])
+def test_policy_output_is_explicit_and_task_is_only_metadata(monkeypatch, tmp_path, raw, output):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.deployment import run
+    import dexmani_policy.deployment
+    info = SimpleNamespace(task_name='a/b', to_dict=lambda: {'task_name': 'a/b'})
+    monkeypatch.setattr(dexmani_policy.deployment, 'inspect_policy', lambda *a, **kw: info)
+    monkeypatch.setattr(run, 'resolve_deployment_config', lambda info, runtime: runtime)
+    monkeypatch.setattr(run, 'ObservationBuilder', lambda *a: None)
+    info.observation_fields = ('joint_state',)
+    roots, sessions = [], []
+    directory = run.session_directory
+    def create(root):
+        roots.append(root)
+        return directory(tmp_path)
+    monkeypatch.setattr(run, 'session_directory', create)
+    monkeypatch.setattr(run, 'PolicySession', lambda *a, **kw: sessions.append(kw) or SimpleNamespace(run=lambda: 0))
+    assert run.run_policy('fake', RealConfig(), record_raw=raw, output=tmp_path if output else None) == 0
+    assert bool(roots) == (raw or output)
+    if raw or output:
+        assert sessions[0]['output_dir'].parent == tmp_path
+        assert sessions[0]['output_dir'].name.startswith('session_')
+    else:
+        assert sessions[0]['output_dir'] is None and not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize('raw', [False, True])
+def test_output_directory_failure_only_blocks_required_raw(monkeypatch, raw):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.deployment import run
+    import dexmani_policy.deployment
+    info = SimpleNamespace(observation_fields=('joint_state',), to_dict=lambda: {})
+    monkeypatch.setattr(dexmani_policy.deployment, 'inspect_policy', lambda *a, **kw: info)
+    monkeypatch.setattr(run, 'resolve_deployment_config', lambda info, runtime: runtime)
+    monkeypatch.setattr(run, 'ObservationBuilder', lambda *a: None)
+    def fail(root):
+        raise OSError('directory failed')
+    monkeypatch.setattr(run, 'session_directory', fail)
+    sessions = []
+    monkeypatch.setattr(run, 'PolicySession', lambda *a, **kw: sessions.append(kw) or SimpleNamespace(run=lambda: 0))
+    if raw:
+        with pytest.raises(OSError, match='directory failed'):
+            run.run_policy('fake', RealConfig(), output='/unused', record_raw=True)
+        assert not sessions
+    else:
+        assert run.run_policy('fake', RealConfig(), output='/unused') == 0
+        assert sessions[0]['output_dir'] is None
+
+
+def test_auxiliary_result_failure_does_not_change_close_result(model_session, tmp_path, monkeypatch, caplog):
+    from dexmani_real.deployment.session import PolicySession
+    session = model_session
+    session.model = None
+    session.episodes = []
+    session.output_dir = tmp_path
+    session.save_results = lambda: PolicySession.save_results(session)
+    def fail(*args):
+        raise OSError('result file failed')
+    monkeypatch.setattr('dexmani_real.deployment.session.write_json', fail)
+    assert session.close() == 0
+    assert not session.errors and 'result file failed' in caplog.text
+
+
+@pytest.mark.parametrize('stage', ['load', 'control'])
+@pytest.mark.parametrize('error_type', [SystemExit, ValueError])
+def test_policy_runtime_reports_all_model_failures(model_session, stage, error_type):
+    session = model_session
+    session.info = SimpleNamespace(checkpoint_path=SimpleNamespace(name='fake.pt'),
+                                   weights='raw', inference_steps=1, control_dt_s=.0625)
+    session.runtime = SimpleNamespace(execution=SimpleNamespace(mode='sync', action_steps=1))
+    calls = []
+    session.robot = SimpleNamespace(check=lambda: None, close=lambda: calls.append('robot_close'))
+    session.model = None
+    failed = Future()
+    failed.set_exception(error_type('model failed'))
+    session.prepare_resources = failed.result if stage == 'load' else lambda: None
+    session.start_devices = lambda: None
+    session.run_control_loop = failed.result if stage == 'control' else lambda: None
+    assert session.run() == 1
+    assert calls == ['robot_close']
+    assert session.errors == [dict(stage='session', exception_type=error_type.__name__, message='model failed')]
+    assert session.summary['termination_reason'] == 'failed'
+    assert session.runtime_state.stop_signal.is_set()
+
+
+def test_final_result_interrupt_latches_estop_after_resource_cleanup(model_session):
+    session = model_session
+    calls = []
+    session.robot = SimpleNamespace(close=lambda: calls.append('robot'))
+    session.keyboard = SimpleNamespace(stop=lambda: calls.append('keyboard'))
+    session.sensors = SimpleNamespace(shutdown=lambda state: calls.append('sensors'))
+    session.episode = SimpleNamespace(finish_recording=lambda: calls.append('recorder'))
+    closed = Future()
+    closed.set_result(None)
+    session.model = SimpleNamespace(close=lambda: calls.append('model') or closed)
+    def save():
+        calls.append('result')
+        raise KeyboardInterrupt('final save interrupted')
+    session.save_results = save
+    with pytest.raises(KeyboardInterrupt, match='final save interrupted'):
+        session.close()
+    assert calls == ['robot', 'keyboard', 'sensors', 'recorder', 'model', 'result']
+    assert session.runtime_state.estop_request and session.runtime_state.stop_signal.is_set()
+    assert session.summary['termination_reason'] == 'estop'
+
+
+def test_policy_config_is_saved_once_after_pointcloud_parameters_ready(monkeypatch):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.deployment import session as deployment
+    from dexmani_real.runtime.observation import ObservationNeeds
+    session = deployment.PolicySession.__new__(deployment.PolicySession)
+    session.runtime = RealConfig()
+    session.runtime_state = SessionState()
+    session.capture_needs = ObservationNeeds(point_cloud=True)
+    session.info = SimpleNamespace(observation_fields=('point_cloud',))
+    session.observations = SimpleNamespace(camera_static=False, configure_camera=lambda camera: None)
+    session.check_startup = lambda: None
+    session.startup_allowed = lambda: True
+    session.warmup_policy = lambda: None
+    session.robot = SimpleNamespace(connect=lambda: None)
+    session.camera_calibration_path = None
+    session.record_raw = False
+    session.table_plane_abcd = None
+    session.run_config = {}
+    session.process_context = SimpleNamespace(Process=lambda **kwargs: SimpleNamespace(**kwargs))
+    started = []
+    session.sensors = SimpleNamespace(
+        channels=SimpleNamespace(camera_ring=object(), pointcloud_ring=object()),
+        start=lambda process, **kwargs: started.append(process.name),
+    )
+    plane = [0., 0., 1., 0.]
+    monkeypatch.setattr(deployment, 'snapshot_camera_parameters', lambda *args, **kwargs: object())
+    monkeypatch.setattr(deployment, 'camera_metadata', lambda camera: {'camera_serial': 'fake-camera'})
+    monkeypatch.setattr(deployment, 'load_table_plane', lambda path: plane)
+    monkeypatch.setattr(deployment, 'resolve_table_plane_path', lambda path: '/tmp/fake-plane.json')
+    saves = []
+    session.save_auxiliary = lambda name, writer, payload: saves.append((name, dict(payload)))
+    session.start_devices()
+    assert started == ['camera', 'pointcloud']
+    assert saves == [('run_config.yaml', {
+        'effective_camera': {'camera_T_xarm_base_from_color': None, 'camera_serial': 'fake-camera'},
+        'table_plane_abcd': plane,
+        'table_plane_path': '/tmp/fake-plane.json',
+    })]
