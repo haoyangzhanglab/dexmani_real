@@ -55,7 +55,7 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
             (type(cap) is not int and type(cap) is not float)
             or not math.isfinite(cap) or cap < 0
         ):
-            raise ValueError("rtc_guidance_cap requires an explicit finite nonnegative value")
+            raise ValueError("rtc_guidance_cap requires a finite nonnegative value")
 
 
 def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:

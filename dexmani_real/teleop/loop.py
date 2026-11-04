@@ -18,6 +18,7 @@ from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.runtime.home import HomeConfigurationError, home_arm, home_hand
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
+    check_device_feedback,
     check_observation,
     missing_tactile_channels,
     read_observation,
@@ -495,9 +496,8 @@ class TeleopLoop:
         return "; ".join(issues) if issues else None
 
     def admit_observation(self, row):
-        return check_observation(
-            row, self.runtime, self.control_needs, require_hand=self.runtime.hand.enabled,
-        )
+        return (check_device_feedback(row, self.runtime)
+                + check_observation(row, self.runtime, self.control_needs))
 
     def run_control_tick(self):
         if self.runtime_state.stop_signal.is_set():
@@ -515,13 +515,17 @@ class TeleopLoop:
             return
         self.next_tick_ns = now_ns + self.control_dt_ns
         row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
+        devices = check_device_feedback(row, self.runtime)
+        if devices:
+            self.request_episode_end("control_sources: " + "; ".join(devices))
+            return
         if self.recorder is not None and (quality := self.recording_issue(row)) is not None:
             self.recorder.append(row, quality_issue=quality)
             self.request_episode_end(quality)
             return
         if not sources_available(row, self.control_needs):
             return
-        issues = self.admit_observation(row)
+        issues = check_observation(row, self.runtime, self.control_needs)
         if issues:
             self.request_episode_end("control_sources: " + "; ".join(issues))
             return

@@ -96,26 +96,32 @@ def missing_tactile_channels(row, channels):
     return missing
 
 
-def check_observation(row, runtime, needs, *, require_hand=True, now_ns=None, allow_tactile_hold=False):
-    """按消费者需求检查来源；发布前可重新检查长计算期间的年龄。"""
+def check_device_feedback(row, runtime, *, now_ns=None):
+    """设备事实；长计算后使用新的当前时间重新检查。"""
     now = time.monotonic_ns() if now_ns is None else now_ns
     issues = []
-    stamp = int(row.arm["timestamp_ns"][0])
-    if not sample_is_fresh(stamp, runtime.arm.feedback_max_age_s, now):
+    if not sample_is_fresh(int(row.arm["timestamp_ns"][0]), runtime.arm.feedback_max_age_s, now):
         issues.append("arm_feedback_stale")
-    if require_hand and row.hand is None:
-        issues.append("hand_feedback_unavailable")
-    if require_hand and row.hand is not None:
-        names = ("timestamp_ns",) if allow_tactile_hold else (
-            "timestamp_ns", *(f"tactile_{c}_timestamp_ns" for c in needs.required_tactile)
-        )
-        for name in names:
-            stamp = int(row.hand[name][0])
-            if not sample_is_fresh(stamp, runtime.hand.feedback_max_age_s, now):
-                issues.append(f"hand_{name}_unavailable_or_stale")
-    if require_hand and allow_tactile_hold:
+    if runtime.hand.enabled:
+        if row.hand is None:
+            issues.append("hand_feedback_unavailable")
+        elif not sample_is_fresh(int(row.hand["timestamp_ns"][0]), runtime.hand.feedback_max_age_s, now):
+            issues.append("hand_timestamp_ns_unavailable_or_stale")
+    return issues
+
+
+def check_observation(row, runtime, needs, *, now_ns=None, allow_tactile_hold=False):
+    """模型或录制所需模态，不重复检查关节反馈。"""
+    now = time.monotonic_ns() if now_ns is None else now_ns
+    issues: list[str] = []
+    if allow_tactile_hold:
         issues.extend(f"hand_tactile_{channel}_unavailable"
                       for channel in missing_tactile_channels(row, needs.required_tactile))
+    else:
+        for channel in needs.required_tactile:
+            stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0]) if row.hand is not None else 0
+            if not sample_is_fresh(stamp, runtime.hand.feedback_max_age_s, now):
+                issues.append(f"hand_tactile_{channel}_timestamp_ns_unavailable_or_stale")
     if needs.camera_fields:
         if row.camera is None:
             issues.append("camera_source_unavailable_or_unmatched")

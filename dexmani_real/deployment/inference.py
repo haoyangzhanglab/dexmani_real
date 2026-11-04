@@ -1,7 +1,7 @@
 """模型生命周期与预测在同一个工作线程串行执行。"""
 
 import sys
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
@@ -52,16 +52,6 @@ class PolicyWorker:
         self.future = None
         return future
 
-    def discard_pending(self, timeout_s):
-        """本段停止后回收尚未消费的任务；超时保留归属，禁止下一段复用。"""
-        future = self.future
-        if future is None:
-            return
-        if future not in wait((future,), timeout=timeout_s).done:
-            raise TimeoutError("episode model task remains pending")
-        self.future = None
-        future.result()
-
     def close(self):
         if self.close_future is not None:
             return self.close_future
@@ -73,16 +63,17 @@ class PolicyWorker:
                     retired.result()
             finally:
                 task_error = sys.exc_info()[1]
+                self.future = None
                 try:
                     if self.model is not None:
                         self.model.close()
+                        self.model = None
                 except BaseException as close_error:
                     # 会话通过最外层中断锁存急停；关闭失败不能遮蔽它。
-                    if isinstance(task_error, KeyboardInterrupt):
+                    if isinstance(task_error, (KeyboardInterrupt, SystemExit)):
                         raise task_error from close_error
                     raise
 
         self.close_future = self.executor.submit(close_model)
-        self.future = None
         self.executor.shutdown(wait=False, cancel_futures=False)
         return self.close_future

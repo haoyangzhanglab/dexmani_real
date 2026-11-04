@@ -5,10 +5,8 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import asdict
 from pathlib import Path
 
-from dexmani_real.config.calibration_data import CAMERAS_PATH
 from dexmani_real.config.deployment import (
     DEFAULT_MAX_RUNNING_S,
     DEFAULT_NUM_EPISODES,
@@ -18,10 +16,6 @@ from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.deployment.session import PolicySession
 
 logger = logging.getLogger(__name__)
-
-RUNTIME_SECTIONS = (
-    "execution", "arm", "hand", "motion", "camera", "pointcloud", "hand_pointcloud", "environment",
-)
 
 
 def session_directory(root: Path) -> Path:
@@ -39,10 +33,9 @@ def session_directory(root: Path) -> Path:
 
 
 def run_policy(
-    experiment,
+    policy,
     runtime,
     *,
-    checkpoint="latest",
     weights=None,
     inference_steps=None,
     device="cuda:0",
@@ -68,7 +61,7 @@ def run_policy(
     from dexmani_policy.deployment import inspect_policy
 
     info = inspect_policy(
-        experiment, checkpoint=checkpoint, weights=weights, inference_steps=inference_steps,
+        policy, weights=weights, inference_steps=inference_steps,
     )
     runtime = resolve_deployment_config(info, runtime)
     observations = ObservationBuilder(info, runtime)
@@ -83,21 +76,8 @@ def run_policy(
             if record_raw:
                 raise
             logger.exception("辅助输出目录创建失败：%s", root)
-    payload = {
-        "policy": info.to_dict(),
-        "runtime": {name: asdict(getattr(runtime, name)) for name in RUNTIME_SECTIONS},
-        "camera_calibration_path": str(camera_calibration_path or CAMERAS_PATH),
-        "effective_camera": None,
-        "table_plane_abcd": None,
-        "table_plane_path": None,
-        "seed": seed,
-        "device": device,
-        "num_episodes": num_episodes,
-        "max_duration_s": max_running_s,
-        "record_raw": record_raw,
-    }
 
-    print(f"策略：{experiment}；数值表示 recipe 与控制 dt 来自训练 artifact，设备和标定来自 Real")
+    print(f"策略：{policy}；数值表示 recipe 与控制 dt 来自训练 artifact，设备和标定来自 Real")
     duration = f"{max_running_s:g} s" if max_running_s is not None else "无限制"
     print(
         f"评估：{num_episodes if num_episodes is not None else '不限'} 轮正式运行结束后退出 | "
@@ -114,6 +94,5 @@ def run_policy(
         record_raw=record_raw,
         output_dir=session_dir,
         camera_calibration_path=camera_calibration_path,
-        run_config=payload,
         observations=observations,
     ).run()

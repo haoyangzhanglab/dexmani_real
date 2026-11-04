@@ -14,8 +14,7 @@ from dexmani_real.geometry.pose import Pose, quat_multiply
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.runtime.keyboard import JOG_KEY_PAIRS
 from dexmani_real.runtime.observation import (
-    ObservationNeeds,
-    check_observation,
+    check_device_feedback,
     read_observation,
 )
 
@@ -45,9 +44,7 @@ class CartesianJog:
                 raise OperationCancelled("jog authority revoked")
 
         row = read_observation(None, robot)
-        issues = check_observation(
-            row, runtime, ObservationNeeds(), require_hand=runtime.hand.enabled,
-        )
+        issues = check_device_feedback(row, runtime)
         if issues:
             raise OperationCancelled("jog feedback rejected: " + "; ".join(issues))
         target = None
@@ -66,9 +63,7 @@ class CartesianJog:
             logger.warning("IK rejected target; braking and holding: %s", rejection_reason)
         self.rejection_reason = rejection_reason
         if target is not None:
-            issues = check_observation(
-                row, runtime, ObservationNeeds(), require_hand=runtime.hand.enabled,
-            )
+            issues = check_device_feedback(row, runtime)
             if issues:
                 raise OperationCancelled("jog mapping sources expired: " + "; ".join(issues))
         command = RobotCommand(arm_qpos=target, arm_hold=target is None)

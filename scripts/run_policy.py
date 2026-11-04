@@ -11,6 +11,7 @@ from pathlib import Path
 from dexmani_real.config.deployment import (
     DEFAULT_MAX_RUNNING_S,
     DEFAULT_NUM_EPISODES,
+    RUNTIME_SECTIONS,
 )
 
 
@@ -35,10 +36,10 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument(
-        "experiment",
-        metavar="EXPERIMENT",
+        "policy",
+        metavar="POLICY",
         nargs="?",
-        help="Saved Policy selector or absolute experiment directory; required unless --print-config",
+        help="Checkpoint file or directory containing checkpoints/latest.pt; relative to cwd",
     )
     parser.add_argument(
         "--config",
@@ -46,14 +47,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Trusted Python experiment file exporting CONFIG: RealConfig. "
             "Policy recipe is restored from its checkpoint"
-        ),
-    )
-    parser.add_argument(
-        "--checkpoint",
-        default="latest",
-        help=(
-            "latest (default, checkpoints/latest.pt) or a checkpoint filename/path "
-            "(relative paths use the experiment's checkpoints directory)"
         ),
     )
     parser.add_argument(
@@ -109,22 +102,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not args.print_config and args.experiment is None:
-        parser.error("EXPERIMENT is required unless --print-config is used")
+    if not args.print_config and args.policy is None:
+        parser.error("POLICY is required unless --print-config is used")
 
     from dexmani_real.config.real import load_config
 
     runtime = load_config(args.config)
     if args.print_config:
-        print(json.dumps(asdict(runtime), ensure_ascii=False, indent=2, allow_nan=False))
+        declared = {name: asdict(getattr(runtime, name)) for name in RUNTIME_SECTIONS}
+        print(json.dumps(declared, ensure_ascii=False, indent=2, allow_nan=False))
         return 0
 
     from dexmani_real.deployment.run import run_policy
 
     return run_policy(
-        args.experiment,
+        args.policy,
         runtime,
-        checkpoint=args.checkpoint,
         weights=args.weights,
         inference_steps=args.inference_steps,
         device=args.device,

@@ -6,7 +6,7 @@ import numpy as np
 
 from dexmani_real.control.constraints import MotionConstraints, wrap_nearest_equivalent
 from dexmani_real.control.ik import IKSolver
-from dexmani_real.geometry.pose import Pose, rot6d_to_rotmat
+from dexmani_real.geometry.pose import Pose
 
 
 class HandStartRejected(ValueError):
@@ -82,9 +82,6 @@ class ActionMapper:
 
     def map_joint(self, arm, hand, current_arm_qpos):
         """将关节意图投影到运行范围，不执行几何筛选。"""
-        arm = np.asarray(arm, dtype=np.float64)
-        if arm.shape != (7,) or not np.isfinite(arm).all():
-            raise ValueError("joint intent must be a finite (7,) vector")
         current = np.asarray(current_arm_qpos, dtype=np.float64)
         hand = self.prepare_hand(hand)
         target = project_arm_command(
@@ -117,18 +114,6 @@ class ActionMapper:
             rejection_reason=reason,
             eef_pose=pose,
         )
-
-    def normalize_policy_actions(self, actions, mode):
-        """RTC 前缀与消费共用规范化动作；关节等价分支和 IK 留到实际提交。"""
-        values = np.array(actions, dtype=np.float64, copy=True)
-        hand_start = 7 if mode == "joint" else 9
-        values[:, hand_start:] = np.clip(values[:, hand_start:], self.hand_lower, self.hand_upper)
-        if mode == "eef":
-            workspace = self.solver.constraints.workspace
-            values[:, :3] = np.clip(values[:, :3], workspace[:, 0], workspace[:, 1])
-            rotation = rot6d_to_rotmat(values[:, 3:9])
-            values[:, 3:9] = np.concatenate((rotation[:, :, 0], rotation[:, :, 1]), axis=1)
-        return values
 
 
 def project_arm_command(target_arm_qpos, reference_arm_qpos, *, joint_lower_rad, joint_upper_rad):

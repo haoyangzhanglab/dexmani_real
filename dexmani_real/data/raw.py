@@ -70,9 +70,9 @@ def validate_task_label(task_label) -> None:
     if (
         not isinstance(task_label, str)
         or not task_label.strip()
-        or any(ord(char) < 32 or ord(char) == 127 for char in task_label)
+        or "\0" in task_label
     ):
-        raise ValueError("task_label must be a non-empty string without ASCII control characters")
+        raise ValueError("task_label must be a non-empty string without NUL")
 
 
 def encode_raw_row(row, command):

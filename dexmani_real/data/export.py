@@ -268,8 +268,6 @@ def export_zarr(
     source = requested_source.resolve()
     output = Path(output_path).expanduser()
     target = output.resolve()
-    if target == source or source in target.parents or target in source.parents:
-        raise ValueError("output and Raw input must not contain one another")
     if os.path.lexists(output):
         raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {output}")
     selected, excluded = select_episodes(requested_source, exclude)
