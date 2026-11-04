@@ -45,9 +45,7 @@ def segment(args, *, output=None, list_only=False):
     if not args.headless and not list_only:
         display_available()
     rgb, source, provenance = load_rgb(args)
-    output = output_path(
-        output or args.output, workspace=args.workspace, protected=(source,)
-    )
+    output = output_path(output or args.output, protected=(source,))
     output.mkdir(parents=True, exist_ok=False)
     Image.fromarray(rgb).save(output / "rgb.png")
     source_name = (
@@ -96,7 +94,7 @@ def select(args):
     from PIL import Image
 
     source = args.segmentation_dir.expanduser().resolve()
-    output = output_path(args.output, workspace=args.workspace, protected=(source,))
+    output = output_path(args.output, protected=(source,))
     provenance = json.loads(
         existing_file(source / "segmentation_result.json").read_text()
     )
@@ -136,7 +134,7 @@ def select(args):
     save_selection(output, rgb, candidates, index, provenance)
 
 
-def generate(args, segmentation_dir=None, output=None):
+def generate(args, image=None, output=None):
     from ..reconstruction import generate_mesh, validate_generation_parameters
 
     validate_generation_parameters(
@@ -144,22 +142,15 @@ def generate(args, segmentation_dir=None, output=None):
     )
     if args.preview:
         display_available()
-    source = Path(segmentation_dir or args.segmentation_dir).expanduser().resolve()
-    metadata = json.loads(existing_file(source / "selection.json").read_text())
-    if metadata["selection"] not in {"explicit_headless_instance", "gui_confirmed"}:
-        raise ValueError("建模需要已明确确认的分割")
-    image = existing_file(source / "foreground_rgba.png")
-    output = output_path(
-        output or args.output, workspace=args.workspace, protected=(source,)
-    )
+    image = existing_file(image or args.image)
+    output = output_path(output or args.output, protected=(image,))
     output.mkdir(parents=True, exist_ok=False)
     root = args.workspace / "third_party/Hunyuan3D-2.1"
     weights = args.models_dir / "Hunyuan3D-2.1"
     write_json(
         output / "generation_request.json",
         {
-            "segmentation_directory": str(source),
-            "selected_instance": metadata["selected_instance"],
+            "image_rgba_path": str(image),
             "source_root": str(root),
             "weights_dir": str(weights),
             "seed": args.seed,
@@ -205,7 +196,6 @@ def prepare(args, mesh=None, output=None):
     asset = prepare_asset(
         mesh or args.mesh,
         output or args.output,
-        workspace=args.workspace,
         scale_to_meters=args.scale_to_meters,
         size_axis=args.size_axis,
         size_meters=args.size_meters,
@@ -241,13 +231,18 @@ def build(args):
     validate_generation_parameters(
         args.seed, args.steps, args.octree_resolution, args.num_chunks
     )
-    output = output_path(args.output, workspace=args.workspace)
+    source = args.image if args.image is not None else args.rgbd
+    output = output_path(args.output, protected=(source,))
     output.mkdir(parents=True, exist_ok=False)
     segment(args, output=output / "segmentation")
     # 生成进程退出后释放 CUDA，再准备米制资产。
     process = mp.get_context("spawn").Process(
         target=generate,
-        args=(args, output / "segmentation", output / "generation"),
+        args=(
+            args,
+            output / "segmentation/foreground_rgba.png",
+            output / "generation",
+        ),
         name="object-generation",
     )
     try:

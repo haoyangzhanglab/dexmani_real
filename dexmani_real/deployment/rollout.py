@@ -119,22 +119,27 @@ class Rollout:
         self.history.clear()
         self.previous_arm = self.run_deadline_ns = None
 
-    def finish_recording(self):
+    def finish_recording(self, *, wait=True) -> bool:
         result = self.result
         if self.recorder is not None:
-            save = not self.discard_requested
-            try:
-                self.recorder.finish(
-                    save=save, reason=result.termination_reason,
-                    details=result.errors + ([{"stage": "termination", "reason": result.termination_details}]
-                                             if result.termination_details is not None else []),
-                )
-            finally:
-                result.raw = self.recorder.result()
+            recorder = self.recorder
+            finish_kwargs = {
+                "save": not self.discard_requested, "reason": result.termination_reason,
+                "details": result.errors + ([{"stage": "termination", "reason": result.termination_details}]
+                                            if result.termination_details is not None else []),
+            }
+            if wait:
+                recorder.finish(**finish_kwargs)
+            else:
+                recorder.request_finish(**finish_kwargs)
+                if not recorder.poll_finish():
+                    return False
+            result.raw = recorder.result()
             # 只在真正完成后释放 owner；失败/仍存活时保留 recorder。
             self.recorder = None
-            if not save:
+            if not recorder.finish_request.save:
                 logger.info("Raw 已丢弃。")
+        return True
 
     def run(self, *, poll_operator):
         """运行结束先停设备；段间及最终资源收尾由 Session 编排。"""

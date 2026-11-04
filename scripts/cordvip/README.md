@@ -31,7 +31,7 @@ python scripts/cordvip/track_object.py \
   --with-hand --output /tmp/cordvip/scene_001
 ```
 
-在冻结的 Raw 首帧上确认文本候选，或省略 prompt 手动画 mask。选择保存到输出的 `initial_selections/`；`scene.json` 记录可复用的对象与选择路径。再次运行可指定 `--initial-selection DIR`。复用逐项精确核对首帧 RGB-D、内参和畸变。`source_id`、时间戳、时钟和行号仅作来源说明，允许两个有效帧的这些信息不同；已有选择文件及来源元数据保持原样。mask 文件仍须位于选择目录内，并匹配原始 RGB 网格。
+在冻结的 Raw 首帧上确认文本候选，或省略 prompt 手动画 mask。选择保存到输出的 `initial_selections/`；`scene.json` 记录可复用的对象与选择路径。再次运行可指定 `--initial-selection PATH`：直接传 PNG/NPY mask，或传含 `selection.json` 的目录，其中只需 `mask_file` 指向目录内的 mask。mask 明确应用于当前首帧原始 RGB 网格，不自动猜测或转换坐标网格。目录若含 `source_rgbd.npz`，则逐项精确核对首帧 RGB-D、内参和畸变；没有绑定文件时不验证来源。`source_id`、时间戳、时钟和行号仅作说明，已有输入保持原样。
 
 多物体由一个场景 JSON 声明，路径相对仓库根目录：
 
@@ -50,9 +50,9 @@ python scripts/cordvip/track_object.py \
   --with-hand --headless --output /tmp/cordvip/scene_002
 ```
 
-`role` 是一次保存的标签，不改变算法。省略某个 `asset` 时，该对象只输出连续 mask 与实测深度点，不估计 pose；全部省略时不要求 FoundationPose。无窗口运行要求每个实例都有当前首帧的确认选择，不会自动接受最高分候选。
+`role` 是一次保存的标签，不改变算法。省略某个 `asset` 时，该对象只输出连续 mask 与实测深度点，不估计 pose；全部省略时不要求 FoundationPose。无窗口运行要求每个实例提供当前首帧的有效 mask，可直接用 mask 文件，无需确认标签。
 
-默认顺序处理全部 Raw 行，不按墙钟跳帧。`--max-frames N` 显式限制处理前缀，结果标为 partial。输出目录必须尚不存在；处理前将各资产的固定点/法向写入 `model_templates/<object_id>.npz` 一次，每行结果保存为 `frames/000000.npz` 等，源 row ID、时间和时钟保留。逐帧保存有效/候选 pose 与实测数据，模型点/法向从模板按需重建。mask-only 不生成模板。查看结果是独立步骤：
+默认顺序处理全部 Raw 行，不按墙钟跳帧。`--max-frames N` 显式限制处理前缀，结果标为 partial。输出目录必须尚不存在，可以是 `rollouts/derived/objects` 等独立结果目录；实际输入、Raw episode 内部和已有输出仍受保护。处理前将各资产的固定点/法向写入 `model_templates/<object_id>.npz` 一次，每行结果保存为 `frames/000000.npz` 等，源 row ID、时间和时钟保留。逐帧保存有效/候选 pose 与实测数据，模型点/法向从模板按需重建。mask-only 不生成模板。查看结果是独立步骤：
 
 ```bash
 python -m cordvip_geometry view /tmp/cordvip/scene_001

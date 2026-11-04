@@ -30,7 +30,7 @@ with (
         points_camera = tracker.model_points(result, "object")
 ```
 
-`assets` 为对象名到资产目录的映射，`selections` 为对象名到首帧确认目录的映射。宿主持有相机时，用 `RGBDFrame.from_camera(camera, row.camera)` 构造帧，再调用 `tracker.step(frame)`；首帧显式传入原 RGB 网格的 `initial_masks`。实时重复样本复用结果，Raw 每行均独立处理。点云按需重建为米制 `float32 (N, 3)`，可用 `T_target_camera` 变换到基座坐标系。
+`assets` 为对象名到资产目录的映射，`selections` 为对象名到首帧 PNG/NPY mask 文件或选择目录的映射；目录仅需 `selection.json` 的 `mask_file`，可选 `source_rgbd.npz` 存在时核对首帧实际数据。宿主持有相机时，用 `RGBDFrame.from_camera(camera, row.camera)` 构造帧，再调用 `tracker.step(frame)`。也可省略 `initial_selections`，改在首帧传入原 RGB 网格的 `initial_masks`；两种初始化输入不能混用。实时重复样本复用结果，Raw 每行均独立处理。点云按需重建为米制 `float32 (N, 3)`，可用 `T_target_camera` 变换到基座坐标系。
 
 `SceneTracker.open` 一次加载资产与模型，并负责资源收尾。API 返回内存结果；SAM 日志默认输出到宿主 stderr，指定 `log_dir` 可保存日志。CLI 使用同一工厂，并写入可独立查看的结果目录。接口和返回语义见 [Python API](docs/usage.md#python-api)。
 

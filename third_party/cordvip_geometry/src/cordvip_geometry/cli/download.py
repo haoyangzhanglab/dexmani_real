@@ -39,7 +39,7 @@ def build_parser(*, workspace=None):
 def main(argv=None, *, workspace=None):
     parser = build_parser(workspace=workspace)
     args = parser.parse_args(argv)
-    output = output_path(args.models_dir, workspace=args.workspace, allow_existing=True)
+    output = output_path(args.models_dir, allow_existing=True)
     output.mkdir(parents=True, exist_ok=True)
     for name in args.models:
         spec: dict[str, Any]

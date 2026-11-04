@@ -1,4 +1,4 @@
-"""场景声明和首帧实例确认；选择产物绑定首帧实际数据。"""
+"""场景声明、首帧 mask 输入与交互选择。"""
 
 import json
 import re
@@ -45,7 +45,7 @@ def load_scene(path, *, headless):
             raise ValueError("Scene role must be object or reference")
         if headless and not item.get("initial_selection"):
             raise ValueError(
-                f"{name}: headless scene requires a confirmed initial_selection for the first frame"
+                f"{name}: headless scene requires an initial_selection mask for the first frame"
             )
         if item.get("prompt") is not None and (
             not isinstance(item["prompt"], str) or not item["prompt"].strip()
@@ -163,7 +163,7 @@ def select_mask(rgb, candidates, name):
 def choose_masks(objects, frame, args, output, segmenter, maps):
     import numpy as np
 
-    from ..io import load_initial_selection, write_confirmed_selection, write_json
+    from ..io import load_initial_selection, write_json, write_selection
     from ..rgbd import save_frame
 
     _, depth, _ = maps.apply(frame.rgb, frame.depth_m)
@@ -197,7 +197,7 @@ def choose_masks(objects, frame, args, output, segmenter, maps):
             selected.mkdir(parents=True)
             save_frame(selected / "source_rgbd.npz", frame)
             candidate = candidates[index] if index is not None else None
-            write_confirmed_selection(
+            write_selection(
                 selected,
                 mask,
                 {

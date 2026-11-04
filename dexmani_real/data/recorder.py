@@ -26,25 +26,27 @@ class RecordingError(RuntimeError):
 
 @dataclass(frozen=True)
 class _FinishRequest:
+    save: bool
     reason: str
     details: tuple[dict, ...]
     recording_truncated_reason: str | None
+    deadline: float
 
 
 class EpisodeRecorder:
-    """每个 episode 独占一个 writer，调用方须先停止运动再阻塞收尾。"""
+    """每个 episode 独占一个 writer，调用方须先停止运动再登记收尾。"""
 
     def __init__(self, data_dir, *, control_hz):
         sampling_clock_ns(control_hz)
         self.data_dir = Path(data_dir)
         self.control_hz = float(control_hz)
         self.thread = None
-        self.queue: Queue[tuple[Observation, RobotCommand | None] | _FinishRequest] = Queue(maxsize=16)
+        self.queue: Queue[tuple[Observation, RobotCommand | None]] = Queue(maxsize=16)
         self.ready = threading.Event()
         self.error = None
         self.is_recording = False
         self.recording_truncated_reason = None
-        self.finish_request = None
+        self.finish_request: _FinishRequest | None = None
         self.warned_tactile_channels = set()
         self.staging_path: Path | None = None
         self.published_path: Path | None = None
@@ -168,36 +170,32 @@ class EpisodeRecorder:
             return self.recording_truncated_reason
         return None
 
-    def finish(self, *, save, reason, details=None):
-        """关闭后由监督方发布；首次 finish 建立唯一收尾预算。"""
-        if self.finish_request is not None:
-            self.check_error()
-            return self.published_path
+    def request_finish(self, *, save, reason, details=None) -> _FinishRequest:
+        """停止接纳新行；首次请求固定处置意图和整个收尾的等待预算。"""
         self.is_recording = False
-        try:
-            self.finish_request = request = _FinishRequest(
-                reason, tuple(dict(item) for item in (details or ())),
-                self.recording_truncated_reason,
+        if self.finish_request is None:
+            self.finish_request = _FinishRequest(
+                save, reason, tuple(dict(item) for item in (details or ())),
+                self.recording_truncated_reason, time.monotonic() + RECORDER_STOP_TIMEOUT_S,
             )
-            # 建立 finish 后的中断也须记为失败，不能让重入误报已完成。
-            deadline = time.monotonic() + RECORDER_STOP_TIMEOUT_S
-            if self.writer_pending and self.error is None:
-                self.queue.put(request, timeout=max(0.0, deadline - time.monotonic()))
-            if self.thread is not None and self.thread.ident is not None:
-                self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        except Full:
-            self.store_error(TimeoutError("recording finish queue timed out"))
-        except BaseException as exc:
-            self.store_error(exc)
-            if not isinstance(exc, Exception):
-                raise
+        return self.finish_request
+
+    def poll_finish(self) -> bool:
+        """False 仅表示仍在等待；关闭且处置完成才返回 True，失败照常抛出。"""
+        request = self.finish_request
+        if request is None:
+            raise RuntimeError("recording finish has not been requested")
         if self.writer_pending:
+            self.check_error()
+            if time.monotonic() < request.deadline:
+                return False
             self.store_error(TimeoutError("recording writer did not exit before the deadline"))
+        # 线程退出后读取最终错误，包括 close 的失败。
         self.check_error()
         if self.staging_path is None:
-            return None
+            return True
         try:
-            if save and self.written_frames > 0:
+            if request.save and self.written_frames > 0:
                 destination = self.staging_path.with_name(self.staging_path.name.removeprefix(".tmp_"))
                 publish(self.staging_path, destination)
                 self.published_path, self.staging_path = destination, None
@@ -216,6 +214,14 @@ class EpisodeRecorder:
             if not isinstance(exc, Exception):
                 raise
             self.check_error()
+        return True
+
+    def finish(self, *, save, reason, details=None):
+        """同步调用复用同一请求与完成检查；等待中断由调用方处理。"""
+        request = self.request_finish(save=save, reason=reason, details=details)
+        while not self.poll_finish():
+            # 中断 join 在当前 Python 中可能误报活线程已退出，不能据此发布文件。
+            time.sleep(min(0.005, max(0.0, request.deadline - time.monotonic())))
         return self.published_path
 
     def write_episode(self, metadata):
@@ -230,10 +236,11 @@ class EpisodeRecorder:
                     try:
                         item = self.queue.get(timeout=0.05)
                     except Empty:
+                        # 单生产者已停止 append，取空后即可安全结束已接纳的前缀。
+                        finish = self.finish_request
+                        if finish is not None:
+                            break
                         continue
-                    if isinstance(item, _FinishRequest):
-                        finish = item
-                        break
                     writer.append_frame(*item)
                 if finish is not None and self.error is None:
                     writer.finish(

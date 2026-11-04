@@ -96,6 +96,8 @@ class PolicySession:
             logger.exception("辅助输出保存失败：%s", path)
 
     def save_results(self):
+        if self.episode is not None and self.episode.recorder is not None:
+            self.episode.result.raw = self.episode.recorder.result()
         if self.output_dir is None:
             return
         path = self.output_dir / "session_result.json"
@@ -488,7 +490,14 @@ class PolicySession:
         if self.runtime_state.quit_requested or self.runtime_state.estop_request:
             return
         try:
-            episode.finish_recording()
+            while True:
+                self.poll_operator()
+                robot.service_feedback()
+                if self.runtime_state.quit_requested or self.runtime_state.estop_request:
+                    return
+                if episode.finish_recording(wait=False):
+                    break
+                time.sleep(0.005)
             deadline = time.monotonic() + MODEL_SHUTDOWN_TIMEOUT_S
             while model.future is not None:
                 self.poll_operator()

@@ -34,7 +34,7 @@ SAM 默认 small、BF16、eager。large 先下载权重，再为相关命令传 
 
 ## 准备物体资产
 
-单图建模和已有 mesh 校准流程见[物体重建与点云](../../../docs/object_reconstruction.md)。阶段命令为 `object segment/select/generate/build/prepare/preview`，输出参数统一为 `--output`，文本参数为 `--prompt`。
+单图建模和已有 mesh 校准流程见[物体重建与点云](../../../docs/object_reconstruction.md)。阶段命令为 `object segment/select/generate/build/prepare/preview`，输出参数统一为 `--output`，文本参数为 `--prompt`。`object generate --image PATH` 直接接收含有效前景和透明背景的 RGBA 文件，不依赖分割目录或确认记录；`build` 直接使用分割阶段生成的 `foreground_rgba.png`。
 
 Hunyuan 在独立生成进程中运行；生成 mesh 导出前简化到最多 20,000 面，仍需显式指定米制尺度。`generation_result.json` 记录 `source_faces`、`mesh_simplification` 和实际导出的 `faces` / `vertices`。prepare 保留原点与朝向，在米制网格上按指定 seed / 点数采样固定点及三角面法向。
 
@@ -56,7 +56,7 @@ python scripts/cordvip/track_object.py \
   --with-hand --output /tmp/cordvip/scene_001
 ```
 
-首帧冻结后人工确认候选，或省略 prompt 手画 mask。选择保存为 `initial_selections/<id>/`。复用时，`source_rgbd.npz` 中的 RGB、米制深度、内参、畸变模型与系数必须与实际首帧逐项精确相等。`source_id`、时间戳、时钟和行号仅作来源说明，允许两个有效帧的这些信息不同；复用不改写已有选择文件及来源元数据。mask 文件仍须位于选择目录内，始终属于原始 RGB 网格，由 tracker 统一去畸变一次。
+首帧冻结后人工确认候选，或省略 prompt 手画 mask。选择保存为 `initial_selections/<id>/`。`--initial-selection PATH` 和 scene 的 `initial_selection` 都接受 PNG/NPY mask 文件，或含 `selection.json` 的目录；目录只需 `mask_file` 指向目录内的真实 mask。输入 mask 明确应用于当前首帧原始 RGB 网格，由 tracker 统一去畸变一次，不要求确认标签或候选索引。目录若提供 `source_rgbd.npz`，其中 RGB、米制深度、内参、畸变模型与系数必须与实际首帧逐项精确相等；没有绑定文件时不验证来源。`source_id`、时间戳、时钟和行号仅作说明，复用不改写已有输入。
 
 多物体通过场景文件声明，路径相对 workspace：
 
@@ -75,11 +75,11 @@ python scripts/cordvip/track_object.py \
   --with-hand --headless --output /tmp/cordvip/scene_002
 ```
 
-无 asset 的对象输出 mask 和独立实测点。`role` 仅作 metadata。headless 要求每个对象都有当前首帧的确认选择。默认处理全部 Raw 行；`--max-frames N` 显式限制前缀，结果标为 partial。同一 Raw 行提供 RGB-D、实测关节与时钟，行关联不证明物理同步。
+无 asset 的对象输出 mask 和独立实测点。`role` 仅作 metadata。headless 要求每个对象提供当前首帧的有效初始 mask。默认处理全部 Raw 行；`--max-frames N` 显式限制前缀，结果标为 partial。同一 Raw 行提供 RGB-D、实测关节与时钟，行关联不证明物理同步。
 
 ## Python API
 
-独立子包安装后直接 import。`SceneTracker.open` 负责一次加载与收尾；`workspace` 默认当前目录，资产和选择的相对路径基于 workspace。`models_dir`、`sam_python` 及 SAM 配对可按需指定。`log_dir` 省略时，SAM 日志输出到 stderr。
+独立子包安装后直接 import。`SceneTracker.open` 负责一次加载与收尾；`workspace` 默认当前目录，资产和选择的相对路径基于 workspace。`initial_selections` 与首帧 `step` 的 `initial_masks` 二选一。`models_dir`、`sam_python` 及 SAM 配对可按需指定。`log_dir` 省略时，SAM 日志输出到 stderr。
 
 ```python
 from dexmani_real.data.raw import RawReader
@@ -141,7 +141,7 @@ with np.load(directory / "frames/000000.npz", allow_pickle=False) as row:
         )
 ```
 
-模板与帧文件独占创建；未完成的 NPZ 会清理。技术错误直接结束运行并保留成功前缀，深度支持不足按算法形成 `POSE_LOST`。模板使用 object frame，实测点和手点使用 color-camera frame，单位均为米；启用手几何时每帧附外参、关节状态与来源时间。法向仅表示网格表面几何。
+输出可位于 `episodes` 或 `rollouts` 下的独立新目录，例如 `rollouts/derived/objects`；仍拒绝写入实际输入、Raw episode 内部或已有目标，悬空符号链接也不能覆盖。模板与帧文件独占创建；未完成的 NPZ 会清理。技术错误直接结束运行并保留成功前缀，深度支持不足按算法形成 `POSE_LOST`。模板使用 object frame，实测点和手点使用 color-camera frame，单位均为米；启用手几何时每帧附外参、关节状态与来源时间。法向仅表示网格表面几何。
 
 ```bash
 python -m cordvip_geometry view /tmp/cordvip/scene_001

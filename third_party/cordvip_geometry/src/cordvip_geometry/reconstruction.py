@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .geometry import MAX_MESH_FACES, simplify_mesh
-from .io import existing_file
+from .io import existing_file, output_path
 
 
 def validate_generation_parameters(
@@ -44,19 +44,10 @@ def generate_mesh(
         int, (seed, steps, octree_resolution, num_chunks)
     )
     image_path = existing_file(image_rgba_path)
-    root = Path(source_root).expanduser().resolve()
-    package_parent = root / "hy3dshape"
-    existing_file(package_parent / "hy3dshape" / "pipelines.py")
-    weights = Path(weights_dir).expanduser().resolve() / "hunyuan3d-dit-v2-1"
-    config_path = existing_file(weights / "config.yaml")
-    checkpoint_path = existing_file(weights / "model.fp16.ckpt")
-    output = Path(output_mesh_path).expanduser().resolve()
-    if output.exists():
-        raise FileExistsError(f"Refusing to overwrite generated mesh: {output}")
+    output = output_path(output_mesh_path, protected=(image_path,))
     if output.suffix.lower() != ".obj":
         raise ValueError("Generated mesh output must use .obj")
 
-    import yaml
     from PIL import Image
 
     with Image.open(image_path) as source_image:
@@ -75,6 +66,15 @@ def generate_mesh(
         raise ValueError(
             "RGBA input must contain a nonempty foreground and transparent background"
         )
+    root = Path(source_root).expanduser().resolve()
+    package_parent = root / "hy3dshape"
+    existing_file(package_parent / "hy3dshape" / "pipelines.py")
+    weights = Path(weights_dir).expanduser().resolve() / "hunyuan3d-dit-v2-1"
+    config_path = existing_file(weights / "config.yaml")
+    checkpoint_path = existing_file(weights / "model.fp16.ckpt")
+
+    import yaml
+
     with config_path.open(encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
     # 内嵌 DinoV2 配置，禁止 conditioner 隐式下载。

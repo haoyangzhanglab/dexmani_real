@@ -76,7 +76,6 @@ def prepare_asset(
     mesh_path,
     output,
     *,
-    workspace,
     scale_to_meters=None,
     size_axis=None,
     size_meters=None,
@@ -85,7 +84,7 @@ def prepare_asset(
 ):
     validate_asset_parameters(scale_to_meters, size_axis, size_meters, num_points, seed)
     source = existing_file(mesh_path)
-    output = output_path(output, workspace=workspace, protected=(source,))
+    output = output_path(output, protected=(source,))
     mesh = load_mesh(source)
     measured_extent = None
     if scale_to_meters is None:

@@ -77,7 +77,7 @@ def parse_tracking_args(argv=None, *, workspace=None):
     parser.add_argument("--prompt", help="首帧文本候选；省略时手画 mask")
     parser.add_argument(
         "--initial-selection", type=Path,
-        help="复用绑定数据完全相同的首帧确认选择，允许 Raw 搬迁",
+        help="当前首帧原始 RGB 网格的 PNG/NPY mask，或含 selection.json 的目录",
     )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
@@ -149,8 +149,8 @@ def parse_object_args(argv=None, *, workspace=None):
     select.add_argument("--segmentation-dir", type=Path, required=True)
     select.add_argument("--instance", type=int)
     select.add_argument("--headless", action="store_true")
-    generate = commands.add_parser("generate", help="从确认的 RGBA 生成未定尺度 mesh")
-    generate.add_argument("--segmentation-dir", type=Path, required=True)
+    generate = commands.add_parser("generate", help="从 RGBA 生成未定尺度 mesh")
+    generate.add_argument("--image", type=Path, required=True, help="透明背景 RGBA 文件")
     add_models_directory(generate, workspace)
     add_generate_arguments(generate)
     build = commands.add_parser("build", help="分割、生成，并按显式尺度准备资产")

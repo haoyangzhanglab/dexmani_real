@@ -57,7 +57,6 @@ def allocate_task(task, output=None):
         raise ValueError(f"{task}: 没有包含 asset.json 的物体子目录")
     output = output_path(
         output or task / f"sampled_{TOTAL_POINTS}",
-        workspace=ROOT,
         protected=directories,
     )
     objects = []

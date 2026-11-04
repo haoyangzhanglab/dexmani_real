@@ -97,7 +97,7 @@ history 首次有效观测重复填满 `n_obs_steps`，之后每个正常控制�
 
 策略不增加首动作的两秒等待期限。每轮正式开始建立一次实验时长（默认 60 秒）；API 显式传入 `max_running_s=None` 时，首预测仍在运行期间可持续等待，S/Q/Esc 仍有效。普通 async 的首预测完成时若完整时间窗口已过期，仍立即结束本段；sync 和 RTC 的首结果不按预测年龄丢弃。发送后的目标由 arm owner 的租期约束，owner 停止即结束本段，迟到预测不能恢复。启动取消计数在键盘启用前捕获，贯穿长初始化；内部停止不算用户取消。
 
-每段结束先停止设备，再由 Session 完成录制和模型回收；已知退出、急停或致命失败时，先 close 机器人再等待慢资源。writer 有自己的有界收尾预算；arm 每次 close 都按 EXECUTOR_TIMEOUT_S（当前 3 秒）有界等待 owner，随后读取晚到故障，确认退出后关闭管道；不使用 terminate/kill 强制结束 SDK owner。writer 正常关闭后按已确定的保存意图发布，失败 Raw staging 保留，零行不发布。运行失败与容器发布状态独立；后续模型或 close 失败不会反向否定已发布数据。线程、进程和 Future 的超时不代表已退出，仍保留句柄并报告未完成。
+每段结束先停止设备，再由 Session 完成录制和模型回收；正常段间等待 writer 时继续处理按键和设备反馈，Q/Esc 转入最终关闭，先 close 机器人再等待慢资源。writer 首次收尾请求固定保存决定和 60 秒等待预算，转入最终关闭不重置；登记和完成检查不等待帧队列腾空。arm 每次 close 都按 EXECUTOR_TIMEOUT_S（当前 3 秒）有界等待 owner，随后读取晚到故障，确认退出后关闭管道；不使用 terminate/kill 强制结束 SDK owner。writer 正常关闭后按已确定的保存意图发布，失败 Raw staging 保留，零行不发布。运行失败与容器发布状态独立；后续模型或 close 失败不会反向否定已发布数据。线程、进程和 Future 的超时不代表已退出，仍保留句柄并报告未完成。
 
 Policy Raw 直接使用结果的 episode 编号（如 `episode_002`），准备取消后允许编号空洞；既有数据不重命名。
 
@@ -127,7 +127,7 @@ replay 在 prepare 后读取一次当前 arm/hand 姿态并检查新鲜度，只
 
 Canonical 可导出到 Raw 输入目录内的新目标（例如 `raw_runs/canonical.zarr`），已有目标及符号链接仍拒绝覆盖；导出前固定输入 episode 集合，staging 不进入本次输入集合。
 
-每次新导出生成独立 `source_id`，原样搬迁保留 ID，供人工归档和实验说明。Canonical 保存影响数值结果的处理配方与完整 URDF；实验应记录 source_id、导出 Real SHA、训练 Policy SHA 及手模板来源。修改处理算法或模板后重新导出，已有未知来源须如实保留。
+Canonical 保存训练和部署重建使用的数值配方，不另存随机归档 ID 或完整 URDF。实验版本及手模板来源可按需要记录；旧数据中额外的归档属性在读取时自然忽略。
 
 遥操作额外逐行保存 `vr_wrist_pos`、`vr_wrist_quat_wxyz`、`vr_landmarks`、`vr_recv_ts_ns`、`vr_sequence_id`，用于调试，不进入训练导出。VR 使用右手数据，21 个 landmark 保持 SDK 原顺序；来源时间取所需通道首次主机接收时间的较早者。接收端先校验并归一化原始姿态四元数，再转换为 FLU；零范数或非有限姿态被拒绝。位置用米、四元数 WXYZ；来源帧重复时 ID 和时间保持原值。提供的 `runtime_config_json`、VR 变换、手标定和每段一份初始锚点随 Raw 保存。逐次操作与失败控制时点用日志诊断。
 
@@ -202,6 +202,8 @@ RGB-D 的非零 Brown 畸变需结合实际模型消费者判断：Real 反投�
 ## 离线物体几何和分析
 
 CordVIP 提供离线物体几何、实测点云和位姿分析，尚未接入主包 Policy 观测。使用流程、模型安装及输出字段见 [CordVIP 文档](scripts/cordvip/README.md)。
+
+`--initial-selection` 可直接提供当前首帧原始 RGB 网格的 PNG/NPY mask，或引用 mask 的选择目录；目录中的首帧 RGB-D 绑定文件可选，提供时须匹配实际输入。`object generate --image PATH` 直接使用 RGBA。派生结果可写入 `rollouts/derived/objects` 等新目录，实际输入、Raw episode 内部及已有目标仍受保护。
 
 ```bash
 python scripts/cordvip/track_object.py --episode episodes/TASK/EPISODE --scene scene.json --with-hand --output /tmp/cordvip/scene_001

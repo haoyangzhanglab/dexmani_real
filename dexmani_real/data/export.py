@@ -10,7 +10,6 @@ from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
-from uuid import uuid4
 
 import numpy as np
 import zarr
@@ -33,10 +32,7 @@ from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
 from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
-from dexmani_real.robot.model import (
-    XARM7_XHAND_RIGHT_URDF_PATH,
-    XHAND_FINGERTIP_LINK_NAMES,
-)
+from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.utils.io import publish
 from dexmani_real.utils.timing import sampling_clock_ns
 
@@ -339,7 +335,6 @@ def export_zarr(
         )
         root.attrs["episode_ids"] = episode_ids
         root.attrs["episode_quality"] = episode_quality
-        root.attrs["source_id"] = str(uuid4())
         root.store.close()
         store = None
         publish(cast(Path, staging), target)
@@ -382,7 +377,6 @@ def create_store(store, processing, camera, *, task, control_hz):
         pointcloud_config=asdict(processing.pointcloud),
         hand_pointcloud_config=asdict(processing.hand_pointcloud),
         fingertip_link_names=list(XHAND_FINGERTIP_LINK_NAMES),
-        kinematics_urdf=XARM7_XHAND_RIGHT_URDF_PATH.read_text(encoding="utf-8"),
         table_plane_abcd=processing.table_plane_abcd,
         depth_scale_m_per_unit=camera.depth_scale_m,
     )

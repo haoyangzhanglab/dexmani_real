@@ -1,6 +1,6 @@
 """物体候选预览、显式确认与选择产物；不持有分割模型。"""
 
-from ..io import write_confirmed_selection
+from ..io import write_selection
 from ..viewer import display_available
 
 
@@ -93,7 +93,7 @@ def save_selection(output, rgb, candidates, index, provenance):
     if not mask.any() or mask.all():
         raise ValueError("生成输入必须包含非空物体和非空背景；请重新分割或拍摄")
     overlay(rgb, candidate, index).save(output / "overlay.png")
-    write_confirmed_selection(
+    write_selection(
         output,
         mask,
         {

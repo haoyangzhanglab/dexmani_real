@@ -40,10 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Alternative Zarr cache output path for this task "
-            "(default: datasets/<task_name>.zarr). The default cache name "
+            "Alternative canonical Zarr output path for this task "
+            "(default: datasets/<task_name>.zarr). The default name "
             "comes from the input directory; task labels come from Raw. "
-            "The destination must be new and must not overlap the input directory."
+            "The destination must be new; a new target inside the input directory is allowed."
         ),
     )
     parser.add_argument(
