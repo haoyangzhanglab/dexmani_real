@@ -40,14 +40,13 @@ class RealConfig:
 
 def load_config(path: str | Path | None = None) -> RealConfig:
     """省略路径使用默认值；实验文件直接导出 CONFIG，不连接设备或读取标定。"""
-    config = RealConfig()
-    if path is not None:
-        path = Path(path).expanduser()
-        if path.suffix != ".py":
-            raise ValueError("experiment config must be a Python .py file")
-        loaded = runpy.run_path(str(path)).get("CONFIG")
-        if not isinstance(loaded, RealConfig):
-            raise TypeError(f"{path} must define CONFIG: RealConfig")
-        config = loaded
+    if path is None:
+        return RealConfig()
+    path = Path(path).expanduser()
+    if path.suffix != ".py":
+        raise ValueError("experiment config must be a Python .py file")
+    config = runpy.run_path(str(path)).get("CONFIG")
+    if not isinstance(config, RealConfig):
+        raise TypeError(f"{path} must define CONFIG: RealConfig")
     # 业务校验和序列化由实际使用或归档该配置的边界负责。
     return config

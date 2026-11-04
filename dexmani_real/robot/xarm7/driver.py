@@ -5,12 +5,12 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.xarm7 import (
-    SDK_STREAM_TIMEOUT_S,
-    SDK_TIMEOUT_S,
-    ArmConfig,
-)
+from dexmani_real.config.xarm7 import ArmConfig
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
+
+# 低频命令允许较慢回复；set_state 内还会查询状态，需给 3 s 停止等待留余量。
+SDK_TIMEOUT_S = 1.0
+SDK_STREAM_TIMEOUT_S = 0.020
 
 CONTROLLER_ERROR_HELP: dict[int, str] = {
     1: "Emergency Stop button pressed — release the E-stop button, then re-enable the robot",

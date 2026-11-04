@@ -12,14 +12,16 @@ from dexmani_real.config.calibration_data import CAMERAS_PATH
 from dexmani_real.config.deployment import (
     DEFAULT_MAX_RUNNING_S,
     DEFAULT_NUM_EPISODES,
-    RUNTIME_SECTIONS,
 )
 from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.deployment.session import PolicySession
 
-
 logger = logging.getLogger(__name__)
+
+RUNTIME_SECTIONS = (
+    "execution", "arm", "hand", "motion", "camera", "pointcloud", "hand_pointcloud", "environment",
+)
 
 
 def session_directory(root: Path) -> Path:

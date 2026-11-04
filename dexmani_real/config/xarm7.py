@@ -9,21 +9,12 @@ import numpy as np
 
 from dexmani_real.robot.model import ARM_DOF, XARM7_HARD_LOWER, XARM7_HARD_UPPER
 
-# 低频命令允许较慢回复；set_state 内还会查询状态，需给 3 s 停止等待留余量。
-SDK_TIMEOUT_S = 1.0
-SDK_STREAM_TIMEOUT_S = 0.020
-EXECUTOR_TIMEOUT_S = 3.0
-HOME_DWELL_S = 0.30
-HOME_CONVERGENCE_TIMEOUT_S = 15.0
-
 
 @dataclass(frozen=True)
 class HomingConfig:
     timeout_s: float = 60.0
-    convergence_rad: float = 0.002618
     max_speed_deg_s: float = 45.0
     max_acceleration_deg_per_s2: float = 900.0
-    velocity_convergence_rad_s: float = 0.03
 
     @property
     def max_speed_rad_per_s(self) -> float:
@@ -37,10 +28,8 @@ class HomingConfig:
         acceleration = self.max_acceleration_rad_per_s2
         if not isfinite(acceleration) or not 0.01 <= acceleration <= 20:
             raise ValueError("homing acceleration must be in [0.01, 20] rad/s²")
-        for name in ("timeout_s", "convergence_rad", "velocity_convergence_rad_s"):
-            value = getattr(self, name)
-            if not isfinite(value) or value <= 0:
-                raise ValueError(f"homing.{name} must be finite and positive")
+        if not isfinite(self.timeout_s) or self.timeout_s <= 0:
+            raise ValueError("homing.timeout_s must be finite and positive")
         speed = self.max_speed_rad_per_s
         if not isfinite(speed) or not 0.0001 <= speed <= pi:
             raise ValueError("homing.max_speed_deg_s must convert to [0.0001, π] rad/s")
@@ -65,6 +54,10 @@ class ArmConfig:
     servo_hz: float = 100.0
     feedback_hz: float = 25.0
     feedback_max_age_s: float = 4 / 30
+
+    # HOME、伺服准备与相机标定共用的实测停稳阈值。
+    standstill_position_tolerance_rad: float = 0.002618
+    standstill_velocity_tolerance_rad_s: float = 0.03
 
     homing: HomingConfig = field(default_factory=HomingConfig)
 
@@ -106,9 +99,7 @@ class ArmConfig:
                 raise ValueError(f"arm {name} must be finite and positive")
         if 1 / self.feedback_hz >= self.feedback_max_age_s:
             raise ValueError("feedback period must fit freshness budget")
-        for value in (self.homing.convergence_rad, self.homing.velocity_convergence_rad_s):
-            if not isfinite(value) or value <= 0:
-                raise ValueError("arm standstill thresholds must be finite and positive")
+        self._validate_standstill()
         speed = self.max_joint_velocity_rad_per_s
         if not isfinite(speed) or not 0.0001 <= speed <= pi:
             raise ValueError("max_joint_velocity_deg_per_s must convert to [0.0001, π] rad/s")
@@ -124,8 +115,17 @@ class ArmConfig:
         if cog.shape != (3,) or not np.isfinite(cog).all():
             raise ValueError("tcp_load_cog_mm must be a finite (3,) vector")
 
+    def _validate_standstill(self) -> None:
+        for value in (
+            self.standstill_position_tolerance_rad,
+            self.standstill_velocity_tolerance_rad_s,
+        ):
+            if not isfinite(value) or value <= 0:
+                raise ValueError("arm standstill thresholds must be finite and positive")
+
     def validate_home(self) -> None:
         self.homing.validate()
+        self._validate_standstill()
         home = np.asarray(self.home_qpos, dtype=np.float64)
         if home.shape != (ARM_DOF,) or not np.isfinite(home).all():
             raise ValueError("arm home_qpos must contain seven finite values")

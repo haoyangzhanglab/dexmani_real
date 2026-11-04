@@ -3,12 +3,11 @@
 import logging
 import time
 
-from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.ik import IKSolver
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import home_arm, home_hand
+from dexmani_real.runtime.home import HomeConfigurationError, home_arm, home_hand
 from dexmani_real.runtime.jog import CartesianJog
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime

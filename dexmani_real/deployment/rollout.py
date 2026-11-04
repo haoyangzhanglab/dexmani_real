@@ -12,8 +12,6 @@ from typing import cast
 
 import numpy as np
 
-from dexmani_real.config.deployment import COMMAND_LEASE_NS
-from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S
 from dexmani_real.data.raw import snapshot_recording_metadata
 from dexmani_real.data.recorder import EpisodeRecorder
 from dexmani_real.deployment.inference import MODEL_SHUTDOWN_TIMEOUT_S
@@ -26,14 +24,19 @@ from dexmani_real.deployment.schedule import (
     prefetch_handoff,
 )
 from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand, arm_reference_from_feedback
+from dexmani_real.robot.commands import (
+    COMMAND_LEASE_NS,
+    OperationCancelled,
+    RobotCommand,
+    arm_reference_from_feedback,
+)
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
     missing_tactile_channels,
     read_observation,
 )
-from dexmani_real.runtime.state import RunEndReason
+from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S, RunEndReason
 from dexmani_real.utils.log import error_detail
 
 logger = logging.getLogger(__name__)

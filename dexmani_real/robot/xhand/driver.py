@@ -8,10 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from dexmani_real.config.xhand import (
-    CONNECT_TIMEOUT_S,
-    HandConfig,
-)
+from dexmani_real.config.xhand import HandConfig
 from dexmani_real.robot.commands import (
     OperationCancelled,
     RobotError,
@@ -32,6 +29,7 @@ from dexmani_real.utils.timing import sample_is_fresh
 logger = logging.getLogger(__name__)
 
 SDK_PROTOCOL = {"ethercat": "EtherCAT", "serial": "RS485"}
+CONNECT_TIMEOUT_S = 2.0
 CONNECT_POLL_INTERVAL_S = 0.02
 COMMUNICATION_CRC_ERROR_CODE = 1_501_070
 COMBINED_FORCE_UNAVAILABLE_CODE = 1_501_018

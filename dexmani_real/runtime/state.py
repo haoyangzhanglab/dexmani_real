@@ -9,6 +9,9 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from multiprocessing.synchronize import Event
 
+# 首次关节反馈或控制观测就绪的等待预算。
+INITIAL_STATE_TIMEOUT_S = 1.0
+
 
 class RunEndReason(IntEnum):
     """操作结束意图；异常详情由操作结果保存。"""

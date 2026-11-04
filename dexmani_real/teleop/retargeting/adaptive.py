@@ -15,6 +15,8 @@ from dexmani_real.robot.model import (
 from dexmani_real.teleop.retargeting.landmarks import HandCalibration, prepare_landmarks
 from dexmani_real.teleop.retargeting.objective import HandObjective
 
+LOSS_TOLERANCE = 1e-7
+
 FINGER_FRAME_NAMES = (
     ("right_hand_thumb_rota_link1", "right_hand_thumb_rota_link2"),
     ("right_hand_index_rota_link1", "right_hand_index_rota_link2"),
@@ -55,7 +57,7 @@ class AdaptiveHandRetargeter:
         self.optimizer.set_maxeval(config.max_evaluations)
         self.optimizer.set_maxtime(config.max_solve_time_s)
         # 同一 loss 容差用于优化收敛和下方 seed 改善判据。
-        self.optimizer.set_ftol_abs(config.ftol_abs)
+        self.optimizer.set_ftol_abs(LOSS_TOLERANCE)
         self.calibration = None
         self.reference_qpos = None
         self.reference_timestamp_ns = None
@@ -143,7 +145,7 @@ class AdaptiveHandRetargeter:
             return None
         solution = np.clip(solution, lower, upper)
         final_loss = objective(solution, np.empty(0))
-        if not np.isfinite(final_loss) or final_loss > initial_loss + self.config.ftol_abs:
+        if not np.isfinite(final_loss) or final_loss > initial_loss + LOSS_TOLERANCE:
             self.rejection_reason = "hand solver did not improve the reference seed"
             return None
         # 实测起点或最后提交参考同时作为 warm start、阻尼中心和唯一滤波状态。

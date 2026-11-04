@@ -56,14 +56,11 @@ class StaticCollisionBox:
             raise ValueError("static collision box size_xyz_m must contain positive full side lengths")
 
 
-class HomeConfigurationError(ValueError):
-    """HOME 配置无效，本次操作不能执行。"""
-
-
 @dataclass(frozen=True)
 class EnvironmentConfig:
     workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
-    eef_workspace_margin_m: float = 0.005
+    # 最终 EEF 验收允许超出名义工作空间的距离，向外放宽边界。
+    eef_workspace_tolerance_m: float = 0.005
     # EEF/jog 使用的静态障碍物。
     static_boxes: tuple[StaticCollisionBox, ...] = ()
 
@@ -72,7 +69,7 @@ class EnvironmentConfig:
 
     def validate(self) -> None:
         self.workspace.as_array()
-        if not isfinite(self.eef_workspace_margin_m) or self.eef_workspace_margin_m < 0:
-            raise ValueError("eef_workspace_margin_m must be finite and non-negative")
+        if not isfinite(self.eef_workspace_tolerance_m) or self.eef_workspace_tolerance_m < 0:
+            raise ValueError("eef_workspace_tolerance_m must be finite and non-negative")
         for box in self.static_boxes:
             box.validate()

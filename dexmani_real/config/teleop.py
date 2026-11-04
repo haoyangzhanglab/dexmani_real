@@ -72,7 +72,6 @@ class HandRetargetingConfig:
     max_joint_speed_rad_s: float = 4.0
     max_evaluations: int = 50
     max_solve_time_s: float = 0.025
-    ftol_abs: float = 1e-7
 
     def validate(self) -> None:
         for name in ("calibration_samples", "max_evaluations"):
@@ -86,7 +85,7 @@ class HandRetargetingConfig:
         for name in (
             "calibration_timeout_s",
             "huber_delta_m", "direction_huber_delta", "pinch_start_m", "pinch_full_m",
-            "max_joint_speed_rad_s", "max_solve_time_s", "ftol_abs",
+            "max_joint_speed_rad_s", "max_solve_time_s",
         ):
             value = getattr(self, name)
             if not np.isfinite(value) or value <= 0:

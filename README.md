@@ -25,9 +25,19 @@ CONFIG = replace(base,
 )
 ```
 
+常用控制精度参数：
+
+| 配置字段 | 默认值及用途 |
+| --- | --- |
+| `arm.standstill_position_tolerance_rad` | `0.002618 rad`，实测位置稳定及 HOME 到位容差 |
+| `arm.standstill_velocity_tolerance_rad_s` | `0.03 rad/s`，实测停稳速度阈值 |
+| `environment.eef_workspace_tolerance_m` | `0.005 m`，最终 EEF 工作区验收容差 |
+
+停稳阈值由 HOME、伺服准备与相机标定共用；`homing` 保留回零超时、速度和加速度。EEF 工作区容差允许最终验收超出名义边界，默认向外放宽 5 mm；键盘目标的 `workspace_command_margin_m` 仍向内收缩工作区。
+
 任务、路径、段数、时长、录制选择及 `--weights/--inference-steps/--seed/--device` 通过 CLI 指定。遥操作和键盘点动可在 Python 配置中设 `hand.enabled=False`；VR 遥操作还须使用 `--no-record` 关闭录制，实物手须移除或固定在配置的 HOME 姿态，供碰撞规划使用。Policy 要求启用 hand。Policy 配方从 checkpoint 恢复，其训练配置和运行快照可使用 YAML。
 
-Policy 默认只保存 `run_config.yaml` 和 `session_result.json`；需要完整 Raw 时使用 `python scripts/run_policy.py EXPERIMENT --record-raw`。未录制时只启动模型实际输入和静态参数所需的传感器与标定。
+Policy 默认仅终端输出；指定 `--output DIR` 时保存 `run_config.yaml` 和 `session_result.json`。需要完整 Raw 时使用 `python scripts/run_policy.py EXPERIMENT --record-raw`，未指定输出目录时使用 `rollouts/`。未录制时只启动模型实际输入和静态参数所需的传感器与标定。
 
 遥操作录制选项由 CLI 提供：`--record/--no-record` 默认开启，`--episodes-dir` 默认 `episodes`，`--max-duration` 默认每段 60 秒。相对录制目录相对仓库根目录，绝对路径直接使用，再拼接 TASK。录制时 TASK 须满足下文任务标签规则，且不能是 `.`、`..` 或包含路径分隔符；允许 `.research` 和首尾空格。`--no-record` 不使用 TASK，也不校验录制目录规则。例如：
 
@@ -73,7 +83,7 @@ Policy 只使用终端提示；其他保留音频的入口使用系统 `aplay` �
 
 Policy 顺序启动：配置与 PolicyInfo 准入、启动键盘、唯一模型线程加载完成、连接设备与所需传感器、真实快照预热、待命。加载期间可取消，不会迟到连接设备。设备和模型支持正常多轮复用。连接后使用实测姿态初始化，不自动 hand HOME 或触觉清零；需要固定实验初姿时显式按 H。每段 B 后先确认停止并等待有效初值，在停止期间初始化 writer；writer ready 后重新等待新的关节反馈和有效控制输入，再准备 streaming，以最终当前观测建立锚点。一次读 CRC 可在准备预算内后续采样恢复，等待期间取消不会迟到激活。录制前须取得 aggregate、dense 各自完整的真实初值，缺少时不创建 writer；准备期持续无可用初值只结束本段，保持待命，可稍后再 B。零行不发布。正常 S/C/D 后完成记录和模型任务回收，再接纳下一段；无在途请求或正常回复后的普通取消，在停止确认、健康检查及资源收尾成功后回待命，可重新 B；在途取消结果不明则关闭当前 Owner，不自动恢复。Q/Esc 仍退出，真实设备及必要资源故障仍失败。
 
-Teleop 手部实测起点必须位于配置操作范围，范围外会列出关节及就位要求，只拒绝本段，不发送跳变目标。默认 distal 5°/10° 下限保留其历史保守操作约束；范围内起点未经裁剪建立首帧参考，10 ms、4 rad/s 时经过 mapper 的最终目标每轴变化不超过 0.04 rad。默认显式 HOME 目标已向范围内部留出 5° 到位容差；自定义范围或 HOME 时也需留出余量，HOME 成功不豁免实测范围检查。
+Teleop 手部实测起点必须位于配置操作范围，范围外会列出关节及就位要求，只拒绝本段，不发送跳变目标。默认 distal 下限为拇指 10°、其余手指 5°；范围内起点未经裁剪建立首帧参考，10 ms、4 rad/s 时经过 mapper 的最终目标每轴变化不超过 0.04 rad。默认显式 HOME 目标在范围内部留出 5° 到位容差；自定义范围或 HOME 时也需留出余量，HOME 成功不豁免实测范围检查。
 
 策略周期、数值 recipe、输入模态和动作窗口从 checkpoint 恢复，不改变录制的完整多模态 schema。点云 recipe 可省略有默认值的配置项，未知字段和无效参数仍报错。触觉输入按当前 Policy 的固定字段形状提供：finger_tactile_force 为 `(5, 3)`，taxel_tactile_force 为 `(5, 120, 3)`。sync 等待预测后顺序执行动作；async 按原观测时间锚点裁掉过期动作，可继续旧计划的完整有效尾部；映射跨过名义 tick 后，只要来源、完整预测窗口和实验时长仍有效便可提交，每次控制机会至多提交一个候选；RTC 使用规范化策略动作前缀，按实际提交进度裁剪接续，不承诺精确槽。两种异步模式都先接收已有可用结果，再判断耗尽；无有效旧尾部和新结果时结束本段，不重复末动作、不重新赋时或重新 bootstrap。
 
@@ -129,7 +139,7 @@ arm 外部目标仍严格检查格式、有限性和配置限位。完整轨迹�
 
 XHand 连接要求设备 ID 正确且取得有效关节反馈，不等待触觉。周期绝对目标的写 CRC 返回未确认，不阻塞重试旧目标；连续 5 次写 CRC 才进入现有停止路径，允许的非 CRC 命令返回会清零计数，读取成功不会清零。读 CRC 丢弃整帧且不更新来源时间。停止保留 0.25 s 有限 CRC 重试：实测关节在原有 `4/30 s` 内才 hold，否则 passive；退出仍请求 passive。软件等待不能强制中断阻塞的手部 SDK，后续关闭成功也不能抹去停止失败。
 
-XHand 过流告警（SDK `1501035`、关节板 `110`）限频 warning 并继续运行；缺失触觉按通道保持，有效关节和其他通道继续更新。未知故障与非法关节/目标数据仍报错；关闭时汇总读写 CRC、触觉缺帧和过流计数。本机安装 SDK `1.5.2` 仅有原生实现，未确认缓存更新及帧来源时间，继续 `read_state(True)`，暂不启用发送后缓存复用；详见[收敛任务书](docs/xhand_simplification_taskbook.md#sdk-反馈读取)。
+XHand 过流告警（SDK `1501035`、关节板 `110`）限频 warning 并继续运行；缺失触觉按通道保持，有效关节和其他通道继续更新。未知故障与非法关节/目标数据仍报错；关闭时汇总读写 CRC、触觉缺帧和过流计数。本机安装 SDK `1.5.2` 仅有原生实现，未确认缓存更新及帧来源时间，继续 `read_state(True)`，暂不启用发送后缓存复用。
 
 xArm 连接只建立 SDK、校验设备并读取有效反馈，不代表已经准备运动；相机标定的直接连接保持只读。同一 SDK 会话仅在首次完整运动准备中配置碰撞灵敏度和 TCP 负载，失败或取消不记为完成，新连接重新配置；每次准备仍保留使能、显式发送模式命令并检查应答、对应加速度及最终 State 0，随后用新鲜反馈确认停稳。`api.mode` 是异步报告缓存，不用于跳过模式命令或拦截 servo；命令成功应答不代表实测到位。首个目标到达时再次检查速度并使用当前反馈建立 Ruckig 参考，后续周期延续规划状态。Mode 0 仅用于需要移动的显式 HOME，已到位时不为初始化参数进入运动模式。保留一个本地 cancel_epoch，恢复前确认停止、清旧邮箱、短锁内复核取消后清 stop。stopped 只代表停止处理完成，不能掩盖 SDK 失败。
 
@@ -202,4 +212,4 @@ python -m cordvip_geometry view /tmp/cordvip/scene_001
 
 开发约定见 [AGENTS.md](AGENTS.md)。
 
-离线回归使用 `python -B -m pytest -p no:cacheprovider tests`；测试注入 fake driver，不连接真实设备。静态检查使用 `python -B -m ruff check --no-cache --select F dexmani_real tests`。SharedRing 复制竞争最多尝试两次，随后可复用相同字段集合的完整快照，保留原时间和 sequence；没有快照时不发送依赖该来源的动作，准备等待仍有期限。
+静态检查使用 `python -B -m ruff check --no-cache --select F dexmani_real`。SharedRing 复制竞争最多尝试两次，随后可复用相同字段集合的完整快照，保留原时间和 sequence；没有快照时不发送依赖该来源的动作，准备等待仍有期限。

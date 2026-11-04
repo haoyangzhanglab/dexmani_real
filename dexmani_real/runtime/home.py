@@ -6,12 +6,15 @@ from contextlib import contextmanager
 
 import numpy as np
 
-from dexmani_real.config.control import HomeConfigurationError
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.utils.timing import sample_is_fresh
 
 logger = logging.getLogger(__name__)
 HOME_CONSECUTIVE_SAMPLES = 3
+
+
+class HomeConfigurationError(ValueError):
+    """HOME 配置无效，本次操作不能执行。"""
 
 
 @contextmanager

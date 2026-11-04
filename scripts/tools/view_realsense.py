@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.config.perception import DEPTH_RANGE_M
 from dexmani_real.utils.log import configure_logging
 
 if TYPE_CHECKING:
@@ -81,6 +80,10 @@ class RealSenseViewer:
         return self.processor
 
     def capture(self) -> None:
+        from dexmani_real.perception.pointcloud import (
+            DEPTH_RANGE_M,
+            build_raw_point_cloud,
+        )
         from dexmani_real.utils.visualization.image import ImageViewer, rgbd_panel
 
         print("P=开关点云 S=切换 raw/processed Q/Esc=退出；关闭点云窗口后 RGB-D 预览继续。")
@@ -131,10 +134,6 @@ class RealSenseViewer:
                     if mode == "processed":
                         cloud = self.ensure_processor().process(frame.depth, frame.rgb)
                     else:
-                        from dexmani_real.perception.pointcloud import (
-                            build_raw_point_cloud,
-                        )
-
                         cloud = build_raw_point_cloud(
                             depth_raw=frame.depth, color=frame.rgb, depth_scale_m=depth_scale_m,
                             intrinsics=self.camera.color_intrinsics,

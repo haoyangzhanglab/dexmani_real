@@ -4,7 +4,8 @@ import numpy as np
 
 from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 
-
+# 设备 owner 检查目标租期；它不代表物理停止延迟。
+COMMAND_LEASE_NS = 2_000_000_000
 # 当前关节范围内 float32 反馈的位置舍入容差（rad），不适用于外部目标。
 _FEEDBACK_POSITION_ROUNDOFF_RAD = 1e-6
 

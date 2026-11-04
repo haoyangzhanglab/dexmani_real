@@ -5,9 +5,10 @@ from typing import cast
 import numpy as np
 from numpy.typing import NDArray
 
-from dexmani_real.config.perception import DEPTH_RANGE_M, PointCloudConfig
+from dexmani_real.config.perception import PointCloudConfig
 from dexmani_real.geometry.camera import CameraIntrinsics, deproject_depth, depth_rays
 
+DEPTH_RANGE_M = (0.30, 1.50)
 NEIGHBORHOOD_KERNEL = np.ones((3, 3), dtype=np.uint8)
 EDGE_JUMP_M = 0.030
 EDGE_SURFACE_BAND_M = 0.008

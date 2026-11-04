@@ -14,9 +14,6 @@ from dexmani_real.robot.model import (
     XHAND_RATED_QPOS_MIN_RAD,
 )
 
-CONNECT_TIMEOUT_S = 2.0
-INITIAL_STATE_TIMEOUT_S = 1.0
-
 
 @dataclass(frozen=True)
 class HandConfig:

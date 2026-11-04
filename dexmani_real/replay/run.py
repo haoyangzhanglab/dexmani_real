@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.config.deployment import COMMAND_LEASE_NS
 from dexmani_real.replay.trajectory import load_trajectory
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
+from dexmani_real.robot.commands import (
+    COMMAND_LEASE_NS,
+    OperationCancelled,
+    RobotCommand,
+    RobotError,
+)
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime

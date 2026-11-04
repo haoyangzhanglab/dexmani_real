@@ -5,12 +5,9 @@ import multiprocessing as mp
 import time
 from typing import TYPE_CHECKING
 
-from dexmani_real.config.xarm7 import (
-    EXECUTOR_TIMEOUT_S,
-    HOME_CONVERGENCE_TIMEOUT_S,
-)
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.xarm7.protocol import (
+    READY_TIMEOUT_S,
     ArmChannels,
     HomeRequest,
     PrepareRequest,
@@ -22,6 +19,8 @@ if TYPE_CHECKING:
     from dexmani_real.runtime.state import SessionState
 
 logger = logging.getLogger(__name__)
+
+EXECUTOR_TIMEOUT_S = 3.0
 
 
 class ArmProcess:
@@ -69,7 +68,7 @@ class ArmProcess:
 
         cancel_epoch = self.runtime_state.cancel_epoch
         startup_deadline_ns = time.monotonic_ns() + int(
-            (HOME_CONVERGENCE_TIMEOUT_S + EXECUTOR_TIMEOUT_S) * 1e9
+            (READY_TIMEOUT_S + EXECUTOR_TIMEOUT_S) * 1e9
         )
 
         def check_startup():
@@ -207,7 +206,7 @@ class ArmProcess:
     def prepare(self, cancel_epoch, *, service):
         self.request_operation(
             PrepareRequest(
-                time.monotonic_ns() + int((HOME_CONVERGENCE_TIMEOUT_S + EXECUTOR_TIMEOUT_S) * 1e9),
+                time.monotonic_ns() + int((READY_TIMEOUT_S + EXECUTOR_TIMEOUT_S) * 1e9),
             ),
             service=service,
             abort=lambda: self.runtime_state.cancel_epoch != cancel_epoch or self.io.stop.is_set(),

@@ -65,8 +65,8 @@ def collect_samples(runtime, output_dir):
         "max_reprojection_rms_px": MAX_REPROJECTION_RMS_PX,
         "max_position_spread_m": MAX_POSITION_SPREAD_M,
         "max_rotation_spread_deg": MAX_ROTATION_SPREAD_DEG,
-        "arm_max_speed_rad_s": runtime.arm.homing.velocity_convergence_rad_s,
-        "arm_max_drift_rad": runtime.arm.homing.convergence_rad,
+        "arm_max_speed_rad_s": runtime.arm.standstill_velocity_tolerance_rad_s,
+        "arm_max_drift_rad": runtime.arm.standstill_position_tolerance_rad,
         "arm_feedback_max_age_s": runtime.arm.feedback_max_age_s,
         "camera_max_age_s": runtime.camera.max_frame_age_s,
     }

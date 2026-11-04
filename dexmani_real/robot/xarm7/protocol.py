@@ -8,6 +8,9 @@ import numpy as np
 from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
 
+# startup/prepare 的基础等待预算；HOME 使用独立的 homing.timeout_s。
+READY_TIMEOUT_S = 15.0
+
 ARM_STATE_DTYPE = np.dtype(
     [
         ("qpos", "<f8", ARM_JOINT_SHAPE),

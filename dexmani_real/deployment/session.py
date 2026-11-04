@@ -9,8 +9,6 @@ from concurrent.futures import wait
 from dataclasses import asdict
 from typing import cast
 
-from dexmani_real.config.control import HomeConfigurationError
-from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.data.raw import camera_metadata
 from dexmani_real.deployment.inference import MODEL_SHUTDOWN_TIMEOUT_S, PolicyWorker
@@ -18,7 +16,7 @@ from dexmani_real.deployment.rollout import Rollout, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import home_arm, home_hand
+from dexmani_real.runtime.home import HomeConfigurationError, home_arm, home_hand
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
@@ -31,7 +29,11 @@ from dexmani_real.runtime.observation import (
     check_observation,
     read_observation,
 )
-from dexmani_real.runtime.state import RunEndReason, SessionState
+from dexmani_real.runtime.state import (
+    INITIAL_STATE_TIMEOUT_S,
+    RunEndReason,
+    SessionState,
+)
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.io import write_json, write_yaml
 from dexmani_real.utils.log import configure_logging, error_detail

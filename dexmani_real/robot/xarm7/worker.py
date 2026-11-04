@@ -5,13 +5,10 @@ import time
 
 import numpy as np
 
-from dexmani_real.config.xarm7 import (
-    HOME_CONVERGENCE_TIMEOUT_S,
-    HOME_DWELL_S,
-)
 from dexmani_real.robot.commands import OperationCancelled, validate_arm_target
 from dexmani_real.robot.xarm7.protocol import (
     ARM_STATE_DTYPE,
+    READY_TIMEOUT_S,
     HomeRequest,
     PrepareRequest,
 )
@@ -20,6 +17,8 @@ from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import next_tick_ns, sample_is_fresh, sampling_clock_ns
 
 logger = logging.getLogger(__name__)
+
+STANDSTILL_DWELL_S = 0.30
 
 
 class ArmController:
@@ -78,7 +77,7 @@ class ArmController:
         target=None,
     ):
         """在绝对期限内确认连续停稳；不合格样本重新累计。"""
-        tolerance = self.cfg.homing.convergence_rad
+        tolerance = self.cfg.standstill_position_tolerance_rad
         interval_ns = round(1e9 / self.cfg.feedback_hz)
         stable = None
         anchor = None
@@ -93,7 +92,7 @@ class ArmController:
             sample_ns = int(self.status["timestamp_ns"])
             if not sample_is_fresh(sample_ns, self.cfg.feedback_max_age_s, completed_ns):
                 raise TimeoutError(f"{stage}: current arm feedback unavailable/stale")
-            valid = np.max(np.abs(v)) <= self.cfg.homing.velocity_convergence_rad_s
+            valid = np.max(np.abs(v)) <= self.cfg.standstill_velocity_tolerance_rad_s
             if target is not None:
                 valid = valid and np.max(np.abs(q - target)) <= tolerance
             if valid:
@@ -101,7 +100,7 @@ class ArmController:
                     stable, anchor = None, q.copy()
                 # SDK 未提供采样时刻；首尾查询的等待时间不能算作已观测到的停稳。
                 stable = completed_ns if stable is None else stable
-                if sample_ns - stable >= int(HOME_DWELL_S * 1e9):
+                if sample_ns - stable >= int(STANDSTILL_DWELL_S * 1e9):
                     return
             else:
                 stable = anchor = None
@@ -114,7 +113,7 @@ class ArmController:
         target = validate_arm_target(self.cfg.home_qpos, self.cfg.joint_limit_lower,
                                      self.cfg.joint_limit_upper)
         self.wait_settled(check_abort, stage="HOME standstill", deadline_ns=deadline_ns)
-        if np.max(np.abs(self.status["qpos"] - target)) > self.cfg.homing.convergence_rad:
+        if np.max(np.abs(self.status["qpos"] - target)) > self.cfg.standstill_position_tolerance_rad:
             self.driver.prepare_motion(0, check_abort=check_abort)
             self.wait_settled(check_abort, stage="HOME mode standstill", deadline_ns=deadline_ns)
             check_abort()
@@ -152,7 +151,7 @@ class ArmController:
                 self.driver.prepare_motion(1, check_abort=check_abort)
                 settled_deadline_ns = min(
                     message.deadline_ns,
-                    time.monotonic_ns() + int(HOME_CONVERGENCE_TIMEOUT_S * 1e9),
+                    time.monotonic_ns() + int(READY_TIMEOUT_S * 1e9),
                 )
                 self.wait_settled(
                     lambda: self.check_lifecycle(
@@ -205,7 +204,7 @@ class ArmController:
         if self.active is None:
             # prepare 后可能还要等待观测或推理；首个目标使用当前实测起点。
             q, v = self.status["qpos"], self.status["qvel"]
-            if np.max(np.abs(v)) > self.cfg.homing.velocity_convergence_rad_s:
+            if np.max(np.abs(v)) > self.cfg.standstill_velocity_tolerance_rad_s:
                 raise RuntimeError("arm moved after standstill preparation")
             self.reference = ArmTrajectory(self.cfg, q, v)
         self.active = goal

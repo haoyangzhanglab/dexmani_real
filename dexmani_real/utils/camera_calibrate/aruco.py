@@ -64,9 +64,12 @@ class ArucoSampler:
 
     def stationary_arm(self, read_arm, arm_config, reference=None):
         arm = read_arm()
-        if np.max(np.abs(arm["qvel"])) > arm_config.homing.velocity_convergence_rad_s:
+        if np.max(np.abs(arm["qvel"])) > arm_config.standstill_velocity_tolerance_rad_s:
             raise ValueError("arm is moving during calibration capture")
-        if reference is not None and np.max(np.abs(arm["qpos"] - reference)) > arm_config.homing.convergence_rad:
+        if (
+            reference is not None
+            and np.max(np.abs(arm["qpos"] - reference)) > arm_config.standstill_position_tolerance_rad
+        ):
             raise ValueError("arm drifted during calibration capture")
         return arm
 

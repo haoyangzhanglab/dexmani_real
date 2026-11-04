@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
-from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S
 from dexmani_real.robot.commands import (
     OperationCancelled,
     RobotError,
@@ -19,6 +18,7 @@ from dexmani_real.robot.model import (
     XHAND_RATED_QPOS_MIN_RAD,
 )
 from dexmani_real.robot.xhand.feedback import XHandFeedback
+from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S
 from dexmani_real.utils.timing import next_tick_ns, sample_is_fresh
 
 logger = logging.getLogger(__name__)

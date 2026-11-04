@@ -8,8 +8,6 @@ from collections.abc import Sequence
 from enum import Enum
 from typing import cast
 
-from dexmani_real.config.control import HomeConfigurationError
-from dexmani_real.config.xhand import INITIAL_STATE_TIMEOUT_S
 from dexmani_real.control.actions import HandStartRejected
 from dexmani_real.data.raw import snapshot_recording_metadata
 from dexmani_real.data.recorder import (
@@ -17,7 +15,7 @@ from dexmani_real.data.recorder import (
     RecordingError,
 )
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
-from dexmani_real.runtime.home import home_arm, home_hand
+from dexmani_real.runtime.home import HomeConfigurationError, home_arm, home_hand
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_observation,
@@ -25,7 +23,7 @@ from dexmani_real.runtime.observation import (
     read_observation,
     sources_available,
 )
-from dexmani_real.runtime.state import RunEndReason
+from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S, RunEndReason
 from dexmani_real.utils.log import error_detail
 from dexmani_real.utils.timing import sampling_clock_ns
 
