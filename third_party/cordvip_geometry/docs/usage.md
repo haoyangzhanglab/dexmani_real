@@ -85,7 +85,7 @@ python scripts/cordvip/track_object.py \
   --with-hand --headless --output /tmp/cordvip/scene_002
 ```
 
-无 asset 的对象只要求有效 RGB 与去畸变后非空 mask，首帧和后续帧均允许零深度或少量有效深度；状态为 `OBSERVED_ONLY`，点集仅含当前采样网格上实际提取的深度点，`observed_valid` 表示点集是否非空，无深度时不补点或生成 pose。有 asset 的对象继续要求足够的采样后实测点、至少 4 个 `depth >= 0.001 m` 的 FoundationPose 深度像素及模型匹配支持；交互选择的深度预检查只用于这类对象，混合场景分别判断。
+无 asset 的对象只要求有效 RGB 与去畸变后非空 mask，首帧和后续帧均允许零深度或少量有效深度；状态为 `OBSERVED_ONLY`，点集仅含当前采样网格上实际提取的深度点，`observed_valid` 表示点集是否非空，无深度时不补点或生成 pose。场景没有任何 asset 时，仍校验 `pixel_stride`，跳过未使用的位姿匹配参数检查。有 asset 的对象继续要求足够的采样后实测点、至少 4 个 `depth >= 0.001 m` 的 FoundationPose 深度像素及模型匹配支持；交互选择的深度预检查只用于这类对象，混合场景分别判断。
 
 scene 只使用 `id`、`asset`、`initial_selection` 和 `prompt`。`asset` 和 `initial_selection` 省略或为 `null` 时表示未提供；指定时须为非空路径文本，空字符串或其他类型直接报错。CLI 输入路径同样不接受空字符串。headless 跟踪仍要求每个对象提供当前首帧的有效初始 mask。默认处理全部 Raw 行；`--max-frames N` 显式限制前缀，终端打印处理数量。同一 Raw 行提供 RGB-D、实测关节与原始时间，行关联不证明物理同步。
 
@@ -122,7 +122,7 @@ with SceneTracker.open({"object": asset_dir}) as tracker:
         )
 ```
 
-`camera` 是标定快照，相机适配只需样本中的 `uint8 rgb` 和原始 `uint16 depth`，可附 `timestamp_ns`，不要求 `ring_sequence` 或拼接来源 ID。直接构造 `RGBDFrame` 时须提供 RGB、米制浮点 depth、K 和实际畸变信息；depth 在入口转为 float32 并检查形状、有限性及非负，不猜测毫米或 raw counts。`source_id`、`timestamp_ns`、`clock` 是可省略的说明：字符串允许为空，整数时间允许为 0；保存时仅省略缺失项，读取和查看保留空字符串与 0。说明不参与身份匹配、去重或时序准入。
+`camera` 是标定快照，相机适配只需样本中的 `uint8 rgb` 和原始 `uint16 depth`，可附 `timestamp_ns`，不要求 `ring_sequence` 或拼接来源 ID。直接构造 `RGBDFrame` 时须提供 RGB、米制浮点 depth、K 和实际畸变信息；depth 在入口转为 float32 并检查形状、有限性及非负，不猜测毫米或 raw counts。`source_id`、`timestamp_ns`、`clock` 是可省略的说明：字符串允许为空，整数时间允许为 0；保存时仅省略缺失项，读取和查看保留空字符串与 0。说明不参与身份匹配、去重或时序准入。Raw 手几何的来源时间也允许从 0 开始，负值表示缺失，不计算该行的来源时间偏差。
 
 tracker 固定使用一套图像网格和相机几何，按调用顺序推进；实时宿主可在相机输入处按 ring sequence 去重。Raw 几何每行独立处理，不要求 observation 时间为正或递增；帧的 `row_index` 是实际 Raw 行号，`timestamp_ns` 原样来自该行 `camera_ns`，包括 0，不用 observation 时间替代，也不自动生成 `source_id` 或推断 `clock`。手部 FK 在读取关节数组时检查行号为有效整数且位于 reader 的行范围内，使用完整原始 timing 行判断时间可用性。`model_points` 返回米制 `float32 (N, 3)`；默认 camera frame，指定有效 `T_target_camera` 可变换到目标系。pose 无效或无 asset 时返回空点。
 

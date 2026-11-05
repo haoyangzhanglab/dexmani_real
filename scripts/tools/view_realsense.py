@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
@@ -36,7 +36,7 @@ class RealSenseViewer:
         runtime.camera.validate()
         configure_logging()
         # 预览不额外修改曝光优先级；其余启动设置使用实验配置。
-        self.camera = RealSenseCamera(runtime.camera, auto_exposure_priority=None)
+        self.camera = RealSenseCamera(runtime.camera, depth_enabled=True, auto_exposure_priority=None)
         try:
             self.camera.connect()
             print(f"Connected: {self.camera.active_serial}")
@@ -90,7 +90,7 @@ class RealSenseViewer:
         cloud_enabled = self.args.cloud is not None
         mode = self.args.cloud or "processed"
         image_viewer = cloud_viewer = None
-        depth_scale_m = self.camera.depth_scale_m
+        depth_scale_m = cast(float, self.camera.depth_scale_m)
         try:
             image_viewer = ImageViewer("RealSense RGB-D | P=cloud S=raw/processed Q/Esc=quit")
             while True:
@@ -130,18 +130,19 @@ class RealSenseViewer:
                 frame = self.camera.read()
                 if frame is None:
                     continue
+                depth = cast(np.ndarray, frame.depth)
                 if cloud_viewer is not None:
                     if mode == "processed":
-                        cloud = self.ensure_processor().process(frame.depth, frame.rgb)
+                        cloud = self.ensure_processor().process(depth, frame.rgb)
                     else:
                         cloud = build_raw_point_cloud(
-                            depth_raw=frame.depth, color=frame.rgb, depth_scale_m=depth_scale_m,
+                            depth_raw=depth, color=frame.rgb, depth_scale_m=depth_scale_m,
                             intrinsics=self.camera.color_intrinsics,
                             T_xarm_base_from_color=self.ensure_cloud_transform(),
                         )
                     cloud_viewer.update(cloud)
                 image_viewer.show(rgbd_panel(
-                    frame.rgb, frame.depth.astype(np.float32) * depth_scale_m,
+                    frame.rgb, depth.astype(np.float32) * depth_scale_m,
                     depth_range_m=DEPTH_RANGE_M,
                 ))
         finally:

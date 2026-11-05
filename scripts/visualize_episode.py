@@ -13,6 +13,7 @@ import sys
 import time
 from itertools import islice
 from pathlib import Path
+from typing import cast
 
 os.environ.setdefault("RUST_LOG", "error")
 
@@ -225,9 +226,10 @@ class EpisodeVisualizer:
         if rgb.dtype != np.uint8 or rgb.shape != (color.height, color.width, 3):
             raise ValueError(f"RGB shape or dtype invalid at frame {step_idx}")
         depth = np.asarray(self.reader["depth"][step_idx])
+        depth_scale_m = cast(float, self.camera_model.depth_scale_m)
         log_rgbd(
-            rgb, depth, depth_scale_m=self.camera_model.depth_scale_m,
-            depth_range_m=(0, 10000 * self.camera_model.depth_scale_m),
+            rgb, depth, depth_scale_m=depth_scale_m,
+            depth_range_m=(0, 10000 * depth_scale_m),
         )
         return depth
 

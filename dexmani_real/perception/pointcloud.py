@@ -159,7 +159,7 @@ class PointCloudProcessor:
     def __init__(
         self,
         *,
-        depth_scale_m: float,
+        depth_scale_m: float | None,
         intrinsics: CameraIntrinsics,
         T_xarm_base_from_color: np.ndarray | None,
         table_plane_abcd: tuple[float, float, float, float] | None,
@@ -168,6 +168,8 @@ class PointCloudProcessor:
         config.validate()
         if T_xarm_base_from_color is None:
             raise ValueError("pointcloud requires camera extrinsics")
+        if depth_scale_m is None:
+            raise ValueError("pointcloud requires a camera depth scale")
         if config.remove_table and table_plane_abcd is None:
             raise ValueError("remove_table=True requires a calibrated table plane")
 

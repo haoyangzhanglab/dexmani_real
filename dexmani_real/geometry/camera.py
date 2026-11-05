@@ -71,17 +71,19 @@ class CameraIntrinsics:
 
 @dataclass(frozen=True)
 class CameraSnapshot:
-    """实际相机的静态参数；变换由 color optical frame 到 xArm base，平移单位米。"""
+    """相机静态参数；serial 可省略，无深度时无尺度，变换为 color optical→xArm base（米）。"""
 
-    serial: str
+    serial: str | None
     color: CameraIntrinsics
-    depth_scale_m: float
+    depth_scale_m: float | None
     T_xarm_base_from_color: np.ndarray | None
 
     def __post_init__(self):
-        if not isinstance(self.serial, str) or not self.serial.strip():
-            raise ValueError("active camera serial must be nonempty")
-        if not np.isfinite(self.depth_scale_m) or self.depth_scale_m <= 0:
+        if self.serial is not None and not isinstance(self.serial, str):
+            raise ValueError("camera serial must be a string or None")
+        if self.depth_scale_m is not None and (
+            not np.isfinite(self.depth_scale_m) or self.depth_scale_m <= 0
+        ):
             raise ValueError("depth_scale_m must be finite and positive")
         if self.T_xarm_base_from_color is not None:
             transform = np.array(self.T_xarm_base_from_color, dtype=np.float64, copy=True)

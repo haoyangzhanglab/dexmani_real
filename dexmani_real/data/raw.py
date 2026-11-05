@@ -10,7 +10,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot, parse_camera_matrix
+from dexmani_real.geometry.camera import (
+    CameraIntrinsics,
+    CameraSnapshot,
+    parse_camera_matrix,
+)
 from dexmani_real.geometry.pose import validate_rigid_transform
 from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
 from dexmani_real.utils.timing import sampling_clock_ns
@@ -113,15 +117,17 @@ def encode_timing_row(row):
 def camera_metadata(camera: CameraSnapshot):
     color = camera.color
     values = {
-        "camera_serial": camera.serial,
-        "camera_payload_mode": "depth_to_color_aligned_rgbd",
+        "camera_payload_mode": "rgb" if camera.depth_scale_m is None else "depth_to_color_aligned_rgbd",
         "camera_color_width": color.width,
         "camera_color_height": color.height,
         "camera_color_intrinsics": color.matrix().reshape(-1).tolist(),
         "camera_color_distortion_model": color.distortion_model,
         "camera_color_distortion_coeffs": list(color.distortion_coeffs),
-        "depth_scale": camera.depth_scale_m,
     }
+    if camera.serial is not None:
+        values["camera_serial"] = camera.serial
+    if camera.depth_scale_m is not None:
+        values["depth_scale"] = camera.depth_scale_m
     if camera.T_xarm_base_from_color is not None:
         values["camera_T_xarm_base_from_color"] = camera.T_xarm_base_from_color.reshape(-1).tolist()
     return values
@@ -147,7 +153,7 @@ def decode_camera_metadata(meta) -> CameraSnapshot:
             np.asarray(meta["camera_T_xarm_base_from_color"]).reshape(4, 4),
             label="camera_T_xarm_base_from_color",
         )
-    return CameraSnapshot(meta["camera_serial"], color, float(meta["depth_scale"]), transform)
+    return CameraSnapshot(meta.get("camera_serial"), color, float(meta["depth_scale"]), transform)
 
 
 def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata):
@@ -366,8 +372,6 @@ class RawReader:
         self.data_file = h5py.File(self.path / "data.h5", "r")
         try:
             self.num_frames = len(self.data_file["timing/rows"])
-            self.control_hz = float(self.meta["control_hz"])
-            sampling_clock_ns(self.control_hz)
         except BaseException:
             try:
                 self.close()
@@ -378,6 +382,12 @@ class RawReader:
     @property
     def meta(self):
         return self.data_file["meta"].attrs
+
+    @property
+    def control_hz(self):
+        hz = float(self.meta["control_hz"])
+        sampling_clock_ns(hz)
+        return hz
 
     @property
     def fields(self):

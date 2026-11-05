@@ -77,15 +77,14 @@ def collect_samples(runtime, output_dir):
     output.mkdir(parents=True, exist_ok=False)
     samples = output / "samples"
     samples.mkdir()
-    camera = RealSenseCamera(runtime.camera, auto_exposure_priority=None)
+    camera = RealSenseCamera(runtime.camera, depth_enabled=False, auto_exposure_priority=None)
     fk = ArmFK()
     count = 0
     try:
         camera.connect()
         sampler = ArucoSampler(camera.color_intrinsics)
         write_json({
-            "camera": {"serial": camera.active_serial, "color": camera.color_intrinsics.to_dict(),
-                        "depth_scale_m": camera.depth_scale_m},
+            "camera": {"serial": camera.active_serial, "color": camera.color_intrinsics.to_dict()},
             "marker": {"dictionary": ARUCO_DICT_NAME, "id": MARKER_ID, "size_m": MARKER_SIZE_M},
             "criteria": criteria, "requested_config": asdict(runtime),
         }, output / "capture.json", overwrite=False)

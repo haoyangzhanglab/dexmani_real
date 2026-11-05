@@ -30,7 +30,6 @@ from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.utils.io import publish
-from dexmani_real.utils.timing import sampling_clock_ns
 
 CANONICAL_FORMAT = "dexmani.real.canonical"
 logger = logging.getLogger(__name__)
@@ -156,7 +155,7 @@ def validate_export_episode(reader: RawReader, fields):
         reader[name]
     camera = export_camera(reader, fields)
     rows = reader["timing/rows"][:]
-    period = sampling_clock_ns(reader.control_hz)
+    period = round(1e9 / reader.control_hz)
 
     def first_bad(bad, offset=0):
         indices = np.flatnonzero(bad)
@@ -164,7 +163,7 @@ def validate_export_episode(reader: RawReader, fields):
 
     control, observation = rows["control_ns"], rows["observation_ns"]
     for bad, detail, offset in (
-        ((control <= 0) | (observation <= 0) | (observation < control), "invalid_control_or_observation_clock", 0),
+        ((control < 0) | (observation < 0) | (observation < control), "invalid_control_or_observation_clock", 0),
         (np.diff(control) <= 0, "control_clock_not_increasing", 1),
         (np.diff(observation) <= 0, "observation_clock_not_increasing", 1),
     ):
@@ -183,7 +182,7 @@ def validate_export_episode(reader: RawReader, fields):
         if not used_by.intersection(fields):
             continue
         values = rows[name]
-        bad = (values <= 0) | (values > observation)
+        bad = (values < 0) | (values > observation)
         bad[1:] |= np.diff(values) < 0
         row = first_bad(bad)
         if row is not None:
@@ -349,7 +348,7 @@ def export_zarr(
                             control_hz=reader.control_hz,
                         )
                     else:
-                        if not np.isclose(reader.dt, root.attrs["dt"], rtol=0, atol=1e-12):
+                        if not np.isclose(reader.dt, root.attrs["dt"], rtol=1e-6, atol=0):
                             raise ValueError("one canonical store requires uniform dt")
                         if "depth" in fields and not depth_scales_match(camera["depth_scale_m"], root.attrs["depth_scale_m_per_unit"]):
                             raise ValueError("depth_scale_m_per_unit must be uniform")

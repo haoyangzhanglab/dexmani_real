@@ -8,7 +8,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
@@ -46,6 +46,9 @@ def calibrate_table_plane(
     from dexmani_real.perception.pointcloud import aligned_depth_points_in_base
     from dexmani_real.utils.table_plane import save_table_plane
 
+    depth_scale_m = camera.depth_scale_m
+    if depth_scale_m is None:
+        raise ValueError("table calibration requires an RGB-D camera")
     lower, upper = config.workspace_bounds()
     print("\n" + "=" * 60)
     print("Table Plane Calibration (multi-frame RANSAC)")
@@ -60,13 +63,13 @@ def calibrate_table_plane(
         if frame is None or frame.depth_frame_number == last_depth_frame_number:
             continue
         last_depth_frame_number = frame.depth_frame_number
-        depth_frames.append(frame.depth)
+        depth_frames.append(cast(np.ndarray, frame.depth))
 
     point_batches: list[np.ndarray] = []
     for depth_raw in depth_frames:
         points = aligned_depth_points_in_base(
             depth_raw=depth_raw,
-            depth_scale_m=camera.depth_scale_m,
+            depth_scale_m=depth_scale_m,
             aligned_depth_intrinsics=camera.color_intrinsics,
             T_xarm_base_from_color=T_xarm_base_from_color,
         )
@@ -124,12 +127,12 @@ def run_pointcloud_diagnostic(args):
         if config.remove_table and not fit_requested else None
     )
     configure_logging()
-    camera = RealSenseCamera(runtime.camera, auto_exposure_priority=None)
+    camera = RealSenseCamera(runtime.camera, depth_enabled=True, auto_exposure_priority=None)
     try:
         camera.connect()
         print(f"Connected: {camera.active_serial}")
         frame = capture_frame(camera)
-        depth_m = frame.depth.astype(np.float32) * camera.depth_scale_m
+        depth_m = cast(np.ndarray, frame.depth).astype(np.float32) * cast(float, camera.depth_scale_m)
         lower, upper = VIS_DEPTH_RANGE_M
         valid = np.isfinite(depth_m) & (depth_m >= lower) & (depth_m <= upper)
         print(f"Depth display range [{lower:.2f}, {upper:.2f}] m: {int(valid.sum())}/{depth_m.size} pixels")
@@ -168,7 +171,7 @@ def run_pointcloud_diagnostic(args):
             T_xarm_base_from_color=base_from_color, config=config, table_plane_abcd=table_plane,
         )
         started = time.perf_counter()
-        result = processor.process(frame.depth, frame.rgb)
+        result = processor.process(cast(np.ndarray, frame.depth), frame.rgb)
         elapsed_ms = (time.perf_counter() - started) * 1000
         print(f"Point-cloud processing: {config}")
         print(f"Output: {len(result)} points ({elapsed_ms:.1f} ms)")

@@ -115,7 +115,7 @@ Canonical 默认导出 [13 个字段](dexmani_real/data/export.py)，保留既�
 
 采集端将 `timing/rows` 的时间字段写为主机单调时钟，单位 ns，缺失值为 -1；control_ns 是读取开始，observation_ns 是读取完成。`timestamp_source` 仅作说明，缺失或使用其他字符串不阻断结构正确的 timing 数据读取，原始时间数值保持不变。臂、手、触觉、相机保留来源时间，缓存不续期；同行不表示硬件同步。启用录制始终采集完整 Raw：实测关节、动作提交尝试、RGB、depth、aggregate、dense、来源时间及元数据，不随策略输入变化。Raw 动作表示提交尝试，不保证前缀包含最后一次实际提交。writer 收尾与保存决定见[高级部署说明](docs/policy_deployment.md#录制收尾与退出结果)。
 
-teleop/jog/replay 从每轮开始计时，只等待剩余周期；慢计算降低实际频率，不补发积压 tick。Canonical 对采样间隔超过名义周期 ±25%、读取跨下一周期给出警告。control/observation 必须为正且各自严格递增，observation 不早于本次 control；所选字段的动态来源时间非正、非因果、倒退或 camera_sequence 异常只汇总一次带定位的 warning。静态相机参数不要求逐帧相机时间有效。Canonical 保留统一名义 dt 和 episode_ends，不另存质量统计，也不重采样。实际时序可查 Raw 的 `timing/rows` 和 `RawReader.timestamps_s`。可导出不代表数据质量适合当前实验。
+teleop/jog/replay 从每轮开始计时，只等待剩余周期；慢计算降低实际频率，不补发积压 tick。Canonical 对采样间隔超过名义周期 ±25%、读取跨下一周期给出警告。control/observation 允许从 0 开始，须各自严格递增，observation 不早于本次 control；所选字段的动态来源时间为负、非因果、倒退或 camera_sequence 异常只汇总一次带定位的 warning，允许重复使用同一来源帧。静态相机参数不要求逐帧相机时间有效。Canonical 保留首段名义 dt 和 episode_ends，跨段周期允许 `rtol=1e-6, atol=0` 的表示误差，不另存质量统计，也不重采样。实际时序可查 Raw 的 `timing/rows` 和 `RawReader.timestamps_s`。可导出不代表数据质量适合当前实验。
 
 导出先验证所选字段的元数据、结构、dtype、计数和时间规则，再逐块读取相应原始数组并检查转换后的有限值。未选字段的坏值不影响导出；仅导出点云时，也按每段实际深度尺寸分块读取。前置验证成功不代表全部数值已通过；坏数值可能在转换开始后甚至末块才发现，整段及整批拒绝语义不变。需要 RGB 时逐帧解码并核对帧数；成功时导出全部行，不截断、切分、插值、补帧或重采样。批量遇到不合格 episode 明确失败；可通过 `--exclude EPISODE` 排除整段后重试，不自动跳过或改写 Raw。排除名单可跨批次复用，不存在于当前输入的名称忽略，统计只计实际排除的唯一 episode。全部完成后才原子发布 Canonical；转换失败关闭资源并删除本次新建的 Canonical staging，清理失败另行记录且不覆盖原错；不删除源 Raw 或既有目标。
 
@@ -193,7 +193,7 @@ solve 的外参输出与派生报告不得覆盖 `capture.json` 或原始采样 
 
 实时相机查看使用 view_realsense.py：默认 RGB-D，在 RGB-D 或点云窗口内按 P 开关点云、S 切换 raw/processed（默认 processed）；`--cloud raw/processed` 可在启动时打开点云并指定初始类型。Q/Esc 或关闭 RGB-D 窗口退出；关闭点云窗口仅关闭点云，按 P 可重新打开。预览不修改曝光优先级，不提供逐帧诊断面板。RGB-D 仅预览时不加载外参、桌面或点云处理器；启用对应点云类型时才加载所需资源。窗口需要桌面/OpenGL。
 
-view_pointcloud.py 提供独立诊断流程：先在终端选择是否拟合桌面，RGB-D 预览按 Enter 继续，随后处理一帧点云、打印点数和本帧处理耗时，关闭相机后静态查看结果；Q/Esc 或关窗退出。桌面拟合固定采集五份不同深度帧，使用当前相机内参；拟合结果可供本次处理使用，仅确认发布才改写共享桌面标定。`--config`、`--camera-calibration` 指定当前实验配置和外参。该流程复用当前点云算法和采集实现，预览不额外修改曝光设置。RGB-D 类型、网格和缓冲所有权由 RealSenseCamera.read 统一保证，预览、标定和采集入口使用同一读取边界。
+view_pointcloud.py 提供独立诊断流程：先在终端选择是否拟合桌面，RGB-D 预览按 Enter 继续，随后处理一帧点云、打印点数和本帧处理耗时，关闭相机后静态查看结果；Q/Esc 或关窗退出。桌面拟合固定采集五份不同深度帧，使用当前相机内参；拟合结果可供本次处理使用，仅确认发布才改写共享桌面标定。`--config`、`--camera-calibration` 指定当前实验配置和外参。该流程复用当前点云算法和采集实现，预览不额外修改曝光设置。RGB-D 类型、网格和缓冲所有权由 RealSenseCamera.read 统一保证，RGB-D 工具、仅 RGB 的 ArUco 标定和按需部署使用同一读取边界。传感进程正常关闭预算为 5 s，包含 L515 在首帧后立即关闭时约 3.2 s 的 SDK stop；超时仍按既有流程终止进程并报告。
 
 RGB-D 的非零 Brown 畸变需结合实际模型消费者判断：Real 反投影会反解 Brown，配套 Policy 的空间投影仅使用 K 和外参。使用空间投影融合前须核对 checkpoint 与相机参数；不支持的组合须明确拒绝，或另行使在线/离线几何共同支持畸变。不能仅凭同时存在 RGB 与 point_cloud 推断模型使用了空间投影。
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.deployment import ExecutionConfig
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
@@ -81,7 +81,7 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
         scale = recipe["depth_scale_m"]
         if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
             raise ValueError("Saved depth_scale_m must be finite and positive")
-        if tuple(recipe["shape"]) != runtime.camera.depth_shape:
+        if tuple(recipe["shape"]) != runtime.camera.image_shape:
             raise ValueError("Live camera shape differs from the saved depth input")
 
     runtime = replace(
@@ -99,5 +99,5 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     validate_robot_config(runtime)
     if info.action_mode == "eef":
         runtime.environment.validate()
-    validate_control_rate(runtime, 1.0 / execution.control_dt_s)
+    validate_control_rate(runtime, 1.0 / cast(float, execution.control_dt_s))
     return runtime

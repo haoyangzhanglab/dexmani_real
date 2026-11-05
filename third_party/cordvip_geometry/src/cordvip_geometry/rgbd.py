@@ -71,6 +71,8 @@ class RGBDFrame:
     @classmethod
     def from_camera(cls, camera, camera_row):
         """复用 CameraSnapshot 标定，将运行时相机行转为米制帧。"""
+        if camera.depth_scale_m is None:
+            raise ValueError("RGB-D geometry requires a camera depth scale")
         rgb = np.asarray(camera_row["rgb"])
         depth = np.asarray(camera_row["depth"])
         shape = (camera.color.height, camera.color.width)

@@ -216,6 +216,7 @@ class PolicySession:
         channels = (
             SensorChannels(
                 self.process_context, camera=self.runtime.camera,
+                depth_enabled=needs.point_cloud or "depth" in needs.camera_fields,
                 pointcloud_num_points=self.runtime.pointcloud.num_points if needs.point_cloud else None,
                 pointcloud_camera_fields=needs.camera_fields,
             ) if camera_required else None

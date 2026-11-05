@@ -83,10 +83,11 @@ class ObservationBuilder:
         requested = set(self.fields) & {"depth", "camera_intrinsic", "camera_extrinsic"}
         if not requested:
             return
-        if "depth" in requested and not depth_scales_match(
-            camera.depth_scale_m, self.info.depth_config["depth_scale_m"],
-        ):
-            raise ValueError("Live depth scale differs from the saved raw-count input recipe")
+        if "depth" in requested:
+            if camera.depth_scale_m is None:
+                raise ValueError("depth observations require a camera depth scale")
+            if not depth_scales_match(camera.depth_scale_m, self.info.depth_config["depth_scale_m"]):
+                raise ValueError("Live depth scale differs from the saved raw-count input recipe")
         requested.discard("depth")
         if not requested:
             return

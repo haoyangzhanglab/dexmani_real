@@ -100,29 +100,30 @@ class SceneTracker:
         min_matched_fraction=0.15,
         initial_selections=None,
     ):
-        for name, value in (
-            ("pixel_stride", pixel_stride),
-            ("min_matched_pixels", min_matched_pixels),
-        ):
+        integer_parameters = [("pixel_stride", pixel_stride)]
+        if assets:
+            integer_parameters.append(("min_matched_pixels", min_matched_pixels))
+        for name, value in integer_parameters:
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, np.integer))
                 or value < 1
             ):
                 raise ValueError(f"{name} must be a positive integer")
-        for name, value in (
-            ("depth_tolerance_m", depth_tolerance_m),
-            ("min_matched_fraction", min_matched_fraction),
-        ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, Real)
-                or not isfinite(value)
-                or value <= 0
+        if assets:
+            for name, value in (
+                ("depth_tolerance_m", depth_tolerance_m),
+                ("min_matched_fraction", min_matched_fraction),
             ):
-                raise ValueError(f"{name} must be finite and positive")
-        if min_matched_fraction > 1:
-            raise ValueError("min_matched_fraction must be in (0,1]")
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, Real)
+                    or not isfinite(value)
+                    or value <= 0
+                ):
+                    raise ValueError(f"{name} must be finite and positive")
+            if min_matched_fraction > 1:
+                raise ValueError("min_matched_fraction must be in (0,1]")
         for name in assets:
             validate_object_name(name)
         if initial_selections is not None:

@@ -24,16 +24,15 @@ VR_DTYPE = np.dtype(
 )
 
 
-def camera_dtype(height: int, width: int) -> np.dtype:
-    return np.dtype(
-        [
-            # 取 RGB 与深度中较早的首次接收时刻，重复帧不刷新时间。
-            ("timestamp_ns", "<u8"),
-            ("rgb", "u1", (height, width, 3)),
-            ("depth", "<u2", (height, width)),
-        ],
-        align=True,
-    )
+def camera_dtype(height: int, width: int, *, depth_enabled: bool = True) -> np.dtype:
+    fields: list[tuple] = [
+        # 实际采集通道中最早的首次接收时刻，重复帧不刷新时间。
+        ("timestamp_ns", "<u8"),
+        ("rgb", "u1", (height, width, 3)),
+    ]
+    if depth_enabled:
+        fields.append(("depth", "<u2", (height, width)))
+    return np.dtype(fields, align=True)
 
 
 def pointcloud_dtype(num_points: int, camera=None, camera_fields=()) -> np.dtype:
@@ -54,12 +53,13 @@ class SensorChannels:
         ctx,
         *,
         camera: CameraConfig | None = None,
+        depth_enabled: bool = True,
         vr: bool = False,
         pointcloud_num_points: int | None = None,
         pointcloud_camera_fields: tuple[str, ...] = (),
     ):
         self.camera_ring = (
-            SharedRing(ctx, camera_dtype(camera.height, camera.width), 5)
+            SharedRing(ctx, camera_dtype(camera.height, camera.width, depth_enabled=depth_enabled), 5)
             if camera is not None
             else None
         )
@@ -73,7 +73,7 @@ class SensorChannels:
         )
 
         self.is_running = ctx.RawValue("b", True)
-        self.camera_depth_scale = ctx.RawValue("d", 0.0)
+        self.camera_depth_scale = ctx.RawValue("d", 0.0) if camera is not None and depth_enabled else None
         self.camera_serial = ctx.RawArray("c", 32)
         self.camera_intrinsics = ctx.RawArray("c", 2048)
 
@@ -90,7 +90,8 @@ def snapshot_camera_parameters(
     if include_extrinsics:
         loader = load_camera_extrinsics if require_extrinsics else load_optional_camera_extrinsics
         transform = loader(serial, calibration_path)
-    return CameraSnapshot(serial, color, channels.camera_depth_scale.value, transform)
+    scale = channels.camera_depth_scale.value if channels.camera_depth_scale is not None else None
+    return CameraSnapshot(serial, color, scale, transform)
 
 
 def read_vr_frame(channels):
@@ -101,9 +102,9 @@ def read_vr_frame(channels):
     return {name: record[name] for name in record.dtype.names}
 
 
-def read_camera_frame(channels, *, fields=("rgb", "depth")):
+def read_camera_frame(channels, *, fields=None):
     result = channels.camera_ring.read(
-        fields=("timestamp_ns", *fields),
+        fields=channels.camera_ring.dtype.names if fields is None else ("timestamp_ns", *fields),
     )
     if result is None:
         return None

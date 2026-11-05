@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 CAMERA_READY_TIMEOUT_S = 15.0
 POINTCLOUD_READY_TIMEOUT_S = 30.0
 VR_READY_TIMEOUT_S = 120.0
-# 相机 read <= 0.3 s、来源 stall 2 s；不与 writer 的 flush 预算共享。
-SENSOR_SHUTDOWN_TIMEOUT_S = 3.0
+# L515 RGB-only 在首帧后立即关闭时，SDK stop 实测约 3.2 s；此预算独立于来源 TTL 和录制收尾。
+SENSOR_SHUTDOWN_TIMEOUT_S = 5.0
 WORKER_STOP_TIMEOUT_S = 1.0
 
 

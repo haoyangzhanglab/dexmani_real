@@ -17,7 +17,7 @@ class CameraConfig:
     l515_confidence_threshold: int | None = None
 
     @property
-    def depth_shape(self) -> tuple[int, int]:
+    def image_shape(self) -> tuple[int, int]:
         return (self.height, self.width)
 
     def validate(self) -> None:
