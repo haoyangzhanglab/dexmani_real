@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""采集实时 VR 数据标定朝向，通过质量检查后保存对齐变换。"""
+"""采集实时 VR 数据标定朝向，显示统计并保存对齐角度。"""
 
 from __future__ import annotations
 
@@ -125,7 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         forwards, stale_count = collect_headings(events, args.ref, args.duration)
 
     try:
-        calibration = estimate_heading(forwards, args.ref)
+        calibration = estimate_heading(forwards)
     except ValueError as exc:
         print(f"ERROR: invalid heading sample: {exc}")
         return 1
@@ -134,16 +133,11 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(forwards) - calibration.frames} rejected, {stale_count} duplicate frames"
     )
     print(
-        f"Quality: {calibration.grade}, σ={calibration.std_deg:.2f}°, "
+        f"Heading spread: σ={calibration.std_deg:.2f}°, "
         f"max={calibration.max_deviation_deg:.2f}°"
     )
 
-    try:
-        output_path = save_vr_transform(calibration, args.output or VR_TRANSFORM_PATH)
-    except ValueError as exc:
-        print(f"\n  NOT written: {exc}")
-        return 1
-
+    output_path = save_vr_transform(calibration, args.output or VR_TRANSFORM_PATH)
     print(f"\nSaved to: {output_path}")
 
     return 0

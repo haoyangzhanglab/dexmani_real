@@ -77,7 +77,7 @@ Policy 只使用终端提示；其他保留音频的入口使用系统 `aplay` �
 
 键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出；S/D 在该入口仍是方向键。启动及 HOME 后先完成伺服准备，再进入点动/hold。松键或 IK/约束拒绝时制动并 hold；有效候选不会只因名义 tick 已过而丢弃。IK 前后只比较方向键及 Q/R/Esc 的输入快照，无关键按下或释放不丢弃有效目标；Q/Esc 的取消仍由回调和实际发布边界执行。busy 期间仍维护按键释放，长按启动键不会穿过收尾自动启动。
 
-Teleop 手部实测起点必须位于配置操作范围，范围外会列出关节及就位要求，只拒绝本段，不发送跳变目标。默认 distal 下限为拇指 10°、其余手指 5°；范围内起点未经裁剪建立首帧参考，10 ms、4 rad/s 时经过 mapper 的最终目标每轴变化不超过 0.04 rad。默认显式 HOME 目标在范围内部留出 5° 到位容差；自定义范围或 HOME 时也需留出余量，HOME 成功不豁免实测范围检查。
+Teleop 手部实测起点必须位于配置操作范围，范围外会列出关节及就位要求，只拒绝本段，不发送跳变目标。默认 distal 下限为拇指 10°、其余手指 5°；仅在 1e-6 rad 数值舍入范围内归一到边界后建立首帧参考，10 ms、4 rad/s 时经过 mapper 的最终目标每轴变化不超过 0.04 rad。默认显式 HOME 目标在范围内部留出 5° 到位容差；自定义范围或 HOME 时也需留出余量，HOME 成功不豁免实测范围检查。
 
 ## 策略部署
 
@@ -109,7 +109,7 @@ Raw 任务标签须为非空、非全空白字符串，不含 NUL；允许换行
 
 Raw 使用 `data.h5` + `rgb.mp4`，遥操作默认保存在 `episodes/TASK/`；训练导出到 `datasets/TASK.zarr`。回放只打印提交数和耗时，不生成审计文件或输出目录，可重复执行同一命令。RawReader 和 `visualize_episode.py --info` 允许诊断显式 `.tmp_*` 路径；导出只检查请求 episode 和解析后 episode 的 basename，拒绝实际 `.tmp_episode` 及其别名，允许普通 `.tmp_workspace` 祖先及用作批量输入的临时工作目录。回放接受显式指定的临时目录，文件锁冲突、损坏或目标无效仍报错。诊断不会发布或改名数据。
 
-Raw 将实测 state 与提交尝试 action 分开保存。组合命令按设备顺序提交，真实故障保持原错并停止；单次手部写 CRC 仍是一次提交尝试，下一周期使用最新目标。送入 arm mailbox 只代表目标发布，不保证每个目标进入 SDK 或物理到位。手部 warm start、阻尼和滤波参考由控制线程在提交尝试正常返回后更新；同一 VR 帧每个控制 tick 仍运行手映射和速度限制。dt 使用本次计算时刻减上次提交尝试参考时刻，未提交的候选不推进参考或时间。SDK 调用正常返回也不证明手部物理执行。
+Raw 将实测 state 与提交尝试 action 分开保存。组合命令按设备顺序提交，真实故障保持原错并停止；单次手部写 CRC 仍是一次提交尝试，下一周期使用最新目标。送入 arm mailbox 只代表目标发布，不保证每个目标进入 SDK 或物理到位。手部 warm start、阻尼和滤波参考由控制线程在提交尝试正常返回后更新；同一 VR 帧每个控制 tick 仍运行手映射和速度限制。dt 使用本次计算时刻减上次提交尝试参考时刻，未提交的候选不推进参考或时间。普通映射失败在原 `target_max_age_s`（默认 0.5 s）目标期限内重发完整旧 arm+hand，不续期；实际重发正常返回后推进手部参考时间。首目标等待不写动作行，等待期间重建尚未生效的启动参考，到期仍停止。SDK 调用正常返回也不证明手部物理执行。
 
 Canonical 默认导出 [13 个字段](dexmani_real/data/export.py)，保留既有单位、输出 dtype、EEF 9D 与 EEF action 21D；用 `--fields` 选择实际所需字段，例如 `python scripts/export_zarr.py episodes/TASK --output datasets/rgb_state.zarr --fields rgb joint_state action`。只读取、检查和计算所选依赖：RGB/状态/action 无需外参或 FK，状态/action 不解码视频。Raw 浮点字段可使用不同浮点精度，转换后的训练值仍须有限；单位和关节顺序在读取相应字段时校验，单独读取图像不依赖动作元数据。导出动作时 policy 等待行的 NaN 仍会被拒绝。sync Policy Raw 的同行 action 是本次提交尝试，不代表由同行观测推理得到。正常保存、可导出和可物理回放是不同条件。相机外参 `camera_T_xarm_base_from_color` 从 color optical 坐标变换到 xArm base，平移单位为米。
 
@@ -129,7 +129,7 @@ Canonical 可导出到 Raw 输入目录内的新目标（例如 `raw_runs/canoni
 
 Canonical 仅保存所选字段需要的数值配方。保存原始 depth 时各段尺度必须相同；仅保存 point_cloud 时逐段转为米，允许原始深度尺度和图像尺寸不同。实际保存的图像数组仍要求形状一致，所有 episode 保持统一 dt。
 
-遥操作额外逐行保存 `vr_wrist_pos`、`vr_wrist_quat_wxyz`、`vr_landmarks`、`vr_recv_ts_ns`、`vr_sequence_id`，用于调试，不进入训练导出。VR 使用右手数据，21 个 landmark 保持 SDK 原顺序；来源时间取所需通道首次主机接收时间的较早者。接收端先校验并归一化原始姿态四元数，再转换为 FLU；零范数或非有限姿态被拒绝。位置用米、四元数 WXYZ；来源帧重复时 ID 和时间保持原值。VR 变换、手标定和每段一份初始锚点随 Raw 保存。逐次操作与失败控制时点用日志诊断。
+遥操作额外逐行保存 `vr_wrist_pos`、`vr_wrist_quat_wxyz`、`vr_landmarks`、`vr_recv_ts_ns`、`vr_sequence_id`，用于调试，不进入训练导出。VR 使用右手数据，21 个 landmark 保持 SDK 原顺序；来源时间取所需通道首次主机接收时间的较早者。接收端先校验并归一化原始姿态四元数，再转换为 FLU；零范数或非有限姿态被拒绝。位置用米、四元数 WXYZ；来源帧重复时 ID 和时间保持原值。每段 Raw 保存实际使用的 `vr_to_robot_rotation` 数值矩阵；手部形态标定和启动锚点只服务在线计算，不另行归档。逐次操作与失败控制时点用日志诊断。
 
 触觉 aggregate `(5,3)` 与 dense `(5,120,3)` 按通道保持最后完整有效值和原来源时间，直到真实新样本恢复，不补零或刷新旧时间。实际依赖触觉的策略仍按 `hand.feedback_max_age_s` 检查所用输入年龄。导出所选触觉时，最大来源年龄超过 0.5 s 给出 warning，不保存统计或筛行。Real 数据使用 SDK sensor axes 和原生尺度，指序为 thumb/index/middle/ring/pinky；与仿真接触力 N 的单位和坐标不同，同名同形状不代表等价，也不假定 dense 求和等于 aggregate。RawReader 校验单位、指序和形状；Canonical 继续拒绝所选字段的缺失、非有限值及 RGB 帧数不匹配。
 
@@ -185,7 +185,7 @@ python scripts/tools/view_pointcloud.py
 
 collect 的相机持续连接，Enter 为一组只读机械臂采样，完成立即断开臂；Q 结束。五帧原 RGB、检测、来源时间、实测位置/速度和样本 ID 保存为 NPZ，检查速度、帧新鲜度以及每次反馈相对采样起点的漂移。solve 不连接设备，按原 ID 排除样本，本批次不存在的 ID 忽略；质量合格后按真实 serial 仅写入 `T_base_from_camera`，保留其他相机条目。终端打印求解方法、样本数、位置/旋转 RMS、最差样本 ID 和输出位置；Python 调用返回含逐样本残差的 `HandEyeResult`，残差按使用的 sample ID 升序排列，`worst_sample` 为数组下标。VR 头朝向直接消费头帧，不要求右手就绪。
 
-VR 运行读取 JSON 中任意有限的 `theta_deg`，例如 `{"theta_deg": 270.0}`，按度构造 `R_z(-theta)`；不限制角度表示区间，也不改写输入。NaN 和正负无穷被拒绝。ref、质量和时间报告不参与运行准入。手工角度的正确性由研究者确认；自动标定在保存时拒绝低质量结果，并输出完整报告。Raw 归档实际使用的旋转矩阵。
+VR 运行读取 JSON 中任意有限的 `theta_deg`，例如 `{"theta_deg": 270.0}`，按度构造 `R_z(-theta)`；不限制角度表示区间，也不改写输入。NaN 和正负无穷被拒绝。ref、质量和时间报告不参与运行准入。手工角度的正确性由研究者确认；自动标定打印标准差、最大偏差和有效样本数，不按质量分级禁止保存；新文件只保存 theta_deg。Raw 归档实际使用的旋转矩阵。
 
 solve 的外参输出不得覆盖 `capture.json` 或原始采样 NPZ。
 
@@ -221,3 +221,5 @@ python -m cordvip_geometry view /tmp/cordvip/scene_001
 开发约定见 [AGENTS.md](AGENTS.md)。
 
 静态检查使用 `python -B -m ruff check --no-cache --select F dexmani_real`。SharedRing 同一 sequence、同一字段集合直接复用独立快照，调用方按只读使用；新序列复制竞争最多尝试两次，随后可复用相同字段集合的完整快照，保留原时间和 sequence；没有快照时不发送依赖该来源的动作，准备等待仍有期限。
+
+遥操作运动学修复和三组离线对照见[手部重定向](docs/hand_retargeting.md#2026-11-05-离线比较与取舍)。实测手部仅允许 1e-6 rad 舍入归一；VR/jog 起点不兼容命令工作空间时拒绝，不自动裁剪起点产生位移。IK 采用每初值 50 次迭代及实际候选误差验收。本轮保留完整手部目标与骨长标定，删除了重复损失回算和逐段标定/成功锚点归档。

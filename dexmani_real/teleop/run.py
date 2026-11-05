@@ -257,6 +257,7 @@ def calibrate_hand(loop, cancel_epoch) -> None:
     if retargeter is None:
         return
     from dexmani_real.teleop.retargeting.landmarks import (
+        HandGeometryRejected,
         hand_lengths,
         prepare_landmarks,
     )
@@ -286,7 +287,7 @@ def calibrate_hand(loop, cancel_epoch) -> None:
                 last_source_ns = stamp
                 try:
                     measurement = hand_lengths(prepare_landmarks(frame["landmarks"]))
-                except ValueError as exc:
+                except HandGeometryRejected as exc:
                     last_error = str(exc)
                 else:
                     measurements.append(measurement)
@@ -300,8 +301,8 @@ def calibrate_hand(loop, cancel_epoch) -> None:
 def build_hand_retargeter(runtime):
     if not runtime.hand.enabled:
         return None
-    from dexmani_real.teleop.retargeting.adaptive import AdaptiveHandRetargeter
+    from dexmani_real.teleop.retargeting.solver import HandRetargeter
 
-    return AdaptiveHandRetargeter(
+    return HandRetargeter(
         runtime.hand_retargeting, runtime.hand,
     )

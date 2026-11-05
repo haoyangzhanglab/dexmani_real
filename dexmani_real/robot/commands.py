@@ -57,6 +57,15 @@ def arm_reference_from_feedback(qpos, lower, upper) -> np.ndarray:
     return np.clip(feedback, lower, upper)
 
 
+def hand_reference_from_feedback(qpos, lower, upper) -> np.ndarray:
+    """仅归一实测手部参考的舍入越界，原反馈保持不变。"""
+    lower, upper = np.asarray(lower), np.asarray(upper)
+    feedback = validate_hand_target(
+        qpos, lower - _FEEDBACK_POSITION_ROUNDOFF_RAD, upper + _FEEDBACK_POSITION_ROUNDOFF_RAD,
+    )
+    return np.clip(feedback, lower, upper)
+
+
 def validate_hand_target(qpos, lower, upper) -> np.ndarray:
     target = np.asarray(qpos, dtype=np.float64)
     lower, upper = np.asarray(lower), np.asarray(upper)

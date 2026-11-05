@@ -1,10 +1,9 @@
-"""VR 朝向估计、质量检查与基座对齐。"""
+"""VR 朝向估计、统计与基座对齐。"""
 
 import json
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -22,19 +21,12 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class HeadingCalibration:
     theta_deg: float
-    reference: str
     std_deg: float
     max_deviation_deg: float
     frames: int
 
-    @property
-    def grade(self):
-        return "excellent" if self.std_deg < 2 else "good" if self.std_deg < 5 else "poor"
 
-
-def estimate_heading(forwards: np.ndarray, reference: str) -> HeadingCalibration:
-    if reference not in ("head", "wrist"):
-        raise ValueError("VR reference must be 'head' or 'wrist'")
+def estimate_heading(forwards: np.ndarray) -> HeadingCalibration:
     directions = forwards[:, :2]
     norms = np.linalg.norm(directions, axis=1)
     valid = np.isfinite(directions).all(axis=1) & (norms >= MIN_FORWARD_NORM)
@@ -58,7 +50,6 @@ def estimate_heading(forwards: np.ndarray, reference: str) -> HeadingCalibration
     deviation = np.rad2deg(np.angle(np.exp(1j * (angles[inliers] - theta))))
     return HeadingCalibration(
         float(np.rad2deg(theta)),
-        reference,
         float(deviation.std()),
         float(np.abs(deviation).max()),
         int(inliers.sum()),
@@ -66,7 +57,7 @@ def estimate_heading(forwards: np.ndarray, reference: str) -> HeadingCalibration
 
 
 def load_vr_transform(path: str | Path) -> np.ndarray:
-    """从有效角度构造运行变换，历史标定报告不参与运行准入。"""
+    """从有限朝向角构造机器人基座对齐旋转。"""
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     theta_deg = float(payload["theta_deg"])
     if not np.isfinite(theta_deg):
@@ -78,18 +69,7 @@ def load_vr_transform(path: str | Path) -> np.ndarray:
 
 
 def save_vr_transform(calibration: HeadingCalibration, path: str | Path = VR_TRANSFORM_PATH) -> Path:
-    if calibration.grade == "poor":
-        raise ValueError("VR heading quality is poor; collect a steadier sample")
-    return write_json({
-        "theta_deg": calibration.theta_deg,
-        "ref": calibration.reference,
-        "quality": {
-            "std_deg": calibration.std_deg,
-            "max_deviation_deg": calibration.max_deviation_deg,
-            "frames": calibration.frames,
-        },
-        "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
-    }, path)
+    return write_json({"theta_deg": calibration.theta_deg}, path)
 
 
 def read_heading(event, reference):

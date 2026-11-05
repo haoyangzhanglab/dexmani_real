@@ -96,17 +96,13 @@ class IKSolver:
         pool: list[IKCandidate] = []
         tried: list[np.ndarray] = []
         rejections = []
-        converged = False
 
         def try_seed(seed):
-            nonlocal converged
             # 相近但不同的初值仍可能到达不同分支，仅跳过完全相同的初值。
             if any(np.array_equal(seed, old) for old in tried):
                 return None
             tried.append(seed.copy())
             candidate, reason = self.try_clik(seed, target_base, target, current, previous, pool)
-            if reason != "solver_no_convergence":
-                converged = True
             if candidate is not None:
                 pool.append(candidate)
             elif reason != "duplicate":
@@ -141,23 +137,18 @@ class IKSolver:
                 return IKResult(qpos=best.qpos)
 
         rejections.extend(c.rejection_reason for c in pool if c.rejection_reason is not None)
-        reason = "solver_no_convergence"
-        if converged:
-            reason = "no_valid_candidate: " + "; ".join(dict.fromkeys(rejections))
+        reason = "no_valid_candidate: " + "; ".join(dict.fromkeys(rejections))
         return IKResult(qpos=None, reason=reason)
 
     def try_clik(self, seed, target_base, target, current, previous, pool):
-        raw, converged, _ = self.model.compute_IK_CLIK(
-            self.eef_link_id, target_base, seed.copy(), []
+        raw, _, _ = self.model.compute_IK_CLIK(
+            self.eef_link_id, target_base, seed.copy(), [], max_iter=50
         )
-        if raw is not None:
-            raw = np.asarray(raw, dtype=np.float64)
-            if raw.shape != (7,) or not np.isfinite(raw).all():
-                raise ValueError("CLIK output must be finite shape (7,)")
-        if not converged:
-            return None, "solver_no_convergence"
         if raw is None:
-            raise ValueError("CLIK reported convergence without a joint vector")
+            return None, "solver_no_candidate"
+        raw = np.asarray(raw, dtype=np.float64)
+        if raw.shape != (7,) or not np.isfinite(raw).all():
+            raise ValueError("CLIK output must be finite shape (7,)")
 
         lower, upper = self.limits.T
         q = wrap_nearest_equivalent(raw, current, lower, upper)

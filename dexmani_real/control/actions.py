@@ -9,8 +9,8 @@ from dexmani_real.control.ik import IKSolver
 from dexmani_real.geometry.pose import Pose
 
 
-class HandStartRejected(ValueError):
-    """实测手姿态无法作为本段有界动作的起点；设备会话仍可继续使用。"""
+class StartPoseRejected(ValueError):
+    """实测姿态无法作为本段有界动作的起点；设备会话仍可继续使用。"""
 
 
 @dataclass(frozen=True)

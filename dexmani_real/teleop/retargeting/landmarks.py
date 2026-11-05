@@ -11,6 +11,10 @@ FINGER_CHAINS = np.arange(1, 21).reshape(5, 4)
 TIP_INDICES = np.array([4, 8, 12, 16, 20])
 
 
+class HandGeometryRejected(ValueError):
+    """新鲜输入无法定义当前手部几何目标，可短暂保持上一命令。"""
+
+
 @dataclass(frozen=True)
 class HandTargets:
     positions: np.ndarray
@@ -25,14 +29,14 @@ def prepare_landmarks(landmarks):
     points = np.asarray(landmarks, dtype=np.float64)
     lengths = np.linalg.norm(points[BONE_CHILDREN] - points[BONE_PARENTS], axis=1)
     if np.any(lengths < 0.002) or np.any(lengths > 0.18):
-        raise ValueError("hand bone lengths must be between 2 and 180 mm")
+        raise HandGeometryRejected("hand bone lengths must be between 2 and 180 mm")
     centered = points - points[0]
     forward = centered[9]
     side = centered[5] - centered[17]
     forward = forward / np.linalg.norm(forward)
     side = side - np.dot(side, forward) * forward
     if np.linalg.norm(side) < 0.01:
-        raise ValueError("degenerate palm: index/pinky span is below 10 mm")
+        raise HandGeometryRejected("degenerate palm: index/pinky span is below 10 mm")
     side /= np.linalg.norm(side)
     # 由有序解剖标记确定法向，不用 SVD 的任意符号，也不引入反射矩阵。
     normal = np.cross(side, forward)
@@ -49,7 +53,6 @@ def hand_lengths(points):
 class HandCalibration:
     bone_lengths: np.ndarray
     palm_width: float
-    sample_count: int
 
     @classmethod
     def from_measurements(cls, measurements, config):
@@ -60,7 +63,7 @@ class HandCalibration:
         relative_mad = np.median(np.abs(values - median), axis=0) / median
         if np.max(relative_mad) > config.calibration_max_relative_mad:
             raise ValueError("hand calibration bone lengths are unstable")
-        return cls(median[:15].reshape(5, 3), float(median[15]), len(values))
+        return cls(median[:15].reshape(5, 3), float(median[15]))
 
     def targets(
         self, points, robot_points, config, *, robot_segments, robot_palm_width,
@@ -73,7 +76,7 @@ class HandCalibration:
         measured = np.r_[lengths.ravel(), np.linalg.norm(points[5] - points[17])]
         reference = np.r_[self.bone_lengths.ravel(), self.palm_width]
         if np.max(np.abs(measured / reference - 1.0)) > config.bone_length_tolerance:
-            raise ValueError("hand bone lengths changed beyond the calibrated tolerance")
+            raise HandGeometryRejected("hand bone lengths changed beyond the calibrated tolerance")
         unit_bones = bones / lengths[:, :, None]
         base = unit_bones[0, 0, :2]
         norm = np.linalg.norm(base)

@@ -9,6 +9,7 @@ from collections.abc import Iterable
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from dexmani_real.control.constraints import workspace_start_rejection
 from dexmani_real.control.ik import IKResult
 from dexmani_real.geometry.pose import Pose, quat_multiply
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
@@ -81,6 +82,11 @@ class CartesianJog:
         if baseline_pose is None:
             baseline_qpos = measured_qpos
             baseline_pose = self.solver.compute_eef_pose_base(measured_qpos)
+            reason = workspace_start_rejection(
+                baseline_pose.p, self.position_lower, self.position_upper,
+            )
+            if reason is not None:
+                return baseline_pose, IKResult(qpos=None, reason=reason)
         dx, drpy = jog_delta(
             pressed_keys, self.config.delta_pos_m, self.config.delta_rpy_rad
         )

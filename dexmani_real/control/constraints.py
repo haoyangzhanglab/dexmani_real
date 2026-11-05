@@ -8,6 +8,13 @@ from dexmani_real.robot.model import XARM7_EQUIVALENT_JOINT_MASK
 EQUIVALENT_JOINTS = np.asarray(XARM7_EQUIVALENT_JOINT_MASK, dtype=bool)
 
 
+def workspace_start_rejection(position, lower, upper):
+    """启动不能通过目标裁剪隐式移动；这里只容纳浮点计算舍入。"""
+    if np.any(position < lower - 1e-9) or np.any(position > upper + 1e-9):
+        return "实测末端起点超出命令工作空间；请手动就位或调整范围后重试"
+    return None
+
+
 def joint_target_rejection(q, limits):
     lower, upper = limits.T
     if np.any(q < lower) or np.any(q > upper):
