@@ -199,3 +199,14 @@ def test_nominal_period_tolerance(episode, tmp_path, hz, accepted):
         with pytest.raises(ValueError, match="uniform dt"):
             export_zarr(tmp_path, target, processing=ExportConfig(), fields=("depth",))
         assert not target.exists() and not list(tmp_path.glob(".combined.zarr.tmp-*"))
+
+
+def test_removed_archive_attributes_are_optional(episode, tmp_path):
+    with h5py.File(episode / "data.h5", "a") as data:
+        meta = data["meta"].attrs
+        for name in ("runtime_config_json", "hand_tactile_hold_policy", "timestamp_source"):
+            assert name not in meta
+            meta[name] = "unused legacy annotation"
+    with RawReader(episode) as reader:
+        assert len(list(iter_raw_rows(reader, reader.read_camera()))) == 3
+    export_zarr(episode, tmp_path / "legacy.zarr", processing=ExportConfig(), fields=("depth",))

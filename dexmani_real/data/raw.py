@@ -52,7 +52,7 @@ VR_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
 }
 
 
-# 时间字段单位 ns；采集端使用主机单调时钟，timestamp_source 仅作说明，不参与读取准入。
+# 时间字段单位 ns；采集端使用主机单调时钟。
 # 缺失用 -1，触觉时间为最后一份完整通道帧的来源时间。
 TIMING_ROW_DTYPE = np.dtype(
     [
@@ -157,7 +157,7 @@ def decode_camera_metadata(meta) -> CameraSnapshot:
 
 
 def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata):
-    """记录实际相机与触觉保持语义，不将旧值解释为当前接触。"""
+    """记录实际相机参数、触觉单位、指序及复位结果。"""
     metadata = camera_metadata(camera_snapshot)
     metadata.update(tactile_reset_metadata)
     if tactile_reset_metadata:
@@ -166,7 +166,6 @@ def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata):
     metadata.update(
         hand_tactile_units=TACTILE_UNITS,
         hand_tactile_finger_order=TACTILE_FINGER_ORDER,
-        hand_tactile_hold_policy="last_valid_until_recovery",
     )
     return metadata
 
@@ -247,7 +246,6 @@ class RawWriter:
         self.meta.attrs.update(
             termination_reason="recording_incomplete",
             control_hz=self.control_hz,
-            timestamp_source="host_monotonic_ns",
             arm_action_semantics=ARM_ACTION_SEMANTICS,
             joint_units="rad",
             arm_joint_names=json.dumps(XARM7_JOINT_NAMES),

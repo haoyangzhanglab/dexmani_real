@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import logging
-import sys
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -14,8 +12,6 @@ from dexmani_real.utils.log import configure_logging
 
 if TYPE_CHECKING:
     from dexmani_real.perception.pointcloud import PointCloudProcessor
-
-logger = logging.getLogger(__name__)
 
 
 class RealSenseViewer:
@@ -42,13 +38,7 @@ class RealSenseViewer:
             print(f"Connected: {self.camera.active_serial}")
             self.capture()
         finally:
-            original_error = sys.exc_info()[1]
-            try:
-                self.camera.disconnect()
-            except BaseException:
-                if original_error is None:
-                    raise
-                logger.exception("camera disconnect failed")
+            self.camera.disconnect()
         return 0
 
     def ensure_cloud_transform(self) -> np.ndarray:
@@ -146,21 +136,12 @@ class RealSenseViewer:
                     depth_range_m=DEPTH_RANGE_M,
                 ))
         finally:
-            original_error = sys.exc_info()[1]
-            errors = []
-            for stage, resource in (
-                ("cloud_viewer_close", cloud_viewer), ("image_viewer_close", image_viewer),
-            ):
-                if resource is not None:
-                    try:
-                        resource.close()
-                    except BaseException as exc:
-                        errors.append((stage, exc))
-            if errors:
-                for stage, error in errors[1:] if original_error is None else errors:
-                    logger.error("%s failed", stage, exc_info=(type(error), error, error.__traceback__))
-                if original_error is None:
-                    raise errors[0][1]
+            try:
+                if cloud_viewer is not None:
+                    cloud_viewer.close()
+            finally:
+                if image_viewer is not None:
+                    image_viewer.close()
 
 
 def main(argv=None) -> int:

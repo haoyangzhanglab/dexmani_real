@@ -45,12 +45,11 @@ def run_teleop(
     record: bool,
     episodes_dir: str,
     max_duration_s: float,
-    runtime_config_json: str | None,
     task_name=DEFAULT_TASK_NAME,
     vr_transform_path=VR_TRANSFORM_PATH,
     camera_calibration_path=None,
 ) -> int:
-    """装配遥操作资源并收尾；runtime_config_json 为 None 时不归档配置属性。"""
+    """装配遥操作资源并收尾。"""
     configure_logging()
     validate_robot_config(runtime)
     runtime.environment.validate()
@@ -124,7 +123,6 @@ def run_teleop(
                 audio=audio,
                 recording_dir=recording_dir,
                 max_duration_s=max_duration_s,
-                runtime_config_json=runtime_config_json,
             )
             keyboard.bindings["d"] = runtime_state.request_stop
             keyboard.start()

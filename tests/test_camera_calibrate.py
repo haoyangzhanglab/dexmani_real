@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import cv2
 import numpy as np
@@ -272,3 +273,31 @@ def test_sampling_pnp_uses_camera_intrinsics_and_distortion(model):
 
     np.testing.assert_allclose(estimated_rvec, rvec, atol=1e-5)
     np.testing.assert_allclose(estimated_tvec, tvec, atol=1e-6)
+
+
+def test_collect_records_actual_camera_without_requested_config(tmp_path, monkeypatch):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.geometry import kinematics
+    from dexmani_real.sensor import realsense
+    from dexmani_real.utils.camera_calibrate.calibrate import collect_samples
+
+    intrinsics = CameraIntrinsics(32, 32, 100., 100., 16., 16., "none", (0.,) * 5)
+    camera = Mock(active_serial="actual-camera", color_intrinsics=intrinsics)
+    camera_factory = Mock(return_value=camera)
+    monkeypatch.setattr(realsense, "RealSenseCamera", camera_factory)
+    monkeypatch.setattr(kinematics, "ArmFK", Mock())
+    monkeypatch.setattr("builtins.input", lambda _: "q")
+    runtime = RealConfig()
+    output = tmp_path / "capture"
+
+    assert collect_samples(runtime, output) == 0
+
+    metadata = json.loads((output / "capture.json").read_text())
+    assert set(metadata) == {"camera", "marker", "criteria"}
+    assert metadata["camera"] == {"serial": "actual-camera", "color": intrinsics.to_dict()}
+    assert metadata["marker"]["size_m"] > 0
+    assert metadata["criteria"]["camera_max_age_s"] == runtime.camera.max_frame_age_s
+    camera_factory.assert_called_once_with(
+        runtime.camera, depth_enabled=False, auto_exposure_priority=None,
+    )
+    camera.disconnect.assert_called_once()

@@ -130,6 +130,8 @@ tracker 固定使用一套图像网格和相机几何，按调用顺序推进；
 
 ## 输出与查看
 
+Python 宿主可用 `cordvip_geometry.io.scene_arrays(result)` 展开逐帧结果，再用同模块的 `write_npz(path, arrays)` 保存；跟踪算法本身不负责序列化。
+
 | 输出 | 内容 |
 | --- | --- |
 | `scene.json` | 对象 ID、asset、选择与标签；单位、坐标；有手部输出时保存关节顺序及 link_names |

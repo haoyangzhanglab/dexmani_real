@@ -198,3 +198,143 @@ def test_sensor_shutdown_reports_forced_termination(caplog):
     process.terminate.assert_called_once()
     assert "terminated during shutdown" in caplog.text
     assert not sensors.processes
+
+
+@pytest.mark.parametrize("count", [123, 30000, 30001, 59999, 60001])
+@pytest.mark.parametrize("publish", [False, True])
+def test_table_calibration_samples_full_range(monkeypatch, tmp_path, capsys, count, publish):
+    from dexmani_real.geometry import plane
+    from dexmani_real.perception import pointcloud
+    from dexmani_real.utils import table_plane
+    from scripts.tools import view_pointcloud
+
+    points = np.column_stack((np.linspace(.2, .8, count), np.zeros(count), np.full(count, .1)))
+    frames = iter([None] + [SimpleNamespace(depth_frame_number=i, depth=np.array([[i]]))
+                           for i in (1, 1, 2, 2, 3, 4, 5)])
+    camera = SimpleNamespace(depth_scale_m=.001, color_intrinsics=None, read=lambda: next(frames))
+    converted = []
+
+    def deproject(**kwargs):
+        converted.append(int(kwargs["depth_raw"][0, 0]))
+        return points
+
+    batches = []
+    fit = SimpleNamespace(plane_abcd=(0., 0., 1., -.1), inlier_points=1000,
+                          evaluated_points=1000, inlier_ratio=1., rms_residual_m=0., tilt_deg=0.)
+    monkeypatch.setattr(pointcloud, "aligned_depth_points_in_base", deproject)
+    monkeypatch.setattr(plane, "fit_table_plane", lambda p: batches.append(p) or fit)
+    save = Mock()
+    monkeypatch.setattr(table_plane, "save_table_plane", save)
+    answers = iter(["", "y" if publish else "n"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+    path = tmp_path / "plane.json"
+    assert view_pointcloud.calibrate_table_plane(
+        camera=camera, T_xarm_base_from_color=np.eye(4), config=PointCloudConfig(),
+        plane_path=path) == fit.plane_abcd
+    assert converted == [1, 2, 3, 4, 5]
+    selected = batches[0].reshape(5, min(count, 30000), 3)
+    for batch in selected:
+        assert len(np.unique(batch[:, 0])) == min(count, 30000)
+        np.testing.assert_array_equal(batch[[0, -1]], points[[0, -1]])
+        np.testing.assert_array_equal(batch, selected[0])
+        if count <= 30000:
+            np.testing.assert_array_equal(batch, points)
+    assert save.call_count == int(publish)
+    if publish:
+        save.assert_called_once_with(path, fit)
+    assert "collision" not in capsys.readouterr().out
+
+
+@pytest.fixture
+def viewer_resources(monkeypatch):
+    from dexmani_real.config import real
+    from dexmani_real.perception import pointcloud
+    from dexmani_real.sensor import realsense
+    from dexmani_real.utils.camera_calibrate import extrinsics
+    from dexmani_real.utils.visualization import image, pointcloud as visualization
+
+    events = []
+    camera = Mock(active_serial="camera-A", depth_scale_m=.001)
+    camera.connect.side_effect = lambda: events.append("connect")
+    camera.disconnect.side_effect = lambda: events.append("disconnect")
+    camera.read.return_value = SimpleNamespace(
+        rgb=np.zeros((4, 4, 3), np.uint8), depth=np.full((4, 4), 500, np.uint16),
+    )
+    preview = Mock()
+    preview.close.side_effect = lambda: events.append("preview_close")
+    cloud = Mock()
+    cloud.close.side_effect = lambda: events.append("cloud_close")
+    cloud.poll_events.return_value = ["q"]
+    processor = Mock()
+    processor.process.return_value = np.ones((16, 6), np.float32)
+
+    def open_cloud(**kwargs):
+        events.append("cloud_open")
+        return cloud
+
+    monkeypatch.setattr(real, "load_config", lambda **kwargs: RealConfig(
+        pointcloud=PointCloudConfig(remove_table=False),
+    ))
+    monkeypatch.setattr(realsense, "RealSenseCamera", lambda *args, **kwargs: camera)
+    monkeypatch.setattr(image, "ImageViewer", lambda *args: preview)
+    monkeypatch.setattr(visualization, "PointCloudViewer", open_cloud)
+    monkeypatch.setattr(extrinsics, "load_camera_extrinsics", lambda *args: np.eye(4))
+    monkeypatch.setattr(pointcloud, "PointCloudProcessor", lambda **kwargs: processor)
+    return SimpleNamespace(events=events, camera=camera, preview=preview,
+                           cloud=cloud, processor=processor)
+
+
+@pytest.mark.parametrize("quit_preview", [False, True])
+def test_static_viewer_closes_camera_before_cloud(monkeypatch, viewer_resources, quit_preview):
+    from scripts.tools import view_pointcloud
+
+    resources = viewer_resources
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    resources.preview.poll_events.return_value = ["q" if quit_preview else "enter"]
+    assert view_pointcloud.main([]) == 0
+    expected = ["connect", "preview_close", "disconnect"]
+    if not quit_preview:
+        expected += ["cloud_open", "cloud_close"]
+        resources.processor.process.assert_called_once()
+    else:
+        resources.processor.process.assert_not_called()
+    assert resources.events == expected
+
+
+def test_static_viewer_preserves_cleanup_exception_chain(monkeypatch, viewer_resources):
+    from scripts.tools import view_pointcloud
+
+    resources = viewer_resources
+    failure = ValueError("preview failed")
+    close_failure = OSError("preview close failed")
+    resources.preview.show.side_effect = failure
+    resources.preview.close.side_effect = close_failure
+    monkeypatch.setattr("builtins.input", lambda _: "n")
+    with pytest.raises(OSError, match="preview close failed") as raised:
+        view_pointcloud.main([])
+    assert raised.value.__context__ is failure
+    resources.camera.disconnect.assert_called_once()
+    resources.processor.process.assert_not_called()
+    assert "cloud_open" not in resources.events
+
+
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_live_viewer_closes_both_windows_and_camera(monkeypatch, viewer_resources, close_fails):
+    from dexmani_real.perception import pointcloud
+    from scripts.tools.view_realsense import RealSenseViewer
+
+    resources = viewer_resources
+    resources.preview.poll_events.return_value = []
+    monkeypatch.setattr(pointcloud, "build_raw_point_cloud", lambda **kwargs: np.ones((1, 6)))
+    if close_fails:
+        def fail_close():
+            resources.events.append("cloud_close")
+            raise OSError("cloud close failed")
+        resources.cloud.close.side_effect = fail_close
+    viewer = RealSenseViewer(SimpleNamespace(config=None, camera_calibration=None, cloud="raw"))
+    if close_fails:
+        with pytest.raises(OSError, match="cloud close failed"):
+            viewer.run()
+    else:
+        assert viewer.run() == 0
+    assert resources.events == ["connect", "cloud_open", "cloud_close", "preview_close", "disconnect"]

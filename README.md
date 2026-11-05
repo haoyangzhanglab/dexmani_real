@@ -50,7 +50,7 @@ python scripts/collect_teleop.py --print-config
 python scripts/run_policy.py --print-config
 ```
 
-这些命令只打印声明配置的 JSON，不连接设备、不读取标定或加载 checkpoint。Policy 仅打印部署相关配置段；最终输入 recipe 从 checkpoint 恢复。HandConfig 构造时将 NumPy 整数转为 Python 整数，设备调用、JSON/YAML 归档使用同一表示；布尔和浮点不能用作整数配置。遥操作的打印配置和 Raw 快照中的 `collection` 包含最终 CLI 录制选项，仅作为归档表示。Python 入口传入 `runtime_config_json=None` 时省略该归档属性，CLI 录制仍保存配置 JSON。启用分支负责业务校验，实测相机事实在连接后记录。
+这些命令只打印声明配置的 JSON，不连接设备、不读取标定或加载 checkpoint。Policy 仅打印部署相关配置段；最终输入 recipe 从 checkpoint 恢复。HandConfig 构造时将 NumPy 整数转为 Python 整数，设备调用、JSON/YAML 归档使用同一表示；布尔和浮点不能用作整数配置。遥操作打印配置中的 `collection` 包含最终 CLI 录制选项；运行直接消费显式参数，Raw 不保存整份请求配置。启用分支负责业务校验，实测相机事实在连接后记录。
 
 ## 常用实验路径
 
@@ -113,7 +113,7 @@ Raw 将实测 state 与提交尝试 action 分开保存。组合命令按设备�
 
 Canonical 默认导出 [13 个字段](dexmani_real/data/export.py)，保留既有单位、输出 dtype、EEF 9D 与 EEF action 21D；用 `--fields` 选择实际所需字段，例如 `python scripts/export_zarr.py episodes/TASK --output datasets/rgb_state.zarr --fields rgb joint_state action`。只读取、检查和计算所选依赖：RGB/状态/action 无需外参或 FK，状态/action 不解码视频。Raw 浮点字段可使用不同浮点精度，转换后的训练值仍须有限；单位和关节顺序在读取相应字段时校验，单独读取图像不依赖动作元数据。导出动作时 policy 等待行的 NaN 仍会被拒绝。sync Policy Raw 的同行 action 是本次提交尝试，不代表由同行观测推理得到。正常保存、可导出和可物理回放是不同条件。相机外参 `camera_T_xarm_base_from_color` 从 color optical 坐标变换到 xArm base，平移单位为米。
 
-采集端将 `timing/rows` 的时间字段写为主机单调时钟，单位 ns，缺失值为 -1；control_ns 是读取开始，observation_ns 是读取完成。`timestamp_source` 仅作说明，缺失或使用其他字符串不阻断结构正确的 timing 数据读取，原始时间数值保持不变。臂、手、触觉、相机保留来源时间，缓存不续期；同行不表示硬件同步。启用录制始终采集完整 Raw：实测关节、动作提交尝试、RGB、depth、aggregate、dense、来源时间及元数据，不随策略输入变化。Raw 动作表示提交尝试，不保证前缀包含最后一次实际提交。writer 收尾与保存决定见[高级部署说明](docs/policy_deployment.md#录制收尾与退出结果)。
+采集端将 `timing/rows` 的时间字段写为主机单调时钟，单位 ns，缺失值为 -1；control_ns 是读取开始，observation_ns 是读取完成。原始时间数值保持不变。臂、手、触觉、相机保留来源时间，缓存不续期；同行不表示硬件同步。启用录制始终采集完整 Raw：实测关节、动作提交尝试、RGB、depth、aggregate、dense、来源时间及元数据，不随策略输入变化。Raw 动作表示提交尝试，不保证前缀包含最后一次实际提交。writer 收尾与保存决定见[高级部署说明](docs/policy_deployment.md#录制收尾与退出结果)。
 
 teleop/jog/replay 从每轮开始计时，只等待剩余周期；慢计算降低实际频率，不补发积压 tick。Canonical 对采样间隔超过名义周期 ±25%、读取跨下一周期给出警告。control/observation 允许从 0 开始，须各自严格递增，observation 不早于本次 control；所选字段的动态来源时间为负、非因果、倒退或 camera_sequence 异常只汇总一次带定位的 warning，允许重复使用同一来源帧。静态相机参数不要求逐帧相机时间有效。Canonical 保留首段名义 dt 和 episode_ends，跨段周期允许 `rtol=1e-6, atol=0` 的表示误差，不另存质量统计，也不重采样。实际时序可查 Raw 的 `timing/rows` 和 `RawReader.timestamps_s`。可导出不代表数据质量适合当前实验。
 
@@ -129,9 +129,9 @@ Canonical 可导出到 Raw 输入目录内的新目标（例如 `raw_runs/canoni
 
 Canonical 仅保存所选字段需要的数值配方。保存原始 depth 时各段尺度必须相同；仅保存 point_cloud 时逐段转为米，允许原始深度尺度和图像尺寸不同。实际保存的图像数组仍要求形状一致，所有 episode 保持统一 dt。
 
-遥操作额外逐行保存 `vr_wrist_pos`、`vr_wrist_quat_wxyz`、`vr_landmarks`、`vr_recv_ts_ns`、`vr_sequence_id`，用于调试，不进入训练导出。VR 使用右手数据，21 个 landmark 保持 SDK 原顺序；来源时间取所需通道首次主机接收时间的较早者。接收端先校验并归一化原始姿态四元数，再转换为 FLU；零范数或非有限姿态被拒绝。位置用米、四元数 WXYZ；来源帧重复时 ID 和时间保持原值。提供的 `runtime_config_json`、VR 变换、手标定和每段一份初始锚点随 Raw 保存。逐次操作与失败控制时点用日志诊断。
+遥操作额外逐行保存 `vr_wrist_pos`、`vr_wrist_quat_wxyz`、`vr_landmarks`、`vr_recv_ts_ns`、`vr_sequence_id`，用于调试，不进入训练导出。VR 使用右手数据，21 个 landmark 保持 SDK 原顺序；来源时间取所需通道首次主机接收时间的较早者。接收端先校验并归一化原始姿态四元数，再转换为 FLU；零范数或非有限姿态被拒绝。位置用米、四元数 WXYZ；来源帧重复时 ID 和时间保持原值。VR 变换、手标定和每段一份初始锚点随 Raw 保存。逐次操作与失败控制时点用日志诊断。
 
-触觉 aggregate `(5,3)` 与 dense `(5,120,3)` 按通道保持最后完整有效值和原来源时间，直到真实新样本恢复；元数据声明 `hand_tactile_hold_policy="last_valid_until_recovery"`，不补零或刷新旧时间。实际依赖触觉的策略仍按 `hand.feedback_max_age_s` 检查所用输入年龄。导出所选触觉时，最大来源年龄超过 0.5 s 给出 warning，不保存统计或筛行。Real 数据使用 SDK sensor axes 和原生尺度，指序为 thumb/index/middle/ring/pinky；与仿真接触力 N 的单位和坐标不同，同名同形状不代表等价，也不假定 dense 求和等于 aggregate。RawReader 校验单位、指序和形状；Canonical 继续拒绝所选字段的缺失、非有限值及 RGB 帧数不匹配。
+触觉 aggregate `(5,3)` 与 dense `(5,120,3)` 按通道保持最后完整有效值和原来源时间，直到真实新样本恢复，不补零或刷新旧时间。实际依赖触觉的策略仍按 `hand.feedback_max_age_s` 检查所用输入年龄。导出所选触觉时，最大来源年龄超过 0.5 s 给出 warning，不保存统计或筛行。Real 数据使用 SDK sensor axes 和原生尺度，指序为 thumb/index/middle/ring/pinky；与仿真接触力 N 的单位和坐标不同，同名同形状不代表等价，也不假定 dense 求和等于 aggregate。RawReader 校验单位、指序和形状；Canonical 继续拒绝所选字段的缺失、非有限值及 RGB 帧数不匹配。
 
 T 仅在空闲、无录制且手部无接触时显式执行。Robot 确认停止并检查取消后清空旧触觉缓存，保留关节，再向 `0x11`–`0x15` 各请求一次；记录操作时间和已执行每指返回码，CRC/已知触觉不可用不阻止其余指请求，操作者可再次按 T 重试。清缓存后取消无需恢复旧值，后续反馈自然补齐，下一次 B 再检查真实初值。返回码不证明物理零点校准效果，真实设备故障仍报错。
 
@@ -193,7 +193,7 @@ solve 的外参输出不得覆盖 `capture.json` 或原始采样 NPZ。
 
 实时相机查看使用 view_realsense.py：默认 RGB-D，在 RGB-D 或点云窗口内按 P 开关点云、S 切换 raw/processed（默认 processed）；`--cloud raw/processed` 可在启动时打开点云并指定初始类型。Q/Esc 或关闭 RGB-D 窗口退出；关闭点云窗口仅关闭点云，按 P 可重新打开。预览不修改曝光优先级，不提供逐帧诊断面板。RGB-D 仅预览时不加载外参、桌面或点云处理器；启用对应点云类型时才加载所需资源。窗口需要桌面/OpenGL。
 
-view_pointcloud.py 提供独立诊断流程：先在终端选择是否拟合桌面，RGB-D 预览按 Enter 继续，随后处理一帧点云、打印点数和本帧处理耗时，关闭相机后静态查看结果；Q/Esc 或关窗退出。桌面拟合固定采集五份不同深度帧，使用当前相机内参；拟合结果可供本次处理使用，仅确认发布才改写共享桌面标定。`--config`、`--camera-calibration` 指定当前实验配置和外参。该流程复用当前点云算法和采集实现，预览不额外修改曝光设置。RGB-D 类型、网格和缓冲所有权由 RealSenseCamera.read 统一保证，RGB-D 工具、仅 RGB 的 ArUco 标定和按需部署使用同一读取边界。传感进程正常关闭预算为 5 s，包含 L515 在首帧后立即关闭时约 3.2 s 的 SDK stop；超时仍按既有流程终止进程并报告。
+view_pointcloud.py 提供独立诊断流程：先在终端选择是否拟合桌面，RGB-D 预览按 Enter 继续，随后处理一帧点云、打印点数和本帧处理耗时，关闭相机后静态查看结果；Q/Esc 或关窗退出。桌面拟合固定采集五份不同深度帧，使用当前相机内参；每帧超过 30,000 点时沿完整索引范围确定性限点。拟合结果用于点云去桌面，可供本次处理使用，仅确认发布才改写共享桌面标定。`--config`、`--camera-calibration` 指定当前实验配置和外参。该流程复用当前点云算法和采集实现，预览不额外修改曝光设置。RGB-D 类型、网格和缓冲所有权由 RealSenseCamera.read 统一保证，RGB-D 工具、仅 RGB 的 ArUco 标定和按需部署使用同一读取边界。传感进程正常关闭预算为 5 s，包含 L515 在首帧后立即关闭时约 3.2 s 的 SDK stop；超时仍按既有流程终止进程并报告。
 
 RGB-D 的非零 Brown 畸变需结合实际模型消费者判断：Real 反投影会反解 Brown，配套 Policy 的空间投影仅使用 K 和外参。使用空间投影融合前须核对 checkpoint 与相机参数；不支持的组合须明确拒绝，或另行使在线/离线几何共同支持畸变。不能仅凭同时存在 RGB 与 point_cloud 推断模型使用了空间投影。
 
@@ -220,4 +220,4 @@ python -m cordvip_geometry view /tmp/cordvip/scene_001
 
 开发约定见 [AGENTS.md](AGENTS.md)。
 
-静态检查使用 `python -B -m ruff check --no-cache --select F dexmani_real`。SharedRing 复制竞争最多尝试两次，随后可复用相同字段集合的完整快照，保留原时间和 sequence；没有快照时不发送依赖该来源的动作，准备等待仍有期限。
+静态检查使用 `python -B -m ruff check --no-cache --select F dexmani_real`。SharedRing 同一 sequence、同一字段集合直接复用独立快照，调用方按只读使用；新序列复制竞争最多尝试两次，随后可复用相同字段集合的完整快照，保留原时间和 sequence；没有快照时不发送依赖该来源的动作，准备等待仍有期限。

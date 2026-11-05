@@ -49,7 +49,6 @@ class TeleopLoop:
         controller,
         recording_dir,
         max_duration_s,
-        runtime_config_json,
         keyboard,
         audio,
         camera_snapshot=None,
@@ -68,7 +67,6 @@ class TeleopLoop:
         self.controller = controller
         self.recording_dir = recording_dir
         self.max_duration_s = max_duration_s
-        self.runtime_config_json = runtime_config_json
         self.task_label = task_label
         self.camera_snapshot = camera_snapshot
         self.keyboard = keyboard
@@ -251,8 +249,6 @@ class TeleopLoop:
                     tactile_reset_metadata=self.robot.hand.tactile_reset_metadata,
                 )
                 metadata["vr_to_robot_rotation"] = self.controller.rotation.as_matrix().tolist()
-                if self.runtime_config_json is not None:
-                    metadata["runtime_config_json"] = self.runtime_config_json
                 if self.controller.hand_retargeter is not None:
                     metadata["hand_retargeting_calibration_json"] = json.dumps(
                         self.controller.hand_retargeter.calibration_metadata(), allow_nan=False,

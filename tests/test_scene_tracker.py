@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -6,7 +7,10 @@ import numpy as np
 import pytest
 from cordvip_geometry import tracking
 from cordvip_geometry.cli.scene import choose_masks, load_scene
+from cordvip_geometry.cli.view import view_results
+from cordvip_geometry.io import scene_arrays, write_npz
 from cordvip_geometry.rgbd import RGBDFrame
+from cordvip_geometry.viewer import scene_clouds
 
 
 class Segmenter:
@@ -69,9 +73,30 @@ def test_mixed_scene_and_pose_depth_requirement(tmp_path, monkeypatch):
     pose.register.assert_not_called()
     tracker = tracking.SceneTracker(Segmenter(), {"model": (None, None, None)},
                                     foundationpose_root=None, debug_dir=tmp_path)
-    result = tracker.step(frame(.5), initial_masks=masks)
+    current = replace(frame(.5), row_index=0, timestamp_ns=0, source_id="")
+    result = tracker.step(current, initial_masks=masks)
     assert result["objects"]["model"]["state"] == "TRACKING"
     assert result["objects"]["observed"]["state"] == "OBSERVED_ONLY"
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    write_npz(frames / "000000.npz", scene_arrays(result))
+    with np.load(frames / "000000.npz", allow_pickle=False) as saved:
+        row = dict(saved)
+    assert row["timestamp_ns"] == row["row_index"] == 0
+    assert row["source_id"] == "" and "clock" not in row
+    for name in masks:
+        cloud = result["objects"][name]["cloud"]
+        np.testing.assert_array_equal(row[name + "__observed_points_camera"],
+                                      cloud.observed_points_camera)
+        assert row[name + "__observed_points_camera"].dtype == np.float32
+    assert np.isnan(row["observed__T_camera_object"]).all()
+    colors = {"model": (255, 0, 0), "observed": (0, 255, 0)}
+    points, _ = scene_clouds(row, masks, colors)
+    assert len(points) == 512
+    template = np.array([[0., 0., .5], [.1, 0., .5]], np.float32)
+    points, _ = scene_clouds(row, masks, colors, model_templates={"model": template})
+    np.testing.assert_array_equal(points, template)
+    assert view_results(tmp_path, headless=True) == 0
 
 
 def test_initial_mask_bypasses_unused_prompt(tmp_path):

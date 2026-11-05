@@ -130,3 +130,60 @@ def write_npz(path, arrays):
     except BaseException:
         path.unlink()
         raise
+
+
+def scene_arrays(result):
+    """将同行跟踪结果展开为逐帧 NPZ 的数组与标量。"""
+    import numpy as np
+
+    frame = result["frame"]
+    hand = result.get("hand")
+    payload = {
+        "rgb": result["rgb"],
+        "K": frame.K,
+        "operation": result["operation"],
+    }
+    for name in ("source_id", "row_index", "timestamp_ns", "clock"):
+        value = getattr(frame, name)
+        if value is not None:
+            payload[name] = value
+    if hand is not None:
+        payload.update(
+            hand_points_camera=hand["points_camera"],
+            hand_normals_camera=hand["normals_camera"],
+            hand_link_ids=hand["link_ids"],
+            joint_state=hand["joint_state"],
+            T_base_camera=hand["T_base_camera"],
+            hand_timing_available=hand["timing_available"],
+            hand_camera_skew_ms=hand["skew_ms"] if hand["timing_available"] else np.nan,
+            arm_timestamp_ns=hand["arm_timestamp_ns"],
+            hand_timestamp_ns=hand["hand_timestamp_ns"],
+            camera_timestamp_ns=hand["camera_timestamp_ns"],
+        )
+    for name, item in result["objects"].items():
+        cloud, pose_ok = item["cloud"], item["pose_valid"]
+        fields = {
+            "state": item["state"],
+            "pose_valid": pose_ok,
+            "error": item["error"] or "",
+            "observed_valid": item["observed_valid"],
+            "T_camera_object": item["pose"] if pose_ok else np.full((4, 4), np.nan),
+            "candidate_T_camera_object": (
+                item["candidate_pose"]
+                if item["candidate_pose"] is not None
+                else np.full((4, 4), np.nan)
+            ),
+            "observed_points_camera": cloud.observed_points_camera,
+            "observed_colors": cloud.observed_colors,
+            "semantic_mask": cloud.semantic_mask,
+            "observed_mask": cloud.observed_mask,
+        }
+        if cloud.model_supported_mask is not None:
+            fields["model_supported_mask"] = cloud.model_supported_mask
+            fields["observed_model_depth_residual_m"] = (
+                cloud.observed_model_depth_residual_m
+            )
+            fields["model_supported_point_count"] = cloud.model_supported_point_count
+            fields["model_supported_fraction"] = cloud.model_supported_fraction
+        payload.update({f"{name}__{key}": value for key, value in fields.items()})
+    return payload

@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import logging
-import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -16,7 +14,6 @@ if TYPE_CHECKING:
     from dexmani_real.config.perception import PointCloudConfig
     from dexmani_real.sensor.realsense import RealSenseCamera
 
-logger = logging.getLogger(__name__)
 VIS_DEPTH_RANGE_M = (0.3, 2.5)
 TABLE_CALIBRATION_FRAMES = 5
 
@@ -75,8 +72,8 @@ def calibrate_table_plane(
         )
         points = points[np.all((points >= lower) & (points <= upper), axis=1)]
         if points.shape[0] > 30_000:
-            step = max(1, points.shape[0] // 30_000)
-            points = points[::step][:30_000]
+            indices = np.linspace(0, len(points) - 1, 30_000, dtype=np.intp)
+            points = points[indices]
         point_batches.append(points)
     calibration_points = np.concatenate(point_batches, axis=0)
     fit = fit_table_plane(calibration_points)
@@ -91,7 +88,7 @@ def calibrate_table_plane(
 
     print(
         "  WARNING: publishing updates the shared plane used by point-cloud "
-        "cropping and table collision geometry."
+        "table removal."
     )
     confirmed = input(f"Publish to {plane_path}? [y/N] ").strip().lower() in {
         "y",
@@ -147,13 +144,7 @@ def run_pointcloud_diagnostic(args):
                     break
                 time.sleep(0.01)
         finally:
-            original_error = sys.exc_info()[1]
-            try:
-                preview.close()
-            except BaseException:
-                if original_error is None:
-                    raise
-                logger.exception("RGB-D preview close also failed")
+            preview.close()
 
         intrinsics = camera.color_intrinsics
         base_from_color = load_camera_extrinsics(camera.active_serial, args.camera_calibration)
@@ -176,13 +167,7 @@ def run_pointcloud_diagnostic(args):
         print(f"Point-cloud processing: {config}")
         print(f"Output: {len(result)} points ({elapsed_ms:.1f} ms)")
     finally:
-        original_error = sys.exc_info()[1]
-        try:
-            camera.disconnect()
-        except BaseException:
-            if original_error is None:
-                raise
-            logger.exception("camera disconnect also failed")
+        camera.disconnect()
 
     # 采集全部结束且相机成功关闭后才创建静态点云窗口。
     from dexmani_real.utils.visualization.pointcloud import PointCloudViewer
@@ -193,13 +178,7 @@ def run_pointcloud_diagnostic(args):
         while not any(key in {"q", "esc", "closed"} for key in viewer.poll_events()):
             time.sleep(0.01)
     finally:
-        original_error = sys.exc_info()[1]
-        try:
-            viewer.close()
-        except BaseException:
-            if original_error is None:
-                raise
-            logger.exception("point-cloud window close also failed")
+        viewer.close()
     return 0
 
 

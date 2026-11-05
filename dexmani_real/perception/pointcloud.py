@@ -131,7 +131,8 @@ def aligned_depth_points_in_base(
     T_xarm_base_from_color: np.ndarray,
 ) -> np.ndarray:
     """桌面标定使用深度过滤后的点，不执行桌面和工作空间裁剪。"""
-    depth_m = depth_raw.astype(np.float32) * np.float32(depth_scale_m)
+    depth_m = depth_raw.astype(np.float32)
+    depth_m *= np.float32(depth_scale_m)
     points, _, _ = deproject_depth(
         depth_m,
         filter_depth(depth_m),
@@ -148,10 +149,12 @@ def build_raw_point_cloud(
     intrinsics: CameraIntrinsics,
     T_xarm_base_from_color: np.ndarray,
 ) -> np.ndarray:
-    depth_m = depth_raw.astype(np.float32) * np.float32(depth_scale_m)
+    depth_m = depth_raw.astype(np.float32)
+    depth_m *= np.float32(depth_scale_m)
     points, rows, columns = deproject_depth(depth_m, depth_raw > 0, intrinsics)
     xyz = transform_points(points, T_xarm_base_from_color)
-    rgb = color[rows, columns].astype(np.float32) / 255.0
+    rgb = color[rows, columns].astype(np.float32)
+    rgb /= 255.0
     return np.column_stack((xyz, rgb))
 
 
@@ -187,20 +190,26 @@ class PointCloudProcessor:
             self.table_offset = plane_color[3]
 
     def process(self, depth_raw: np.ndarray, color: np.ndarray) -> np.ndarray:
-        depth_m = depth_raw.astype(np.float32) * self.depth_scale
+        depth_m = depth_raw.astype(np.float32)
+        depth_m *= self.depth_scale
         valid = filter_depth(depth_m)
         if self.config.remove_table:
             # 先沿射线裁掉桌面，避免为桌面像素分配三维点。
-            height = depth_m * self.table_height_per_depth + self.table_offset
+            height = depth_m * self.table_height_per_depth
+            height += self.table_offset
             valid &= height > self.config.table_margin_m
         for axis in range(3):
-            coordinate = self.rays_base[..., axis] * depth_m + self.translation[axis]
+            coordinate = self.rays_base[..., axis] * depth_m
+            coordinate += self.translation[axis]
             valid &= (coordinate >= self.lower[axis]) & (coordinate <= self.upper[axis])
         pixels = np.flatnonzero(valid)
         if not len(pixels):
             return np.empty((0, 6), dtype=np.float32)
-        points = self.rays_base.reshape(-1, 3)[pixels] * depth_m.ravel()[pixels, None] + self.translation
-        colors = color.reshape(-1, 3)[pixels].astype(np.float32) / 255.0
+        points = self.rays_base.reshape(-1, 3)[pixels]
+        points *= depth_m.ravel()[pixels, None]
+        points += self.translation
+        colors = color.reshape(-1, 3)[pixels].astype(np.float32)
+        colors /= 255.0
         points, colors = voxel_downsample(points, colors)
         keep = radius_inliers(points)
         points, colors = points[keep], colors[keep]

@@ -7,7 +7,6 @@ import os
 import tempfile
 import time
 from collections.abc import Iterable
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -86,7 +85,7 @@ def collect_samples(runtime, output_dir):
         write_json({
             "camera": {"serial": camera.active_serial, "color": camera.color_intrinsics.to_dict()},
             "marker": {"dictionary": ARUCO_DICT_NAME, "id": MARKER_ID, "size_m": MARKER_SIZE_M},
-            "criteria": criteria, "requested_config": asdict(runtime),
+            "criteria": criteria,
         }, output / "capture.json", overwrite=False)
         print("标记须相对 EEF 刚性固定。用厂商示教或独立点动工具摆位，停止并退出控制连接。")
         print("相机保持连接；Enter 只读采样，完成后机械臂连接立即关闭；Q 结束。")

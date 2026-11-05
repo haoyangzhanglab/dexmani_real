@@ -10,9 +10,9 @@ from .scene import choose_masks, load_scene
 def run(args):
     from dexmani_real.data.raw import RawReader
 
-    from ..io import new_output, write_json, write_npz
+    from ..io import new_output, scene_arrays, write_json, write_npz
     from ..raw import RawHandCloud, iter_raw_rows
-    from ..tracking import SceneTracker, scene_arrays
+    from ..tracking import SceneTracker
 
     objects = (
         load_scene(args.scene, headless=args.headless)

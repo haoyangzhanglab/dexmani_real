@@ -48,11 +48,18 @@ class SharedRing:
         return sequence
 
     def read(self, *, fields=None) -> tuple[np.void | dict, int] | None:
+        """返回脱离共享槽的完整快照；调用方按只读使用，包括其中的数组。"""
         field_key = None if fields is None else frozenset(fields)
         for _ in range(2):
             sequence = self.latest_sequence
             if sequence <= 0:
                 break
+            if (
+                self._last_snapshot is not None
+                and sequence == self._last_snapshot[1]
+                and field_key == self._last_fields
+            ):
+                return self._last_snapshot
             slot = self.slots[sequence % self.capacity]
             marker = 2 * sequence
             if int(slot["sequence"]) != marker:

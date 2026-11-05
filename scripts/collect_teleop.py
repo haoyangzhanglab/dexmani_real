@@ -52,18 +52,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     runtime = load_config(args.config)
-    runtime_config_json = None
-    if args.print_config or args.record:
-        # collection 仅用于打印与 Raw 归档；运行直接消费下面的显式参数。
+    if args.print_config:
+        # collection 展示最终 CLI 选项；运行直接消费下面的显式参数。
         snapshot = asdict(runtime)
         snapshot["collection"] = dict(
             enabled=args.record,
             episodes_dir=args.episodes_dir,
             max_duration_s=args.max_duration,
         )
-        runtime_config_json = json.dumps(snapshot, ensure_ascii=False, indent=2, allow_nan=False)
-    if args.print_config:
-        print(runtime_config_json)
+        print(json.dumps(snapshot, ensure_ascii=False, indent=2, allow_nan=False))
         return 0
 
     from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
@@ -74,7 +71,6 @@ def main(argv: list[str] | None = None) -> int:
         record=args.record,
         episodes_dir=args.episodes_dir,
         max_duration_s=args.max_duration,
-        runtime_config_json=runtime_config_json,
         task_name=args.task_name,
         vr_transform_path=VR_TRANSFORM_PATH if args.vr_transform is None else args.vr_transform,
         camera_calibration_path=args.camera_calibration,
