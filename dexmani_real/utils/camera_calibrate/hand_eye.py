@@ -17,17 +17,19 @@ MAX_ROTATION_RMS_DEG = 3.0
 
 @dataclass(frozen=True)
 class HandEyeResult:
+    """外参及按输入顺序排列的残差；位置为 mm，旋转为 deg。"""
+
     T_base_from_camera: np.ndarray
     method: str
     position_errors_mm: np.ndarray
     rotation_errors_deg: np.ndarray
 
     @property
-    def position_rms_mm(self):
+    def position_rms_mm(self) -> float:
         return float(np.sqrt(np.mean(self.position_errors_mm**2)))
 
     @property
-    def rotation_rms_deg(self):
+    def rotation_rms_deg(self) -> float:
         return float(np.sqrt(np.mean(self.rotation_errors_deg**2)))
 
     @property
@@ -39,6 +41,7 @@ class HandEyeResult:
 
     @property
     def worst_sample(self) -> int:
+        """最差残差的数组下标；原始 sample ID 由调用方映射。"""
         # 按各自门限归一化，位置与旋转异常均可定位。
         errors = np.maximum(
             self.position_errors_mm / MAX_POSITION_RMS_MM,

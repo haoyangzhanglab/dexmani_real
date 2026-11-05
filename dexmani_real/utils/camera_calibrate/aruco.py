@@ -110,7 +110,7 @@ class ArucoSampler:
         rotations = Rotation.from_rotvec(sample["marker_rvec"][valid])
         translations = sample["marker_tvec"][valid]
         first, second = np.triu_indices(len(translations), k=1)
-        position_spread = np.max(np.linalg.norm(translations[first] - translations[second], axis=1))
+        position_spread: np.floating = np.max(np.linalg.norm(translations[first] - translations[second], axis=1))
         rotation_spread = np.rad2deg((rotations[first].inv() * rotations[second]).magnitude()).max()
         # 先检查一致性再平均，避免平面双解或异常帧污染整组姿态。
         if position_spread > MAX_POSITION_SPREAD_M or rotation_spread > MAX_ROTATION_SPREAD_DEG:

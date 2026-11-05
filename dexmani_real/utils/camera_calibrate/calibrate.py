@@ -6,26 +6,13 @@ import json
 import os
 import tempfile
 import time
+from collections.abc import Iterable
 from dataclasses import asdict
-from datetime import datetime, timezone
 from pathlib import Path
 
-import cv2
 import numpy as np
 
-from dexmani_real.geometry.camera import CameraIntrinsics
 from dexmani_real.geometry.pose import validate_rigid_transform
-from dexmani_real.utils.camera_calibrate.aruco import (
-    ARUCO_DICT_NAME,
-    CAPTURE_FRAMES,
-    MARKER_ID,
-    MARKER_SIZE_M,
-    MAX_POSITION_SPREAD_M,
-    MAX_REPROJECTION_RMS_PX,
-    MAX_ROTATION_SPREAD_DEG,
-    MIN_DETECTED_FRAMES,
-    ArucoSampler,
-)
 from dexmani_real.utils.camera_calibrate.extrinsics import save_camera_calibration
 from dexmani_real.utils.camera_calibrate.hand_eye import HandEyeResult, solve_hand_eye
 from dexmani_real.utils.io import publish, write_json
@@ -54,9 +41,22 @@ def save_sample(path, sample_id, sample, eef_pose):
 
 def collect_samples(runtime, output_dir):
     """相机保持连接；每次摆位完成后只读连接机械臂，采样并立即断开。"""
+    import cv2
+
     from dexmani_real.geometry.kinematics import ArmFK
     from dexmani_real.robot.xarm7.driver import XArm7
     from dexmani_real.sensor.realsense import RealSenseCamera
+    from dexmani_real.utils.camera_calibrate.aruco import (
+        ARUCO_DICT_NAME,
+        CAPTURE_FRAMES,
+        MARKER_ID,
+        MARKER_SIZE_M,
+        MAX_POSITION_SPREAD_M,
+        MAX_REPROJECTION_RMS_PX,
+        MAX_ROTATION_SPREAD_DEG,
+        MIN_DETECTED_FRAMES,
+        ArucoSampler,
+    )
 
     runtime.camera.validate()
     criteria = {
@@ -119,20 +119,17 @@ def collect_samples(runtime, output_dir):
     return count
 
 
-def solve_samples(sample_dir, output_path, *, exclude=()) -> HandEyeResult:
-    """只读采样文件，按原 ID 剔除样本；不导入设备连接或执行在线标定。"""
+def solve_samples(
+    sample_dir: str | Path, output_path: str | Path, *, exclude: Iterable[int] = (),
+) -> HandEyeResult:
+    """只读位姿并按原 ID 排除样本；残差按使用的 ID 升序排列，不连接设备。"""
     source = Path(sample_dir).expanduser().resolve()
     output = Path(output_path).expanduser().resolve()
-    capture = json.loads((source / "capture.json").read_text(encoding="utf-8"))
-    camera = capture["camera"]
-    intrinsics = CameraIntrinsics(**camera["color"])
+    capture_path = (source / "capture.json").resolve()
+    serial = json.loads(capture_path.read_text(encoding="utf-8"))["camera"]["serial"]
     sample_paths = sorted((source / "samples").glob("*.npz"))
-    inputs = {(source / "capture.json").resolve(), *(path.resolve() for path in sample_paths)}
-    report_path = output.with_suffix(".result.json")
-    if report_path.resolve() == output:
-        raise ValueError("calibration output and report must be different paths")
-    if output in inputs or report_path.resolve() in inputs:
-        raise ValueError("calibration outputs must not overwrite capture inputs")
+    if output == capture_path or any(output == path.resolve() for path in sample_paths):
+        raise ValueError("calibration output must not overwrite capture inputs")
     excluded = set(exclude)
     samples, all_ids = {}, set()
     for path in sample_paths:
@@ -149,37 +146,19 @@ def solve_samples(sample_dir, output_path, *, exclude=()) -> HandEyeResult:
                     validate_rigid_transform(data["T_base_from_eef"], label=f"sample {sample_id} EEF"),
                     validate_rigid_transform(data["T_camera_from_marker"], label=f"sample {sample_id} marker"),
                 )
-    if excluded - all_ids:
-        raise ValueError(f"unknown excluded sample IDs: {sorted(excluded - all_ids)}")
     if not samples:
         raise ValueError("no calibration samples remain")
     used_ids = sorted(samples)
     eef, markers = (np.stack(poses) for poses in zip(*(samples[identity] for identity in used_ids)))
     result = solve_hand_eye(eef, markers)
-    report = {
-        "sample_directory": str(source), "used_sample_ids": used_ids, "excluded_sample_ids": sorted(excluded),
-        "sample_count": len(used_ids), "method": result.method,
-        "position_errors_mm": result.position_errors_mm.tolist(),
-        "rotation_errors_deg": result.rotation_errors_deg.tolist(),
-        "position_rms_mm": result.position_rms_mm, "rotation_rms_deg": result.rotation_rms_deg,
-        "worst_sample_id": used_ids[result.worst_sample], "quality_ok": result.quality_ok,
-        "calibrated_at_utc": datetime.now(timezone.utc).isoformat(),
-    }
-    write_json(dict(camera_serial=camera["serial"], T_base_from_camera=result.T_base_from_camera.tolist(),
-                    **report), report_path)
+    worst_sample_id = used_ids[result.worst_sample]
     if not result.quality_ok:
         raise ValueError(
             f"hand-eye quality failed: {result.position_rms_mm:.3f} mm / "
-            f"{result.rotation_rms_deg:.3f} deg; worst sample ID {report['worst_sample_id']}"
+            f"{result.rotation_rms_deg:.3f} deg; worst sample ID {worst_sample_id}"
         )
-    save_camera_calibration(
-        result.T_base_from_camera, camera["serial"], output,
-        calibration_capture=dict(
-            width=intrinsics.width, height=intrinsics.height,
-            intrinsics=intrinsics.matrix().tolist(), distortion=list(intrinsics.distortion_coeffs),
-            **report,
-        ),
-    )
-    print(f"{result.method}: RMS={result.position_rms_mm:.3f} mm / {result.rotation_rms_deg:.3f} deg; "
-          f"worst sample ID={report['worst_sample_id']}; 已保存 {output}")
+    save_camera_calibration(result.T_base_from_camera, serial, output)
+    print(f"{result.method}: samples={len(used_ids)}; "
+          f"RMS={result.position_rms_mm:.3f} mm / {result.rotation_rms_deg:.3f} deg; "
+          f"worst sample ID={worst_sample_id}; 已保存 {output}")
     return result

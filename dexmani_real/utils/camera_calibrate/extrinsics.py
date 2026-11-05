@@ -15,7 +15,7 @@ from dexmani_real.utils.io import write_json
 def _read_cameras(path: Path) -> dict:
     cameras = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(cameras, dict):
-        raise ValueError("camera calibration JSON must be an object keyed by serial")
+        raise TypeError("camera calibration JSON must be an object keyed by serial")
     return cameras
 
 
@@ -36,7 +36,7 @@ def load_optional_camera_extrinsics(
     serial: str,
     path: str | Path | None = None,
 ) -> np.ndarray | None:
-    """仅默认标定文件或 serial 缺失时省略外参；显式路径与坏条目仍报错。"""
+    """仅默认文件或其中的 serial 条目缺失时省略外参；显式路径与坏条目仍报错。"""
     if path is not None:
         return load_camera_extrinsics(serial, path)
     if not isinstance(serial, str) or not serial.strip():
@@ -53,8 +53,6 @@ def save_camera_calibration(
     T_base_from_camera: np.ndarray,
     serial: str,
     json_path: Path,
-    *,
-    calibration_capture: dict[str, object] | None = None,
 ) -> None:
     if not isinstance(serial, str) or not serial.strip():
         raise ValueError("camera serial must be non-empty")
@@ -62,8 +60,5 @@ def save_camera_calibration(
         T_base_from_camera, label=f"camera {serial} T_base_from_camera",
     )
     cameras = _read_cameras(json_path) if json_path.exists() else {}
-    entry = {"T_base_from_camera": transform.tolist()}
-    if calibration_capture is not None:
-        entry["calibration_capture"] = calibration_capture
-    cameras[serial] = entry
+    cameras[serial] = {"T_base_from_camera": transform.tolist()}
     write_json(cameras, json_path)

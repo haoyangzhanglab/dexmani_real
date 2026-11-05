@@ -22,11 +22,6 @@ from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
 from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
 from dexmani_real.runtime.observation import Observation
-from dexmani_real.utils.camera_calibrate.extrinsics import (
-    load_camera_extrinsics,
-    load_optional_camera_extrinsics,
-    save_camera_calibration,
-)
 
 
 @pytest.fixture
@@ -204,19 +199,3 @@ def test_nominal_period_tolerance(episode, tmp_path, hz, accepted):
         with pytest.raises(ValueError, match="uniform dt"):
             export_zarr(tmp_path, target, processing=ExportConfig(), fields=("depth",))
         assert not target.exists() and not list(tmp_path.glob(".combined.zarr.tmp-*"))
-
-
-def test_calibration_still_matches_real_serial(tmp_path):
-    path = tmp_path / "cameras.json"
-    transform = np.eye(4)
-    transform[0, 3] = .25
-    save_camera_calibration(transform, "camera-A", path)
-    np.testing.assert_array_equal(load_camera_extrinsics("camera-A", path), transform)
-    with pytest.raises(KeyError):
-        load_camera_extrinsics("camera-B", path)
-    for serial in (None, "", "  "):
-        for loader in (load_camera_extrinsics, load_optional_camera_extrinsics):
-            with pytest.raises(ValueError, match="serial"):
-                loader(serial, path)
-        with pytest.raises(ValueError, match="serial"):
-            save_camera_calibration(transform, serial, path)

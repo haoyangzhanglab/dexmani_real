@@ -171,7 +171,7 @@ python scripts/generate_hand_template.py --num-points 1024 --overwrite
 
 ## 标定和查看
 
-默认相机外参、桌面平面与 VR 朝向 JSON 位于 [config/calibration_data/](dexmani_real/config/calibration_data/)。纯 RGB-D 遥操作和不需要外参的 Policy Raw 录制允许默认外参文件或当前 serial 缺失，此时 Raw 不写入外参；点云、`camera_extrinsic` 等消费者仍要求有效外参。显式标定路径错误、文件损坏或当前条目无效均报错。相机标记须相对 EEF 刚性固定，摆位提供充分旋转激励；先退出厂商示教/独立点动控制连接，再只读采样。
+默认相机外参、桌面平面与 VR 朝向 JSON 位于 [config/calibration_data/](dexmani_real/config/calibration_data/)。纯 RGB-D 遥操作和不需要外参的 Policy Raw 录制允许默认外参文件或当前 serial 对应条目缺失，此时 Raw 不写入外参；点云、`camera_extrinsic` 等消费者仍要求有效外参。显式标定路径错误、文件损坏或当前条目无效均报错。相机标记须相对 EEF 刚性固定，摆位提供充分旋转激励；先退出厂商示教/独立点动控制连接，再只读采样。
 
 ```bash
 python scripts/calibrate_camera.py collect --output calibration_samples/run_001
@@ -183,13 +183,13 @@ python scripts/tools/view_realsense.py --cloud processed
 python scripts/tools/view_pointcloud.py
 ```
 
-collect 的相机持续连接，Enter 为一组只读机械臂采样，完成立即断开臂；Q 结束。五帧原 RGB、检测、来源时间、实测位置/速度和样本 ID 保存为 NPZ，检查速度、帧新鲜度以及每次反馈相对采样起点的漂移。solve 不连接设备，按原 ID 排除样本，保存逐样本残差和 used/excluded/worst IDs；质量合格后写入原 serial 映射格式外参，报告使用同名 `.result.json`。VR 头朝向直接消费头帧，不要求右手就绪。
+collect 的相机持续连接，Enter 为一组只读机械臂采样，完成立即断开臂；Q 结束。五帧原 RGB、检测、来源时间、实测位置/速度和样本 ID 保存为 NPZ，检查速度、帧新鲜度以及每次反馈相对采样起点的漂移。solve 不连接设备，按原 ID 排除样本，本批次不存在的 ID 忽略；质量合格后按真实 serial 仅写入 `T_base_from_camera`，保留其他相机条目。终端打印求解方法、样本数、位置/旋转 RMS、最差样本 ID 和输出位置；Python 调用返回含逐样本残差的 `HandEyeResult`，残差按使用的 sample ID 升序排列，`worst_sample` 为数组下标。VR 头朝向直接消费头帧，不要求右手就绪。
 
 VR 运行读取 JSON 中任意有限的 `theta_deg`，例如 `{"theta_deg": 270.0}`，按度构造 `R_z(-theta)`；不限制角度表示区间，也不改写输入。NaN 和正负无穷被拒绝。ref、质量和时间报告不参与运行准入。手工角度的正确性由研究者确认；自动标定在保存时拒绝低质量结果，并输出完整报告。Raw 归档实际使用的旋转矩阵。
 
-solve 的外参输出与派生报告不得覆盖 `capture.json` 或原始采样 NPZ。
+solve 的外参输出不得覆盖 `capture.json` 或原始采样 NPZ。
 
-采样使用逐帧 IPPE_SQUARE：重投影 RMS ≤ 1 px，至少四帧有效，帧间位置/旋转跨度 ≤ 5 mm / 3°；不一致则重新采样。collect 仅接受 none 或 Brown-Conrady 相机畸变模型。手眼求解固定 HORAUD，闭环 RMS ≤ 5 mm / 3° 才更新外参；这些内部残差不代表真实空间定位精度。solve 直接读取 NPZ 中的 EEF 与 Marker 位姿，不重算 RGB 或逐帧 PnP。
+采样使用逐帧 IPPE_SQUARE：重投影 RMS ≤ 1 px，至少四帧有效，帧间位置/旋转跨度 ≤ 5 mm / 3°；不一致则重新采样。collect 仅接受 none 或 Brown-Conrady 相机畸变模型。手眼求解固定 HORAUD，闭环 RMS ≤ 5 mm / 3° 才更新外参；这些内部残差不代表真实空间定位精度。solve 只需 `capture.json` 中的真实 `camera.serial` 和 NPZ 中的 EEF 与 Marker 位姿，不读取内参、不重算 RGB 或逐帧 PnP。
 
 实时相机查看使用 view_realsense.py：默认 RGB-D，在 RGB-D 或点云窗口内按 P 开关点云、S 切换 raw/processed（默认 processed）；`--cloud raw/processed` 可在启动时打开点云并指定初始类型。Q/Esc 或关闭 RGB-D 窗口退出；关闭点云窗口仅关闭点云，按 P 可重新打开。预览不修改曝光优先级，不提供逐帧诊断面板。RGB-D 仅预览时不加载外参、桌面或点云处理器；启用对应点云类型时才加载所需资源。窗口需要桌面/OpenGL。
 
