@@ -54,6 +54,7 @@ def run(args):
             workspace=args.workspace,
             models_dir=args.models_dir,
             sam_python=args.sam_python,
+            sam_variant=args.sam_variant,
             sam_checkpoint=args.sam_checkpoint,
             sam_config=args.sam_config,
             log_dir=output,

@@ -30,6 +30,35 @@ def validate_object_name(name):
         raise ValueError("Object names must be nonempty single directory names")
 
 
+def _validate_tracking_parameters(
+    *, has_models, pixel_stride, depth_tolerance_m, min_matched_pixels, min_matched_fraction,
+):
+    integer_parameters = [("pixel_stride", pixel_stride)]
+    if has_models:
+        integer_parameters.append(("min_matched_pixels", min_matched_pixels))
+    for name, value in integer_parameters:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, np.integer))
+            or value < 1
+        ):
+            raise ValueError(f"{name} must be a positive integer")
+    if has_models:
+        for name, value in (
+            ("depth_tolerance_m", depth_tolerance_m),
+            ("min_matched_fraction", min_matched_fraction),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
+        if min_matched_fraction > 1:
+            raise ValueError("min_matched_fraction must be in (0,1]")
+
+
 @dataclass
 class ObjectCloud:
     """相机坐标的实测点；模型残差是实测 Z 减模型 Z，无表面处为 NaN。"""
@@ -100,30 +129,11 @@ class SceneTracker:
         min_matched_fraction=0.15,
         initial_selections=None,
     ):
-        integer_parameters = [("pixel_stride", pixel_stride)]
-        if assets:
-            integer_parameters.append(("min_matched_pixels", min_matched_pixels))
-        for name, value in integer_parameters:
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, np.integer))
-                or value < 1
-            ):
-                raise ValueError(f"{name} must be a positive integer")
-        if assets:
-            for name, value in (
-                ("depth_tolerance_m", depth_tolerance_m),
-                ("min_matched_fraction", min_matched_fraction),
-            ):
-                if (
-                    isinstance(value, bool)
-                    or not isinstance(value, Real)
-                    or not isfinite(value)
-                    or value <= 0
-                ):
-                    raise ValueError(f"{name} must be finite and positive")
-            if min_matched_fraction > 1:
-                raise ValueError("min_matched_fraction must be in (0,1]")
+        _validate_tracking_parameters(
+            has_models=bool(assets), pixel_stride=pixel_stride,
+            depth_tolerance_m=depth_tolerance_m, min_matched_pixels=min_matched_pixels,
+            min_matched_fraction=min_matched_fraction,
+        )
         for name in assets:
             validate_object_name(name)
         if initial_selections is not None:
@@ -171,6 +181,11 @@ class SceneTracker:
         min_matched_fraction=0.15,
     ):
         """一次加载资产与模型，退出时释放 SAM 子进程。"""
+        _validate_tracking_parameters(
+            has_models=any(path is not None for path in assets.values()),
+            pixel_stride=pixel_stride, depth_tolerance_m=depth_tolerance_m,
+            min_matched_pixels=min_matched_pixels, min_matched_fraction=min_matched_fraction,
+        )
         from .assets import load_asset
         from .models import DEFAULT_MODELS_DIR, resolve_sam_model
         from .sam2 import SAM2Client

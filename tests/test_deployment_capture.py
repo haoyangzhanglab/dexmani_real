@@ -245,6 +245,48 @@ def test_table_calibration_samples_full_range(monkeypatch, tmp_path, capsys, cou
     assert "collision" not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("slopes,height", [
+    ((0., 0.), 0.), ((.08, -.05), .001), ((0., 0.), .8), ((0., 0.), .4),
+])
+def test_table_calibration_fits_unclipped_height_and_normal(monkeypatch, tmp_path, slopes, height):
+    from dexmani_real.perception import pointcloud
+    from dexmani_real.utils import table_plane
+    from scripts.tools import view_pointcloud
+
+    rng = np.random.default_rng(2026)
+    count = 12000
+    xy = np.column_stack((rng.uniform(.15, .85, count), rng.uniform(-.5, .5, count)))
+    z = height + (xy - (.5, 0.)) @ np.asarray(slopes) + rng.normal(0., .002, count)
+    table = np.column_stack((xy, z))
+    # 两轴范围外各有一个支持点更多的干扰平面，漏筛任一轴都会选错桌面。
+    outside_x = np.column_stack((rng.uniform(.9, 1.2, 30000),
+                                 rng.uniform(-.5, .5, 30000), rng.normal(.3, .001, 30000)))
+    outside_y = np.column_stack((rng.uniform(.15, .85, 30000),
+                                 rng.uniform(.6, .9, 30000), rng.normal(.3, .001, 30000)))
+    points = np.concatenate((table, outside_x, outside_y))
+    frames = iter(SimpleNamespace(depth_frame_number=i, depth=np.array([[i]])) for i in range(5))
+    camera = SimpleNamespace(depth_scale_m=.001, color_intrinsics=None, read=lambda: next(frames))
+    monkeypatch.setattr(pointcloud, "aligned_depth_points_in_base", lambda **kwargs: points)
+    save = Mock()
+    monkeypatch.setattr(table_plane, "save_table_plane", save)
+    answers = iter(["", "n"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+
+    # 使用真实 RANSAC 和最小二乘拟合，不替换 fit_table_plane。
+    a, b, c, d = view_pointcloud.calibrate_table_plane(
+        camera=camera, T_xarm_base_from_color=np.eye(4), config=PointCloudConfig(),
+        plane_path=tmp_path / "plane.json",
+    )
+    fitted_height = -(a * .5 + d) / c
+    expected_normal = np.array([-slopes[0], -slopes[1], 1.])
+    expected_normal /= np.linalg.norm(expected_normal)
+    normal_error = np.degrees(np.arccos(np.clip(np.dot([a, b, c], expected_normal), -1, 1)))
+    assert abs(fitted_height - height) < .0002
+    assert normal_error < .03
+    assert c > 0
+    save.assert_not_called()
+
+
 @pytest.fixture
 def viewer_resources(monkeypatch):
     from dexmani_real.config import real

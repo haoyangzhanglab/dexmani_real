@@ -1,4 +1,5 @@
 import logging
+from unittest.mock import MagicMock, Mock, call
 
 import h5py
 import numpy as np
@@ -10,6 +11,7 @@ from dexmani_real.data.export import ExportConfig, export_zarr
 from dexmani_real.data.raw import (
     RawReader,
     RawWriter,
+    _VideoWriter,
     camera_metadata,
     snapshot_recording_metadata,
 )
@@ -55,6 +57,8 @@ def episode(tmp_path):
         writer.finish("operator", [])
     finally:
         writer.close()
+    assert writer.video is None and writer.data_file is None
+    writer.close()
     return path
 
 
@@ -210,3 +214,218 @@ def test_removed_archive_attributes_are_optional(episode, tmp_path):
     with RawReader(episode) as reader:
         assert len(list(iter_raw_rows(reader, reader.read_camera()))) == 3
     export_zarr(episode, tmp_path / "legacy.zarr", processing=ExportConfig(), fields=("depth",))
+
+
+@pytest.mark.parametrize("model", ["small", "large", "custom"])
+def test_tracking_cli_resolves_sam_once_and_preserves_raw_rows(episode, tmp_path, monkeypatch, model):
+    import json
+
+    from cordvip_geometry import models, sam2
+    from cordvip_geometry.cli import track
+    from cordvip_geometry.cli.arguments import parse_tracking_args
+
+    mask = np.ones((32, 32), bool)
+    selection = tmp_path / "mask.npy"
+    np.save(selection, mask)
+    masks = {"object": mask}
+    segmenter = Mock()
+    segmenter.initialize.return_value = segmenter.track.return_value = masks
+    sam = MagicMock()
+    sam.return_value.__enter__.return_value = segmenter
+    monkeypatch.setattr(sam2, "SAM2Client", sam)
+    resolve = Mock(wraps=models.resolve_sam_model)
+    monkeypatch.setattr(models, "resolve_sam_model", resolve)
+    if model == "custom":
+        checkpoint, config = tmp_path / "custom.pt", "custom.yaml"
+        options = ["--sam-checkpoint", str(checkpoint), "--sam-config", config]
+    else:
+        checkpoint = tmp_path / "third_party/weights" / models.SAM_MODELS[model]["weight"]
+        config = models.SAM_MODELS[model]["config"]
+        options = ["--sam-variant", "large"] if model == "large" else []
+    output = tmp_path / "tracked"
+    args = parse_tracking_args([
+        "--episode", str(episode), "--initial-selection", str(selection), "--headless",
+        "--output", str(output), "--min-matched-pixels", "0", "--depth-tolerance-m", "nan",
+        "--min-matched-fraction", "0", *options,
+    ], workspace=tmp_path)
+    resolve.assert_not_called()
+    assert track.run(args) == 0
+    resolve.assert_called_once_with(
+        args.models_dir, args.sam_variant, args.sam_checkpoint, args.sam_config,
+    )
+    assert sam.call_args.kwargs["checkpoint"] == checkpoint
+    assert sam.call_args.kwargs["config"] == config
+    assert json.loads((output / "scene.json").read_text())["objects"][0]["id"] == "object"
+    assert not (output / "model_templates").exists()
+    paths = sorted((output / "frames").glob("*.npz"))
+    assert len(paths) == 3
+    for index, path in enumerate(paths):
+        with np.load(path, allow_pickle=False) as frame:
+            assert frame["row_index"] == index
+            assert frame["timestamp_ns"] == index * round(1e9 / 29.97)
+            assert frame["object__state"] == "OBSERVED_ONLY"
+            assert frame["object__observed_points_camera"].shape == (256, 3)
+
+
+@pytest.mark.parametrize("options,error,resolutions", [
+    (["--min-matched-pixels", "0"], "min_matched_pixels", 0),
+    (["--sam-checkpoint", "custom.pt"], "完整配对", 1),
+    (["--sam-config", "custom.yaml"], "完整配对", 1),
+    (["--sam-checkpoint", "custom.pt", "--sam-config", "custom.yaml",
+      "--sam-variant", "large"], "自训配对", 1),
+])
+def test_tracking_cli_rejects_invalid_setup_before_asset_load(
+    episode, tmp_path, monkeypatch, options, error, resolutions,
+):
+    from cordvip_geometry import assets, models, sam2
+    from cordvip_geometry.cli import track
+    from cordvip_geometry.cli.arguments import parse_tracking_args
+
+    resolve = Mock(wraps=models.resolve_sam_model)
+    load, sam = Mock(), Mock()
+    monkeypatch.setattr(models, "resolve_sam_model", resolve)
+    monkeypatch.setattr(assets, "load_asset", load)
+    monkeypatch.setattr(sam2, "SAM2Client", sam)
+    args = parse_tracking_args([
+        "--episode", str(episode), "--asset", "missing_asset", "--prompt", "object",
+        "--output", str(tmp_path / "tracked"), *options,
+    ], workspace=tmp_path)
+    resolve.assert_not_called()
+    with pytest.raises(ValueError, match=error):
+        track.run(args)
+    assert resolve.call_count == resolutions
+    load.assert_not_called()
+    sam.assert_not_called()
+
+
+@pytest.mark.parametrize("kind", ["reader", "writer"])
+@pytest.mark.parametrize("failures", [(), ("video",), ("hdf5",), ("video", "hdf5")])
+def test_raw_close_attempts_both_resources_and_retains_failed_handles(tmp_path, kind, failures):
+    video_error, data_error = OSError("video close failed"), OSError("hdf5 close failed")
+    video, data = Mock(), Mock()
+    video.close.side_effect = video_error if "video" in failures else None
+    data.close.side_effect = data_error if "hdf5" in failures else None
+    calls = Mock()
+    calls.attach_mock(video, "video")
+    calls.attach_mock(data, "data")
+    if kind == "reader":
+        resource = RawReader.__new__(RawReader)
+        resource.dataset_cache = {"depth": object()}
+        resource.video_container, resource.data_file = video, data
+        video_attribute = "video_container"
+    else:
+        resource = RawWriter(tmp_path, control_hz=30)
+        resource.video, resource.data_file = video, data
+        resource.arrays = {"depth": np.empty((2, 1, 1), np.uint16)}
+        resource.timing_rows = np.empty(2)
+        resource.buffered = 1
+        resource.finish, resource.flush = Mock(), Mock()
+        video_attribute = "video"
+
+    if failures:
+        with pytest.raises(OSError) as raised:
+            resource.close()
+        assert raised.value is (data_error if "hdf5" in failures else video_error)
+        if len(failures) == 2:
+            assert raised.value.__context__ is video_error
+    else:
+        resource.close()
+    assert calls.mock_calls == [call.video.close(), call.data.close()]
+    assert getattr(resource, video_attribute) is (video if "video" in failures else None)
+    assert resource.data_file is (data if "hdf5" in failures else None)
+    if kind == "reader":
+        assert not resource.dataset_cache
+    else:
+        assert not resource.arrays and resource.timing_rows is None
+        assert resource.buffered == 1 and resource.frame_count == 0
+        resource.finish.assert_not_called()
+        resource.flush.assert_not_called()
+
+    video.close.side_effect = data.close.side_effect = None
+    resource.close()
+    resource.close()
+    assert getattr(resource, video_attribute) is None and resource.data_file is None
+    assert video.close.call_count == 1 + ("video" in failures)
+    assert data.close.call_count == 1 + ("hdf5" in failures)
+
+
+@pytest.mark.parametrize("flush_failure", [None, "encode", "mux"])
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_video_close_flushes_once_and_always_closes_container(tmp_path, flush_failure, close_fails):
+    flush_error, close_error = OSError("flush failed"), OSError("container close failed")
+    stream, container = Mock(), Mock()
+    stream.encode.return_value = ["packet"]
+    if flush_failure == "encode":
+        stream.encode.side_effect = flush_error
+    elif flush_failure == "mux":
+        container.mux.side_effect = flush_error
+    if close_fails:
+        container.close.side_effect = close_error
+    writer = _VideoWriter(tmp_path / "rgb.mp4", fps=30, width=32, height=32)
+    writer.stream, writer.container = stream, container
+    if flush_failure or close_fails:
+        with pytest.raises(OSError) as raised:
+            writer.close()
+        assert raised.value is (close_error if close_fails else flush_error)
+        if flush_failure and close_fails:
+            assert raised.value.__context__ is flush_error
+    else:
+        writer.close()
+    assert writer.stream is None
+    assert writer.container is (container if close_fails else None)
+    stream.encode.assert_called_once_with(None)
+    container.close.assert_called_once_with()
+    assert container.mux.call_count == (flush_failure != "encode")
+
+    container.close.side_effect = None
+    writer.close()
+    writer.close()
+    assert writer.container is None
+    stream.encode.assert_called_once_with(None)
+    assert container.close.call_count == 1 + close_fails
+
+
+@pytest.mark.parametrize("failure", ["flush", "container", "hdf5", "all"])
+def test_recorder_does_not_publish_after_raw_close_failure(tmp_path, monkeypatch, failure):
+    from dexmani_real.data import recorder
+
+    video = _VideoWriter(tmp_path / "rgb.mp4", fps=30, width=32, height=32)
+    video.stream, video.container = Mock(), Mock()
+    video.stream.encode.return_value = []
+    data = Mock()
+    operations = {
+        "flush": video.stream.encode, "container": video.container.close, "hdf5": data.close,
+    }
+    for name, operation in operations.items():
+        if failure in (name, "all"):
+            operation.side_effect = OSError(f"{name} failed")
+
+    def open_writer(writer, metadata):
+        writer.video, writer.data_file = video, data
+        writer.frame_count = 1
+
+    monkeypatch.setattr(RawWriter, "open", open_writer)
+    finish = Mock()
+    monkeypatch.setattr(RawWriter, "finish", finish)
+    publish = Mock()
+    monkeypatch.setattr(recorder, "publish", publish)
+    recording = recorder.EpisodeRecorder(tmp_path, control_hz=30)
+    recording.start(task_label="test", collection_source="policy_rollout", metadata={},
+                    episode_name="close_failure")
+    recording.request_finish(save=True, reason="operator")
+    recording.thread.join(timeout=2)
+    assert not recording.writer_pending
+    expected_failure = "hdf5" if failure == "all" else failure
+    with pytest.raises(recorder.RecordingError, match=f"{expected_failure} failed") as raised:
+        recording.poll_finish()
+    if failure == "all":
+        error = raised.value.__cause__
+        for name in ("hdf5", "container", "flush"):
+            assert str(error) == f"{name} failed"
+            error = error.__context__
+    finish.assert_called_once()
+    publish.assert_not_called()
+    assert recording.result()["status"] == "failed"
+    assert recording.published_path is None
+    assert recording.staging_path.is_dir()
+    assert not (tmp_path / "close_failure").exists()

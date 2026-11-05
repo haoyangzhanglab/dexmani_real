@@ -93,6 +93,8 @@ scene 只使用 `id`、`asset`、`initial_selection` 和 `prompt`。`asset` 和 
 
 独立子包安装后直接 import。`SceneTracker.open` 负责一次加载与收尾；`workspace` 默认当前目录，资产和选择的相对路径基于 workspace。`initial_selections` 与首帧 `step` 的 `initial_masks` 二选一。`models_dir`、`sam_python` 及 SAM 配对可按需指定。`log_dir` 省略时，SAM 日志输出到 stderr。
 
+`pixel_stride` 始终须为正整数；只有至少一个对象提供非 `None` 资产路径时，才检查 `min_matched_pixels` 为正整数、`depth_tolerance_m` 为有限正数、`min_matched_fraction` 在 `(0,1]` 内。这些检查在解析模型、加载资产和启动 SAM 前完成，直接构造 `SceneTracker` 也保留同样的数值规则。跟踪 CLI 将 SAM 型号或自训配对原样交给 `open` 统一解析，不预先解析一份模型配置；位姿参数错误因此也早于 CLI 的模型解析。
+
 ```python
 from dexmani_real.data.raw import RawReader
 from cordvip_geometry import SceneTracker, track_raw

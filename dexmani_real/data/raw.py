@@ -6,7 +6,7 @@ import json
 import logging
 from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
@@ -20,6 +20,7 @@ from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
 from dexmani_real.utils.timing import sampling_clock_ns
 
 if TYPE_CHECKING:
+    import av
     import h5py
 
 logger = logging.getLogger(__name__)
@@ -200,33 +201,24 @@ class _VideoWriter:
         av_frame = av.VideoFrame.from_ndarray(frame, format="rgb24").reformat(format="yuv444p")
         av_frame.pts = self.frame_count
         av_frame.time_base = 1 / self.rate
-        for packet in self.stream.encode(av_frame):
-            self.container.mux(packet)
+        stream = cast("av.video.stream.VideoStream", self.stream)
+        container = cast("av.container.OutputContainer", self.container)
+        for packet in stream.encode(av_frame):
+            container.mux(packet)
         self.frame_count += 1
 
     def close(self):
         if self.container is None:
             return
-        failure = None
+        # 取走编码流；flush 即使失败，也不能再次送入编码器。
+        stream, self.stream = self.stream, None
         try:
-            if self.stream is not None:
-                for packet in self.stream.encode(None):
+            if stream is not None:
+                for packet in stream.encode(None):
                     self.container.mux(packet)
-        except BaseException as exc:
-            failure = exc
         finally:
-            self.stream = None
-        try:
             self.container.close()
-        except BaseException as exc:
-            if failure is None:
-                failure = exc
-            else:
-                logger.exception("video container close also failed")
-        else:
             self.container = None
-        if failure is not None:
-            raise failure
 
 
 class RawWriter:
@@ -288,7 +280,7 @@ class RawWriter:
             name: np.empty((batch_size, *dataset.shape[1:]), dtype=dataset.dtype)
             for name, dataset in self.datasets.items()
         }
-        self.timing_rows = np.empty(batch_size, dtype=TIMING_ROW_DTYPE)
+        self.timing_rows: np.ndarray | None = np.empty(batch_size, dtype=TIMING_ROW_DTYPE)
         height, width, _ = rgb_shape
         self.video = _VideoWriter(
             self.path / "rgb.mp4", fps=self.control_hz, width=width, height=height
@@ -304,10 +296,11 @@ class RawWriter:
         values["depth"] = depth
         for name, array in self.arrays.items():
             array[self.buffered] = values[name]
-        self.timing_rows[self.buffered] = timing
-        self.video.write_frame(rgb)
+        timing_rows = cast(np.ndarray, self.timing_rows)
+        timing_rows[self.buffered] = timing
+        cast(_VideoWriter, self.video).write_frame(rgb)
         self.buffered += 1
-        if self.buffered == len(self.timing_rows):
+        if self.buffered == len(timing_rows):
             self.flush()
 
     def flush(self):
@@ -320,7 +313,7 @@ class RawWriter:
             self.datasets[name].resize(end, axis=0)
             self.datasets[name][self.frame_count : end] = values[:count]
         self.row_times.resize(end, axis=0)
-        self.row_times[self.frame_count : end] = self.timing_rows[:count]
+        self.row_times[self.frame_count : end] = cast(np.ndarray, self.timing_rows)[:count]
         self.frame_count = end
 
     def finish(self, reason, details, *, recording_truncated_reason=None):
@@ -335,20 +328,18 @@ class RawWriter:
         self.meta.attrs["termination_reason"] = reason
 
     def close(self):
-        errors = []
-        for stage, resource in (("video_close", self.video), ("hdf5_close", self.data_file)):
-            if resource is not None:
-                try:
-                    resource.close()
-                except BaseException as exc:
-                    errors.append((stage, exc))
-        self.arrays = {}
-        self.timing_rows = None
-        if errors:
-            first = errors[0][1]
-            for stage, error in errors[1:]:
-                logger.error("%s also failed", stage, exc_info=(type(error), error, error.__traceback__))
-            raise first
+        try:
+            try:
+                if self.video is not None:
+                    self.video.close()
+                    self.video = None
+            finally:
+                if self.data_file is not None:
+                    self.data_file.close()
+                    self.data_file = None
+        finally:
+            self.arrays = {}
+            self.timing_rows = None
 
 
 def require_published_raw(path):
@@ -365,7 +356,7 @@ class RawReader:
         requested_path = Path(episode_path).expanduser()
         self.path = requested_path.resolve()
         self.rgb_path = self.path / "rgb.mp4"
-        self.video_container = None
+        self.video_container: av.container.InputContainer | None = None
         self.dataset_cache: dict[str, h5py.Dataset] = {}
         self.data_file = h5py.File(self.path / "data.h5", "r")
         try:
@@ -467,23 +458,14 @@ class RawReader:
 
     def close(self):
         self.dataset_cache.clear()
-        errors = []
-        for attribute, stage in (
-            ("video_container", "video_reader_close"), ("data_file", "hdf5_reader_close"),
-        ):
-            resource = getattr(self, attribute)
-            if resource is not None:
-                try:
-                    resource.close()
-                except BaseException as exc:
-                    errors.append((stage, exc))
-                else:
-                    setattr(self, attribute, None)
-        if errors:
-            first = errors[0][1]
-            for stage, error in errors[1:]:
-                logger.error("%s also failed", stage, exc_info=(type(error), error, error.__traceback__))
-            raise first
+        try:
+            if self.video_container is not None:
+                self.video_container.close()
+                self.video_container = None
+        finally:
+            if self.data_file is not None:
+                self.data_file.close()
+                self.data_file = None
 
     def __enter__(self):
         return self

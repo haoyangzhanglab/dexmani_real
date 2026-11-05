@@ -86,7 +86,7 @@ def parse_tracking_args(argv=None, *, workspace=None):
         "--with-hand", action="store_true", help="附加同行实测关节的 FK 手点云"
     )
     parser.add_argument("--hand-points", type=int, default=1024)
-    parser.add_argument("--pixel-stride", type=int, default=2)
+    parser.add_argument("--pixel-stride", type=positive_int, default=2)
     parser.add_argument("--depth-tolerance-m", type=float, default=0.015)
     parser.add_argument("--min-matched-pixels", type=int, default=30)
     parser.add_argument("--min-matched-fraction", type=float, default=0.15)
@@ -111,10 +111,7 @@ def parse_tracking_args(argv=None, *, workspace=None):
         args.prompt is None or not args.prompt.strip()
     ):
         parser.error("未提供初始 mask 时需要非空 --prompt，或通过 --scene 指定对象")
-    try:
-        return resolve_sam_arguments(args)
-    except ValueError as error:
-        parser.error(str(error))
+    return args
 
 
 def add_segment_arguments(parser, workspace):

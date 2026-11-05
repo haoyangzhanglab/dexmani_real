@@ -1,16 +1,24 @@
 # DexMani Real 相机、点云与桌面机制收敛任务书
 
+## 当前状态（2026-11-05）
+
+- A—D 已在 `61b23d1` 落地；本轮按最新源码复核，HEAD、本地 main 与远端 main 均为该提交，已有成果保留。
+- E 已完成代码修复：标定只按既有 XY 范围筛选，完整 XYZ 参与真实 RANSAC 拟合；水平边界桌面、倾斜桌面和 XY 范围外干扰点的合成测试通过，并完成两份真实记录的离线比较。
+- Raw 三处局部收尾已改为直接 try/finally；跟踪参数检查已前移至 SceneTracker.open 的模型解析、资产加载和 SAM 启动之前，直接构造入口复用同一检查。后续调用链审查已消除跟踪 CLI 的提前、重复 SAM 解析，补齐 Raw 生命周期类型及使用文档。
+- 相关 pytest 共 176 项通过，修改的 Python 文件 Ruff F 检查、5 个相关实现文件的定向 mypy 检查及两个包的 wheel 构建通过。Raw 正常路径使用真实 h5py/PyAV；关闭故障、相机生命周期和模型启动顺序使用替身验证。
+- 未执行真实相机、机器人、GUI 或 GPU 验证；真实记录没有桌面真值，实机绝对标定精度仍未验证。未更新共享 table_plane.json 或相机外参，发布仍需现有人工确认。
+
 ## 1. 目标、范围与执行基线
 
 项目定位为个人机器人学习研究。围绕真实实验流程，使相机、标定、桌面和点云机制轻而薄、简洁好用、直观高效。优先修复已经确认的问题，删除无用途传参和归档，减少重复复制与分配；按实际职责整理代码，不扩建通用平台。
 
 - 仓库：haoyangzhanglab/dexmani_real。
 - 审查日期：2026-11-05。
-- 源码基线：[db848ea345d4f96e43d4c90475ebfd7093fad9d6](https://github.com/haoyangzhanglab/dexmani_real/commit/db848ea345d4f96e43d4c90475ebfd7093fad9d6)。
-- 本文是待执行方案，列出的“已落地”指基线源码已有对应实现，不代表本轮已完成真机或完整测试验收。
+- 原始审查基线：[db848ea345d4f96e43d4c90475ebfd7093fad9d6](https://github.com/haoyangzhanglab/dexmani_real/commit/db848ea345d4f96e43d4c90475ebfd7093fad9d6)；本轮复核基线为 `61b23d1`。
+- 本文记录已完成的改动及其设计依据；第 6—9 节的 A—D 不是待执行清单。代码与离线测试完成不代表真机或 GPU 验收完成。
 - 实施前读取最新源码、AGENTS.md 和工作区改动。已有等价实现应验收后跳过，不覆盖他人工作，不为复现本文描述而回退代码。
 
-本专题覆盖相机驱动、相机标定、桌面拟合、点云处理及其共享内存读取；只对直接关联的 Raw 录制、导出和 CordVIP 序列化做必要调整。默认执行任务 A—D，任务 E 独立验证后决定是否合入；标定质量门槛、控制停止策略等暂缓事项不混入本轮。
+本专题覆盖相机驱动、相机标定、桌面拟合、点云处理及其共享内存读取；只对直接关联的 Raw 录制、导出和 CordVIP 做必要调整。A—D 已完成，本轮完成 E、Raw 局部收尾和跟踪参数检查前移；标定质量门槛、控制停止策略等暂缓事项不混入本轮。
 
 根目录已有 [DEPLOYMENT_SIMPLIFICATION_TASKBOOK.md](DEPLOYMENT_SIMPLIFICATION_TASKBOOK.md)，覆盖跨仓库部署与数据机制。本文收敛本专题的剩余工作，不要求重新执行该文件中已完成的任务，不扩展修改 dexmani_policy。重叠内容以最新源码、用户当前要求及本文对本专题的更新决定为准，不恢复已删除机制。
 
@@ -82,20 +90,20 @@
 
 保留 RGB-D 与对应点云从同一源帧读取的现有机制；保留实时新鲜度、设备反馈和实际控制约束。离线来源警告的放宽不能套用到实时设备有效性检查。
 
-## 6. 任务 A：修复桌面标定采样与提示
+## 6. 任务 A：修复桌面标定采样与提示（61b23d1 已完成）
 
 主要位置：[scripts/tools/view_pointcloud.py](scripts/tools/view_pointcloud.py) 的 calibrate_table_plane。
 
 ### A1. 消除限点采样的前部偏置
 
-当前每帧先进行工作空间裁剪，再执行：
+修复前每帧先进行工作空间裁剪，再执行：
 
 ~~~python
 step = max(1, points.shape[0] // 30_000)
 points = points[::step][:30_000]
 ~~~
 
-当 N 为 30,001—59,999 时，step 为 1，实际只取前 30,000 点；其他数量也可能遗漏尾部。改为覆盖完整索引范围、确定且无重复的采样，例如只在 N > 30,000 时执行：
+旧实现当 N 为 30,001—59,999 时，step 为 1，实际只取前 30,000 点；其他数量也可能遗漏尾部。现已改为覆盖完整索引范围、确定且无重复的采样，只在 N > 30,000 时执行：
 
 ~~~python
 indices = np.linspace(0, len(points) - 1, 30_000, dtype=np.intp)
@@ -106,7 +114,7 @@ points = points[indices]
 
 ### A2. 修正用途说明
 
-删除提示中的 “table collision geometry”。明确共享平面用于点云去桌面；不要顺带把平面接入机器人碰撞规划。
+已删除提示中的 “table collision geometry”，明确共享平面用于点云去桌面，未将平面接入机器人碰撞规划。
 
 保持现有发布确认及相机关闭时机：拟合结果可用于当前查看；只有现有显式确认才更新共享平面文件。采集结束后先关闭相机，再进入静态点云窗口。
 
@@ -115,9 +123,9 @@ points = points[indices]
 - N 不超过上限时不截断；超过上限时索引合法、确定、无重复，覆盖首尾，不只保留前缀。
 - 至少覆盖 30,001、59,999 和大于 60,000 的代表数量。
 - 提示与真实控制实现一致。
-- 不在本任务混入 Z 范围、RANSAC 阈值、固定随机种子或其他数值行为调整。
+- A 未混入 Z 范围、RANSAC 阈值或随机种子调整；本轮 Z 筛选修正见 E。
 
-## 7. 任务 B：删除残留归档与跨层传参
+## 7. 任务 B：删除残留归档与跨层传参（61b23d1 已完成）
 
 主要位置：
 
@@ -128,24 +136,24 @@ points = points[indices]
 - dexmani_real/data/raw.py
 - 实际相关调用方与既有说明
 
-先用 rg 沿字段的写入、传递、读取核对消费者，再完成整条链删除。文档或日志只是解释用途时，不把它们当作必须维持运行依赖的理由。
+已沿字段的写入、传递、读取核对消费者并完成整条链删除。文档或日志只是解释用途时，不把它们当作必须维持运行依赖的理由。
 
 ### B1. 标定采集配置
 
-删除 capture.json 中 requested_config=asdict(runtime) 的整份请求配置副本，删除因此无用的导入。
+已删除 capture.json 中 requested_config=asdict(runtime) 的整份请求配置副本及因此无用的导入。
 
 保留实际 camera serial、color 内参、marker 字典/ID/物理尺寸，以及采样条件。求解端继续只读取实际需要的 serial 与样本位姿，不因为删除归档而重新要求完整 capture 元数据。
 
 ### B2. 遥操作配置传递
 
-删除 runtime_config_json 在 CLI → run_teleop → 遥操作循环 → 每个 episode 属性之间的传递、成员变量和参数。
+已删除 runtime_config_json 在 CLI → run_teleop → 遥操作循环 → 每个 episode 属性之间的传递、成员变量和参数。
 
 保留 --print-config 的现有用途，在入口构建并打印实际配置即可。本轮不新建另一套归档文件或配置管理器；已有正常运行级配置记录可复用。Raw 保留实际数据解释所需信息，删除完整配置副本不影响采集行为、控制频率和数据列。
 
 ### B3. 固定说明属性
 
-- 删除 hand_tactile_hold_policy 的无行为消费者属性；保持实际 last-valid 触觉处理及原始时间，不把旧触觉数据伪装成新采样。
-- timestamp_source 已不参与读取准入。核对最新调用方后删除纯说明写入及过时注释，时钟含义集中写入已有格式说明。
+- 已删除 hand_tactile_hold_policy 的无行为消费者属性；保持实际 last-valid 触觉处理及原始时间，不把旧触觉数据伪装成新采样。
+- timestamp_source 不参与读取准入，纯说明写入及过时注释已删除，时钟含义保留在已有格式说明。
 - 老文件中的多余属性自然忽略，不新增迁移脚本、schema 版本或双读分支。
 
 ### B4. 本轮保留的信息
@@ -161,13 +169,13 @@ arm_action_semantics 当前具有动作含义与实际读端检查，本轮不�
 - 精简后的新 Raw/采样数据可被实际消费者读取；旧数据多余属性不会触发新门槛。
 - RGB-only、完整 RGB-D 录制和按字段导出的现有路径保持各自含义。
 
-## 8. 任务 C：减少重复图像复制与临时分配
+## 8. 任务 C：减少重复图像复制与临时分配（61b23d1 已完成）
 
 主要位置：[ipc/ring.py](dexmani_real/ipc/ring.py)、[perception/pointcloud.py](dexmani_real/perception/pointcloud.py)，并沿 ipc/sensors、runtime/observation、录制器和相关查看器核对实际调用方。
 
 ### C1. 相同序列复用已复制的快照
 
-SharedRing 已有 _last_fields 与 _last_snapshot；当前成功读取即使序列未变，也会重新复制载荷。复用现有状态增加简单命中路径：
+修复前 SharedRing 即使序列未变也会重新复制载荷。现已复用 _last_fields 与 _last_snapshot，命中路径如下：
 
 1. 读取当前已发布 sequence。
 2. 有缓存、sequence 相同且请求字段集合相同时，直接返回此前已经脱离共享槽的完整快照。
@@ -175,13 +183,13 @@ SharedRing 已有 _last_fields 与 _last_snapshot；当前成功读取即使序�
 4. 保持复制竞争时现有完整快照回退、无数据返回行为，不增加等待、重试层或零拷贝共享槽视图。
 5. 不修改源 timestamp，不把命中缓存解释成新帧。
 
-实施前重新核对最新调用方不原地修改返回内容。需要修改的真实消费者在自身创建工作副本，不能修改共享缓存。简短记录“返回快照按只读使用”的内部约定即可，不建立不可变数组包装或所有权类型体系，也不把 NumPy flags 宣称为通用不可变保证。
+返回快照按只读使用的内部约定已写入 read 注释。需要修改的真实消费者在自身创建工作副本，不能修改共享缓存；不建立不可变数组包装或所有权类型体系，也不把 NumPy flags 宣称为通用不可变保证。
 
 优先保证相机和点云的显式 fields 读取路径。若改动覆盖整条 read 路径，也需检查 fields=None 的结构化快照调用方；无需为小型载荷另建专用优化接口。
 
 ### C2. 在新分配数组上减少中间结果
 
-优先检查以下表达式：
+以下新分配数组上的局部原地运算已完成：
 
 - 原始深度 astype(float32) 后的尺度乘法。
 - 深度乘平面系数后的偏移。
@@ -207,11 +215,11 @@ SharedRing 已有 _last_fields 与 _last_snapshot；当前成功读取即使序�
 - 复制竞争与无数据场景保持现有返回含义，不直接暴露共享内存。
 - 同一输入下，优化前后点数、顺序、dtype、RGB、空结果及过滤选择一致；若改变了数值行为，撤回对应优化或单独解释验证，不以宽松容差掩盖阈值变化。
 
-## 9. 任务 D：小范围职责整理与文档同步
+## 9. 任务 D：小范围职责整理与文档同步（61b23d1 已完成）
 
 ### D1. 将序列化移出跟踪算法
 
-将 scene_arrays 从 third_party/cordvip_geometry/src/cordvip_geometry/tracking.py 移入现有 io.py，同步 cli/track.py 和全部实际调用方。
+scene_arrays 已从 third_party/cordvip_geometry/src/cordvip_geometry/tracking.py 移入现有 io.py，cli/track.py 和实际调用方已同步，无旧位置的兼容包装。
 
 本任务只调整职责，不顺带删除逐帧数组或改变结果格式。保留模型模板、有效位姿、实测点、索引映射和法向等实际计算数据。不要用别名或包装函数长期保留第二个实现；若存在真实外部公开引用，在文档中说明具体导入位置变化。
 
@@ -228,22 +236,22 @@ SharedRing 已有 _last_fields 与 _last_snapshot；当前成功读取即使序�
 
 ### D3. 文档同步
 
-只更新受本次改动影响的既有 README、用法说明、函数注释和 CLI 帮助：
+已同步受 A—D 影响的既有 README、用法说明、函数注释和 CLI 帮助；本轮复核继续遵守以下边界：
 
 - 清除桌面碰撞几何的错误描述。
 - 清除被删除配置属性、传参或旧导入位置的说明。
 - 不恢复来源绑定、强制报告、全模态导出、来源字段必填或纯 RGB 必须有深度的描述。
 - 本轮无需新增说明书、验证证据包或多份任务进度文件。
 
-## 10. 任务 E：桌面 Z 裁剪的独立行为修正
+## 10. 任务 E：桌面 Z 裁剪的独立行为修正（本轮已完成）
 
-这项会改变标定输入分布，应与 A—D 的结构和复制调整分开实施、验证。
+这项改变标定输入分布，已与 A—D 的结构和复制调整分开实施、验证。
 
 ### 问题与已知依据
 
-当前 calibrate_table_plane 对标定点直接应用生产 PointCloudConfig 的 XYZ 工作空间。桌面靠近 Z 边界时，单侧截断测量噪声可能让拟合高度偏移，同时降低 RMS。
+61b23d1 的 calibrate_table_plane 对标定点直接应用生产 PointCloudConfig 的 XYZ 工作空间。桌面靠近 Z 边界时，单侧截断测量噪声可能让拟合高度偏移，同时降低 RMS；该问题已在本轮修复。
 
-审查时对基线 fit_table_plane 做过合成复现：
+本轮使用实际 fit_table_plane 复现了原审查的合成对比：
 
 - NumPy default_rng(2026)，N=12,000。
 - 按顺序生成 x∈[0.15,0.85]、y∈[-0.5,0.5]、z∼N(0,0.002²)，单位米。
@@ -252,13 +260,29 @@ SharedRing 已有 _last_fields 与 _last_snapshot；当前成功读取即使序�
 
 该结果证明条件性偏差，不证明当前实机已经存在相同误差。
 
-### 推荐方向与实施边界
+### 已完成的实现与验证
 
-标定优先使用既有 XY 范围，避免直接继承物体点云的近桌面 Z 边界。生产点云的完整 XYZ 裁剪保持不变。
+标定仅使用既有 XY 范围选择点，保留完整 XYZ 参与拟合。深度过滤、五个不同 depth frame number、每帧最多 30,000 点的全范围确定性采样、RANSAC 和发布确认均保留；生产点云的完整 XYZ 裁剪与去桌面规则不变。未新增 ROI、阈值、裁剪模式或自动回退。
 
-先验证桌面靠近上下 Z 边界、桌面不靠边界，以及存在地面或第二平面的代表场景。现有向上平面、倾角、支持度检查继续保留。若 XY 范围仍包含可能胜过桌面的其他平面，只在实际场景证明需要时确定一个明确、足够宽的标定 Z 范围；不臆造阈值，不新增标定配置体系。
+新增测试从 calibrate_table_plane 入口调用真实拟合函数，仅替换相机和反投影输入。水平桌面位于 Z 下限、上限、区间内部，以及中心高度 1 mm、斜率 (0.08, -0.05) 的倾斜桌面均通过；X、Y 范围外各加入 30,000 个干扰平面点，验证两轴筛选。高度误差小于 0.2 mm、法向误差小于 0.03°；这些是合成测试容差，不是新增标定门槛。
 
-有足够代表性数据时，可作为独立改动完成并说明输入分布变化。缺少实机或等价场景数据时，完成能执行的合成验证，明确列为待验证行为项，不声称实机精度已经改善，也不阻断 A—D 交付。
+两份本地 RGB-D 记录使用各自原始内参、畸变、尺度和外参，取第 0—4 行的五份不同深度数组，按默认工作空间比较旧 XYZ 路径与修改后的实际 calibrate_table_plane。两者均保留原深度过滤、每帧采样和拟合算法，高度取基座系 (x=0.5, y=0)：
+
+| 记录（位于 episodes/） | 高度 mm（XYZ → XY） | 倾角 °（XYZ → XY） | RMS mm（XYZ → XY） |
+| --- | --- | --- | --- |
+| pnp_apple_banana/episode_20261101_174250 | 13.439 → 13.435 | 1.32928 → 1.32866 | 1.70644 → 1.70406 |
+| pick_place_toy/episode_20260908_212811 | 15.909 → 15.903 | 0.83954 → 0.83861 | 2.05052 → 2.04716 |
+
+这些记录中的差异很小，未证明真实精度改善；记录不含桌面真值或硬件 depth frame number，也不能替代清空桌面后的设备标定验收。比较全程只读并取消发布，共享桌面与相机标定文件未改变。
+
+### Raw 收尾与跟踪参数检查
+
+- _VideoWriter.close、RawWriter.close、RawReader.close 已删除首错保存、错误列表与附加异常仲裁，改为直接 try/finally。前一个关闭失败仍尝试后一个；成功句柄清空，失败句柄保留，连续错误保留原生异常链。
+- 视频 flush 仅尝试一次，失败仍关闭容器；RawWriter 无论关闭是否失败都释放批缓冲引用，不隐式 finish、追加或发布。真实 recorder 线程下的 flush、容器、HDF5 单独及连续失败均验证不发布并保留暂存目录；未改动录制线程、队列、超时和上层 __exit__。
+- open 与构造入口共用短小私有参数检查。open 按非 None 资产路径判断是否有模型任务，pixel_stride 始终为正整数，其余三项仅有模型时检查；min_matched_fraction=1 仍可用。CLI pixel_stride 复用 positive_int，其他可选参数未统一增加全局校验。
+- 跟踪 CLI 已删除参数解析阶段的 SAM 预解析，将 sam_variant、checkpoint 和 config 原样交给 open；模型选择只有一处解析。真实 Raw 到 scene.json/NPZ 的测试覆盖默认 small、large、自训配对、仅观测时忽略位姿参数，以及非法位姿参数和错误配对在资产加载前失败。
+- 视频收尾先取走编码流，再用一层 try/finally 完成 flush 与容器关闭，仍保证 flush 一次。Raw 可选视频句柄和批缓冲的类型与关闭状态对齐；活动写入以 cast 表达已打开的不变量，不增加运行时预检或状态字段。
+- 替身验证非法参数在模型解析、资产加载、SAM/位姿模型及子进程启动前失败；仅观测对象的未使用位姿参数仍被忽略。这不是实际 GPU 模型验证。
 
 ## 11. 本轮保持与暂缓的行为
 
@@ -277,17 +301,9 @@ SharedRing 已有 _last_fields 与 _last_snapshot；当前成功读取即使序�
 
 审查中的双重失败注入显示：NPZ 写入与 unlink 同时失败时，清理异常会成为最外层，写入异常仍保留在异常链。此现象不要求恢复旧的复杂错误状态机。只清理本次创建的文件；独占打开失败不能删除已有目标。
 
-## 12. 实施顺序与验证
+## 12. 实施记录与验证
 
-建议按以下顺序形成清晰、可审查的改动：
-
-1. A：桌面采样与提示。
-2. B：删除残留归档、成员和传参。
-3. C：快照复用及局部数组分配优化。
-4. D：序列化职责整理、调用方与文档同步。
-5. E：具备验证条件时独立处理桌面 Z 裁剪。
-
-该顺序不要求每一步等待人工确认。按实际依赖推进已授权工作；发现基线之后已有等价实现时核对并跳过。
+A—D 已在 61b23d1 按上述职责完成，本轮复核保留；E、Raw 局部收尾与跟踪参数前移已完成。下表保留原有验收边界，不表示要求再次执行已完成改动。
 
 ### 针对性验收范围
 
@@ -299,20 +315,26 @@ SharedRing 已有 _last_fields 与 _last_snapshot；当前成功读取即使序�
 | 数组优化 | 相同解码 RGB-D 的处理前后结果，代表性边界深度、空点与不足点；不将有损视频前后颜色要求为逐像素相等 |
 | 序列化移动 | 结果键、数值、dtype 和公开调用方；无资产与有资产结果均能被现有 viewer 读取 |
 | RGB/RGB-D | 只采实际需要通道；深度消费者继续拒绝没有深度尺度的输入；完整录制仍有对应源帧 |
-| 资源行为 | 相关路径的异常与关闭顺序没有因整理改变；不额外启动硬件或模型 |
+| 资源行为 | 原生异常链、关闭顺序、成功/失败句柄、flush 一次、批缓冲释放及失败不发布 |
+| 跟踪参数 | 有无模型的两类入口一致；非法参数不启动模型或子进程，fraction=1 保持可用 |
 | Z 裁剪 | 合成偏差、正常桌面、边界桌面及第二平面；单独报告数值行为变化 |
 
 这些是行为范围，不要求为每一行建立永久测试。优先复用已有 tests/test_camera_calibrate.py、tests/test_deployment_capture.py、tests/test_raw_export.py、tests/test_realsense.py、tests/test_scene_tracker.py，按修改范围选择执行。对桌面采样与 ring 行为补少量有意义的验证即可，不写仅镜像实现的测试或全组合矩阵。
 
-按 AGENTS.md 禁用仓库内 pytest/ruff/mypy 缓存。例如：
+本轮在已有 real_robot 环境执行，按 AGENTS.md 禁用仓库内缓存：
 
 ~~~bash
-python -B -m pytest -p no:cacheprovider tests/test_realsense.py tests/test_deployment_capture.py
+env PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OPENBLAS_NUM_THREADS=1 \
+  /home/zhanghaoyang/miniconda3/envs/real_robot/bin/python -B -m pytest -p no:cacheprovider \
+  tests/test_deployment_capture.py tests/test_scene_tracker.py tests/test_raw_export.py \
+  tests/test_ipc_ring.py tests/test_camera_calibrate.py tests/test_realsense.py
 ~~~
 
-其他受影响测试按实际改动追加；静态检查对实际修改的 Python 文件执行 python -B -m ruff check --no-cache --select F。不要为补齐审查环境安装整套硬件/GPU 栈、创建大量配置或恢复额外基础设施；依赖可用时运行必要验证，不可用时说明具体限制。
+结果：176 passed。对本轮修改的 8 个 Python 文件执行 python -B -m ruff check --no-cache --select F，通过。对 raw.py、view_pointcloud.py、tracking.py、cli/arguments.py、cli/track.py 执行 mypy --no-incremental --cache-dir=/dev/null --follow-imports=silent --ignore-missing-imports --check-untyped-defs，通过；这不覆盖缺少类型信息的第三方 SDK 实现。
 
-审查阶段已核对相关源码，并实际复现桌面限点偏置、Z 截断条件性偏差、同序列重复复制与 NPZ 双重失败异常链。未执行完整 pytest、真实相机、机器人或 GPU 验证；历史提交说明中的验证不能充当本轮独立验收。
+主包和 cordvip_geometry 均在 /tmp 临时构建目录完成 wheel 构建，核对必要源码及标定资源存在，并编译检查包内全部 80 / 25 个 Python 模块；临时产物已清理。该构建未安装包或编译 CUDA 扩展。未安装新依赖，未新增脚本、报告或归档文件。
+
+新增数值用例使用真实 fit_table_plane，Raw 正常读写使用真实 h5py/PyAV；异常路径和昂贵启动边界使用替身。另完成两份真实记录的离线对比，结果见第 10 节。未执行真实相机采集、GUI、机器人、SAM/FoundationPose GPU 跟踪或视频全场景编码质量验证；历史提交说明不充当本轮验收。
 
 ## 13. 完成交付标准
 

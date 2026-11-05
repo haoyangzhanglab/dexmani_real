@@ -70,7 +70,8 @@ def calibrate_table_plane(
             aligned_depth_intrinsics=camera.color_intrinsics,
             T_xarm_base_from_color=T_xarm_base_from_color,
         )
-        points = points[np.all((points >= lower) & (points <= upper), axis=1)]
+        # 标定仅限制 XY；Z 边界会单侧截断桌面噪声并偏移拟合高度。
+        points = points[np.all((points[:, :2] >= lower[:2]) & (points[:, :2] <= upper[:2]), axis=1)]
         if points.shape[0] > 30_000:
             indices = np.linspace(0, len(points) - 1, 30_000, dtype=np.intp)
             points = points[indices]

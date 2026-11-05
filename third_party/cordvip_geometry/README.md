@@ -32,7 +32,7 @@ with (
         points_camera = tracker.model_points(result, "object")
 ```
 
-`assets` 为对象名到资产目录的映射，`selections` 为对象名到首帧 PNG/NPY mask 文件或选择目录的映射；目录仅需 `selection.json` 的 `mask_file`，附带来源文件不参与校验。宿主持有相机时，用 `RGBDFrame.from_camera(camera, row.camera)` 构造帧，再调用 `tracker.step(frame)`。也可省略 `initial_selections`，改在首帧传入原 RGB 网格的 `initial_masks`；两种初始化输入不能混用。tracker 按每次调用推进，Raw 每行均独立处理；实时宿主可在相机输入处按 ring sequence 去重。点云按需重建为米制 `float32 (N, 3)`，可用 `T_target_camera` 变换到基座坐标系。
+`assets` 为对象名到资产目录或 `None` 的映射，`None` 表示该对象仅输出分割与实测点云。`selections` 为对象名到首帧 PNG/NPY mask 文件或选择目录的映射；目录仅需 `selection.json` 的 `mask_file`，附带来源文件不参与校验。宿主持有相机时，用 `RGBDFrame.from_camera(camera, row.camera)` 构造帧，再调用 `tracker.step(frame)`。也可省略 `initial_selections`，改在首帧传入原 RGB 网格的 `initial_masks`；两种初始化输入不能混用。tracker 按每次调用推进，Raw 每行均独立处理；实时宿主可在相机输入处按 ring sequence 去重。点云按需重建为米制 `float32 (N, 3)`，可用 `T_target_camera` 变换到基座坐标系。
 
 mask 支持 `1/L/P` PNG 及 bool/uint8 单通道 NPY，尺寸须与 RGB 一致；`P` 模式按实际调色板转灰度，再以非零像素为前景，其他多通道和高位深输入不支持。已有初始 mask 时忽略 prompt，mask 加载失败直接报错。普通选择保存允许全前景，空选择仍拒绝；Hunyuan 生成入口另要求透明背景。CLI 与 Python API 的对象名均按唯一、非空的合法单级目录名原样使用，允许 `Object-1`、`1st_object`、中文和 `A__B`；禁止 `.`、`..`、路径分隔符及绝对路径。
 
