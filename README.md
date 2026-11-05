@@ -10,7 +10,7 @@ xArm7 + XHand + RealSense RGB-D + VR/HTS 的个人研究代码，支持遥操作
 python -m pip install -e ".[interactive,control,geometry,visualization]"
 ```
 
-设备 SDK、HTS、Pinocchio、MPlib、NLopt 和配套 Policy 按实际实验环境安装。机器人模型和手模板从源码目录 `assets/` 加载，运行时保留 checkout。几何模型的独立环境见 [CordVIP 使用说明](third_party/cordvip_geometry/docs/usage.md)。
+设备 SDK、HTS、Pinocchio、NLopt 和配套 Policy 按实际实验环境安装。机器人模型和手模板从源码目录 `assets/` 加载，运行时保留 checkout。几何模型的独立环境见 [CordVIP 使用说明](third_party/cordvip_geometry/docs/usage.md)。
 
 省略 `--config` 使用 dataclass 默认值。需要修改设备、模式、增益、频率或点数时，新建可信本地 Python 文件并导出 `CONFIG: RealConfig`；例如将下例保存为 `~/dexmani_config.py`，运行时传入 `--config ~/dexmani_config.py`：
 
@@ -222,4 +222,4 @@ python -m cordvip_geometry view /tmp/cordvip/scene_001
 
 静态检查使用 `python -B -m ruff check --no-cache --select F dexmani_real`。SharedRing 同一 sequence、同一字段集合直接复用独立快照，调用方按只读使用；新序列复制竞争最多尝试两次，随后可复用相同字段集合的完整快照，保留原时间和 sequence；没有快照时不发送依赖该来源的动作，准备等待仍有期限。
 
-遥操作运动学修复和三组离线对照见[手部重定向](docs/hand_retargeting.md#2026-11-05-离线比较与取舍)。实测手部仅允许 1e-6 rad 舍入归一；VR 起点不兼容名义工作空间时拒绝。jog 起点按端点验收范围接纳，内缩 margin 限制新目标；内缩范围外可向内退回，向外不扩大越界，纯旋转不夹带平移，超出端点范围仍拒绝。IK 采用每初值 50 次迭代及实际候选误差验收。本轮保留完整手部目标与骨长标定，删除了重复损失回算和逐段标定/成功锚点归档。
+遥操作运动学修复和三组离线对照见[手部重定向](docs/hand_retargeting.md#2026-11-05-离线比较与取舍)。实测手部仅允许 1e-6 rad 舍入归一；VR 起点不兼容名义工作空间时拒绝。jog 起点按端点验收范围接纳，内缩 margin 限制新目标；内缩范围外可向内退回，向外不扩大越界，纯旋转不夹带平移，超出端点范围仍拒绝。机械臂 IK 使用原生 Pinocchio，每个初值最多更新 50 次，再按实际候选误差与约束验收。本轮保留完整手部目标与骨长标定，删除了重复损失回算和逐段标定/成功锚点归档。

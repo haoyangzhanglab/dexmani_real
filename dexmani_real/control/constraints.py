@@ -32,8 +32,10 @@ def wrap_nearest_equivalent(qpos, reference, joint_limit_lower, joint_limit_uppe
     k_min = np.ceil((lower - q) / period)
     k_max = np.floor((upper - q) / period)
     nearest = np.clip(np.rint((ref - q) / period), k_min, k_max)
-    # 无可用等价分支时保留原值，由调用方裁剪或拒绝。
-    result[EQUIVALENT_JOINTS] = np.where(k_min <= k_max, q + nearest * period, q)
+    # 仅归一合法分支的浮点舍入；无可用等价分支时保留原值，由调用方裁剪或拒绝。
+    result[EQUIVALENT_JOINTS] = np.where(
+        k_min <= k_max, np.clip(q + nearest * period, lower, upper), q
+    )
     return result
 
 

@@ -8,9 +8,8 @@ from dexmani_real.control.constraints import (
     joint_target_rejection,
     wrap_nearest_equivalent,
 )
-from dexmani_real.geometry.kinematics import kinematic_urdf
+from dexmani_real.geometry.kinematics import ArmFK
 from dexmani_real.geometry.pose import Pose, compute_pose_error
-from dexmani_real.robot.model import XARM7_JOINT_NAMES
 
 JOINT_WEIGHTS = np.array((4.0, 1.8, 1.2, 0.6, 0.6, 0.9, 0.35))
 PREVIOUS_WEIGHTS = np.array((10, 4, 2, 1, 0.5, 0.6, 0.1))
@@ -41,26 +40,20 @@ class IKCandidate:
 
 class IKSolver:
     def __init__(self, constraints, *, position_tolerance, rotation_tolerance):
-        from mplib.pymp.kinematics.pinocchio import PinocchioModel
-
         self.constraints = constraints
         self.position_tolerance = position_tolerance
         self.rotation_tolerance = rotation_tolerance
         if any(not np.isfinite(v) or v <= 0 for v in (position_tolerance, rotation_tolerance)):
             raise ValueError("IK pose tolerances must be finite and positive")
-        self.model = PinocchioModel.create_from_urdf_string(
-            kinematic_urdf("link_base", stop_link="right_hand_link"),
+        self.fk = ArmFK()
+        frame = self.fk.model.frames[self.fk.eef_frame_id]
+        self.eef_joint_id = frame.parent
+        self.eef_from_joint = frame.placement.inverse()
+        model_limits = np.column_stack(
+            (self.fk.model.lowerPositionLimit, self.fk.model.upperPositionLimit)
         )
-        self.model.set_joint_order(list(XARM7_JOINT_NAMES))
-        self.model.set_link_order(self.model.get_link_names(user=False))
-        self.eef_link_id = self.model.get_link_names().index("custom_eef_link")
-        model_limits = np.concatenate(self.model.get_joint_limits())
-        if (
-            model_limits.shape != (7, 2)
-            or not np.isfinite(model_limits).all()
-            or np.any(model_limits[:, 0] >= model_limits[:, 1])
-        ):
-            raise ValueError("IK requires finite, ordered (7, 2) model limits")
+        if not np.isfinite(model_limits).all() or np.any(model_limits[:, 0] >= model_limits[:, 1]):
+            raise ValueError("IK requires finite, ordered model limits")
         self.limits = constraints.limits
         if np.any(self.limits[:, 0] < model_limits[:, 0] - MODEL_LIMIT_TOL_RAD) or np.any(
             self.limits[:, 1] > model_limits[:, 1] + MODEL_LIMIT_TOL_RAD
@@ -70,29 +63,22 @@ class IKSolver:
         self.limit_center = self.limits.mean(axis=1)
         self.limit_radius = 0.5 * (self.limits[:, 1] - self.limits[:, 0])
 
-    def compute_eef_pose_base(self, qpos):
-        self.model.compute_forward_kinematics(qpos)
-        pose = self.model.get_link_pose(self.eef_link_id)
-        return Pose(p=np.asarray(pose.p).copy(), q=np.asarray(pose.q))
+    def compute_eef_pose_base(self, qpos: np.ndarray) -> Pose:
+        transform = self.fk.forward(qpos)
+        quaternion = self.fk.pin.Quaternion(transform[:3, :3]).coeffs()[[3, 0, 1, 2]]
+        return Pose(p=transform[:3, 3], q=quaternion)
 
-    def compute_eef_jacobian_base(self, qpos):
-        self.model.compute_forward_kinematics(qpos)
-        jacobian = np.asarray(
-            self.model.compute_single_link_jacobian(qpos, self.eef_link_id, False)
-        )[:, :7]
-        if jacobian.shape != (6, 7) or not np.isfinite(jacobian).all():
-            raise ValueError("IK Jacobian must be finite shape (6, 7)")
-        position = np.asarray(self.model.get_link_pose(self.eef_link_id).p)
-        # Pinocchio WORLD 的线速度原点在基座，转换到 EEF 原点。
-        linear = jacobian[:3] + np.cross(jacobian[3:].T, position).T
-        return np.vstack((linear, jacobian[3:]))
+    def compute_eef_jacobian_base(self, qpos: np.ndarray) -> np.ndarray:
+        pin = self.fk.pin
+        # 基座轴向、EEF 原点，供零空间秩诊断与搜索使用。
+        return pin.computeFrameJacobian(
+            self.fk.model, self.fk.data, qpos, self.fk.eef_frame_id,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        )
 
-    def solve(self, target, current, previous, *, hand_qpos):
-        import mplib
-
+    def solve(self, target: Pose, current, previous, *, hand_qpos) -> IKResult:
         current, previous = (np.asarray(q, dtype=np.float64) for q in (current, previous))
         self.constraints.collision_model.set_hand_qpos(hand_qpos)
-        target_base = mplib.Pose(p=target.p, q=target.q)
         pool: list[IKCandidate] = []
         tried: list[np.ndarray] = []
         rejections = []
@@ -101,11 +87,11 @@ class IKSolver:
             # 相近但不同的初值仍可能到达不同分支，仅跳过完全相同的初值。
             if any(np.array_equal(seed, old) for old in tried):
                 return None
-            tried.append(seed.copy())
-            candidate, reason = self.try_clik(seed, target_base, target, current, previous, pool)
+            tried.append(seed)
+            candidate, reason = self.try_clik(seed, target, current, previous)
             if candidate is not None:
                 pool.append(candidate)
-            elif reason != "duplicate":
+            else:
                 rejections.append(reason)
             return candidate
 
@@ -140,23 +126,33 @@ class IKSolver:
         reason = "no_valid_candidate: " + "; ".join(dict.fromkeys(rejections))
         return IKResult(qpos=None, reason=reason)
 
-    def try_clik(self, seed, target_base, target, current, previous, pool):
-        raw, _, _ = self.model.compute_IK_CLIK(
-            self.eef_link_id, target_base, seed.copy(), [], max_iter=50
-        )
-        if raw is None:
-            return None, "solver_no_candidate"
-        raw = np.asarray(raw, dtype=np.float64)
-        if raw.shape != (7,) or not np.isfinite(raw).all():
-            raise ValueError("CLIK output must be finite shape (7,)")
+    def compute_clik(self, seed: np.ndarray, target: Pose) -> np.ndarray:
+        """目标系 log6 误差配合父关节 LOCAL 雅可比，最多更新 50 次。"""
+        pin, model, data = self.fk.pin, self.fk.model, self.fk.data
+        target_joint = pin.SE3(pin.Quaternion(*target.q).matrix(), target.p) * self.eef_from_joint
+        q = seed.copy()
+        for iteration in range(51):
+            pin.forwardKinematics(model, data, q)
+            error = pin.log6(target_joint.actInv(data.oMi[self.eef_joint_id])).vector
+            if np.linalg.norm(error) < 1e-5 or iteration == 50:
+                break
+            jacobian = pin.computeJointJacobian(model, data, q, self.eef_joint_id)
+            regularized = jacobian @ jacobian.T
+            regularized.flat[::7] += 1e-12
+            velocity = -jacobian.T @ np.linalg.solve(regularized, error)
+            q = pin.integrate(model, q, velocity * .1)
+        return q
+
+    def try_clik(self, seed, target: Pose, current, previous) -> tuple[IKCandidate | None, str]:
+        raw = self.compute_clik(seed, target)
+        if not np.isfinite(raw).all():
+            raise ValueError("IK iterate is non-finite")
 
         lower, upper = self.limits.T
         q = wrap_nearest_equivalent(raw, current, lower, upper)
         reason = joint_target_rejection(q, self.limits)
         if reason is not None:
             return None, reason
-        if any(np.max(np.abs(q - c.qpos)) < 1e-4 for c in pool):
-            return None, "duplicate"
         pose = self.compute_eef_pose_base(q)
         position_error, rotation_error = compute_pose_error(target, pose)
         if not np.isfinite((position_error, rotation_error)).all():

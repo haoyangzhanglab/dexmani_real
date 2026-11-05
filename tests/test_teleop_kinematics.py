@@ -1,4 +1,3 @@
-import sys
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -7,12 +6,15 @@ import numpy as np
 import pytest
 
 from dexmani_real.config.teleop import TeleopConfig
+from dexmani_real.config.xarm7 import ArmConfig
 from dexmani_real.config.xhand import HandConfig
 from dexmani_real.control.actions import ActionMapper, StartPoseRejected
+from dexmani_real.control.constraints import joint_target_rejection, wrap_nearest_equivalent
 from dexmani_real.control.ik import IKResult, IKSolver
-from dexmani_real.geometry.pose import Pose
+from dexmani_real.geometry.pose import Pose, compute_pose_error
 from dexmani_real.robot.commands import (
     hand_reference_from_feedback,
+    validate_arm_target,
     validate_hand_target,
 )
 from dexmani_real.teleop.vr import VRController
@@ -79,11 +81,9 @@ def test_vr_start_keeps_existing_roundoff_allowance(offset, accepted):
 
 
 @pytest.fixture
-def ik_solver(monkeypatch):
-    monkeypatch.setitem(sys.modules, 'mplib', SimpleNamespace(Pose=Pose))
+def ik_solver():
     solver = IKSolver.__new__(IKSolver)
-    solver.eef_link_id = 0
-    solver.model = SimpleNamespace(compute_IK_CLIK=Mock(return_value=(np.zeros(7), False, None)))
+    solver.compute_clik = Mock(return_value=np.zeros(7))
     solver.limits = np.tile([-1., 1.], (7, 1))
     solver.joint_ranges = np.ones(7)*2
     solver.limit_center = np.zeros(7)
@@ -97,43 +97,165 @@ def ik_solver(monkeypatch):
 @pytest.mark.parametrize('raw,error,collision,accepted', [
     (np.zeros(7), 0., None, True), (np.zeros(7), .1, None, False),
     (np.zeros(7), 0., 'collision', False), (np.ones(7)*10, 0., None, False),
-    (None, 0., None, False),
 ])
 def test_ik_uses_actual_candidate(ik_solver, raw, error, collision, accepted):
     solver = ik_solver
-    solver.model.compute_IK_CLIK.return_value = raw, False, None
+    solver.compute_clik.return_value = raw
     solver.constraints.endpoint_rejection.return_value = collision
     target = Pose(np.zeros(3), np.array([1., 0, 0, 0]))
     solver.compute_eef_pose_base.return_value = Pose([error, 0, 0], target.q)
-    candidate, _ = solver.try_clik(np.zeros(7), target, target, np.zeros(7), np.zeros(7), [])
+    candidate, _ = solver.try_clik(np.zeros(7), target, np.zeros(7), np.zeros(7))
     assert (candidate is not None and candidate.rejection_reason is None) == accepted
-    assert solver.model.compute_IK_CLIK.call_args.kwargs['max_iter'] == 50
+    solver.compute_clik.assert_called_once()
+    assert solver.compute_clik.call_args.args[1] is target
 
 
-@pytest.mark.parametrize('raw', [np.full(7, np.nan), np.full(7, np.inf), np.zeros(6), np.zeros((7, 1))])
-def test_ik_rejects_malformed_backend_output(ik_solver, raw):
-    ik_solver.model.compute_IK_CLIK.return_value = raw, False, None
-    with pytest.raises(ValueError, match='CLIK output'):
+@pytest.mark.parametrize('raw', [np.full(7, np.nan), np.full(7, np.inf)])
+def test_ik_rejects_nonfinite_iterate(ik_solver, raw):
+    ik_solver.compute_clik.return_value = raw
+    with pytest.raises(ValueError, match='IK iterate is non-finite'):
         ik_solver.solve(Pose(np.zeros(3), [1., 0, 0, 0]), np.zeros(7), np.zeros(7), hand_qpos=np.zeros(12))
+    ik_solver.constraints.endpoint_rejection.assert_not_called()
 
 
-def test_ik_solve_accepts_unconverged_candidate(ik_solver):
+def test_ik_fast_accepts_valid_previous_seed(ik_solver):
     hand = np.ones(12)
-    result = ik_solver.solve(Pose(np.zeros(3), [1., 0, 0, 0]), np.zeros(7), np.zeros(7), hand_qpos=hand)
+    result = ik_solver.solve(Pose(np.zeros(3), [1., 0, 0, 0]), np.full(7, .01), np.zeros(7), hand_qpos=hand)
     np.testing.assert_array_equal(result.qpos, np.zeros(7))
-    ik_solver.model.compute_IK_CLIK.assert_called_once()
+    ik_solver.compute_clik.assert_called_once()
     ik_solver.constraints.collision_model.set_hand_qpos.assert_called_once_with(hand)
 
 
-def test_ik_no_candidate_is_distinct_from_backend_failure(ik_solver):
-    target = Pose(np.zeros(3), [1., 0, 0, 0])
-    ik_solver.model.compute_IK_CLIK.return_value = None, False, None
-    result = ik_solver.solve(target, np.zeros(7), np.zeros(7), hand_qpos=np.zeros(12))
+def test_ik_checks_valid_neighbour_after_colliding_candidate(ik_solver):
+    previous, current = np.zeros(7), np.full(7, 5e-5)
+    ik_solver.compute_clik.side_effect = [previous.copy(), current.copy()]
+    ik_solver.constraints.endpoint_rejection.side_effect = ['self_collision', None]
+    # 禁止额外探索绕过第二个候选被误丢的问题。
+    ik_solver.nullspace_direction = Mock(return_value=None)
+
+    result = ik_solver.solve(
+        Pose(np.zeros(3), [1., 0, 0, 0]), current, previous, hand_qpos=np.zeros(12),
+    )
+
+    assert ik_solver.compute_clik.call_count == 2
+    for call, seed in zip(ik_solver.compute_clik.call_args_list, (previous, current)):
+        np.testing.assert_array_equal(call.args[0], seed)
+    assert ik_solver.compute_eef_pose_base.call_count == 2
+    assert ik_solver.constraints.endpoint_rejection.call_count == 2
+    np.testing.assert_array_equal(ik_solver.constraints.endpoint_rejection.call_args.args[0], current)
+    np.testing.assert_array_equal(result.qpos, current)
+    ik_solver.nullspace_direction.assert_not_called()
+
+
+@pytest.mark.parametrize('lower,upper,raw_angle,boundary', [
+    (-2*np.pi, .2, .2 - 2*np.pi, .2),
+    (-.2, 2*np.pi, 2*np.pi - .2, -.2),
+])
+def test_ik_accepts_equivalent_angle_at_strict_limits(ik_solver, lower, upper, raw_angle, boundary):
+    ik_solver.limits[0] = lower, upper
+    ik_solver.joint_ranges = np.diff(ik_solver.limits, axis=1).ravel()
+    ik_solver.limit_center = ik_solver.limits.mean(axis=1)
+    ik_solver.limit_radius = ik_solver.joint_ranges / 2
+    raw = np.zeros(7)
+    raw[0] = raw_angle
+    current = np.zeros(7)
+    wrapped = wrap_nearest_equivalent(raw, current, *ik_solver.limits.T)
+
+    assert np.all(wrapped >= ik_solver.limits[:, 0])
+    assert np.all(wrapped <= ik_solver.limits[:, 1])
+    assert wrapped[0] == boundary
+    assert joint_target_rejection(wrapped, ik_solver.limits) is None
+    validate_arm_target(wrapped, *ik_solver.limits.T)
+
+    ik_solver.compute_clik.return_value = raw
+    ik_solver.nullspace_direction = Mock(return_value=None)
+    result = ik_solver.solve(
+        Pose(np.zeros(3), [1., 0, 0, 0]), current, current, hand_qpos=np.zeros(12),
+    )
+    np.testing.assert_array_equal(result.qpos, wrapped)
+    ik_solver.constraints.endpoint_rejection.assert_called_once()
+
+
+@pytest.mark.parametrize('joint', [0, 1], ids=['no_equivalent_branch', 'non_equivalent_joint'])
+def test_ik_preserves_and_rejects_unwrappable_angle(ik_solver, joint):
+    raw = np.zeros(7)
+    raw[joint] = np.nextafter(1., np.inf)
+    current = np.zeros(7)
+    wrapped = wrap_nearest_equivalent(raw, current, *ik_solver.limits.T)
+    np.testing.assert_array_equal(wrapped, raw)
+    assert joint_target_rejection(wrapped, ik_solver.limits) == 'operational_limits'
+    with pytest.raises(ValueError, match='arm target violates joint limits'):
+        validate_arm_target(raw, *ik_solver.limits.T)
+
+    ik_solver.compute_clik.return_value = raw
+    result = ik_solver.solve(
+        Pose(np.zeros(3), [1., 0, 0, 0]), current, current, hand_qpos=np.zeros(12),
+    )
     assert result.qpos is None
-    assert result.reason == 'no_valid_candidate: solver_no_candidate'
-    ik_solver.model.compute_IK_CLIK.side_effect = RuntimeError('backend failed')
-    with pytest.raises(RuntimeError, match='backend failed'):
+    assert result.reason == 'no_valid_candidate: operational_limits'
+    ik_solver.compute_clik.assert_called_once()
+    ik_solver.compute_eef_pose_base.assert_not_called()
+    ik_solver.constraints.endpoint_rejection.assert_not_called()
+
+
+def test_ik_propagates_clik_errors(ik_solver):
+    target = Pose(np.zeros(3), [1., 0, 0, 0])
+    ik_solver.compute_clik.side_effect = np.linalg.LinAlgError('factorization failed')
+    with pytest.raises(np.linalg.LinAlgError, match='factorization failed'):
         ik_solver.solve(target, np.zeros(7), np.zeros(7), hand_qpos=np.zeros(12))
+
+
+@pytest.fixture
+def native_ik_solver():
+    pytest.importorskip('pinocchio')
+    arm = ArmConfig()
+    constraints = SimpleNamespace(
+        limits=np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper)),
+        collision_model=Mock(), endpoint_rejection=Mock(return_value=None),
+    )
+    return IKSolver(constraints, position_tolerance=.002, rotation_tolerance=np.deg2rad(2))
+
+
+@pytest.mark.parametrize('qpos', [
+    ArmConfig().home_qpos, np.zeros(7), [.4, -.3, .6, 1., -2., .8, -.5],
+], ids=['home', 'singular', 'rotated'])
+def test_native_eef_jacobian_matches_pose_difference(native_ik_solver, qpos):
+    from scipy.spatial.transform import Rotation
+
+    solver = native_ik_solver
+    qpos = np.asarray(qpos)
+    jacobian = solver.compute_eef_jacobian_base(qpos)
+    finite_difference = np.empty((6, 7))
+    for joint in range(7):
+        delta = np.eye(7)[joint] * 1e-6
+        plus = solver.compute_eef_pose_base(qpos + delta)
+        minus = solver.compute_eef_pose_base(qpos - delta)
+        finite_difference[:3, joint] = (plus.p - minus.p) / 2e-6
+        relative = (Rotation.from_quat(plus.q[[1, 2, 3, 0]])
+                    * Rotation.from_quat(minus.q[[1, 2, 3, 0]]).inv())
+        finite_difference[3:, joint] = relative.as_rotvec() / 2e-6
+    np.testing.assert_allclose(jacobian, finite_difference, atol=1e-8, rtol=0)
+
+
+def test_native_clik_accepts_final_iterate_within_project_tolerance(native_ik_solver, monkeypatch):
+    solver = native_ik_solver
+    current = np.array(ArmConfig().home_qpos)
+    saved = current.copy()
+    target = solver.compute_eef_pose_base(current)
+    target.p[0] += .008
+    integrate = Mock(wraps=solver.fk.pin.integrate)
+    monkeypatch.setattr(solver.fk.pin, 'integrate', integrate)
+
+    result = solver.solve(target, current, current, hand_qpos=np.zeros(12))
+
+    assert result.qpos is not None
+    assert integrate.call_count == 50
+    np.testing.assert_array_equal(current, saved)
+    position_error, rotation_error = compute_pose_error(target, solver.compute_eef_pose_base(result.qpos))
+    # 达到迭代预算时仍验收实际位姿，不把内部 1e-5 停止阈值当作成功标准。
+    assert 1e-5 < position_error <= solver.position_tolerance
+    assert rotation_error <= solver.rotation_tolerance
+    solver.constraints.endpoint_rejection.assert_called_once()
 
 
 def test_joint_mapping_keeps_projection_without_loading_geometry():
