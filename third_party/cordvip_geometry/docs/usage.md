@@ -36,11 +36,11 @@ SAM 默认 small、BF16、eager。large 先下载权重，再为相关命令传 
 
 单图建模和已有 mesh 校准流程见[物体重建与点云](../../../docs/object_reconstruction.md)。阶段命令为 `object segment/select/generate/build/prepare/preview`，输出参数统一为 `--output`，文本参数为 `--prompt`。`object generate --image PATH` 直接接收含有效前景和透明背景的 RGBA 文件；`build` 直接使用分割阶段生成的 `foreground_rgba.png`。
 
-`object select --segmentation-dir DIR --instance 0 --headless --output NEW_DIR` 只要求 `DIR/rgb.png` 和原有数组结构的 `DIR/candidates.npz`。输出仅有所选的 `mask.png`、`foreground_rgba.png`、新生成的 `overlay.png` 和记录索引、标签、框及分数的 `selection.json`。目录中若有 `source_rgbd.npz`，须可读取且 RGB 像素与 `rgb.png` 相同，并复制到输出；没有时正常选择。分割日志、候选 JPG 和原始图片副本均不参与选择，原始分割过程仍可保留调试文件。再次选择须使用原候选目录。
+`object select --segmentation-dir DIR --instance 0 --headless --output NEW_DIR` 只要求 `DIR/rgb.png` 和原有数组结构的 `DIR/candidates.npz`。输出仅有所选的 `mask.png`、`foreground_rgba.png`、新生成的 `overlay.png` 和记录索引、标签、框及分数的 `selection.json`。目录附带来源文件不参与校验或复制；再次选择须使用原候选目录。object segment/select/build 在 headless 下唯一候选可省略 `--instance`，多候选必须明确索引。
 
 候选包中的 `masks` 为 bool `(N,H,W)`，`boxes` 为有限实数 `(N,4)`，`scores` 与 `mask_scores` 为有限实数 `(N,)`，`labels` 为 Unicode 字符串 `(N,)`；`N` 须为正数且各数组一致，mask 尺寸与 RGB 相同。损坏的候选直接报错。
 
-Hunyuan 在独立生成进程中运行；生成 mesh 导出前简化到最多 20,000 面，仍需显式指定米制尺度。`generation_result.json` 记录 `source_faces`、`mesh_simplification` 和实际导出的 `faces` / `vertices`。prepare 保留原点与朝向，在米制网格上按指定 seed / 点数采样固定点及三角面法向。
+Hunyuan 在独立生成进程中运行；生成 mesh 导出前简化到最多 20,000 面，仍需显式指定米制尺度。分割与生成的参数、耗时及生成网格大小直接打印到终端。prepare 保留原点与朝向，在米制网格上按指定 seed / 点数采样固定点及三角面法向。
 
 多个物体的总点数分配：
 
@@ -60,7 +60,7 @@ python scripts/cordvip/track_object.py \
   --with-hand --output /tmp/cordvip/scene_001
 ```
 
-提供 `--prompt` 后，Grounding DINO 检测目标，SAM2 生成冻结首帧上的候选 mask，再人工选择实例。新选择保存为 `initial_selections/<id>/`，其中 `selection.json` 记录 mask 文件名、候选索引和两项分数；prompt 与模型来源分别记录在 `scene.json`、`models.json`。也可通过 `--initial-selection PATH` 或 scene 的 `initial_selection` 加载已有首帧 mask；未提供已有 mask 的对象必须提供非空 prompt，无候选时明确报错。PNG/NPY mask 文件可直接使用；选择目录只需 `selection.json` 的 `mask_file` 指向目录内的真实 mask。输入 mask 明确应用于当前首帧原始 RGB 网格，由 tracker 统一去畸变一次。目录若提供 `source_rgbd.npz`，其中 RGB、米制深度、内参、畸变模型与系数必须与实际首帧逐项精确相等；没有绑定文件时不验证来源。`source_id`、时间戳、时钟和行号仅作说明，复用不改写已有输入。
+提供 `--prompt` 后，Grounding DINO 检测目标，SAM2 生成冻结首帧上的候选 mask，再人工选择实例。新选择保存为 `initial_selections/<id>/`，其中 `selection.json` 记录 mask 文件名、候选索引和两项分数；prompt 记录在 `scene.json`。也可通过 `--initial-selection PATH` 或 scene 的 `initial_selection` 加载已有首帧 mask；未提供已有 mask 的对象必须提供非空 prompt，无候选时明确报错。PNG/NPY mask 文件可直接使用；选择目录只需 `selection.json` 的 `mask_file` 指向目录内的真实 mask。输入 mask 均应用于当前指定首帧原始 RGB 网格，由 tracker 统一去畸变一次，目录附带的 RGB-D 或来源说明不参与接纳。
 
 mask 须与 RGB 同尺寸，支持 `1/L/P` PNG 和 bool/uint8 单通道 NPY；零为背景、非零为前景。`P` 模式先按实际调色板转换为灰度，不按调色板索引判断；不接受其他多通道或高位深输入，不自动反色或缩放。
 
@@ -70,9 +70,9 @@ mask 须与 RGB 同尺寸，支持 `1/L/P` PNG 和 bool/uint8 单通道 NPY；�
 
 ```json
 {"objects": [
-  {"id": "toy", "role": "object", "asset": "/tmp/cordvip/toy_asset",
+  {"id": "toy", "asset": "/tmp/cordvip/toy_asset",
    "initial_selection": "/tmp/cordvip/toy_first_frame"},
-  {"id": "basket", "role": "reference", "asset": "/tmp/cordvip/basket_asset",
+  {"id": "basket", "asset": "/tmp/cordvip/basket_asset",
    "initial_selection": "/tmp/cordvip/basket_first_frame"}
 ]}
 ```
@@ -83,7 +83,7 @@ python scripts/cordvip/track_object.py \
   --with-hand --headless --output /tmp/cordvip/scene_002
 ```
 
-无 asset 的对象输出 mask 和独立实测点。`role` 仅作 metadata。headless 要求每个对象提供当前首帧的有效初始 mask。默认处理全部 Raw 行；`--max-frames N` 显式限制前缀，结果标为 partial。同一 Raw 行提供 RGB-D、实测关节与时钟，行关联不证明物理同步。
+无 asset 的对象输出 mask 和独立实测点。scene 只使用对象 ID、asset、initial_selection 和 prompt；允许额外 note，role 也作为未消费的注释。headless 跟踪仍要求每个对象提供当前首帧的有效初始 mask。默认处理全部 Raw 行；`--max-frames N` 显式限制前缀，终端打印处理数量。同一 Raw 行提供 RGB-D、实测关节与时钟，行关联不证明物理同步。
 
 ## Python API
 
@@ -118,7 +118,7 @@ with SceneTracker.open({"object": asset_dir}) as tracker:
         )
 ```
 
-`camera` 是标定快照，样本包含 `uint8 rgb`、原始 `uint16 depth`、`timestamp_ns` 与 `ring_sequence`。Frame 统一检查动态数组、米制深度、标定和时钟；tracker 固定使用一套相机几何，按来源时序处理。实时重复帧复用结果，Raw 每行独立处理。`model_points` 返回米制 `float32 (N, 3)`；默认 camera frame，指定有效 `T_target_camera` 可变换到目标系。pose 无效或无 asset 时返回空点。
+`camera` 是标定快照，样本包含 `uint8 rgb`、原始 `uint16 depth`、`timestamp_ns` 与 `ring_sequence`。直接构造 `RGBDFrame` 时须提供 RGB、米制浮点 depth、K 和实际畸变信息；depth 在入口转为 float32 并检查形状、有限性及非负，不猜测毫米或 raw counts。source_id、timestamp_ns、clock、row_index 可省略；保存时省略缺失项。tracker 固定使用一套图像网格和相机几何，按调用顺序推进；实时宿主可在相机输入处按 ring sequence 去重，Raw 每行独立处理。手部 FK 仍要求真实 row_index，时间可用性根据该行实际时间判断。`model_points` 返回米制 `float32 (N, 3)`；默认 camera frame，指定有效 `T_target_camera` 可变换到目标系。pose 无效或无 asset 时返回空点。
 
 宿主在所需位置主动调用这些接口；当前主包的控制、Raw writer 和策略观测未接线。
 
@@ -126,12 +126,9 @@ with SceneTracker.open({"object": asset_dir}) as tracker:
 
 | 输出 | 内容 |
 | --- | --- |
-| `scene.json` | 对象 ID、role、asset、选择与标签 |
-| `run.json` | 实际参数、资产来源、颜色、单位及可选手标定 |
+| `scene.json` | 对象 ID、asset、选择与标签；单位、坐标；有手部输出时保存关节顺序及 link_names |
 | `model_templates/<id>.npz` | 有资产对象的固定 `points_object` / `normals_object`，米制 float32，原顺序 |
-| `frames/<row>.npz` | 来源行/时钟、RGB、K、mask、实测点、位姿状态和深度支持；可附手几何 |
-| `models.json` | 工厂已返回的模型来源；初始化失败时只记录已取得的信息 |
-| `result.json` | completed / partial / interrupted / failed、失败原因及处理行数 |
+| `frames/<row>.npz` | RGB、K、mask、实测点、位姿状态和深度支持；可附手几何及来源说明 |
 | `sam2_worker.log` | CLI 的分割进程日志与 traceback |
 
 逐帧对象字段使用 `<id>__` 前缀。`pose_valid` 与 `observed_valid` 独立；pose 失效时 `T_camera_object` 为 NaN，实测点仍可有效。`candidate_T_camera_object` 仅供诊断；已计算的深度支持 mask、残差和统计在失败帧中也保存。模型点由模板与有效 pose 重建：
@@ -149,7 +146,7 @@ with np.load(directory / "frames/000000.npz", allow_pickle=False) as row:
         )
 ```
 
-输出可位于 `episodes` 或 `rollouts` 下的独立新目录，例如 `rollouts/derived/objects`；仍拒绝写入实际输入、Raw episode 内部或已有目标，悬空符号链接也不能覆盖。模板与帧文件独占创建；未完成的 NPZ 会清理。技术错误直接结束运行并保留成功前缀，深度支持不足按算法形成 `POSE_LOST`。模板使用 object frame，实测点和手点使用 color-camera frame，单位均为米；启用手几何时每帧附外参、关节状态与来源时间。法向仅表示网格表面几何。
+输出可位于 `episodes` 或 `rollouts` 下的独立新目录，例如 `rollouts/derived/objects`；仍拒绝写入实际输入、Raw episode 内部或已有目标，悬空符号链接也不能覆盖。模板与帧文件独占创建；未完成的 NPZ 会清理。技术错误直接结束运行并保留成功前缀，深度支持不足按算法形成 `POSE_LOST`。模板使用 object frame，实测点和手点使用 color-camera frame，单位均为米；启用手几何时每帧附外参、关节状态与来源时间，`hand_link_ids` 索引 `scene.json` 中 `hand.link_names`。法向仅表示网格表面几何。进度、中断和失败通过终端、异常及退出码体现。
 
 ```bash
 python -m cordvip_geometry view /tmp/cordvip/scene_001
@@ -157,4 +154,4 @@ python -m cordvip_geometry view /tmp/cordvip/scene_001 --no-3d
 python -m cordvip_geometry view /tmp/cordvip/scene_001 --headless
 ```
 
-查看器使用 `n` / Space 前进、`v` 切换 observed / model、`q` / Esc 或关窗退出。每行只读取显示字段一次，模板在首次 model 显示时加载；静止时只轮询事件与渲染。`--no-3d` 只显示二维结果，`--headless` 只读取 RGB 与来源行/时钟。查看仅依赖输出目录。
+查看器使用 `n` / Space 前进、`v` 切换 observed / model、`q` / Esc 或关窗退出。每行只读取显示字段一次，模板在首次 model 显示时加载；静止时只轮询事件与渲染。`--no-3d` 只显示二维结果，`--headless` 读取 RGB 并打印已有来源说明；允许缺少说明及文件名与行号不同。查看使用固定调色板，仅依赖帧数组和按需加载的模型模板。

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .geometry import MAX_MESH_FACES, simplify_mesh
+from .geometry import simplify_mesh
 from .io import existing_file, output_path
 
 
@@ -125,7 +125,6 @@ def generate_mesh(
         or np.any(mesh.extents <= 0)
     ):
         raise RuntimeError("Hunyuan returned empty, nonfinite or degenerate geometry")
-    source_faces = len(mesh.faces)
     mesh = simplify_mesh(mesh)
     payload = mesh.export(file_type="obj").encode("utf-8")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -133,23 +132,5 @@ def generate_mesh(
         stream.write(payload)
     elapsed = time.monotonic() - started
 
-    return {
-        "method": "Hunyuan3D-2.1 shape-only",
-        "source_root": str(root),
-        "image_rgba_path": str(image_path),
-        "weights_directory": str(weights),
-        "mesh_path": str(output),
-        "seed": seed,
-        "steps": steps,
-        "octree_resolution": octree_resolution,
-        "num_chunks": num_chunks,
-        "device": str(target),
-        "source_faces": source_faces,
-        "mesh_simplification": "quadric_decimation"
-        if source_faces > MAX_MESH_FACES
-        else "none",
-        "vertices": len(mesh.vertices),
-        "faces": len(mesh.faces),
-        "bounds_unscaled": mesh.bounds.tolist(),
-        "generation_seconds": elapsed,
-    }
+    print(f"Mesh: {output}; vertices={len(mesh.vertices)}, faces={len(mesh.faces)}, elapsed={elapsed:.2f}s", flush=True)
+    return output

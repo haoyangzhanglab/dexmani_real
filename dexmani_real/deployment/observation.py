@@ -50,7 +50,8 @@ class ObservationBuilder:
         if "hand_fk" in self.dependencies:
             self.hand_fk = HandFK(
                 info.fingertip_link_names
-                if "fingertips" in self.dependencies else XHAND_FINGERTIP_LINK_NAMES,
+                if "fingertips" in self.dependencies and info.fingertip_link_names is not None
+                else XHAND_FINGERTIP_LINK_NAMES,
             )
             if "hand_cloud" in self.dependencies:
                 self.hand_cloud = HandPointCloud(self.hand_fk, runtime.hand_pointcloud.num_points)

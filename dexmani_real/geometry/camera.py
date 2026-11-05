@@ -8,6 +8,7 @@ from functools import lru_cache
 from typing import Any
 
 import numpy as np
+from numpy.typing import DTypeLike
 
 
 def depth_scales_match(a: float, b: float) -> bool:
@@ -47,7 +48,7 @@ class CameraIntrinsics:
     def to_dict(self) -> dict[str, Any]:
         return {**asdict(self), "distortion_coeffs": list(self.distortion_coeffs)}
 
-    def matrix(self, *, dtype: np.typing.DTypeLike = np.float64) -> np.ndarray:
+    def matrix(self, *, dtype: DTypeLike = np.float64) -> np.ndarray:
         return np.array(
             [[self.fx, 0.0, self.ppx], [0.0, self.fy, self.ppy], [0.0, 0.0, 1.0]],
             dtype=dtype,
@@ -81,14 +82,17 @@ def camera_parameters_cv(
     """将已校验几何转为 float32 K(9) 和 base→color [R|t](12)，采用 optical RDF 轴。"""
     parameters = {"camera_intrinsic": color.matrix(dtype=np.float32).ravel()}
     if T_xarm_base_from_color is not None:
-        rotation = T_xarm_base_from_color[:3, :3].T
-        translation = -rotation @ T_xarm_base_from_color[:3, 3]
-        parameters["camera_extrinsic"] = (
-            np.column_stack((rotation, translation)).astype(np.float32).ravel()
-        )
+        parameters["camera_extrinsic"] = camera_extrinsic_cv(T_xarm_base_from_color)
     for values in parameters.values():
         values.setflags(write=False)
     return parameters
+
+
+def camera_extrinsic_cv(T_xarm_base_from_color: np.ndarray) -> np.ndarray:
+    """已校验的 color→base 变换转为训练所用 base→color [R|t]。"""
+    rotation = T_xarm_base_from_color[:3, :3].T
+    translation = -rotation @ T_xarm_base_from_color[:3, 3]
+    return np.column_stack((rotation, translation)).astype(np.float32).ravel()
 
 
 def undistorted_depth_coordinates(

@@ -12,32 +12,20 @@ def load_scene(path, *, headless):
     data = json.loads(Path(path).read_text())
     if (
         not isinstance(data, dict)
-        or set(data) != {"objects"}
-        or not isinstance(data["objects"], list)
+        or not isinstance(data.get("objects"), list)
     ):
         raise ValueError("scene JSON must contain an objects list")
     if not data["objects"]:
         raise ValueError("scene requires at least one fixed instance")
     objects = {}
     for item in data["objects"]:
-        if not isinstance(item, dict) or set(item) - {
-            "id",
-            "role",
-            "asset",
-            "initial_selection",
-            "prompt",
-        }:
-            raise ValueError(
-                "Each scene object accepts id, role, asset, initial_selection, prompt"
-            )
+        if not isinstance(item, dict):
+            raise ValueError("Each scene object must be a dictionary")
         name = item.get("id", "")
         validate_object_name(name)
         if name in objects:
             raise ValueError("Scene object IDs must be unique")
-        item = item.copy()
-        item["role"] = item.get("role", "object")
-        if item["role"] not in {"object", "reference"}:
-            raise ValueError("Scene role must be object or reference")
+        item = {key: item[key] for key in ("id", "asset", "initial_selection", "prompt") if key in item}
         if headless and not item.get("initial_selection"):
             raise ValueError(
                 f"{name}: headless scene requires an initial_selection mask for the first frame"
@@ -55,8 +43,7 @@ def load_scene(path, *, headless):
 def choose_masks(objects, frame, args, output, segmenter, maps):
     import numpy as np
 
-    from ..io import load_initial_selection, write_json, write_selection
-    from ..rgbd import save_frame
+    from ..io import load_initial_selection, write_selection
 
     _, depth, _ = maps.apply(frame.rgb, frame.depth_m)
     masks, scene_objects = {}, []
@@ -85,7 +72,6 @@ def choose_masks(objects, frame, args, output, segmenter, maps):
             masks[name] = mask
             selected = output / "initial_selections" / name
             selected.mkdir(parents=True)
-            save_frame(selected / "source_rgbd.npz", frame)
             write_selection(
                 selected,
                 mask,
@@ -104,5 +90,4 @@ def choose_masks(objects, frame, args, output, segmenter, maps):
             if path is not None:
                 scene_item[key] = str(Path(path).expanduser().resolve())
         scene_objects.append(scene_item)
-    write_json(output / "scene.json", {"objects": scene_objects})
-    return masks
+    return masks, scene_objects

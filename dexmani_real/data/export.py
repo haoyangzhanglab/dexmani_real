@@ -6,7 +6,6 @@ import logging
 import os
 import shutil
 import tempfile
-from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -16,20 +15,16 @@ import zarr
 
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.data.raw import (
-    ROBOT_DATASET_SPECS,
     TACTILE_AGE_WARNING_NS,
     RawReader,
     require_published_raw,
-    validate_task_label,
 )
 from dexmani_real.geometry.camera import (
-    CameraSnapshot,
-    camera_parameters_cv,
+    camera_extrinsic_cv,
     depth_scales_match,
-    validate_aligned_depth_distortion,
 )
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
-from dexmani_real.geometry.pose import encode_eef_pose
+from dexmani_real.geometry.pose import encode_eef_pose, validate_rigid_transform
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
@@ -51,106 +46,170 @@ class ExportConfig:
     table_plane_abcd: tuple[float, float, float, float] | None = None
 
 
-def canonical_array_specs(
-    num_points: int,
-    rgb_height: int,
-    rgb_width: int,
-    hand_num_points: int,
-) -> dict[str, tuple[tuple[int, ...], np.dtype[Any]]]:
-    """公共导出的固定 13 字段及逐行形状、类型。"""
-    return {
-        "joint_state": ((19,), np.dtype(np.float32)),
-        "action": ((19,), np.dtype(np.float32)),
-        "action_ee": ((21,), np.dtype(np.float32)),
-        "finger_tactile_force": ((5, 3), np.dtype(np.float32)),
-        "taxel_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
-        "fingertip_xyz": ((5, 3), np.dtype(np.float32)),
-        "eef_pose": ((9,), np.dtype(np.float32)),
-        "camera_intrinsic": ((9,), np.dtype(np.float32)),
-        "camera_extrinsic": ((12,), np.dtype(np.float32)),
-        "rgb": ((rgb_height, rgb_width, 3), np.dtype(np.uint8)),
-        "depth": ((rgb_height, rgb_width), np.dtype(np.uint16)),
-        "point_cloud": ((num_points, 6), np.dtype(np.float32)),
-        "hand_pointcloud": ((hand_num_points, 6), np.dtype(np.float32)),
+# 输出字段直接对应 Raw 输入；FK 和相机计算由下方普通条件启用。
+FIELD_INPUTS = {
+    "joint_state": ("arm_qpos", "hand_qpos"),
+    "action": ("action_arm_joint_target", "action_hand_joint_target"),
+    "action_ee": ("action_arm_joint_target", "action_hand_joint_target"),
+    "eef_pose": ("arm_qpos",),
+    "fingertip_xyz": ("arm_qpos", "hand_qpos"),
+    "hand_pointcloud": ("arm_qpos", "hand_qpos"),
+    "finger_tactile_force": ("hand_contact",),
+    "taxel_tactile_force": ("hand_tactile_force",),
+    "rgb": ("rgb",),
+    "depth": ("depth",),
+    "camera_intrinsic": (),
+    "camera_extrinsic": (),
+    "point_cloud": ("rgb", "depth"),
+}
+SOURCE_FIELDS = {
+    "arm_ns": {"joint_state", "eef_pose", "fingertip_xyz", "hand_pointcloud"},
+    "hand_ns": {"joint_state", "fingertip_xyz", "hand_pointcloud"},
+    "tactile_aggregate_ns": {"finger_tactile_force"},
+    "tactile_dense_ns": {"taxel_tactile_force"},
+    "camera_ns": {"rgb", "depth", "point_cloud"},
+}
+ARM_FK_FIELDS = {"action_ee", "eef_pose", "fingertip_xyz", "hand_pointcloud"}
+HAND_FK_FIELDS = {"fingertip_xyz", "hand_pointcloud"}
+
+
+def resolve_fields(fields):
+    selected = set(FIELD_INPUTS if fields is None else fields)
+    if not selected or selected - FIELD_INPUTS.keys():
+        raise ValueError(f"fields must be nonempty and selected from {tuple(FIELD_INPUTS)}")
+    return tuple(name for name in FIELD_INPUTS if name in selected)
+
+
+def export_camera(reader, fields):
+    """只读取所选输出实际使用的相机参数，不补造完整相机快照。"""
+    names = set(fields)
+    camera: dict[str, Any] = {"parameters": {}}
+    snapshot = reader.read_camera() if "point_cloud" in names else None
+    if snapshot is not None:
+        if snapshot.T_xarm_base_from_color is None:
+            raise ValueError("point_cloud requires camera extrinsics")
+        camera["snapshot"] = snapshot
+    if names & {"rgb", "depth", "point_cloud"}:
+        if snapshot is not None:
+            shape = (snapshot.color.height, snapshot.color.width)
+        else:
+            shape = tuple(
+                np.asarray(reader.meta[f"camera_color_{axis}"]).item()
+                for axis in ("height", "width")
+            )
+            if any(type(value) is not int or value <= 0 for value in shape):
+                raise ValueError("camera image dimensions must be positive integers")
+        camera["shape"] = shape
+    if names & {"depth", "point_cloud"}:
+        if snapshot is not None:
+            scale = snapshot.depth_scale_m
+        else:
+            scale = float(reader.meta["depth_scale"])
+            if not np.isfinite(scale) or scale <= 0:
+                raise ValueError("depth_scale must be finite and positive")
+        camera["depth_scale_m"] = scale
+        expected = (reader.num_frames, *camera["shape"])
+        depth = reader["depth"]
+        if depth.shape != expected or depth.dtype != np.uint16:
+            raise ValueError(f"depth must be uint16 {expected}")
+    if "camera_intrinsic" in names:
+        if snapshot is not None:
+            matrix = snapshot.color.matrix(dtype=np.float32)
+        else:
+            matrix = np.asarray(reader.meta["camera_color_intrinsics"], dtype=np.float64).reshape(3, 3)
+            pinhole = np.array([
+                [matrix[0, 0], 0, matrix[0, 2]],
+                [0, matrix[1, 1], matrix[1, 2]],
+                [0, 0, 1],
+            ])
+            if (not np.isfinite(matrix).all() or min(matrix[0, 0], matrix[1, 1]) <= 0
+                    or not np.allclose(matrix, pinhole, rtol=0, atol=1e-9)):
+                raise ValueError("camera_color_intrinsics must be a finite pinhole matrix")
+            matrix = pinhole.astype(np.float32)
+        camera["parameters"]["camera_intrinsic"] = matrix.ravel()
+    if "camera_extrinsic" in names:
+        transform = snapshot.T_xarm_base_from_color if snapshot is not None else validate_rigid_transform(
+            np.asarray(reader.meta["camera_T_xarm_base_from_color"]).reshape(4, 4),
+            label="camera_T_xarm_base_from_color",
+        )
+        camera["parameters"]["camera_extrinsic"] = camera_extrinsic_cv(transform)
+    return camera
+
+
+def canonical_array_specs(fields, processing, camera):
+    shapes = {
+        "joint_state": (19,), "action": (19,), "action_ee": (21,),
+        "finger_tactile_force": (5, 3), "taxel_tactile_force": (5, 120, 3),
+        "fingertip_xyz": (5, 3), "eef_pose": (9,),
+        "camera_intrinsic": (9,), "camera_extrinsic": (12,),
+        "point_cloud": (processing.pointcloud.num_points, 6),
+        "hand_pointcloud": (processing.hand_pointcloud.num_points, 6),
     }
+    if "rgb" in fields:
+        shapes["rgb"] = (*camera["shape"], 3)
+    if "depth" in fields:
+        shapes["depth"] = camera["shape"]
+    return {name: (shapes[name], np.dtype({"rgb": np.uint8, "depth": np.uint16}.get(name, np.float32)))
+            for name in fields}
 
 
-def validate_export_episode(reader: RawReader) -> tuple[CameraSnapshot, dict]:
-    """前置验证元数据、结构和时间；数值及 RGB 在流式转换时验证。"""
-    validate_task_label(reader.meta["task_label"])
+def validate_export_episode(reader: RawReader, fields):
+    """校验所用输入与基本控制时间，来源时钟只作定位诊断。"""
     frames = reader.num_frames
     if frames <= 0:
         raise ValueError("episode contains no rows")
-    reader.require_fields(*ROBOT_DATASET_SPECS, "rgb", "depth")
-    camera = reader.read_camera()
-    validate_aligned_depth_distortion(camera.color.distortion_model)
-    if camera.T_xarm_base_from_color is None:
-        raise ValueError("canonical export requires camera extrinsics")
-    color = camera.color
-    expected = (frames, color.height, color.width)
-    if reader["depth"].shape != expected or reader["depth"].dtype != np.uint16:
-        raise ValueError(f"depth must be uint16 {expected}")
-    if frames == 1:
-        logger.warning(
-            "%s: single row, no sampling interval to verify", reader.path
-        )
+    inputs = {name for field in fields for name in FIELD_INPUTS[field]}
+    reader.require_fields(*inputs)
+    for name in inputs - {"rgb"}:
+        reader[name]
+    camera = export_camera(reader, fields)
     rows = reader["timing/rows"][:]
     period = sampling_clock_ns(reader.control_hz)
-    tolerance = period // 4
 
-    def reject_invalid(bad, detail, offset=0):
+    def first_bad(bad, offset=0):
         indices = np.flatnonzero(bad)
-        if len(indices):
-            row = int(indices[0]) + offset
-            raise ValueError(f"{detail} at row {row}")
+        return int(indices[0]) + offset if len(indices) else None
 
     control, observation = rows["control_ns"], rows["observation_ns"]
-    reject_invalid((control <= 0) | (observation < control), "invalid_control_or_observation_clock")
-    grid_error = control - int(control[0]) - np.arange(frames) * period
-    reject_invalid(np.diff(control) <= 0, "control_clock_not_increasing", 1)
-    reject_invalid(np.diff(observation) <= 0, "observation_clock_not_increasing", 1)
-    if np.any(np.abs(np.diff(control) - period) > tolerance):
+    for bad, detail, offset in (
+        ((control <= 0) | (observation <= 0) | (observation < control), "invalid_control_or_observation_clock", 0),
+        (np.diff(control) <= 0, "control_clock_not_increasing", 1),
+        (np.diff(observation) <= 0, "observation_clock_not_increasing", 1),
+    ):
+        row = first_bad(bad, offset)
+        if row is not None:
+            raise ValueError(f"{detail} at row {row}")
+    if frames == 1:
+        logger.warning("%s: single row, no sampling interval to verify", reader.path)
+    if np.any(np.abs(np.diff(control) - period) > period // 4):
         logger.warning("%s: control interval jitter/gaps; 不重采样，实际时间保留于 Raw", reader.path)
-    mean_period = None
-    if frames >= 2:
-        duration = int(control[-1]) - int(control[0])
-        mean_period = duration / (frames - 1)
-    readout = observation - control
     if np.any(observation[:-1] >= control[1:]):
         logger.warning("%s: observation readout overlaps the next control sample", reader.path)
 
-    for name in ("arm_ns", "hand_ns", "tactile_aggregate_ns", "tactile_dense_ns", "camera_ns"):
+    diagnostics = []
+    for name, used_by in SOURCE_FIELDS.items():
+        if not used_by.intersection(fields):
+            continue
         values = rows[name]
-        reject_invalid((values <= 0) | (values > observation), f"invalid_source_clock:{name}")
-        reject_invalid(np.diff(values) < 0, f"source_clock_regressed:{name}", 1)
-    sequence = rows["camera_sequence"]
-    reject_invalid(sequence < 0, "invalid_camera_sequence")
-    reject_invalid(np.diff(sequence) < 0, "camera_sequence_regressed", 1)
-    # 访问 dataset 触发 RawReader 的结构/dtype 校验，不读取数值切片。
-    for name in ROBOT_DATASET_SPECS:
-        reader[name]
-    tactile_ages = {
-        channel: int((observation - rows[f"tactile_{channel}_ns"]).max())
-        for channel in ("aggregate", "dense")
-    }
-    if any(age > TACTILE_AGE_WARNING_NS for age in tactile_ages.values()):
-        logger.warning(
-            "%s: tactile held beyond %.1f s (aggregate=%.3f s, dense=%.3f s); "
-            "保留全部行及原来源时间，使用前请检查触觉质量",
-            reader.path, TACTILE_AGE_WARNING_NS / 1e9,
-            tactile_ages["aggregate"] / 1e9, tactile_ages["dense"] / 1e9,
-        )
-    return camera, dict(
-        collection_source=reader.meta.get("collection_source"),
-        max_control_grid_deviation_ns=int(np.abs(grid_error).max()),
-        max_readout_ns=int(readout.max()),
-        max_tactile_aggregate_age_ns=tactile_ages["aggregate"],
-        max_tactile_dense_age_ns=tactile_ages["dense"],
-        mean_control_period_ns=mean_period,
-        max_control_interval_ns=int(np.diff(control).max()) if frames > 1 else None,
-        termination_reason=reader.meta.get("termination_reason"),
-        recording_truncated_reason=reader.meta.get("recording_truncated_reason"),
-    )
+        bad = (values <= 0) | (values > observation)
+        bad[1:] |= np.diff(values) < 0
+        row = first_bad(bad)
+        if row is not None:
+            diagnostics.append(f"{name} invalid/regressed at row {row}")
+        if name.startswith("tactile_"):
+            row = first_bad(observation - values > TACTILE_AGE_WARNING_NS)
+            if row is not None:
+                diagnostics.append(f"{name} held beyond {TACTILE_AGE_WARNING_NS / 1e9:g}s at row {row}")
+    if SOURCE_FIELDS["camera_ns"].intersection(fields):
+        sequence = rows["camera_sequence"]
+        bad = sequence < 0
+        bad[1:] |= np.diff(sequence) < 0
+        row = first_bad(bad)
+        if row is not None:
+            diagnostics.append(f"camera_sequence invalid/regressed at row {row}")
+    if diagnostics:
+        logger.warning("%s: %s; 保留全部原始行，不修补来源时间", reader.path, "; ".join(diagnostics))
+    return camera
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
@@ -175,78 +234,75 @@ def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
 
 
 def iter_canonical_blocks(
-    reader: RawReader,
-    config: ExportConfig,
-    *,
-    arm_fk,
-    hand_fk,
-    hand_cloud,
-    chunk_frames: int,
-    camera: CameraSnapshot,
+    reader: RawReader, config: ExportConfig, *, fields, arm_fk, hand_fk,
+    hand_cloud, camera,
 ):
-    """每块原始数值只读一次，全部通过 finite 检查后转换；坏块拒绝整段。"""
     frames = reader.num_frames
-    height, width = camera.color.height, camera.color.width
-    processor = PointCloudProcessor(
-        depth_scale_m=camera.depth_scale_m,
-        intrinsics=camera.color,
-        T_xarm_base_from_color=camera.T_xarm_base_from_color,
-        table_plane_abcd=config.table_plane_abcd,
-        config=config.pointcloud,
-    )
-    camera_parameters = camera_parameters_cv(camera.color, camera.T_xarm_base_from_color)
-    with closing(reader.iter_rgb_frames()) as images:
-        for start in range(0, frames, chunk_frames):
-            end = min(frames, start + chunk_frames)
-            raw = {name: reader[name][start:end] for name in ROBOT_DATASET_SPECS}
-            for name, values in raw.items():
-                valid = np.isfinite(values).reshape(end - start, -1).all(axis=1)
-                if not valid.all():
-                    row = start + int(np.flatnonzero(~valid)[0])
-                    raise ValueError(f"nonfinite:{name} at row {row}")
-            arm, hand = raw["arm_qpos"], raw["hand_qpos"]
-            arm_action, hand_action = (
-                raw["action_arm_joint_target"],
-                raw["action_hand_joint_target"],
-            )
-            poses = eef_poses(arm, arm_fk=arm_fk)
-            action_poses = eef_poses(arm_action, arm_fk=arm_fk)
-            hand_features = hand_geometry(
-                poses,
-                hand,
-                arm_fk=arm_fk,
-                hand_fk=hand_fk,
-                hand_cloud=hand_cloud,
-            )
-            block = {
-                "joint_state": np.concatenate((arm, hand), axis=1, dtype=np.float32),
-                "action": np.concatenate((arm_action, hand_action), axis=1, dtype=np.float32),
-                "action_ee": np.concatenate((encode_eef_pose(action_poses), hand_action), axis=1, dtype=np.float32),
-                "eef_pose": encode_eef_pose(poses).astype(np.float32),
-                "finger_tactile_force": raw["hand_contact"].astype(np.float32, copy=False),
-                "taxel_tactile_force": raw["hand_tactile_force"].astype(np.float32, copy=False),
-                **hand_features,
-            }
-            for name, values in camera_parameters.items():
-                block[name] = np.broadcast_to(values, (end - start, values.size))
-            # 深度按块读取，RGB 逐帧解码到输出数组。
-            rgb = np.empty((end - start, height, width, 3), dtype=np.uint8)
-            depth = reader["depth"][start:end]
-            clouds = np.empty((end - start, config.pointcloud.num_points, 6), dtype=np.float32)
+    inputs = {name for field in fields for name in FIELD_INPUTS[field]}
+    specs = canonical_array_specs(fields, config, camera)
+    row_bytes = sum(int(np.prod(shape)) * dtype.itemsize for shape, dtype in specs.values())
+    if "point_cloud" in fields and "depth" not in fields:
+        # 点云逐帧计算，但原始深度仍按块读取；图像尺寸可以逐段变化。
+        row_bytes += int(np.prod(camera["shape"])) * np.dtype(np.uint16).itemsize
+    chunk_frames = min(MAX_BATCH_FRAMES, max(1, PROCESSING_BYTES // row_bytes))
+    processor = None
+    if "point_cloud" in fields:
+        snapshot = camera["snapshot"]
+        processor = PointCloudProcessor(
+            depth_scale_m=snapshot.depth_scale_m, intrinsics=snapshot.color,
+            T_xarm_base_from_color=snapshot.T_xarm_base_from_color,
+            table_plane_abcd=config.table_plane_abcd, config=config.pointcloud,
+        )
+    # 视频容器归 RawReader 所有，退出 reader 上下文时统一关闭。
+    images = reader.iter_rgb_frames() if "rgb" in inputs else None
+    for start in range(0, frames, chunk_frames):
+        end = min(frames, start + chunk_frames)
+        count = end - start
+        raw = {name: reader[name][start:end] for name in inputs - {"rgb"}}
+        block = {}
+        if "joint_state" in fields:
+            block["joint_state"] = np.concatenate((raw["arm_qpos"], raw["hand_qpos"]), axis=1, dtype=np.float32)
+        if "action" in fields:
+            block["action"] = np.concatenate((raw["action_arm_joint_target"], raw["action_hand_joint_target"]), axis=1, dtype=np.float32)
+        if "action_ee" in fields:
+            poses = eef_poses(raw["action_arm_joint_target"], arm_fk=arm_fk)
+            block["action_ee"] = np.concatenate((encode_eef_pose(poses), raw["action_hand_joint_target"]), axis=1, dtype=np.float32)
+        if {"eef_pose", "fingertip_xyz", "hand_pointcloud"}.intersection(fields):
+            poses = eef_poses(raw["arm_qpos"], arm_fk=arm_fk)
+            if "eef_pose" in fields:
+                block["eef_pose"] = encode_eef_pose(poses).astype(np.float32)
+            if hand_fk is not None:
+                block.update(hand_geometry(
+                    poses, raw["hand_qpos"], arm_fk=arm_fk, hand_fk=hand_fk,
+                    hand_cloud=hand_cloud, include_fingertips="fingertip_xyz" in fields,
+                ))
+        for name, source in (("finger_tactile_force", "hand_contact"), ("taxel_tactile_force", "hand_tactile_force")):
+            if name in fields:
+                block[name] = raw[source].astype(np.float32, copy=False)
+        for name, values in camera["parameters"].items():
+            block[name] = np.broadcast_to(values, (count, values.size))
+        if "depth" in fields:
+            block["depth"] = raw["depth"]
+        if images is not None:
+            height, width = camera["shape"]
+            if "rgb" in fields:
+                block["rgb"] = np.empty((count, height, width, 3), dtype=np.uint8)
+            if processor is not None:
+                block["point_cloud"] = np.empty((count, config.pointcloud.num_points, 6), dtype=np.float32)
             for offset, index in enumerate(range(start, end)):
                 image = next(images, None)
                 if image is None or image.shape != (height, width, 3) or image.dtype != np.uint8:
-                    raise ValueError(
-                        f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
-                    )
-                cloud = processor.process(depth[offset], image)
-                if not len(cloud):
-                    raise ValueError(f"point_cloud unavailable at row {index}")
-                rgb[offset], clouds[offset] = image, cloud
-            block.update(rgb=rgb, depth=depth, point_cloud=clouds)
-            yield block
-        if next(images, None) is not None:
-            raise ValueError(f"{reader.path / 'rgb.mp4'}: unexpected RGB frame at row {frames}")
+                    raise ValueError(f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}")
+                if "rgb" in fields:
+                    block["rgb"][offset] = image
+                if processor is not None:
+                    cloud = processor.process(raw["depth"][offset], image)
+                    if not len(cloud):
+                        raise ValueError(f"point_cloud unavailable at row {index}")
+                    block["point_cloud"][offset] = cloud
+        yield block
+    if images is not None and next(images, None) is not None:
+        raise ValueError(f"{reader.path / 'rgb.mp4'}: unexpected RGB frame at row {frames}")
 
 
 def export_zarr(
@@ -254,14 +310,16 @@ def export_zarr(
     output_path: str | Path,
     *,
     processing: ExportConfig,
+    fields=None,
     exclude: tuple[str, ...] = (),
     progress_callback=None,
 ) -> dict:
-    # Canonical 始终导出两种点云，须在按点数创建存储前接纳实际启用的配置。
-    processing.pointcloud.validate()
-    processing.hand_pointcloud.validate()
+    fields = resolve_fields(fields)
+    if "point_cloud" in fields:
+        processing.pointcloud.validate()
+    if "hand_pointcloud" in fields:
+        processing.hand_pointcloud.validate()
     requested_source = Path(input_root).expanduser()
-    source = requested_source.resolve()
     output = Path(output_path).expanduser()
     target = output.resolve()
     if os.path.lexists(output):
@@ -270,8 +328,6 @@ def export_zarr(
     staging = None
     store = None
     ends: list[int] = []
-    episode_ids: list[str] = []
-    episode_quality = []
     try:
         for index, episode in enumerate(selected):
             if progress_callback:
@@ -280,61 +336,53 @@ def export_zarr(
             try:
                 require_published_raw(episode)
                 with RawReader(episode) as reader:
-                    camera, quality = validate_export_episode(reader)
+                    camera = validate_export_episode(reader, fields)
                     frames = reader.num_frames
                     logger.info("%s: exporting full episode (%d frames)", episode.name, frames)
-                    task = reader.meta["task_label"]
-                    height, width = camera.color.height, camera.color.width
                     if index == 0:
-                        arm_fk, hand_fk = ArmFK(), HandFK()
-                        hand_cloud = HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
+                        arm_fk = ArmFK() if ARM_FK_FIELDS.intersection(fields) else None
+                        hand_fk = HandFK() if HAND_FK_FIELDS.intersection(fields) else None
+                        hand_cloud = (HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
+                                      if "hand_pointcloud" in fields else None)
                         target.parent.mkdir(parents=True, exist_ok=True)
                         staging = Path(
                             tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
                         )
                         store = zarr.DirectoryStore(str(staging))
-                        root, arrays, chunk = create_store(
+                        root, arrays = create_store(
                             store,
                             processing,
                             camera,
-                            task=task,
+                            fields=fields,
                             control_hz=reader.control_hz,
                         )
                     else:
-                        if task != root.attrs["task_name"] or not np.isclose(
-                            reader.dt, root.attrs["dt"], rtol=0, atol=1e-12
-                        ):
-                            raise ValueError("one canonical store requires uniform task and dt")
-                        if not depth_scales_match(camera.depth_scale_m, root.attrs["depth_scale_m_per_unit"]):
+                        if not np.isclose(reader.dt, root.attrs["dt"], rtol=0, atol=1e-12):
+                            raise ValueError("one canonical store requires uniform dt")
+                        if "depth" in fields and not depth_scales_match(camera["depth_scale_m"], root.attrs["depth_scale_m_per_unit"]):
                             raise ValueError("depth_scale_m_per_unit must be uniform")
-                        if (height, width, 3) != arrays["rgb"].shape[1:]:
-                            raise ValueError("inconsistent RGB shape")
+                        for name in ("rgb", "depth"):
+                            if name in fields:
+                                shape = (*camera["shape"], 3) if name == "rgb" else camera["shape"]
+                                if shape != arrays[name].shape[1:]:
+                                    raise ValueError(f"inconsistent {name} shape")
 
                     blocks = iter_canonical_blocks(
                         reader,
                         processing,
+                        fields=fields,
                         arm_fk=arm_fk,
                         hand_fk=hand_fk,
                         hand_cloud=hand_cloud,
-                        chunk_frames=chunk,
                         camera=camera,
                     )
                     append_episode(arrays, offset, blocks, frames)
                     ends.append(offset + frames)
-                    episode_quality.append(quality)
             except (KeyError, ValueError) as exc:
                 raise ValueError(f"Raw {episode}: {exc}") from exc
-            except Exception:
-                logger.exception("Export failed at %s", episode)
-                raise
-            episode_ids.append(
-                episode.name if episode == source else episode.relative_to(source).as_posix()
-            )
         root.create_group("meta").create_dataset(
             "episode_ends", data=np.asarray(ends, dtype=np.int64)
         )
-        root.attrs["episode_ids"] = episode_ids
-        root.attrs["episode_quality"] = episode_quality
         root.store.close()
         store = None
         publish(cast(Path, staging), target)
@@ -343,7 +391,6 @@ def export_zarr(
             progress_callback(len(selected), len(selected))
         return dict(
             episode_count=len(ends), total_frames=ends[-1], excluded_episodes=sorted(excluded),
-            episode_quality=episode_quality,
         )
     finally:
         if staging is not None:
@@ -358,28 +405,22 @@ def export_zarr(
                 logger.exception("export staging cleanup also failed: %s", staging)
 
 
-def create_store(store, processing, camera, *, task, control_hz):
-    height, width = camera.color.height, camera.color.width
-    specs = canonical_array_specs(
-        processing.pointcloud.num_points,
-        height,
-        width,
-        processing.hand_pointcloud.num_points,
-    )
-    row_bytes = sum(int(np.prod(shape)) * dtype.itemsize for shape, dtype in specs.values())
-    chunk = min(MAX_BATCH_FRAMES, max(1, PROCESSING_BYTES // row_bytes))
+def create_store(store, processing, camera, *, fields, control_hz):
+    specs = canonical_array_specs(fields, processing, camera)
     root = zarr.group(store=store, overwrite=True)
-    root.attrs.update(
-        format=CANONICAL_FORMAT,
-        task_name=task,
-        dt=1.0 / control_hz,
-        action_semantics="absolute_joint_goal_not_next_step_arrival",
-        pointcloud_config=asdict(processing.pointcloud),
-        hand_pointcloud_config=asdict(processing.hand_pointcloud),
-        fingertip_link_names=list(XHAND_FINGERTIP_LINK_NAMES),
-        table_plane_abcd=processing.table_plane_abcd,
-        depth_scale_m_per_unit=camera.depth_scale_m,
-    )
+    root.attrs.update(format=CANONICAL_FORMAT, dt=1.0 / control_hz)
+    if {"action", "action_ee"}.intersection(fields):
+        root.attrs["action_semantics"] = "absolute_joint_goal_not_next_step_arrival"
+    if "point_cloud" in fields:
+        root.attrs["pointcloud_config"] = asdict(processing.pointcloud)
+        if processing.pointcloud.remove_table:
+            root.attrs["table_plane_abcd"] = processing.table_plane_abcd
+    if "hand_pointcloud" in fields:
+        root.attrs["hand_pointcloud_config"] = asdict(processing.hand_pointcloud)
+    if "fingertip_xyz" in fields:
+        root.attrs["fingertip_link_names"] = list(XHAND_FINGERTIP_LINK_NAMES)
+    if "depth" in fields:
+        root.attrs["depth_scale_m_per_unit"] = camera["depth_scale_m"]
     data = root.create_group("data")
     arrays = {}
     for name, (shape, dtype) in specs.items():
@@ -392,7 +433,7 @@ def create_store(store, processing, camera, *, task, control_hz):
             dtype=dtype,
             compressor=zarr.get_codec({"id": "zstd", "level": 3}),
         )
-    return root, arrays, chunk
+    return root, arrays
 
 
 def append_episode(arrays, offset, blocks, frames):
@@ -400,7 +441,11 @@ def append_episode(arrays, offset, blocks, frames):
         array.resize((offset + frames, *array.shape[1:]))
     count = 0
     for block in blocks:
-        rows = len(block["joint_state"])
+        if not block or block.keys() != arrays.keys():
+            raise ValueError("canonical block must contain exactly the selected fields")
+        rows = len(next(iter(block.values())))
+        if any(len(values) != rows for values in block.values()):
+            raise ValueError("canonical fields must have equal row counts")
         for name, values in block.items():
             if np.issubdtype(values.dtype, np.floating):
                 valid = np.isfinite(values).reshape(rows, -1).all(axis=1)

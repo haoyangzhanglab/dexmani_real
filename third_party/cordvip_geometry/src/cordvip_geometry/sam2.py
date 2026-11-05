@@ -7,7 +7,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, BinaryIO, cast
+from typing import BinaryIO, cast
 
 import numpy as np
 
@@ -30,7 +30,6 @@ class SAM2Client:
             Path(models_dir).expanduser().resolve() / GROUNDING_MODEL["directory"]
         )
         self.log_path = Path(log_path) if log_path is not None else None
-        self.provenance: dict[str, Any] = {}
         self._process = self._log = None
         self._ids = self._shape = None
 
@@ -92,7 +91,6 @@ class SAM2Client:
             ) from error
         if reply.get("error"):
             raise RuntimeError(f"SAM2 startup: {reply['error']}; {diagnostics}")
-        self.provenance = reply["provenance"]
         return self
 
     def _call(self, operation, arrays=None, **parameters):
@@ -138,7 +136,6 @@ class SAM2Client:
             box_threshold=box_threshold,
             text_threshold=text_threshold,
         )
-        self.provenance.update(reply["provenance"])
         return [
             {
                 "mask": mask,

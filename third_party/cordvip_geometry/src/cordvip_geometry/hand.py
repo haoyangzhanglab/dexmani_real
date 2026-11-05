@@ -64,7 +64,7 @@ class HandCloud:
         unknown = excluded - {link.attrib["name"] for link in root.findall("link")}
         if unknown:
             raise ValueError(f"excluded links are absent from URDF: {sorted(unknown)}")
-        meshes, names, assets = [], [], [str(path)]
+        meshes, names = [], []
         for link in root.findall("link"):
             name = link.attrib["name"]
             if name in excluded:
@@ -104,7 +104,6 @@ class HandCloud:
                         f"{mesh_path}: mesh must have finite, positive surface area"
                     )
                 parts.append(mesh)
-                assets.append(str(mesh_path))
             if parts:
                 names.append(name)
                 meshes.append(trimesh.util.concatenate(parts))
@@ -131,16 +130,10 @@ class HandCloud:
         self.link_ids = np.concatenate(link_ids)
         self.link_ids.setflags(write=False)
         self.metadata = {
-            "urdf": str(path),
-            "source_files": assets,
             "joint_names": list(self.joint_names),
             "joint_units": "rad",
             "link_names": names,
-            "excluded_links": sorted(excluded),
-            "num_points": int(num_points),
-            "seed": int(seed),
             "units": "m",
-            "points_per_link": counts.tolist(),
         }
 
     def transform(self, q):

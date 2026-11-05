@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""将完整有效的 Raw episode 导出为全模态 Canonical Zarr。"""
+"""将 Raw episode 的所选字段导出为 Canonical Zarr。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from dexmani_real.config.real import load_config
-from dexmani_real.data.export import ExportConfig, export_zarr
+from dexmani_real.data.export import FIELD_INPUTS, ExportConfig, export_zarr
 from dexmani_real.utils.table_plane import load_table_plane
 
 
@@ -20,7 +20,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Export published Raw episodes with valid data to a canonical multimodal Zarr. "
             "Validate structure and timing first, numeric values during chunk conversion. "
-            "Reject the whole export on any invalid row and publish only after all episodes succeed; "
+            "Warn on source-clock diagnostics; reject missing/nonfinite selected data. "
+            "Publish only after all episodes succeed; "
             "use --exclude and retry."
         )
     )
@@ -31,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "One raw task or episode directory. Exports to "
             "datasets/<task_name>.zarr by default (see --output). "
-            "Every row and required modality must be valid. "
+            "Every row of the selected fields must be valid. "
             "The destination must not already exist."
         ),
     )
@@ -42,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Alternative canonical Zarr output path for this task "
             "(default: datasets/<task_name>.zarr). The default name "
-            "comes from the input directory; task labels come from Raw. "
+            "comes from the input directory. "
             "The destination must be new; a new target inside the input directory is allowed."
         ),
     )
@@ -51,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Trusted Python experiment file exporting CONFIG: RealConfig",
+    )
+    parser.add_argument(
+        "--fields", nargs="+", choices=tuple(FIELD_INPUTS),
+        help="Canonical fields to export; omitted means all 13 fields.",
     )
     parser.add_argument(
         "--exclude",
@@ -73,11 +78,12 @@ def default_output_path(input_root: Path) -> Path:
     return Path("datasets") / f"{task_name}.zarr"
 
 
-def load_processing_config(path: Path | None) -> ExportConfig:
+def load_processing_config(path: Path | None, fields) -> ExportConfig:
     """Load processing values; read the current table plane only for table removal."""
     runtime = load_config(path)
     plane = (
-        load_table_plane(runtime.environment.table_plane_path) if runtime.pointcloud.remove_table else None
+        load_table_plane(runtime.environment.table_plane_path)
+        if "point_cloud" in fields and runtime.pointcloud.remove_table else None
     )
     return ExportConfig(
         pointcloud=runtime.pointcloud,
@@ -93,7 +99,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_path = (
         args.output if args.output is not None else default_output_path(args.input_root)
     )
-    processing = load_processing_config(args.config)
+    fields = tuple(FIELD_INPUTS) if args.fields is None else args.fields
+    processing = load_processing_config(args.config, fields)
     from dexmani_real.utils.log import configure_logging
 
     configure_logging()
@@ -107,6 +114,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.input_root,
             output_path,
             processing=processing,
+            fields=fields,
             exclude=tuple(args.exclude),
             progress_callback=update_progress,
         )

@@ -11,6 +11,7 @@ import numpy as np
 from .geometry import transform_points
 
 logger = logging.getLogger(__name__)
+OBJECT_COLORS = ((50, 220, 230), (220, 90, 230), (80, 220, 100), (240, 220, 70))
 
 
 def scene_display(frame, object_ids, colors) -> np.ndarray:

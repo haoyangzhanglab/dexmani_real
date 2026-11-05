@@ -54,7 +54,8 @@ python scripts/cordvip/reconstruct_object.py \
 
 - `segmentation/foreground_rgba.png`：实际送入重建模型的透明背景图。
 - `generation/mesh_unscaled.obj`：已简化、尚未标定尺度的网格。
-- `generation/generation_result.json`：模型和参数、简化前的 `source_faces`、`mesh_simplification`，以及导出网格的 `faces`/`vertices`。
+
+分割和生成参数、耗时、导出网格的顶点及面数直接打印到终端。
 
 所有输出目录必须是新目录，重复运行时更换目录名。此阶段不会保存最终点云；先检查简化后网格的外形、内腔和坐标轴。面数简化不包含孔洞修补等通用网格清理。
 
@@ -126,7 +127,7 @@ python -m cordvip_geometry object generate \
 
 `object generate --image PATH` 也可直接使用自行准备的 RGBA 文件；图像必须包含有效前景和透明背景。之后按第 3 步处理新的网格路径，并去掉 `--preview`。
 
-`object select` 的必需输入只有候选目录中的 `rgb.png` 和 `candidates.npz`，不依赖分割日志、候选 JPG 或原始照片副本。选择目录仅保存 `mask.png`、`foreground_rgba.png`、当前候选生成的 `overlay.png` 和简洁的 `selection.json`；输入若含 `source_rgbd.npz`，须可读取且 RGB 像素与候选 RGB 相同，再一并保留以便复用时核对实际首帧。再次选择仍指向原候选目录，输出目录拒绝覆盖。
+`object select` 的必需输入只有候选目录中的 `rgb.png` 和 `candidates.npz`，不依赖分割日志、候选 JPG 或原始照片副本。选择目录仅保存 `mask.png`、`foreground_rgba.png`、当前候选生成的 `overlay.png` 和简洁的 `selection.json`；附带来源文件不参与校验或复制。headless 下唯一候选可省略 `--instance`，多候选须指定索引。再次选择仍指向原候选目录，输出目录拒绝覆盖。
 
 现有苹果、香蕉、碗资产位于 [pnp_apple_banana](../assets/pointcloud_template/object/pnp_apple_banana)，分别按约 8 cm 直径、18 cm 两端直线距离、17 cm 碗口外径标定，每个物体 1024 点。具体尺度定义见各自的 `asset.json`；[预览图](../assets/pointcloud_template/object/pnp_apple_banana/preview.png)可用于快速检查。
 

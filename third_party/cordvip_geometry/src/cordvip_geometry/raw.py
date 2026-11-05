@@ -97,11 +97,6 @@ class RawHandCloud:
         self.T_base_camera = camera.T_xarm_base_from_color
         if self.T_base_camera is None:
             raise ValueError("hand cloud requires recorded camera extrinsics")
-        raw_notes = {
-            key: str(reader.meta[key])
-            for key in ("notes", "timestamp_source", "termination_reason")
-            if key in reader.meta
-        }
         excluded = ("right_hand_ee_link", *XHAND_FINGERTIP_LINK_NAMES)
         excluded_links = [
             link.attrib["name"]
@@ -117,18 +112,13 @@ class RawHandCloud:
             seed=HAND_SAMPLE_SEED,
             T_camera_from_root=np.linalg.inv(self.T_base_camera),
         )
-        self.metadata = {
-            **self.hand_model.metadata,
-            "episode": str(reader.path),
-            "joint_source": str(reader.path / "data.h5"),
-            "T_base_camera": self.T_base_camera.tolist(),
-            "camera_extrinsics_source": "Raw meta.camera_T_xarm_base_from_color",
-            "raw_notes": raw_notes,
-        }
+        self.metadata = self.hand_model.metadata
 
     def for_row(self, frame, timing):
         """同一 reader 当前行的实测关节；不插值、不用命令替代反馈。"""
         row = frame.row_index
+        if row is None:
+            raise ValueError("Raw hand geometry requires a row_index")
         arm_ns, hand_ns, camera_ns = (
             int(timing[name]) for name in ("arm_ns", "hand_ns", "camera_ns")
         )
@@ -136,10 +126,7 @@ class RawHandCloud:
             (self.reader["arm_qpos"][row], self.reader["hand_qpos"][row])
         )
         cloud = self.hand_model.transform(joint_state)
-        timing_available = (
-            min(arm_ns, hand_ns, camera_ns) > 0
-            and frame.clock == "host_monotonic_oldest_rgbd_receive"
-        )
+        timing_available = min(arm_ns, hand_ns, camera_ns) > 0
         skew_ms = (
             (max(arm_ns, hand_ns, camera_ns) - min(arm_ns, hand_ns, camera_ns)) / 1e6
             if timing_available

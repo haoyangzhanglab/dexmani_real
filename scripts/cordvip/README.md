@@ -31,7 +31,7 @@ python scripts/cordvip/track_object.py \
   --with-hand --output /tmp/cordvip/scene_001
 ```
 
-提供 `--prompt`，由 Grounding DINO 和 SAM2 生成冻结 Raw 首帧上的候选 mask，再人工选择实例；或用 `--initial-selection PATH` 加载已有首帧 mask。每个对象至少提供其中一种输入，无候选时明确报错。新选择保存到输出的 `initial_selections/`；`scene.json` 记录可复用的对象与选择路径。PNG/NPY mask 可直接使用，选择目录只需 `selection.json` 的 `mask_file` 指向目录内的 mask。mask 明确应用于当前首帧原始 RGB 网格，不自动猜测或转换坐标网格。目录若含 `source_rgbd.npz`，则逐项精确核对首帧 RGB-D、内参和畸变；没有绑定文件时不验证来源。`source_id`、时间戳、时钟和行号仅作说明，已有输入保持原样。
+提供 `--prompt`，由 Grounding DINO 和 SAM2 生成冻结 Raw 首帧上的候选 mask，再人工选择实例；或用 `--initial-selection PATH` 加载已有首帧 mask。每个对象至少提供其中一种输入，无候选时明确报错。新选择保存到输出的 `initial_selections/`；`scene.json` 记录可复用的对象与选择路径。PNG/NPY mask 可直接使用，选择目录只需 `selection.json` 的 `mask_file` 指向目录内的 mask。两者均应用于当前指定首帧原始 RGB 网格，附带来源文件不参与校验；不自动缩放或猜测坐标网格，已有输入保持原样。
 
 多物体由一个场景 JSON 声明，路径相对仓库根目录：
 
@@ -52,7 +52,7 @@ python scripts/cordvip/track_object.py \
 
 `role` 是一次保存的标签，不改变算法。省略某个 `asset` 时，该对象只输出连续 mask 与实测深度点，不估计 pose；全部省略时不要求 FoundationPose。无窗口运行要求每个实例提供当前首帧的有效 mask，可直接使用 mask 文件。
 
-默认顺序处理全部 Raw 行，不按墙钟跳帧。`--max-frames N` 显式限制处理前缀，结果标为 partial。输出目录必须尚不存在，可以是 `rollouts/derived/objects` 等独立结果目录；实际输入、Raw episode 内部和已有输出仍受保护。处理前将各资产的固定点/法向写入 `model_templates/<object_id>.npz` 一次，每行结果保存为 `frames/000000.npz` 等，源 row ID、时间和时钟保留。逐帧保存有效/候选 pose 与实测数据，模型点/法向从模板按需重建。mask-only 不生成模板。查看结果是独立步骤：
+默认顺序处理全部 Raw 行，不按墙钟跳帧。`--max-frames N` 显式限制处理前缀，终端打印实际处理行数。输出目录必须尚不存在，可以是 `rollouts/derived/objects` 等独立结果目录；实际输入、Raw episode 内部和已有输出仍受保护。处理前将各资产的固定点/法向写入 `model_templates/<object_id>.npz` 一次，每行结果保存为 `frames/000000.npz` 等，源 row ID、时间和时钟保留。逐帧保存有效/候选 pose 与实测数据，模型点/法向从模板按需重建。mask-only 不生成模板。查看结果是独立步骤：
 
 ```bash
 python -m cordvip_geometry view /tmp/cordvip/scene_001
@@ -61,9 +61,9 @@ python -m cordvip_geometry view /tmp/cordvip/scene_001 --no-3d
 python -m cordvip_geometry view /tmp/cordvip/scene_001 --headless
 ```
 
-查看器用 `n`/Space 前进一行，`v` 只更新 observed/model 点云，`q`/`Q`/Esc 或关窗退出；首次 model 切换加载输出内模板，本次查看复用。静止时仅轮询事件和渲染。`--no-3d` 不读取模板或解压点云，`view --headless` 只检查 RGB 和来源行/时钟，不加载 OpenCV/Open3D。查看无需原资产、Raw 或模型环境；资产路径只作来源记录。
+查看器用 `n`/Space 前进一行，`v` 只更新 observed/model 点云，`q`/`Q`/Esc 或关窗退出；首次 model 切换加载输出内模板，本次查看复用。静止时仅轮询事件和渲染。`--no-3d` 不读取模板或解压点云，`view --headless` 检查 RGB 并打印已有来源说明，不加载 OpenCV/Open3D。查看使用固定调色板，无需原资产、Raw、模型环境或运行报告。
 
-实测点来自当前 mask 与深度，模型点由模板与有效 pose 重建；深度支持参与 `POSE_LOST` 判定。正常 pose 丢失仍保留独立语义实测点，以及已计算的支持掩码/残差和门控前候选位姿；候选不等于有效位姿，无效 pose 和 mask-only 在 model 模式显示空点。模型或 renderer 的技术异常结束任务为 failed，并保留已写入前缀。`--with-hand` 直接使用同一 Raw 行的 19 维实测关节生成 FK 手点，不使用 action，不证明物理同步，也不代表通过训练时序准入。
+实测点来自当前 mask 与深度，模型点由模板与有效 pose 重建；深度支持参与 `POSE_LOST` 判定。正常 pose 丢失仍保留独立语义实测点，以及已计算的支持掩码/残差和门控前候选位姿；候选不等于有效位姿，无效 pose 和 mask-only 在 model 模式显示空点。模型或 renderer 的技术异常直接抛出并非零退出，保留已写入前缀。`--with-hand` 直接使用同一 Raw 行的 19 维实测关节生成 FK 手点，不使用 action，不证明物理同步，也不代表通过训练时序准入。
 
 模板的 `points_object`、`normals_object` 保持资产载入后的顺序、float32 和米制 object frame；camera 模型点按原公式变换为 float32，法向矩乘保留自然 dtype。同一帧 NPZ 保留 `K`，手几何启用时还保留 camera 手点/法向、`T_base_camera`、link IDs 与关节状态。NumPy 重建示例见[使用文档](../../third_party/cordvip_geometry/docs/usage.md#输出与查看)。
 

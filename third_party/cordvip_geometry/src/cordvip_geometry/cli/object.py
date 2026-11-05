@@ -3,10 +3,10 @@
 import logging
 import multiprocessing as mp
 import shlex
-import shutil
 import sys
+import time
 
-from ..io import existing_file, output_path, write_json
+from ..io import existing_file, output_path
 from .arguments import parse_object_args
 from .selection import choose, display_available, save_candidates, save_selection
 
@@ -18,21 +18,15 @@ def load_rgb(args):
     from PIL import Image, ImageOps
 
     path = existing_file(args.image if args.image is not None else args.rgbd)
-    info = {"source_file": str(path)}
     if args.image is not None:
         with Image.open(path) as image:
             rgb = np.asarray(ImageOps.exif_transpose(image).convert("RGB")).copy()
-        info["input_type"] = "image"
     else:
         from ..rgbd import load_frame
 
         frame = load_frame(path)
         rgb = frame.rgb
-        info.update(
-            input_type="saved_rgbd",
-            mask_grid="original_rgb_grid; not_automatically_rectified",
-        )
-    return rgb, path, info
+    return rgb, path
 
 
 def segment(args, *, output=None, list_only=False):
@@ -42,22 +36,12 @@ def segment(args, *, output=None, list_only=False):
 
     if not args.headless and not list_only:
         display_available()
-    rgb, source, provenance = load_rgb(args)
+    rgb, source = load_rgb(args)
     output = output_path(output or args.output, protected=(source,))
     output.mkdir(parents=True, exist_ok=False)
     Image.fromarray(rgb).save(output / "rgb.png")
-    source_name = (
-        "source_rgbd.npz" if args.rgbd is not None else f"source{source.suffix.lower()}"
-    )
-    shutil.copyfile(source, output / source_name)
-    provenance.update(
-        prompt=args.prompt,
-        box_threshold=args.box_threshold,
-        text_threshold=args.text_threshold,
-        headless=args.headless,
-        saved_source=source_name,
-    )
-    write_json(output / "segmentation_request.json", provenance)
+    print(f"Segmentation: prompt={args.prompt!r}, box_threshold={args.box_threshold}, text_threshold={args.text_threshold}", flush=True)
+    started = time.monotonic()
     with SAM2Client(
         args.sam_python,
         args.workspace,
@@ -72,12 +56,10 @@ def segment(args, *, output=None, list_only=False):
             box_threshold=args.box_threshold,
             text_threshold=args.text_threshold,
         )
-        provenance["model"] = segmenter.provenance
-    provenance["num_candidates"] = len(candidates)
-    write_json(output / "segmentation_result.json", provenance)
+    print(f"Candidates={len(candidates)}, elapsed={time.monotonic() - started:.2f}s", flush=True)
     if not candidates:
         raise RuntimeError(
-            f"没有检测到目标；原图和请求已保留在 {output}，可调整文本或阈值"
+            f"没有检测到目标；rgb.png 已保留在 {output}，可调整文本或阈值"
         )
     save_candidates(output, rgb, candidates)
     if list_only:
@@ -128,18 +110,8 @@ def select(args):
         }
         for i in range(count)
     ]
-    binding = source / "source_rgbd.npz"
-    has_binding = binding.exists() or binding.is_symlink()
-    if has_binding:
-        from ..rgbd import load_frame
-
-        frame = load_frame(existing_file(binding))
-        if not np.array_equal(frame.rgb, rgb):
-            raise ValueError("source_rgbd.npz 的 RGB 与候选目录的 rgb.png 不一致")
     index = choose(rgb, candidates, args.instance, headless=args.headless)
     output.mkdir(parents=True, exist_ok=False)
-    if has_binding:
-        shutil.copyfile(binding, output / binding.name)
     save_selection(output, rgb, candidates, index)
 
 
@@ -156,20 +128,9 @@ def generate(args, image=None, output=None):
     output.mkdir(parents=True, exist_ok=False)
     root = args.workspace / "third_party/Hunyuan3D-2.1"
     weights = args.models_dir / "Hunyuan3D-2.1"
-    write_json(
-        output / "generation_request.json",
-        {
-            "image_rgba_path": str(image),
-            "source_root": str(root),
-            "weights_dir": str(weights),
-            "seed": args.seed,
-            "steps": args.steps,
-            "octree_resolution": args.octree_resolution,
-            "num_chunks": args.num_chunks,
-        },
-    )
+    print(f"Generation: seed={args.seed}, steps={args.steps}, octree_resolution={args.octree_resolution}, num_chunks={args.num_chunks}", flush=True)
     mesh_path = output / "mesh_unscaled.obj"
-    result = generate_mesh(
+    mesh_path = generate_mesh(
         image_rgba_path=image,
         source_root=root,
         weights_dir=weights,
@@ -178,15 +139,6 @@ def generate(args, image=None, output=None):
         steps=args.steps,
         octree_resolution=args.octree_resolution,
         num_chunks=args.num_chunks,
-    )
-    write_json(
-        output / "generation_result.json",
-        {
-            **result,
-            "mesh_file": mesh_path.name,
-            "units": "unscaled",
-            "frame": "object",
-        },
     )
     print(
         f"未定尺度 mesh：{mesh_path}；追踪前须提供实测尺寸或明确缩放系数。", flush=True

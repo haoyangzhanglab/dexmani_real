@@ -16,7 +16,7 @@ python -m cordvip_geometry check
 
 常用脚本是[物体重建](../../scripts/cordvip/reconstruct_object.py)、[体积点数分配](../../scripts/cordvip/allocate_points.py)和[Raw 追踪](../../scripts/cordvip/track_object.py)。命令与数据示例见[脚本说明](../../scripts/cordvip/README.md)，细节见[使用文档](docs/usage.md)。
 
-`object select --segmentation-dir DIR --instance 0 --headless --output NEW_DIR` 仅需候选目录的 `rgb.png` 和 `candidates.npz`，输出 `mask.png`、`foreground_rgba.png`、`overlay.png` 与简洁的 `selection.json`；若有 `source_rgbd.npz`，校验可读取且 RGB 像素与候选 RGB 相同后保留绑定。再次选择仍使用原候选目录，不依赖分割日志、预览或原始照片副本。
+`object select --segmentation-dir DIR --instance 0 --headless --output NEW_DIR` 仅需候选目录的 `rgb.png` 和 `candidates.npz`，输出 `mask.png`、`foreground_rgba.png`、`overlay.png` 与简洁的 `selection.json`。唯一候选可省略 `--instance`，多候选需明确索引。再次选择仍使用原候选目录，不依赖分割日志、预览或原始照片副本。
 
 ## Python 调用
 
@@ -32,7 +32,7 @@ with (
         points_camera = tracker.model_points(result, "object")
 ```
 
-`assets` 为对象名到资产目录的映射，`selections` 为对象名到首帧 PNG/NPY mask 文件或选择目录的映射；目录仅需 `selection.json` 的 `mask_file`，可选 `source_rgbd.npz` 存在时核对首帧实际数据。宿主持有相机时，用 `RGBDFrame.from_camera(camera, row.camera)` 构造帧，再调用 `tracker.step(frame)`。也可省略 `initial_selections`，改在首帧传入原 RGB 网格的 `initial_masks`；两种初始化输入不能混用。实时重复样本复用结果，Raw 每行均独立处理。点云按需重建为米制 `float32 (N, 3)`，可用 `T_target_camera` 变换到基座坐标系。
+`assets` 为对象名到资产目录的映射，`selections` 为对象名到首帧 PNG/NPY mask 文件或选择目录的映射；目录仅需 `selection.json` 的 `mask_file`，附带来源文件不参与校验。宿主持有相机时，用 `RGBDFrame.from_camera(camera, row.camera)` 构造帧，再调用 `tracker.step(frame)`。也可省略 `initial_selections`，改在首帧传入原 RGB 网格的 `initial_masks`；两种初始化输入不能混用。tracker 按每次调用推进，Raw 每行均独立处理；实时宿主可在相机输入处按 ring sequence 去重。点云按需重建为米制 `float32 (N, 3)`，可用 `T_target_camera` 变换到基座坐标系。
 
 mask 支持 `1/L/P` PNG 及 bool/uint8 单通道 NPY，尺寸须与 RGB 一致；`P` 模式按实际调色板转灰度，再以非零像素为前景，其他多通道和高位深输入不支持。CLI 与 Python API 的对象名均按唯一、非空的合法单级目录名原样使用，允许 `Object-1`、`1st_object`、中文和 `A__B`；禁止 `.`、`..`、路径分隔符及绝对路径。
 

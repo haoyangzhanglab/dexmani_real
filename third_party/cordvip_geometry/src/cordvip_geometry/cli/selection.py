@@ -1,6 +1,6 @@
 """物体候选预览、显式确认与选择产物；不持有分割模型。"""
 
-from ..io import write_selection
+from ..io import write_npz, write_selection
 from ..viewer import display_available
 
 
@@ -28,13 +28,15 @@ def save_candidates(output, rgb, candidates):
     import numpy as np
     from PIL import Image
 
-    np.savez_compressed(
+    write_npz(
         output / "candidates.npz",
-        masks=np.stack([c["mask"] for c in candidates]),
-        boxes=np.stack([c["box_xyxy"] for c in candidates]),
-        scores=np.asarray([c["score"] for c in candidates]),
-        mask_scores=np.asarray([c["mask_score"] for c in candidates]),
-        labels=np.asarray([c["label"] for c in candidates], dtype=str),
+        {
+            "masks": np.stack([c["mask"] for c in candidates]),
+            "boxes": np.stack([c["box_xyxy"] for c in candidates]),
+            "scores": np.asarray([c["score"] for c in candidates]),
+            "mask_scores": np.asarray([c["mask_score"] for c in candidates]),
+            "labels": np.asarray([c["label"] for c in candidates], dtype=str),
+        },
     )
     width = min(rgb.shape[1], 420)
     height = max(1, round(rgb.shape[0] * width / rgb.shape[1]))
@@ -58,7 +60,11 @@ def choose(rgb, candidates, instance, *, headless, name="object"):
     if instance is not None and not 0 <= instance < len(candidates):
         raise ValueError(f"--instance 必须位于 0..{len(candidates) - 1}")
     if headless:
-        return instance
+        if instance is not None:
+            return instance
+        if len(candidates) == 1:
+            return 0
+        raise ValueError(f"{name}: 多个候选需要明确 --instance（0..{len(candidates) - 1}）")
     display_available()
     import cv2
     import numpy as np

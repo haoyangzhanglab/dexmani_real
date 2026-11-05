@@ -6,9 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .geometry import MAX_MESH_FACES, simplify_mesh, validate_pose
+from .geometry import simplify_mesh, validate_pose
 
-PLUS_REVISION = "58aa7154de23ae86d542366858fc6bcca3b747b0"
 MIN_DEPTH_PIXELS = 4
 
 
@@ -46,8 +45,7 @@ def guide_centered_pose(pose_camera_centered, intrinsics, mask):
 
 class PoseTracker:
     def __init__(self, root, mesh, debug_dir, *, shared_with=None):
-        self.root = Path(root).expanduser().resolve()
-        self.source_faces = len(mesh.faces)
+        root = Path(root).expanduser().resolve()
         self.mesh = simplify_mesh(mesh)
 
         if shared_with is None:
@@ -57,7 +55,7 @@ class PoseTracker:
                 raise RuntimeError(
                     "FoundationPose requires CUDA; input validation alone does not run tracking"
                 )
-            sys.path.insert(0, str(self.root))
+            sys.path.insert(0, str(root))
             estimator_module = importlib.import_module("estimater")
             import nvdiffrast.torch as dr
 
@@ -132,21 +130,3 @@ class PoseTracker:
             .numpy()
             .reshape(4, 4)
         )
-
-    @property
-    def provenance(self):
-        return {
-            "method": "FoundationPose++",
-            "guidance_revision": PLUS_REVISION,
-            "kalman": False,
-            "foundationpose_root": str(self.root),
-            "register_iterations": 5,
-            "track_iterations": 2,
-            "object_initialization_numpy_seed": 0,
-            "model_diameter_m": float(self.estimator.diameter),
-            "source_faces": self.source_faces,
-            "tracking_faces": len(self.mesh.faces),
-            "mesh_simplification": "quadric_decimation"
-            if self.source_faces > MAX_MESH_FACES
-            else "none",
-        }

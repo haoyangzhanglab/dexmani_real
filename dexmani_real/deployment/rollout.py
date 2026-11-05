@@ -86,7 +86,7 @@ class Rollout:
         self.preparation_issue = None
         self.run_deadline_ns = None
         self.last_slot = -1
-        self.dt_ns = round(policy_info.control_dt_s * 1e9)
+        self.dt_ns = round(self.execution.control_dt_s * 1e9)
         self.started_ns = self.next_step_ns = 0
         self.previous_arm = None
         self.first_prediction = True
@@ -247,7 +247,7 @@ class Rollout:
         if not self.preparation_valid():
             raise OperationCancelled("cancelled before recorder start")
         if self.record_raw:
-            self.recorder = EpisodeRecorder(self.output_dir, control_hz=1 / self.policy_info.control_dt_s)
+            self.recorder = EpisodeRecorder(self.output_dir, control_hz=1 / self.execution.control_dt_s)
             metadata = snapshot_recording_metadata(
                 self.camera_snapshot,
                 tactile_reset_metadata=self.robot.hand.tactile_reset_metadata,
@@ -289,11 +289,7 @@ class Rollout:
     def poll_model(self):
         future = self.model.poll()
         if future is not None:
-            result = future.result()
-            actions = np.asarray(result, dtype=np.float64)
-            expected = (self.policy_info.future_steps, self.policy_info.control_action_dim)
-            if actions.shape != expected or not np.isfinite(actions).all():
-                raise ValueError(f"policy prediction requires finite shape {expected}")
+            actions = future.result()
             # 当前 rollout 独占消费预测结果；只有时间窗口模式需要 query 锚点。
             if self.execution.mode == "sync":
                 self.plan = ActionChunk(actions, 0)

@@ -1,4 +1,4 @@
-"""解析训练参数与真机配置，在模型和设备启动前校验。"""
+"""模型加载后解析有效真机配置，在设备连接前校验。"""
 
 from __future__ import annotations
 
@@ -7,15 +7,14 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from dexmani_real.config.deployment import ExecutionConfig
-from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 
 if TYPE_CHECKING:
     from dexmani_real.config.real import RealConfig
 
 
-def _restore_cloud_config(recipe, config_type):
-    config = config_type(**recipe)
+def _restore_cloud_config(recipe, fallback):
+    config = type(fallback)(**recipe) if recipe is not None else fallback
     config.validate()
     return config
 
@@ -23,10 +22,12 @@ def _restore_cloud_config(recipe, config_type):
 def validate_execution_config(info, execution: ExecutionConfig) -> None:
     if execution.mode not in {"sync", "async", "rtc"}:
         raise ValueError("execution.mode must be sync, async or rtc")
-    if execution.mode not in info.supported_execution_modes:
-        raise NotImplementedError(f"Policy does not support {execution.mode} execution")
+    if execution.mode == "rtc" and not info.supports_rtc:
+        raise NotImplementedError("Policy does not support RTC")
 
-    dt = info.control_dt_s
+    dt = execution.control_dt_s
+    if dt is None:
+        raise ValueError("Checkpoint has no control period; set execution.control_dt_s")
     if (
         type(dt) not in (int, float)
         or not math.isfinite(dt * 1e9)
@@ -66,20 +67,13 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     execution = replace(
         runtime.execution,
         action_steps=info.n_action_steps if action_steps is None else action_steps,
+        control_dt_s=(info.control_dt_s if runtime.execution.control_dt_s is None
+                      else runtime.execution.control_dt_s),
     )
     validate_execution_config(info, execution)
     names = set(info.observation_fields)
     if not runtime.hand.enabled:
         raise ValueError("Dexterous policy deployment requires hand.enabled=true")
-    if "fingertip_xyz" in names:
-        links = info.fingertip_link_names
-        if (
-            not isinstance(links, (list, tuple))
-            or len(links) != 5
-            or any(not isinstance(link, str) or not link.strip() for link in links)
-            or len(set(links)) != 5
-        ):
-            raise ValueError("Live fingertip_xyz requires five distinct non-empty link names")
     if "depth" in names:
         recipe = info.depth_config
         if not isinstance(recipe, dict) or "shape" not in recipe or "depth_scale_m" not in recipe:
@@ -94,16 +88,16 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
         runtime,
         execution=execution,
         pointcloud=(
-            _restore_cloud_config(info.pointcloud_config, PointCloudConfig)
+            _restore_cloud_config(info.pointcloud_config, runtime.pointcloud)
             if "point_cloud" in names else runtime.pointcloud
         ),
         hand_pointcloud=(
-            _restore_cloud_config(info.hand_pointcloud_config, HandCloudConfig)
+            _restore_cloud_config(info.hand_pointcloud_config, runtime.hand_pointcloud)
             if "hand_pointcloud" in names else runtime.hand_pointcloud
         ),
     )
     validate_robot_config(runtime)
     if info.action_mode == "eef":
         runtime.environment.validate()
-    validate_control_rate(runtime, 1.0 / info.control_dt_s)
+    validate_control_rate(runtime, 1.0 / execution.control_dt_s)
     return runtime

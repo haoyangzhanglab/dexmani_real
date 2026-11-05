@@ -25,6 +25,7 @@ class PolicyWorker:
 
     def _load(self):
         self.model = self.factory()
+        return self.model.info
 
     def load(self):
         self._submit(self._load)

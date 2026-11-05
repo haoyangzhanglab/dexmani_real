@@ -1,11 +1,8 @@
 """首帧选择与离线结果读写。"""
 
 import json
-import logging
 from datetime import datetime, timezone
 from pathlib import Path
-
-logger = logging.getLogger(__name__)
 
 
 def new_output(path, *, workspace, protected=()):
@@ -105,10 +102,7 @@ def write_selection(directory, mask, metadata, *, mask_file, foreground_rgb=None
 
 
 def load_initial_selection(path, frame):
-    """载入当前首帧原始 RGB 网格的 mask；目录内可选 RGB-D 绑定须匹配。"""
-    import numpy as np
-
-    from .rgbd import load_frame
+    """载入应用于当前首帧原始 RGB 网格的 mask。"""
 
     path = Path(path).expanduser().resolve()
     if not path.is_dir():
@@ -117,14 +111,6 @@ def load_initial_selection(path, frame):
     metadata = json.loads((directory / "selection.json").read_text())
     if not isinstance(metadata, dict) or not isinstance(metadata.get("mask_file"), str):
         raise TypeError("selection.json must name a mask_file")
-    binding = directory / "source_rgbd.npz"
-    if binding.exists() or binding.is_symlink():
-        saved = load_frame(existing_file(binding))
-        for key in ("rgb", "depth_m", "K", "distortion_model", "distortion_coeffs"):
-            if not np.array_equal(getattr(saved, key), getattr(frame, key)):
-                raise ValueError(
-                    f"initial-selection {key} differs from the actual first source frame"
-                )
     mask_path = (directory / metadata["mask_file"]).resolve()
     if not mask_path.is_relative_to(directory):
         raise ValueError("initial-selection mask must remain inside its directory")
@@ -136,22 +122,11 @@ def write_npz(path, arrays):
     import numpy as np
 
     path = Path(path)
+    # 独占打开失败时尚未拥有文件，不能进入半成品清理。
     stream = path.open("xb")
-    failure = None
     try:
-        np.savez_compressed(stream, **arrays)
-    except BaseException as error:  # noqa: BLE001 - 释放资源后重抛首错
-        failure = error
-    try:
-        stream.close()
-    except BaseException as error:
-        if failure is None:
-            failure = error
-        else:
-            logger.exception("NPZ close also failed: %s", path)
-    if failure is not None:
-        try:
-            path.unlink()
-        except OSError:
-            logger.exception("unfinished NPZ removal also failed: %s", path)
-        raise failure
+        with stream:
+            np.savez_compressed(stream, **arrays)
+    except BaseException:
+        path.unlink()
+        raise

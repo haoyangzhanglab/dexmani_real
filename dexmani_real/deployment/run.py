@@ -1,35 +1,15 @@
-"""加载策略信息并完成准入，再创建评估产物和设备会话。"""
+"""校验实验预算，将模型加载和设备生命周期交给会话。"""
 
 from __future__ import annotations
 
-import logging
 import math
-import time
 from pathlib import Path
 
 from dexmani_real.config.deployment import (
     DEFAULT_MAX_RUNNING_S,
     DEFAULT_NUM_EPISODES,
 )
-from dexmani_real.deployment.observation import ObservationBuilder
-from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.deployment.session import PolicySession
-
-logger = logging.getLogger(__name__)
-
-
-def session_directory(root: Path) -> Path:
-    base = root.expanduser().resolve()
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    candidate = base / f"session_{stamp}"
-    dedup = 1
-    while True:
-        try:
-            candidate.mkdir(parents=True, exist_ok=False)
-            return candidate
-        except FileExistsError:
-            candidate = base / f"session_{stamp}_{dedup:02d}"
-            dedup += 1
 
 
 def run_policy(
@@ -58,41 +38,18 @@ def run_policy(
         if num_episodes < 1:
             raise ValueError("num_episodes must be a positive integer")
 
-    from dexmani_policy.deployment import inspect_policy
-
-    info = inspect_policy(
-        policy, weights=weights, inference_steps=inference_steps,
-    )
-    runtime = resolve_deployment_config(info, runtime)
-    observations = ObservationBuilder(info, runtime)
     if camera_calibration_path is not None:
         camera_calibration_path = Path(camera_calibration_path).expanduser().resolve()
-    session_dir = None
-    if output is not None or record_raw:
-        root = output if output is not None else Path(__file__).resolve().parents[2] / "rollouts"
-        try:
-            session_dir = session_directory(Path(root))
-        except Exception:
-            if record_raw:
-                raise
-            logger.exception("辅助输出目录创建失败：%s", root)
-
-    print(f"策略：{policy}；数值表示 recipe 与控制 dt 来自训练 artifact，设备和标定来自 Real")
-    duration = f"{max_running_s:g} s" if max_running_s is not None else "无限制"
-    print(
-        f"评估：{num_episodes if num_episodes is not None else '不限'} 轮正式运行结束后退出 | "
-        f"每轮预算 {duration} | 输入：{', '.join(info.observation_fields)}"
-    )
-    print(f"输出：{session_dir}" if session_dir is not None else "输出：仅终端")
     return PolicySession(
         runtime,
-        info,
+        policy,
+        weights=weights,
+        inference_steps=inference_steps,
         device=device,
         seed=seed,
         max_running_s=max_running_s,
         num_episodes=num_episodes,
         record_raw=record_raw,
-        output_dir=session_dir,
+        output_root=output,
         camera_calibration_path=camera_calibration_path,
-        observations=observations,
     ).run()

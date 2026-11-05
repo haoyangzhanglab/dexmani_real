@@ -11,7 +11,7 @@ from pathlib import Path
 def main(argv=None, *, workspace=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "result", type=Path, help="track 输出目录，含 scene.json、run.json 和 frames/"
+        "result", type=Path, help="track 输出目录，含 scene.json 和 frames/"
     )
     parser.add_argument(
         "--no-3d", action="store_true", help="只看 RGB 叠加，不加载 Open3D"
@@ -19,7 +19,7 @@ def main(argv=None, *, workspace=None):
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="只读取 RGB 和来源行/时钟，不加载 OpenCV/Open3D 或打开窗口",
+        help="只读取 RGB 和可选来源说明，不加载 OpenCV/Open3D 或打开窗口",
     )
     args = parser.parse_args(argv)
     return view_results(args.result, show_3d=not args.no_3d, headless=args.headless)
@@ -37,13 +37,12 @@ def view_results(directory, *, show_3d=True, headless=False):
     model_templates = None
     count = 0
     if not headless:
-        from ..viewer import SceneViewer, scene_clouds, scene_display
+        from ..viewer import OBJECT_COLORS, SceneViewer, scene_clouds, scene_display
 
         scene = json.loads((directory / "scene.json").read_text())
-        run = json.loads((directory / "run.json").read_text())
         names = [item["id"] for item in scene["objects"]]
         model_names = [item["id"] for item in scene["objects"] if item.get("asset")]
-        colors = run["colors_rgb"]
+        colors = {name: OBJECT_COLORS[i % len(OBJECT_COLORS)] for i, name in enumerate(names)}
         viewer = SceneViewer(show_3d=show_3d)
     with viewer if viewer is not None else nullcontext() as viewer:
         for path in paths:
@@ -51,8 +50,9 @@ def view_results(directory, *, show_3d=True, headless=False):
                 # 每个显示字段只解压一次；分析用大数组留在 NPZ 中。
                 frame = {
                     key: saved[key]
-                    for key in ("rgb", "row_index", "timestamp_ns", "clock")
+                    for key in ("row_index", "timestamp_ns", "clock") if key in saved.files
                 }
+                frame["rgb"] = saved["rgb"]
                 if viewer is not None:
                     frame["K"] = saved["K"]
                     for name in names:
@@ -81,23 +81,8 @@ def view_results(directory, *, show_3d=True, headless=False):
                 or min(rgb.shape[:2]) == 0
             ):
                 raise ValueError("scene result RGB must be nonempty uint8 [H,W,3]")
-            row = frame["row_index"].item()
-            timestamp = frame["timestamp_ns"].item()
-            clock = frame["clock"].item()
-            if (
-                type(row) is not int
-                or row < 0
-                or type(timestamp) is not int
-                or timestamp <= 0
-                or not isinstance(clock, str)
-                or not clock
-            ):
-                raise ValueError(
-                    "scene row requires integer source row/time and a nonempty clock"
-                )
-            if path.stem != f"{row:06d}":
-                raise ValueError(f"{path}: filename differs from source row_index")
-            print(f"row={row} timestamp_ns={timestamp} clock={clock}")
+            details = " ".join(f"{key}={frame[key].item()}" for key in ("row_index", "timestamp_ns", "clock") if key in frame)
+            print(f"{path.name}" + (f": {details}" if details else ""))
             if viewer is not None:
                 viewer.update(scene_display(frame, names, colors))
                 if show_3d:

@@ -130,7 +130,6 @@ class SceneTracker:
                 validate_object_name(name)
         self.segmenter = segmenter
         self.assets = assets
-        self.asset_metadata = {}
         self.initial_selections = initial_selections
         self.pixel_stride = pixel_stride
         self.depth_tolerance_m = depth_tolerance_m
@@ -140,7 +139,6 @@ class SceneTracker:
         self.lost_objects = {}
         self.directions = self.maps = None
         self._camera: tuple[np.ndarray, tuple[int, int], str, tuple[float, ...]]
-        self._last_result = None
         shared = None
         for name, (mesh, _, _) in assets.items():
             tracker = PoseTracker(
@@ -188,11 +186,11 @@ class SceneTracker:
         checkpoint, config = resolve_sam_model(
             models_dir, sam_variant, sam_checkpoint, sam_config
         )
-        loaded, metadata = {}, {}
+        loaded = {}
         for name, path in assets.items():
             if path is not None:
                 path = Path(path).expanduser()
-                mesh, points, normals, metadata[name] = load_asset(
+                mesh, points, normals, _ = load_asset(
                     path if path.is_absolute() else workspace / path
                 )
                 loaded[name] = mesh, points, normals
@@ -224,7 +222,6 @@ class SceneTracker:
                     min_matched_pixels=min_matched_pixels,
                     min_matched_fraction=min_matched_fraction,
                 )
-                tracker.asset_metadata = metadata
                 try:
                     yield tracker
                 finally:
@@ -232,7 +229,7 @@ class SceneTracker:
                     tracker.renderers.clear()
 
     def step(self, frame, *, initial_masks=None):
-        """输入原 color 网格；同一实时相机帧复用结果，Raw 每行独立处理。"""
+        """输入原 color 网格，按调用顺序处理每一帧。"""
         maps = self.maps
         first = maps is None
         if first:
@@ -254,8 +251,7 @@ class SceneTracker:
                     validate_object_name(name)
         elif initial_masks is not None:
             raise ValueError("Create a new tracker to initialize another scene")
-        if self._last_result is not None:
-            previous = self._last_result["frame"]
+        if not first:
             K, shape, model, distortion = self._camera
             if (
                 frame.depth_m.shape != shape
@@ -266,18 +262,6 @@ class SceneTracker:
                 raise ValueError(
                     "A tracker requires one fixed camera calibration and image grid"
                 )
-            if (
-                frame.clock != previous.clock
-                or frame.timestamp_ns < previous.timestamp_ns
-            ):
-                raise ValueError("Frames must follow one chronological source clock")
-            if (
-                frame.row_index is None
-                and previous.row_index is None
-                and (frame.source_id, frame.timestamp_ns)
-                == (previous.source_id, previous.timestamp_ns)
-            ):
-                return self._last_result
         if maps is None:
             maps = RectificationMaps(
                 frame.depth_m.shape, frame.K, frame.distortion_coeffs
@@ -377,13 +361,12 @@ class SceneTracker:
                 "candidate_pose": poses.get(name),
                 "observed_valid": bool(len(cloud.observed_points_camera)),
             }
-        self._last_result = {
+        return {
             "frame": frame,
             "rgb": rgb,
             "objects": objects,
             "operation": "initialize" if first else "track",
         }
-        return self._last_result
 
     def model_points(self, result, name, *, T_target_camera=None):
         """按需由有效位姿重建固定模型点，默认位于 camera frame。"""
@@ -400,14 +383,14 @@ def scene_arrays(result):
     frame = result["frame"]
     hand = result.get("hand")
     payload = {
-        "source_id": frame.source_id,
-        "row_index": frame.row_index,
-        "timestamp_ns": frame.timestamp_ns,
-        "clock": frame.clock,
         "rgb": result["rgb"],
         "K": frame.K,
         "operation": result["operation"],
     }
+    for name in ("source_id", "row_index", "timestamp_ns", "clock"):
+        value = getattr(frame, name)
+        if value is not None:
+            payload[name] = value
     if hand is not None:
         T_base_camera = hand["T_base_camera"]
         hand_points, hand_normals = hand["points_camera"], hand["normals_camera"]

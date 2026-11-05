@@ -82,23 +82,6 @@ class GroundedSAM2:
         self.ids: list[str]
         self.shape: tuple[int, int]
         self.index = -1
-        self.provenance: dict[str, Any] = {
-            "method": "Grounding DINO + SAM2.1; fixed IDs; causal single-frame propagation",
-            "sam_root": str(root),
-            "checkpoint": str(checkpoint),
-            "sam_config": config,
-            "device": str(self.device),
-            "precision": "SAM2 bfloat16 autocast",
-            "history_frames": self.history_frames,
-            "fill_hole_area": 0,
-            "max_sprinkle_area": 0,
-            "non_overlap_masks": True,
-            "non_overlap_masks_for_mem_enc": True,
-            "overlap_policy": "initial overlap excluded; propagated SAM2 logit winner",
-            "compile_model": False,
-            "grounding": None,
-            "image_preprocessing": "SAM2 image predictor; video: RGB PIL LANCZOS square resize",
-        }
 
     def load_grounding(self):
         if self.detector is not None:
@@ -127,11 +110,6 @@ class GroundedSAM2:
             )
         finally:
             modeling_grounding_dino.load_cuda_kernels = loader
-        self.provenance["grounding"] = {
-            "directory": str(directory),
-            "precision": "float32",
-            "disable_custom_kernels": True,
-        }
 
     def predict(self, rgb, text, box_threshold, text_threshold):
         text = normalize_prompt(text)
@@ -281,7 +259,7 @@ def main():
                 args.sam_config,
                 args.dino_weights,
             )
-            pickle.dump(({"provenance": engine.provenance}, {}), protocol, protocol=5)
+            pickle.dump(({"ready": True}, {}), protocol, protocol=5)
             protocol.flush()
             while True:
                 try:
@@ -298,7 +276,6 @@ def main():
                         request["box_threshold"],
                         request["text_threshold"],
                     )
-                    reply["provenance"] = engine.provenance
                 elif operation == "initialize":
                     output["masks"] = engine.initialize(
                         arrays["rgb"],

@@ -6,6 +6,7 @@ import time
 from collections.abc import Sequence
 from concurrent.futures import wait
 from dataclasses import asdict
+from pathlib import Path
 from typing import cast
 
 from dexmani_real.config.calibration_data import CAMERAS_PATH
@@ -13,6 +14,8 @@ from dexmani_real.config.deployment import RUNTIME_SECTIONS
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.data.raw import camera_metadata
 from dexmani_real.deployment.inference import MODEL_SHUTDOWN_TIMEOUT_S, PolicyWorker
+from dexmani_real.deployment.observation import ObservationBuilder
+from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.deployment.rollout import Rollout, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
@@ -44,27 +47,36 @@ from dexmani_real.utils.table_plane import load_table_plane, resolve_table_plane
 logger = logging.getLogger(__name__)
 
 
+def session_directory(root: Path) -> Path:
+    base = root.expanduser().resolve()
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    candidate = base / f"session_{stamp}"
+    dedup = 1
+    while True:
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            candidate = base / f"session_{stamp}_{dedup:02d}"
+            dedup += 1
+
+
 class PolicySession:
     def __init__(
-        self, runtime, info, *, output_dir, device, seed,
+        self, runtime, policy, *, weights, inference_steps, output_root, device, seed,
         max_running_s, num_episodes, record_raw, camera_calibration_path,
-        observations,
     ):
-        self.runtime, self.info = runtime, info
+        self.runtime, self.policy = runtime, policy
+        self.weights, self.inference_steps = weights, inference_steps
+        self.info = self.observations = None
         self.table_plane_abcd = None
         self.device, self.seed = device, seed
         self.max_running_s, self.num_episodes = max_running_s, num_episodes
         self.record_raw = record_raw
-        self.output_dir = output_dir
+        self.output_root = output_root
+        self.output_dir = None
         self.camera_calibration_path = camera_calibration_path
-        self.observations = observations
-        record_needs = (
-            ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
-            if record_raw else ObservationNeeds()
-        )
-        self.model_needs = observations.needs
-        self.record_needs = record_needs
-        self.capture_needs = self.model_needs.union(record_needs)
+        self.camera_snapshot = None
         self.runtime_state = SessionState()
         self.startup_cancel_epoch = self.runtime_state.cancel_epoch
         self.sensors = self.robot = self.keyboard = self.model = None
@@ -111,12 +123,7 @@ class PolicySession:
 
     def run(self):
         configure_logging()
-        print(
-            f"执行：{self.info.checkpoint_path.name} ({self.info.weights}) | NFE={self.info.inference_steps} | "
-            f"A_exec={self.runtime.execution.action_steps} | {self.runtime.execution.mode} | "
-            f"{1.0 / self.info.control_dt_s:g} Hz"
-        )
-        print("正在初始化模型和设备…", flush=True)
+        print("正在加载策略模型…", flush=True)
         failure: BaseException | None = None
         try:
             try:
@@ -150,15 +157,6 @@ class PolicySession:
     def prepare_resources(self):
         from dexmani_policy.deployment import load_policy
 
-        needs = self.capture_needs
-        camera_required = needs.camera_worker or self.observations.camera_static
-        if camera_required:
-            self.runtime.camera.validate()
-        self.camera_snapshot = None
-        self.action_mapper = ActionMapper.for_mode(
-            self.info.action_mode, arm=self.runtime.arm, hand=self.runtime.hand,
-            motion=self.runtime.motion, environment=self.runtime.environment,
-        )
         self.keyboard = Keyboard(
             estop_callback=self.runtime_state.request_emergency_stop,
             bindings={
@@ -170,11 +168,49 @@ class PolicySession:
         if not self.startup_allowed():
             raise OperationCancelled("startup cancelled before model load")
         self.model = PolicyWorker(
-            lambda: load_policy(self.info, device=self.device, seed=self.seed),
-            build_observation=self.observations.build,
+            lambda: load_policy(self.policy, weights=self.weights, inference_steps=self.inference_steps,
+                                device=self.device, seed=self.seed),
+            build_observation=lambda rows: self.observations.build(rows),
         )
         self.model.load()
-        self.wait_model()
+        self.info = self.wait_model()
+        self.runtime = resolve_deployment_config(self.info, self.runtime)
+        self.observations = ObservationBuilder(self.info, self.runtime)
+        self.record_needs = (
+            ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
+            if self.record_raw else ObservationNeeds()
+        )
+        self.model_needs = self.observations.needs
+        self.capture_needs = self.model_needs.union(self.record_needs)
+        needs = self.capture_needs
+        camera_required = needs.camera_worker or self.observations.camera_static
+        if camera_required:
+            self.runtime.camera.validate()
+        self.action_mapper = ActionMapper.for_mode(
+            self.info.action_mode, arm=self.runtime.arm, hand=self.runtime.hand,
+            motion=self.runtime.motion, environment=self.runtime.environment,
+        )
+        if self.output_root is not None or self.record_raw:
+            root = self.output_root if self.output_root is not None else Path(__file__).resolve().parents[2] / "rollouts"
+            try:
+                self.output_dir = session_directory(Path(root))
+            except Exception:
+                if self.record_raw:
+                    raise
+                logger.exception("辅助输出目录创建失败：%s", root)
+        print(
+            f"执行：{self.info.checkpoint_path.name} ({self.info.weights}) | NFE={self.info.inference_steps} | "
+            f"A_exec={self.runtime.execution.action_steps} | {self.runtime.execution.mode} | "
+            f"{1.0 / self.runtime.execution.control_dt_s:g} Hz"
+        )
+        duration = f"{self.max_running_s:g} s" if self.max_running_s is not None else "无限制"
+        print(f"评估：{self.num_episodes if self.num_episodes is not None else '不限'} 轮 | 每轮预算 {duration} | 输入：{', '.join(self.info.observation_fields)}")
+        for name, field in (("pointcloud", "point_cloud"), ("hand_pointcloud", "hand_pointcloud")):
+            if field in self.info.observation_fields:
+                print(f"{field}: {asdict(getattr(self.runtime, name))}")
+        if "depth" in self.info.observation_fields:
+            print(f"depth: {self.info.depth_config}")
+        print(f"输出：{self.output_dir}" if self.output_dir is not None else "输出：仅终端")
 
         self.process_context = mp.get_context("spawn")
         channels = (
@@ -318,9 +354,9 @@ class PolicySession:
             self.check_startup()
             future = self.model.poll()
             if future is not None:
-                future.result()
+                result = future.result()
                 self.check_startup()
-                return
+                return result
             time.sleep(0.005)
 
     def warmup_policy(self):

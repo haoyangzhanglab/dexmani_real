@@ -41,18 +41,13 @@ def add_sam_arguments(parser, workspace):
     parser.add_argument("--sam-config", help="自训模型在 SAM2 包内的配置")
 
 
-def resolve_sam_arguments(args, workspace=None):
+def resolve_sam_arguments(args):
     from ..models import resolve_sam_model
 
-    if workspace is not None:
-        args.workspace = Path(workspace).expanduser().resolve()
     args.models_dir = args.models_dir.expanduser().resolve()
-    custom = args.sam_checkpoint is not None or args.sam_config is not None
     args.sam_checkpoint, args.sam_config = resolve_sam_model(
         args.models_dir, args.sam_variant, args.sam_checkpoint, args.sam_config
     )
-    if not custom:
-        args.sam_variant = args.sam_variant or "small"
     return args
 
 
@@ -159,7 +154,7 @@ def parse_object_args(argv=None, *, workspace=None):
         help="从已有候选确认物体",
         description=(
             "从 rgb.png 和 candidates.npz 选择物体，写出 mask.png、foreground_rgba.png、"
-            "overlay.png 和 selection.json；若有 source_rgbd.npz，校验 RGB 像素一致后保留绑定。"
+            "overlay.png 和 selection.json。"
             "再次选择仍使用原候选目录。"
         ),
     )
@@ -192,13 +187,6 @@ def parse_object_args(argv=None, *, workspace=None):
             "--output", type=Path, required=True, help="尚不存在的新输出目录"
         )
     args = parser.parse_args(argv)
-    if (
-        args.command in {"segment", "select", "build"}
-        and args.headless
-        and args.instance is None
-        and not getattr(args, "list_only", False)
-    ):
-        parser.error("--headless 必须指定 --instance；未知索引时先 segment --list-only")
     if args.command == "build" and args.headless and args.preview:
         parser.error("--headless 与 --preview 不能同时使用")
     if hasattr(args, "sam_variant"):
