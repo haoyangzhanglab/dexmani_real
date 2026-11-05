@@ -23,6 +23,7 @@ class HandObjective:
             np.array([config.proximal_direction_weight, config.direction_weight]) / config.direction_huber_delta
         )
         self.pinch_weights = config.pinch_weight * targets.activation**2 / 4.0
+        self.pinch_enabled = bool(np.any(self.pinch_weights))
         self.position_weights = np.zeros((5, 3))
         self.position_weights[:, :2] = config.shape_weight
         self.position_weights[:, 2] = config.tip_weight
@@ -63,17 +64,18 @@ class HandObjective:
             ) / length[:, :, None]
             grad += np.einsum("s,fsc,fscq->q", self.direction_weights, direction_grad, np.diff(jac, axis=1)) / 5.0
 
-        pair = points[1:, 2] - points[0, 2]
-        # 可微范数只用于优化器，不把 epsilon 注入人手角度或尺度估计。
-        distance = np.sqrt(np.sum(pair**2, axis=1) + 1e-12)
-        error = ((distance - targets.pinch_distances) / scale)[:, None]
-        losses, derivatives = huber(error, delta)
-        value += np.dot(self.pinch_weights, losses)
-        if gradient.size:
-            grad += np.einsum(
-                "f,fc,fcq->q", self.pinch_weights * derivatives[:, 0] / scale,
-                pair / distance[:, None], jac[1:, 2] - jac[0, 2],
-            )
+        if self.pinch_enabled:
+            pair = points[1:, 2] - points[0, 2]
+            # 可微范数只用于优化器，不把 epsilon 注入人手角度或尺度估计。
+            distance = np.sqrt(np.sum(pair**2, axis=1) + 1e-12)
+            error = ((distance - targets.pinch_distances) / scale)[:, None]
+            losses, derivatives = huber(error, delta)
+            value += np.dot(self.pinch_weights, losses)
+            if gradient.size:
+                grad += np.einsum(
+                    "f,fc,fcq->q", self.pinch_weights * derivatives[:, 0] / scale,
+                    pair / distance[:, None], jac[1:, 2] - jac[0, 2],
+                )
 
         difference = qpos - self.previous
         value += 0.5 * self.damping * np.dot(difference, difference)
