@@ -144,6 +144,8 @@ def test_submission_cancel_records_attempt_without_advancing_reference(loop, exp
     obj, clock = loop
     previous = obj.last_command
     deadline = obj.target_deadline_ns
+    obj.termination_details = []
+    obj.request_episode_end = TeleopLoop.request_episode_end.__get__(obj)
     obj.controller.compute_target.return_value = ActionResult(np.ones(7), np.ones(12), eef_pose='new_pose')
     def cancel(*args, **kwargs):
         if expired:
@@ -160,9 +162,13 @@ def test_submission_cancel_records_attempt_without_advancing_reference(loop, exp
     attempted = obj.robot.send_action.call_args.args[0]
     np.testing.assert_array_equal(attempted.arm_qpos, np.ones(7))
     obj.recorder.append.assert_called_once_with('cancelled', attempted)
-    obj.request_episode_end.assert_called_once()
-    if expired:
-        assert obj.runtime_state.stop_signal.is_set()
+    assert obj.pending_termination_reason == 'cancelled'
+    assert obj.termination_details == [{
+        'stage': 'termination', 'reason': 'control_interrupted: cancelled between arm and hand',
+    }]
+    assert obj.runtime_state.stop_signal.is_set()
+    assert obj.controller.previous_eef_target == 'old_pose'
+    obj.audio.play.assert_not_called()
 
 
 def test_programming_error_is_not_an_ordinary_hold(loop):

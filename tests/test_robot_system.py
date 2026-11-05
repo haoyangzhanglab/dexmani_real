@@ -1,4 +1,6 @@
+import multiprocessing as mp
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -7,6 +9,7 @@ import pytest
 
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand, RobotError
 from dexmani_real.robot.system import Robot
+from dexmani_real.robot.xarm7.protocol import ArmChannels
 from dexmani_real.robot.xhand.feedback import XHandState
 
 
@@ -135,3 +138,54 @@ def test_hand_sdk_failure_keeps_stop_required(robot):
         obj.send_action(RobotCommand(hand_qpos=np.zeros(12)), expires_ns=clock[0] + 100_000_000)
     assert obj.hand_stop_required
     assert obj.runtime_state.stop_signal.is_set()
+
+
+@pytest.fixture
+def arm_channels():
+    ctx = mp.get_context('spawn')
+    return ArmChannels(ctx, stop_signal=ctx.Event(), emergency_signal=ctx.Event())
+
+
+def test_arm_mailbox_lock_expiry_cancels_without_overwriting_goal(arm_channels):
+    arm_channels.publish_goal(
+        RobotCommand(arm_qpos=np.full(7, .1)), expires_ns=time.monotonic_ns() + 1_000_000_000,
+    )
+    previous = bytes(arm_channels.goal)
+    assert arm_channels.goal_lock.acquire(timeout=.1)
+    try:
+        with pytest.raises(OperationCancelled, match='expired waiting for mailbox'):
+            arm_channels.publish_goal(
+                RobotCommand(arm_qpos=np.full(7, .2)),
+                expires_ns=time.monotonic_ns() + 20_000_000,
+            )
+        assert not arm_channels.goal_lock.acquire(False)
+    finally:
+        arm_channels.goal_lock.release()
+    assert bytes(arm_channels.goal) == previous
+
+
+def test_arm_mailbox_expired_goal_cancels_without_overwriting_goal(arm_channels):
+    arm_channels.publish_goal(
+        RobotCommand(arm_qpos=np.full(7, .1)), expires_ns=time.monotonic_ns() + 1_000_000_000,
+    )
+    previous = bytes(arm_channels.goal)
+    with pytest.raises(OperationCancelled, match='arm target deadline expired'):
+        arm_channels.publish_goal(
+            RobotCommand(arm_hold=True), expires_ns=time.monotonic_ns() - 1,
+        )
+    assert bytes(arm_channels.goal) == previous
+    assert arm_channels.take_goal() is not None
+
+
+@pytest.mark.parametrize('hold', [False, True])
+def test_arm_mailbox_valid_goal_preserves_command_and_deadline(arm_channels, hold):
+    command = RobotCommand(arm_hold=True) if hold else RobotCommand(arm_qpos=np.arange(7) * .1)
+    expires_ns = time.monotonic_ns() + 1_000_000_000
+    arm_channels.publish_goal(command, expires_ns=expires_ns)
+    goal = arm_channels.take_goal()
+    assert goal is not None
+    assert goal['pending']
+    assert bool(goal['hold']) == hold
+    assert goal['expires_ns'] == expires_ns
+    np.testing.assert_array_equal(goal['q_goal'], np.zeros(7) if hold else command.arm_qpos)
+    assert arm_channels.take_goal() is None

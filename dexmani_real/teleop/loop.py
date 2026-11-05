@@ -127,11 +127,9 @@ class TeleopLoop:
         recorder = self.recorder
         if recorder is None:
             return
-        reason = self.pending_termination_reason
-        save = not self.discard_requested
         published = recorder.finish(
-            save=save,
-            reason=reason,
+            save=not self.discard_requested,
+            reason=self.pending_termination_reason,
             details=self.termination_details,
         )
         # finish 失败时保留 recorder，让会话收尾继续持有未释放的 writer。
@@ -140,9 +138,7 @@ class TeleopLoop:
         if self.runtime_state.estop_request:
             self.audio.play("emergency")
             return
-        if request.reason not in {"operator", "quit", "duration_complete"} or any(
-            "exception_type" in detail for detail in request.details
-        ):
+        if request.reason not in {"operator", "quit", "duration_complete"}:
             return
         if published is not None and recorder.recording_truncated_reason is None:
             logger.info("本段已保存。")

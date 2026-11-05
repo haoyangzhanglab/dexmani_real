@@ -52,7 +52,7 @@ class ArmChannels:
 
     def publish_goal(self, command, *, expires_ns):
         if not self.goal_lock.acquire(timeout=max(0, expires_ns - time.monotonic_ns()) / 1e9):
-            raise TimeoutError("arm target publication expired waiting for mailbox")
+            raise OperationCancelled("arm target publication expired waiting for mailbox")
         try:
             if (
                 self.closing.is_set()
