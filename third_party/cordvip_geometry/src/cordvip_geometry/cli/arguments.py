@@ -63,19 +63,19 @@ def parse_tracking_args(argv=None, *, workspace=None):
     )
     parser.set_defaults(workspace=workspace)
     parser.add_argument(
-        "--episode", type=Path, required=True, help="只读 Raw episode 目录"
+        "--episode", required=True, help="只读 Raw episode 目录"
     )
     parser.add_argument(
-        "--scene", type=Path, help="多物体 JSON；对象 id 使用唯一、非空的合法单级目录名"
+        "--scene", help="多物体 JSON；对象 id 使用唯一、非空的合法单级目录名"
     )
     parser.add_argument(
-        "--asset", type=Path, help="米制物体资产；省略时只处理 mask 和实测点"
+        "--asset", help="米制物体资产；省略时只处理 mask 和实测点"
     )
     parser.add_argument(
         "--prompt", help="首帧目标文本；未提供 --initial-selection 时必需"
     )
     parser.add_argument(
-        "--initial-selection", type=Path,
+        "--initial-selection",
         help=(
             "当前首帧原始 RGB 网格的 1/L/P PNG（P 按调色板转灰度，非零为前景）、"
             "bool/uint8 单通道 NPY，或含 selection.json 的目录"
@@ -98,15 +98,19 @@ def parse_tracking_args(argv=None, *, workspace=None):
     for name in ("episode", "scene", "asset", "initial_selection"):
         value = getattr(args, name)
         if value is not None:
-            setattr(args, name, (workspace / value.expanduser()).resolve())
-    if args.scene and (args.asset or args.initial_selection or args.prompt):
+            if not value:
+                parser.error(f"--{name.replace('_', '-')} 需要非空路径")
+            setattr(args, name, (workspace / Path(value).expanduser()).resolve())
+    if args.scene is not None and any(
+        value is not None for value in (args.asset, args.initial_selection, args.prompt)
+    ):
         parser.error("--scene 不能混用单物体参数")
     if args.headless and args.initial_selection is None and args.scene is None:
         parser.error("--headless 需要 --initial-selection 或 --scene")
-    if args.prompt is not None and not args.prompt.strip():
-        parser.error("--prompt 不能为空")
-    if args.scene is None and args.initial_selection is None and args.prompt is None:
-        parser.error("必须提供 --prompt、--initial-selection 或 --scene")
+    if args.scene is None and args.initial_selection is None and (
+        args.prompt is None or not args.prompt.strip()
+    ):
+        parser.error("未提供初始 mask 时需要非空 --prompt，或通过 --scene 指定对象")
     try:
         return resolve_sam_arguments(args)
     except ValueError as error:

@@ -34,7 +34,7 @@ with (
 
 `assets` 为对象名到资产目录的映射，`selections` 为对象名到首帧 PNG/NPY mask 文件或选择目录的映射；目录仅需 `selection.json` 的 `mask_file`，附带来源文件不参与校验。宿主持有相机时，用 `RGBDFrame.from_camera(camera, row.camera)` 构造帧，再调用 `tracker.step(frame)`。也可省略 `initial_selections`，改在首帧传入原 RGB 网格的 `initial_masks`；两种初始化输入不能混用。tracker 按每次调用推进，Raw 每行均独立处理；实时宿主可在相机输入处按 ring sequence 去重。点云按需重建为米制 `float32 (N, 3)`，可用 `T_target_camera` 变换到基座坐标系。
 
-mask 支持 `1/L/P` PNG 及 bool/uint8 单通道 NPY，尺寸须与 RGB 一致；`P` 模式按实际调色板转灰度，再以非零像素为前景，其他多通道和高位深输入不支持。普通选择保存允许全前景，空选择仍拒绝；Hunyuan 生成入口另要求透明背景。CLI 与 Python API 的对象名均按唯一、非空的合法单级目录名原样使用，允许 `Object-1`、`1st_object`、中文和 `A__B`；禁止 `.`、`..`、路径分隔符及绝对路径。
+mask 支持 `1/L/P` PNG 及 bool/uint8 单通道 NPY，尺寸须与 RGB 一致；`P` 模式按实际调色板转灰度，再以非零像素为前景，其他多通道和高位深输入不支持。已有初始 mask 时忽略 prompt，mask 加载失败直接报错。普通选择保存允许全前景，空选择仍拒绝；Hunyuan 生成入口另要求透明背景。CLI 与 Python API 的对象名均按唯一、非空的合法单级目录名原样使用，允许 `Object-1`、`1st_object`、中文和 `A__B`；禁止 `.`、`..`、路径分隔符及绝对路径。
 
 `SceneTracker.open` 一次加载资产与模型，并负责资源收尾。API 返回内存结果；SAM 日志默认输出到宿主 stderr，指定 `log_dir` 可保存日志。CLI 使用同一工厂，并写入可独立查看的结果目录。接口和返回语义见 [Python API](docs/usage.md#python-api)。
 
@@ -42,7 +42,8 @@ mask 支持 `1/L/P` PNG 及 bool/uint8 单通道 NPY，尺寸须与 RGB 一致�
 
 - 深度为 color-camera Z，单位米；0 表示缺测。物体资产保留原点和朝向，固定点与法向按原始顺序使用。
 - 生成 mesh 在导出前简化到最多 20,000 面；已有高面数资产在跟踪初始化时简化一次，位姿与模型深度比较共用该网格。
-- 模型深度只查询当前实测像素。深度支持不足时 pose 失效，独立实测点仍保留；无效 pose 的模型点为空。
+- 无 asset 的对象只要求有效 RGB 与去畸变后非空 mask；首帧和后续帧均允许零深度或少量有效深度，输出 `OBSERVED_ONLY`、实际实测点及其 `observed_valid`，没有深度时点集为空。
+- 有 asset 的对象保留位姿初始化、跟踪与模型匹配所需的深度条件，混合场景逐对象判断。模型深度只查询当前实测像素；深度支持不足时 pose 失效，独立实测点仍保留，无效 pose 的模型点为空。
 - 点数分配脚本按闭合实体体积采样，总计 1024 点；当前示例在 `pnp_apple_banana/sampled_1024`，分配为 432 / 324 / 268。
 
 上游源码、模型授权和安装前提见[安装与权重](docs/usage.md#安装与权重)。

@@ -62,7 +62,7 @@ python scripts/cordvip/track_object.py \
   --with-hand --output /tmp/cordvip/scene_001
 ```
 
-提供 `--prompt` 后，Grounding DINO 检测目标，SAM2 生成冻结首帧上的候选 mask，再人工选择实例。新选择保存为 `initial_selections/<id>/`，其中 `selection.json` 记录 mask 文件名、候选索引和两项分数；prompt 记录在 `scene.json`。也可通过 `--initial-selection PATH` 或 scene 的 `initial_selection` 加载已有首帧 mask；未提供已有 mask 的对象必须提供非空 prompt，无候选时明确报错。PNG/NPY mask 文件可直接使用；选择目录只需 `selection.json` 的 `mask_file` 指向目录内的真实 mask。输入 mask 均应用于当前指定首帧原始 RGB 网格，由 tracker 统一去畸变一次，目录附带的 RGB-D 或来源说明不参与接纳。
+提供 `--prompt` 后，Grounding DINO 检测目标，SAM2 生成冻结首帧上的候选 mask，再人工选择实例。新选择保存为 `initial_selections/<id>/`，其中 `selection.json` 记录 mask 文件名、候选索引和两项分数；prompt 记录在 `scene.json`。也可通过 `--initial-selection PATH` 或 scene 的 `initial_selection` 加载已有首帧 mask；此时忽略 prompt，允许缺省、`null` 或空文本。指定的 mask 不存在、损坏或尺寸错误时直接报错，不回退到 prompt。未提供已有 mask 的对象必须提供非空 prompt，无候选时明确报错。PNG/NPY mask 文件可直接使用；选择目录只需 `selection.json` 的 `mask_file` 指向目录内的真实 mask。输入 mask 均应用于当前指定首帧原始 RGB 网格，由 tracker 统一去畸变一次，目录附带的 RGB-D 或来源说明不参与接纳。
 
 mask 须与 RGB 同尺寸，支持 `1/L/P` PNG 和 bool/uint8 单通道 NPY；零为背景、非零为前景。`P` 模式先按实际调色板转换为灰度，不按调色板索引判断；不接受其他多通道或高位深输入，不自动反色或缩放。
 
@@ -85,7 +85,9 @@ python scripts/cordvip/track_object.py \
   --with-hand --headless --output /tmp/cordvip/scene_002
 ```
 
-无 asset 的对象输出 mask 和独立实测点。scene 只使用 `id`、`asset`、`initial_selection` 和 `prompt`。headless 跟踪仍要求每个对象提供当前首帧的有效初始 mask。默认处理全部 Raw 行；`--max-frames N` 显式限制前缀，终端打印处理数量。同一 Raw 行提供 RGB-D、实测关节与原始时间，行关联不证明物理同步。
+无 asset 的对象只要求有效 RGB 与去畸变后非空 mask，首帧和后续帧均允许零深度或少量有效深度；状态为 `OBSERVED_ONLY`，点集仅含当前采样网格上实际提取的深度点，`observed_valid` 表示点集是否非空，无深度时不补点或生成 pose。有 asset 的对象继续要求足够的采样后实测点、至少 4 个 `depth >= 0.001 m` 的 FoundationPose 深度像素及模型匹配支持；交互选择的深度预检查只用于这类对象，混合场景分别判断。
+
+scene 只使用 `id`、`asset`、`initial_selection` 和 `prompt`。`asset` 和 `initial_selection` 省略或为 `null` 时表示未提供；指定时须为非空路径文本，空字符串或其他类型直接报错。CLI 输入路径同样不接受空字符串。headless 跟踪仍要求每个对象提供当前首帧的有效初始 mask。默认处理全部 Raw 行；`--max-frames N` 显式限制前缀，终端打印处理数量。同一 Raw 行提供 RGB-D、实测关节与原始时间，行关联不证明物理同步。
 
 ## Python API
 

@@ -277,9 +277,9 @@ class SceneTracker:
                         f"Initial mask {name} must use the original bool color grid"
                     )
                 mask = maps.apply_mask(mask)
-                if np.count_nonzero(mask & (depth_m > 0)) < MIN_DEPTH_PIXELS:
+                if not mask.any():
                     raise ValueError(
-                        f"{name}: initial mask requires at least {MIN_DEPTH_PIXELS} valid depth pixels"
+                        f"{name}: initial mask must be nonempty after rectification"
                     )
                 masks[name] = mask
             if not self.assets.keys() <= masks.keys():
@@ -371,7 +371,7 @@ class SceneTracker:
     def model_points(self, result, name, *, T_target_camera=None):
         """按需由有效位姿重建固定模型点，默认位于 camera frame。"""
         item = result["objects"][name]
-        if not item["pose_valid"] or name not in self.assets:
+        if not item["pose_valid"]:
             return np.empty((0, 3), dtype=np.float32)
         pose = item["pose"]
         if T_target_camera is not None:

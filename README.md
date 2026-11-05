@@ -113,7 +113,7 @@ Raw 将实测 state 与提交尝试 action 分开保存。组合命令按设备�
 
 Canonical 默认导出 [13 个字段](dexmani_real/data/export.py)，保留既有单位、输出 dtype、EEF 9D 与 EEF action 21D；用 `--fields` 选择实际所需字段，例如 `python scripts/export_zarr.py episodes/TASK --output datasets/rgb_state.zarr --fields rgb joint_state action`。只读取、检查和计算所选依赖：RGB/状态/action 无需外参或 FK，状态/action 不解码视频。Raw 浮点字段可使用不同浮点精度，转换后的训练值仍须有限；单位和关节顺序在读取相应字段时校验，单独读取图像不依赖动作元数据。导出动作时 policy 等待行的 NaN 仍会被拒绝。sync Policy Raw 的同行 action 是本次提交尝试，不代表由同行观测推理得到。正常保存、可导出和可物理回放是不同条件。相机外参 `camera_T_xarm_base_from_color` 从 color optical 坐标变换到 xArm base，平移单位为米。
 
-`timing/rows` 使用主机单调时钟，单位 ns，缺失值为 -1；control_ns 是读取开始，observation_ns 是读取完成。臂、手、触觉、相机保留来源时间，缓存不续期；同行不表示硬件同步。启用录制始终采集完整 Raw：实测关节、动作提交尝试、RGB、depth、aggregate、dense、来源时间及元数据，不随策略输入变化。Raw 动作表示提交尝试，不保证前缀包含最后一次实际提交。writer 收尾与保存决定见[高级部署说明](docs/policy_deployment.md#录制收尾与退出结果)。
+采集端将 `timing/rows` 的时间字段写为主机单调时钟，单位 ns，缺失值为 -1；control_ns 是读取开始，observation_ns 是读取完成。`timestamp_source` 仅作说明，缺失或使用其他字符串不阻断结构正确的 timing 数据读取，原始时间数值保持不变。臂、手、触觉、相机保留来源时间，缓存不续期；同行不表示硬件同步。启用录制始终采集完整 Raw：实测关节、动作提交尝试、RGB、depth、aggregate、dense、来源时间及元数据，不随策略输入变化。Raw 动作表示提交尝试，不保证前缀包含最后一次实际提交。writer 收尾与保存决定见[高级部署说明](docs/policy_deployment.md#录制收尾与退出结果)。
 
 teleop/jog/replay 从每轮开始计时，只等待剩余周期；慢计算降低实际频率，不补发积压 tick。Canonical 对采样间隔超过名义周期 ±25%、读取跨下一周期给出警告。control/observation 必须为正且各自严格递增，observation 不早于本次 control；所选字段的动态来源时间非正、非因果、倒退或 camera_sequence 异常只汇总一次带定位的 warning。静态相机参数不要求逐帧相机时间有效。Canonical 保留统一名义 dt 和 episode_ends，不另存质量统计，也不重采样。实际时序可查 Raw 的 `timing/rows` 和 `RawReader.timestamps_s`。可导出不代表数据质量适合当前实验。
 

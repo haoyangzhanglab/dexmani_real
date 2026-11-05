@@ -31,7 +31,7 @@ python scripts/cordvip/track_object.py \
   --with-hand --output /tmp/cordvip/scene_001
 ```
 
-提供 `--prompt`，由 Grounding DINO 和 SAM2 生成冻结 Raw 首帧上的候选 mask，再人工选择实例；或用 `--initial-selection PATH` 加载已有首帧 mask。每个对象至少提供其中一种输入，无候选时明确报错。新选择保存到输出的 `initial_selections/`；`scene.json` 记录可复用的对象与选择路径。PNG/NPY mask 可直接使用，选择目录只需 `selection.json` 的 `mask_file` 指向目录内的 mask。两者均应用于当前指定首帧原始 RGB 网格，附带来源文件不参与校验；不自动缩放或猜测坐标网格，已有输入保持原样。
+提供 `--prompt`，由 Grounding DINO 和 SAM2 生成冻结 Raw 首帧上的候选 mask，再人工选择实例；或用 `--initial-selection PATH` 加载已有首帧 mask。初始 mask 优先，提供时忽略 prompt，允许 prompt 缺省、`null` 或为空；明确指定的 mask 无效时直接报错，不回退到 prompt。没有初始 mask 时必须提供非空文本 prompt，无候选时明确报错。新选择保存到输出的 `initial_selections/`；`scene.json` 记录可复用的对象与选择路径。PNG/NPY mask 可直接使用，选择目录只需 `selection.json` 的 `mask_file` 指向目录内的 mask。两者均应用于当前指定首帧原始 RGB 网格，附带来源文件不参与校验；不自动缩放或猜测坐标网格，已有输入保持原样。
 
 多物体由一个场景 JSON 声明，路径相对仓库根目录：
 
@@ -50,7 +50,7 @@ python scripts/cordvip/track_object.py \
   --with-hand --headless --output /tmp/cordvip/scene_002
 ```
 
-scene 只使用 `id`、`asset`、`initial_selection` 和 `prompt`。省略某个 `asset` 时，该对象只输出连续 mask 与实测深度点，不估计 pose；全部省略时不要求 FoundationPose。无窗口运行要求每个实例提供当前首帧的有效 mask，可直接使用 mask 文件。
+scene 只使用 `id`、`asset`、`initial_selection` 和 `prompt`。路径字段 `asset`、`initial_selection` 省略或为 `null` 时表示未提供，指定时须为非空文本。省略某个 `asset` 时，该对象只要求有效 RGB 与去畸变后非空 mask，首帧和后续帧均允许零深度或少量有效深度；输出 `OBSERVED_ONLY`、实际实测点与 `observed_valid`，无深度时点集为空，不估计 pose。全部省略 asset 时不要求 FoundationPose。有 asset 的对象保留位姿所需的采样点数、至少 4 个 `depth >= 0.001 m` 深度像素及模型匹配要求；交互深度预检查也只用于该对象，不影响混合场景中的无 asset 对象。无窗口运行要求每个实例提供当前首帧的有效 mask，可直接使用 mask 文件。
 
 默认顺序处理全部 Raw 行，不按墙钟跳帧，也不要求 observation 时间为正或递增。`--max-frames N` 显式限制处理前缀，终端打印实际处理行数。输出目录必须尚不存在，可以是 `rollouts/derived/objects` 等独立结果目录；实际输入、Raw episode 内部和已有输出仍受保护。处理前将各资产的固定点/法向写入 `model_templates/<object_id>.npz` 一次，每行结果保存为 `frames/000000.npz` 等；`row_index` 是实际 Raw 行号，`timestamp_ns` 原样保留该行 `camera_ns`（包括 0），不自动生成 `source_id` 或推断 `clock`。逐帧保存有效/候选 pose 与实测数据，模型点/法向从模板按需重建。mask-only 不生成模板。查看结果是独立步骤：
 

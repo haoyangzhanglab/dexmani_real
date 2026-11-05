@@ -48,7 +48,8 @@ VR_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
 }
 
 
-# 主机单调时钟；缺失用 -1，触觉时间为最后一份完整通道帧的来源时间。
+# 时间字段单位 ns；采集端使用主机单调时钟，timestamp_source 仅作说明，不参与读取准入。
+# 缺失用 -1，触觉时间为最后一份完整通道帧的来源时间。
 TIMING_ROW_DTYPE = np.dtype(
     [
         (name, "<i8")
@@ -400,11 +401,11 @@ class RawReader:
                 self.validate_joint_metadata("arm", XARM7_JOINT_NAMES)
             elif name in {"hand_qpos", "action_hand_joint_target"}:
                 self.validate_joint_metadata("hand", XHAND_SDK_JOINT_NAMES)
-            if name in {"action_arm_joint_target", "action_hand_joint_target"}:
-                if self.meta["arm_action_semantics"] != ARM_ACTION_SEMANTICS:
-                    raise ValueError(f"Raw arm_action_semantics: expected {ARM_ACTION_SEMANTICS}")
-            if name == "timing/rows" and self.meta["timestamp_source"] != "host_monotonic_ns":
-                raise ValueError("Raw timestamp_source: expected host_monotonic_ns")
+            if (
+                name in {"action_arm_joint_target", "action_hand_joint_target"}
+                and self.meta["arm_action_semantics"] != ARM_ACTION_SEMANTICS
+            ):
+                raise ValueError(f"Raw arm_action_semantics: expected {ARM_ACTION_SEMANTICS}")
             array = self.data_file[name]
             spec = (
                 ((), TIMING_ROW_DTYPE) if name == "timing/rows"

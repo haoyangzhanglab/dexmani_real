@@ -26,16 +26,18 @@ def load_scene(path, *, headless):
         if name in objects:
             raise ValueError("Scene object IDs must be unique")
         item = {key: item[key] for key in ("id", "asset", "initial_selection", "prompt") if key in item}
-        if headless and not item.get("initial_selection"):
+        for key in ("asset", "initial_selection"):
+            value = item.get(key)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{name}: {key} must be a nonempty path string")
+        if headless and item.get("initial_selection") is None:
             raise ValueError(
                 f"{name}: headless scene requires an initial_selection mask for the first frame"
             )
-        if item.get("prompt") is not None and (
-            not isinstance(item["prompt"], str) or not item["prompt"].strip()
+        if item.get("initial_selection") is None and (
+            not isinstance(item.get("prompt"), str) or not item["prompt"].strip()
         ):
-            raise ValueError("Scene prompt must be nonempty text")
-        if not item.get("initial_selection") and item.get("prompt") is None:
-            raise ValueError(f"{name}: scene object requires initial_selection or prompt")
+            raise ValueError(f"{name}: scene object requires initial_selection or nonempty prompt")
         objects[name] = item
     return objects
 
@@ -46,17 +48,22 @@ def choose_masks(objects, frame, args, output, segmenter):
     from ..geometry import RectificationMaps
     from ..io import load_initial_selection, write_selection
 
-    if any(not item.get("initial_selection") for item in objects.values()):
-        maps = RectificationMaps(
-            frame.depth_m.shape, frame.K, frame.distortion_coeffs
-        )
-        valid_depth = maps.apply_mask(frame.depth_m > 0)
+    maps = None
     masks, scene_objects = {}, []
     for name, item in objects.items():
-        if item.get("initial_selection"):
+        if item.get("initial_selection") is not None:
             masks[name] = load_initial_selection(item["initial_selection"], frame)
             selected = item["initial_selection"]
         else:
+            if maps is None:
+                maps = RectificationMaps(
+                    frame.depth_m.shape, frame.K, frame.distortion_coeffs
+                )
+            valid_depth = (
+                maps.apply_mask(frame.depth_m >= 0.001)
+                if item.get("asset") is not None
+                else None
+            )
             candidates = segmenter.predict(
                 frame.rgb,
                 item["prompt"],
@@ -68,12 +75,17 @@ def choose_masks(objects, frame, args, output, segmenter):
                 candidate = candidates[index]
                 mask = candidate["mask"]
                 rectified_mask = maps.apply_mask(mask)
-                if np.count_nonzero(rectified_mask & valid_depth) >= MIN_DEPTH_PIXELS:
+                if not rectified_mask.any():
+                    print(f"{name}: 去畸变后的 mask 不能为空，请重新选择。", flush=True)
+                elif valid_depth is not None and np.count_nonzero(
+                    rectified_mask & valid_depth
+                ) < MIN_DEPTH_PIXELS:
+                    print(
+                        f"{name}: mask 至少需要 {MIN_DEPTH_PIXELS} 个有效深度像素（>= 0.001 m），请重新选择。",
+                        flush=True,
+                    )
+                else:
                     break
-                print(
-                    f"{name}: mask 至少需要 {MIN_DEPTH_PIXELS} 个有效深度像素，请重新选择。",
-                    flush=True,
-                )
             masks[name] = mask
             selected = output / "initial_selections" / name
             selected.mkdir(parents=True)
