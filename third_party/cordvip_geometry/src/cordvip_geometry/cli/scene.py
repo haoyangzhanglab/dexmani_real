@@ -40,12 +40,17 @@ def load_scene(path, *, headless):
     return objects
 
 
-def choose_masks(objects, frame, args, output, segmenter, maps):
+def choose_masks(objects, frame, args, output, segmenter):
     import numpy as np
 
+    from ..geometry import RectificationMaps
     from ..io import load_initial_selection, write_selection
 
-    _, depth, _ = maps.apply(frame.rgb, frame.depth_m)
+    if any(not item.get("initial_selection") for item in objects.values()):
+        maps = RectificationMaps(
+            frame.depth_m.shape, frame.K, frame.distortion_coeffs
+        )
+        valid_depth = maps.apply_mask(frame.depth_m > 0)
     masks, scene_objects = {}, []
     for name, item in objects.items():
         if item.get("initial_selection"):
@@ -63,7 +68,7 @@ def choose_masks(objects, frame, args, output, segmenter, maps):
                 candidate = candidates[index]
                 mask = candidate["mask"]
                 rectified_mask = maps.apply_mask(mask)
-                if np.count_nonzero(rectified_mask & (depth > 0)) >= MIN_DEPTH_PIXELS:
+                if np.count_nonzero(rectified_mask & valid_depth) >= MIN_DEPTH_PIXELS:
                     break
                 print(
                     f"{name}: mask 至少需要 {MIN_DEPTH_PIXELS} 个有效深度像素，请重新选择。",

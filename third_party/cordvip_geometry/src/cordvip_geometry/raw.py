@@ -1,4 +1,4 @@
-"""从一个 RawReader 顺序读取同一行 RGB-D、实测关节和来源时钟。"""
+"""从一个 RawReader 顺序读取同一行 RGB-D、实测关节和原始时间。"""
 
 from __future__ import annotations
 
@@ -7,18 +7,6 @@ import numpy as np
 from .rgbd import RGBDFrame
 
 HAND_SAMPLE_SEED = 0
-
-
-def raw_frame_identity(episode, row_index, timing):
-    """使用 Raw 纳秒时钟，缺失相机时钟时标记为观测时钟；含路径的 ID 仅作来源说明。"""
-    source = f"raw:{episode}:row:{row_index}"
-    stamp = int(timing["observation_ns"])
-    clock = "host_monotonic_observation"
-    if int(timing["camera_sequence"]) >= 0:
-        source = f"raw:{episode}:camera:{int(timing['camera_sequence'])}"
-    if int(timing["camera_ns"]) > 0:
-        stamp, clock = int(timing["camera_ns"]), "host_monotonic_oldest_rgbd_receive"
-    return source, stamp, clock
 
 
 def iter_raw_rows(reader, camera):
@@ -34,19 +22,11 @@ def iter_raw_rows(reader, camera):
             "Raw depth must be uint16 [rows,H,W] matching color intrinsics"
         )
     timing = reader["timing/rows"][:]
-    observation = timing["observation_ns"]
-    if np.any(observation <= 0) or np.any(np.diff(observation) <= 0):
-        raise ValueError(
-            "Raw observation clocks must be positive and strictly increasing"
-        )
     images = iter(reader.iter_rgb_frames())
     for row_index in range(reader.num_frames):
         rgb = next(images, None)
         if rgb is None:
             raise ValueError(f"Raw RGB ended before row {row_index}")
-        source_id, timestamp_ns, clock = raw_frame_identity(
-            reader.path, row_index, timing[row_index]
-        )
         depth_m = depth[row_index].astype(np.float32) * depth_scale
         yield (
             RGBDFrame(
@@ -55,9 +35,7 @@ def iter_raw_rows(reader, camera):
                 K=K,
                 distortion_model=intrinsics.distortion_model,
                 distortion_coeffs=intrinsics.distortion_coeffs,
-                source_id=source_id,
-                timestamp_ns=timestamp_ns,
-                clock=clock,
+                timestamp_ns=int(timing[row_index]["camera_ns"]),
                 row_index=row_index,
             ),
             timing[row_index],
@@ -117,8 +95,15 @@ class RawHandCloud:
     def for_row(self, frame, timing):
         """同一 reader 当前行的实测关节；不插值、不用命令替代反馈。"""
         row = frame.row_index
-        if row is None:
-            raise ValueError("Raw hand geometry requires a row_index")
+        if (
+            isinstance(row, bool)
+            or not isinstance(row, (int, np.integer))
+            or not 0 <= row < self.reader.num_frames
+        ):
+            raise ValueError(
+                "Raw hand geometry requires an integer row_index in "
+                f"0..{self.reader.num_frames - 1}"
+            )
         arm_ns, hand_ns, camera_ns = (
             int(timing[name]) for name in ("arm_ns", "hand_ns", "camera_ns")
         )

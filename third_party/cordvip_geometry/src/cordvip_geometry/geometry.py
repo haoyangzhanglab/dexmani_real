@@ -187,9 +187,9 @@ class RectificationMaps:
                 cv2.CV_32FC1,
             )
 
-    def apply(self, rgb, depth_m, mask=None):
+    def apply(self, rgb, depth_m):
         if self.maps is None:
-            return rgb, depth_m, mask
+            return rgb, depth_m
         import cv2
 
         map_x, map_y = self.maps
@@ -199,7 +199,7 @@ class RectificationMaps:
         depth_m = cv2.remap(
             depth_m, map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT
         )
-        return rgb, depth_m, self.apply_mask(mask) if mask is not None else None
+        return rgb, depth_m
 
     def apply_mask(self, mask):
         if self.maps is None:

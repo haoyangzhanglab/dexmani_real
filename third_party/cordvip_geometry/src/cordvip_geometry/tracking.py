@@ -266,7 +266,7 @@ class SceneTracker:
             maps = RectificationMaps(
                 frame.depth_m.shape, frame.K, frame.distortion_coeffs
             )
-        rgb, depth_m, _ = maps.apply(frame.rgb, frame.depth_m)
+        rgb, depth_m = maps.apply(frame.rgb, frame.depth_m)
         K = frame.K
         if first:
             masks = {}

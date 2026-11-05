@@ -38,6 +38,8 @@ SAM 默认 small、BF16、eager。large 先下载权重，再为相关命令传 
 
 `object select --segmentation-dir DIR --instance 0 --headless --output NEW_DIR` 只要求 `DIR/rgb.png` 和原有数组结构的 `DIR/candidates.npz`。输出仅有所选的 `mask.png`、`foreground_rgba.png`、新生成的 `overlay.png` 和记录索引、标签、框及分数的 `selection.json`。目录附带来源文件不参与校验或复制；再次选择须使用原候选目录。object segment/select/build 在 headless 下唯一候选可省略 `--instance`，多候选必须明确索引。
 
+普通选择与保存只要求选中了前景，允许整张图均为前景，保存后也可重新载入作为初始 mask。Hunyuan 生成仍要求 RGBA 含有效前景和透明背景，在加载模型前检查；全前景选择产物不能直接用于生成，不会自动裁剪或补背景。
+
 候选包中的 `masks` 为 bool `(N,H,W)`，`boxes` 为有限实数 `(N,4)`，`scores` 与 `mask_scores` 为有限实数 `(N,)`，`labels` 为 Unicode 字符串 `(N,)`；`N` 须为正数且各数组一致，mask 尺寸与 RGB 相同。损坏的候选直接报错。
 
 Hunyuan 在独立生成进程中运行；生成 mesh 导出前简化到最多 20,000 面，仍需显式指定米制尺度。分割与生成的参数、耗时及生成网格大小直接打印到终端。prepare 保留原点与朝向，在米制网格上按指定 seed / 点数采样固定点及三角面法向。
@@ -83,7 +85,7 @@ python scripts/cordvip/track_object.py \
   --with-hand --headless --output /tmp/cordvip/scene_002
 ```
 
-无 asset 的对象输出 mask 和独立实测点。scene 只使用对象 ID、asset、initial_selection 和 prompt；允许额外 note，role 也作为未消费的注释。headless 跟踪仍要求每个对象提供当前首帧的有效初始 mask。默认处理全部 Raw 行；`--max-frames N` 显式限制前缀，终端打印处理数量。同一 Raw 行提供 RGB-D、实测关节与时钟，行关联不证明物理同步。
+无 asset 的对象输出 mask 和独立实测点。scene 只使用 `id`、`asset`、`initial_selection` 和 `prompt`。headless 跟踪仍要求每个对象提供当前首帧的有效初始 mask。默认处理全部 Raw 行；`--max-frames N` 显式限制前缀，终端打印处理数量。同一 Raw 行提供 RGB-D、实测关节与原始时间，行关联不证明物理同步。
 
 ## Python API
 
@@ -118,7 +120,9 @@ with SceneTracker.open({"object": asset_dir}) as tracker:
         )
 ```
 
-`camera` 是标定快照，样本包含 `uint8 rgb`、原始 `uint16 depth`、`timestamp_ns` 与 `ring_sequence`。直接构造 `RGBDFrame` 时须提供 RGB、米制浮点 depth、K 和实际畸变信息；depth 在入口转为 float32 并检查形状、有限性及非负，不猜测毫米或 raw counts。source_id、timestamp_ns、clock、row_index 可省略；保存时省略缺失项。tracker 固定使用一套图像网格和相机几何，按调用顺序推进；实时宿主可在相机输入处按 ring sequence 去重，Raw 每行独立处理。手部 FK 仍要求真实 row_index，时间可用性根据该行实际时间判断。`model_points` 返回米制 `float32 (N, 3)`；默认 camera frame，指定有效 `T_target_camera` 可变换到目标系。pose 无效或无 asset 时返回空点。
+`camera` 是标定快照，相机适配只需样本中的 `uint8 rgb` 和原始 `uint16 depth`，可附 `timestamp_ns`，不要求 `ring_sequence` 或拼接来源 ID。直接构造 `RGBDFrame` 时须提供 RGB、米制浮点 depth、K 和实际畸变信息；depth 在入口转为 float32 并检查形状、有限性及非负，不猜测毫米或 raw counts。`source_id`、`timestamp_ns`、`clock` 是可省略的说明：字符串允许为空，整数时间允许为 0；保存时仅省略缺失项，读取和查看保留空字符串与 0。说明不参与身份匹配、去重或时序准入。
+
+tracker 固定使用一套图像网格和相机几何，按调用顺序推进；实时宿主可在相机输入处按 ring sequence 去重。Raw 几何每行独立处理，不要求 observation 时间为正或递增；帧的 `row_index` 是实际 Raw 行号，`timestamp_ns` 原样来自该行 `camera_ns`，包括 0，不用 observation 时间替代，也不自动生成 `source_id` 或推断 `clock`。手部 FK 在读取关节数组时检查行号为有效整数且位于 reader 的行范围内，使用完整原始 timing 行判断时间可用性。`model_points` 返回米制 `float32 (N, 3)`；默认 camera frame，指定有效 `T_target_camera` 可变换到目标系。pose 无效或无 asset 时返回空点。
 
 宿主在所需位置主动调用这些接口；当前主包的控制、Raw writer 和策略观测未接线。
 

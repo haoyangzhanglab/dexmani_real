@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
+from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot, parse_camera_matrix
 from dexmani_real.geometry.pose import validate_rigid_transform
 from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
 from dexmani_real.utils.timing import sampling_clock_ns
@@ -129,7 +129,7 @@ def camera_metadata(camera: CameraSnapshot):
 def decode_camera_metadata(meta) -> CameraSnapshot:
     if meta["camera_payload_mode"] != "depth_to_color_aligned_rgbd":
         raise ValueError("Raw camera payload must be depth-to-color aligned RGB-D")
-    matrix = np.asarray(meta["camera_color_intrinsics"], dtype=np.float64).reshape(3, 3)
+    matrix = parse_camera_matrix(meta["camera_color_intrinsics"])
     color = CameraIntrinsics(
         width=np.asarray(meta["camera_color_width"]).item(),
         height=np.asarray(meta["camera_color_height"]).item(),
@@ -140,8 +140,6 @@ def decode_camera_metadata(meta) -> CameraSnapshot:
         distortion_model=meta["camera_color_distortion_model"],
         distortion_coeffs=tuple(meta["camera_color_distortion_coeffs"]),
     )
-    if not np.allclose(matrix, color.matrix(), rtol=0, atol=1e-9):
-        raise ValueError("camera_color_intrinsics must be a pinhole matrix")
     transform = None
     if "camera_T_xarm_base_from_color" in meta:
         transform = validate_rigid_transform(

@@ -10,7 +10,6 @@ from .scene import choose_masks, load_scene
 def run(args):
     from dexmani_real.data.raw import RawReader
 
-    from ..geometry import RectificationMaps
     from ..io import new_output, write_json, write_npz
     from ..raw import RawHandCloud, iter_raw_rows
     from ..tracking import SceneTracker, scene_arrays
@@ -45,9 +44,6 @@ def run(args):
         first = next(rows, None)
         if first is None:
             raise ValueError("Raw episode contains no RGB-D rows")
-        maps = RectificationMaps(
-            first[0].depth_m.shape, first[0].K, first[0].distortion_coeffs
-        )
         hand_source = (
             RawHandCloud(reader, camera, args.hand_points)
             if args.with_hand
@@ -78,7 +74,7 @@ def run(args):
                         },
                     )
             initial_masks, scene_objects = choose_masks(
-                objects, first[0], args, output, segmenter, maps
+                objects, first[0], args, output, segmenter
             )
             scene = {"objects": scene_objects, "units": "m", "coordinate_frame": "color_camera"}
             if hand_source is not None:

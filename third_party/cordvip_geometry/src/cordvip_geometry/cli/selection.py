@@ -114,8 +114,8 @@ def choose(rgb, candidates, instance, *, headless, name="object"):
 def save_selection(output, rgb, candidates, index):
     candidate = candidates[index]
     mask = candidate["mask"]
-    if not mask.any() or mask.all():
-        raise ValueError("生成输入必须包含非空物体和非空背景；请重新分割或拍摄")
+    if not mask.any():
+        raise ValueError("没有选中前景；请重新选择或分割")
     overlay(rgb, candidate, index).save(output / "overlay.png")
     write_selection(
         output,

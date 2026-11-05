@@ -22,6 +22,7 @@ from dexmani_real.data.raw import (
 from dexmani_real.geometry.camera import (
     camera_extrinsic_cv,
     depth_scales_match,
+    parse_camera_matrix,
 )
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
 from dexmani_real.geometry.pose import encode_eef_pose, validate_rigid_transform
@@ -116,16 +117,7 @@ def export_camera(reader, fields):
         if snapshot is not None:
             matrix = snapshot.color.matrix(dtype=np.float32)
         else:
-            matrix = np.asarray(reader.meta["camera_color_intrinsics"], dtype=np.float64).reshape(3, 3)
-            pinhole = np.array([
-                [matrix[0, 0], 0, matrix[0, 2]],
-                [0, matrix[1, 1], matrix[1, 2]],
-                [0, 0, 1],
-            ])
-            if (not np.isfinite(matrix).all() or min(matrix[0, 0], matrix[1, 1]) <= 0
-                    or not np.allclose(matrix, pinhole, rtol=0, atol=1e-9)):
-                raise ValueError("camera_color_intrinsics must be a finite pinhole matrix")
-            matrix = pinhole.astype(np.float32)
+            matrix = parse_camera_matrix(reader.meta["camera_color_intrinsics"]).astype(np.float32)
         camera["parameters"]["camera_intrinsic"] = matrix.ravel()
     if "camera_extrinsic" in names:
         transform = snapshot.T_xarm_base_from_color if snapshot is not None else validate_rigid_transform(
@@ -342,7 +334,7 @@ def export_zarr(
                     if index == 0:
                         arm_fk = ArmFK() if ARM_FK_FIELDS.intersection(fields) else None
                         hand_fk = HandFK() if HAND_FK_FIELDS.intersection(fields) else None
-                        hand_cloud = (HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
+                        hand_cloud = (HandPointCloud(cast(HandFK, hand_fk), processing.hand_pointcloud.num_points)
                                       if "hand_pointcloud" in fields else None)
                         target.parent.mkdir(parents=True, exist_ok=True)
                         staging = Path(
@@ -460,10 +452,7 @@ def append_episode(arrays, offset, blocks, frames):
 
 def select_episodes(source, exclude):
     episodes = discover_episode_dirs(source)
-    excluded = set(exclude)
-    unknown = excluded - {episode.name for episode in episodes}
-    if unknown:
-        raise ValueError(f"exclusions reference unknown episodes: {sorted(unknown)}")
+    excluded = set(exclude) & {episode.name for episode in episodes}
     selected = [episode for episode in episodes if episode.name not in excluded]
     if not selected:
         raise ValueError("export has no selected episodes")

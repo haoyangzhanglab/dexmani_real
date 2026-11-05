@@ -63,7 +63,7 @@ def parse_tracking_args(argv=None, *, workspace=None):
     )
     parser.set_defaults(workspace=workspace)
     parser.add_argument(
-        "--episode", type=Path, required=True, help="只读已发布 Raw episode"
+        "--episode", type=Path, required=True, help="只读 Raw episode 目录"
     )
     parser.add_argument(
         "--scene", type=Path, help="多物体 JSON；对象 id 使用唯一、非空的合法单级目录名"

@@ -37,9 +37,9 @@ python scripts/cordvip/track_object.py \
 
 ```json
 {"objects": [
-  {"id": "toy", "role": "object", "asset": "/tmp/cordvip/toy_asset",
+  {"id": "toy", "asset": "/tmp/cordvip/toy_asset",
    "initial_selection": "/tmp/cordvip/toy_first_frame"},
-  {"id": "basket", "role": "reference", "asset": "/tmp/cordvip/basket_asset",
+  {"id": "basket", "asset": "/tmp/cordvip/basket_asset",
    "initial_selection": "/tmp/cordvip/basket_first_frame"}
 ]}
 ```
@@ -50,9 +50,9 @@ python scripts/cordvip/track_object.py \
   --with-hand --headless --output /tmp/cordvip/scene_002
 ```
 
-`role` 是一次保存的标签，不改变算法。省略某个 `asset` 时，该对象只输出连续 mask 与实测深度点，不估计 pose；全部省略时不要求 FoundationPose。无窗口运行要求每个实例提供当前首帧的有效 mask，可直接使用 mask 文件。
+scene 只使用 `id`、`asset`、`initial_selection` 和 `prompt`。省略某个 `asset` 时，该对象只输出连续 mask 与实测深度点，不估计 pose；全部省略时不要求 FoundationPose。无窗口运行要求每个实例提供当前首帧的有效 mask，可直接使用 mask 文件。
 
-默认顺序处理全部 Raw 行，不按墙钟跳帧。`--max-frames N` 显式限制处理前缀，终端打印实际处理行数。输出目录必须尚不存在，可以是 `rollouts/derived/objects` 等独立结果目录；实际输入、Raw episode 内部和已有输出仍受保护。处理前将各资产的固定点/法向写入 `model_templates/<object_id>.npz` 一次，每行结果保存为 `frames/000000.npz` 等，源 row ID、时间和时钟保留。逐帧保存有效/候选 pose 与实测数据，模型点/法向从模板按需重建。mask-only 不生成模板。查看结果是独立步骤：
+默认顺序处理全部 Raw 行，不按墙钟跳帧，也不要求 observation 时间为正或递增。`--max-frames N` 显式限制处理前缀，终端打印实际处理行数。输出目录必须尚不存在，可以是 `rollouts/derived/objects` 等独立结果目录；实际输入、Raw episode 内部和已有输出仍受保护。处理前将各资产的固定点/法向写入 `model_templates/<object_id>.npz` 一次，每行结果保存为 `frames/000000.npz` 等；`row_index` 是实际 Raw 行号，`timestamp_ns` 原样保留该行 `camera_ns`（包括 0），不自动生成 `source_id` 或推断 `clock`。逐帧保存有效/候选 pose 与实测数据，模型点/法向从模板按需重建。mask-only 不生成模板。查看结果是独立步骤：
 
 ```bash
 python -m cordvip_geometry view /tmp/cordvip/scene_001

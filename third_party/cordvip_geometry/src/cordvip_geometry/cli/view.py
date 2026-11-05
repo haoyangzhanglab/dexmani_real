@@ -50,7 +50,8 @@ def view_results(directory, *, show_3d=True, headless=False):
                 # 每个显示字段只解压一次；分析用大数组留在 NPZ 中。
                 frame = {
                     key: saved[key]
-                    for key in ("row_index", "timestamp_ns", "clock") if key in saved.files
+                    for key in ("source_id", "row_index", "timestamp_ns", "clock")
+                    if key in saved.files
                 }
                 frame["rgb"] = saved["rgb"]
                 if viewer is not None:
@@ -81,7 +82,11 @@ def view_results(directory, *, show_3d=True, headless=False):
                 or min(rgb.shape[:2]) == 0
             ):
                 raise ValueError("scene result RGB must be nonempty uint8 [H,W,3]")
-            details = " ".join(f"{key}={frame[key].item()}" for key in ("row_index", "timestamp_ns", "clock") if key in frame)
+            details = " ".join(
+                f"{key}={frame[key].item()}"
+                for key in ("source_id", "row_index", "timestamp_ns", "clock")
+                if key in frame
+            )
             print(f"{path.name}" + (f": {details}" if details else ""))
             if viewer is not None:
                 viewer.update(scene_display(frame, names, colors))

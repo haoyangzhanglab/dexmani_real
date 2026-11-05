@@ -46,19 +46,16 @@ class RGBDFrame:
             value = getattr(self, name)
             if value is None:
                 continue
-            if not isinstance(value, str) or not value:
-                raise ValueError(f"{name} must be a nonempty string")
-        for name, minimum in (("timestamp_ns", 1), ("row_index", 0)):
-            value = getattr(self, name)
-            if value is None:
-                continue
+            if not isinstance(value, str):
+                raise ValueError(f"{name} must be a string")
+        value = self.timestamp_ns
+        if value is not None:
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, np.integer))
-                or value < minimum
             ):
-                raise ValueError(f"{name} must be an integer >= {minimum}")
-            object.__setattr__(self, name, int(value))
+                raise ValueError("timestamp_ns must be an integer")
+            object.__setattr__(self, "timestamp_ns", int(value))
         object.__setattr__(self, "rgb", rgb)
         object.__setattr__(self, "depth_m", depth_m)
         object.__setattr__(self, "K", validate_intrinsics(self.K))
@@ -81,21 +78,13 @@ class RGBDFrame:
             raise ValueError(
                 "camera depth must be uint16 [H,W] matching color intrinsics"
             )
-        sequence = camera_row["ring_sequence"]
-        if (
-            isinstance(sequence, bool)
-            or not isinstance(sequence, (int, np.integer))
-            or sequence <= 0
-        ):
-            raise ValueError("camera ring_sequence must be a positive integer")
         return cls(
             rgb=rgb,
             depth_m=np.multiply(depth, camera.depth_scale_m, dtype=np.float32),
             K=camera.color.matrix(),
             distortion_model=camera.color.distortion_model,
             distortion_coeffs=camera.color.distortion_coeffs,
-            source_id=f"camera:{camera.serial}:{int(sequence)}",
-            timestamp_ns=camera_row["timestamp_ns"],
+            timestamp_ns=camera_row.get("timestamp_ns"),
             clock="host_monotonic_oldest_rgbd_receive",
         )
 

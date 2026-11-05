@@ -11,6 +11,20 @@ import numpy as np
 from numpy.typing import DTypeLike
 
 
+def parse_camera_matrix(values) -> np.ndarray:
+    """读取 pinhole K；容纳序列化误差并规范为 float64 矩阵。"""
+    matrix = np.asarray(values, dtype=np.float64).reshape(3, 3)
+    pinhole = np.array([
+        [matrix[0, 0], 0, matrix[0, 2]],
+        [0, matrix[1, 1], matrix[1, 2]],
+        [0, 0, 1],
+    ])
+    if (not np.isfinite(matrix).all() or min(matrix[0, 0], matrix[1, 1]) <= 0
+            or not np.allclose(matrix, pinhole, rtol=0, atol=1e-9)):
+        raise ValueError("camera_color_intrinsics must be a finite pinhole matrix")
+    return pinhole
+
+
 def depth_scales_match(a: float, b: float) -> bool:
     """容纳 SDK/序列化的尺度表示误差，不改变原始深度计数。"""
     return math.isclose(a, b, rel_tol=1e-6, abs_tol=0.0)

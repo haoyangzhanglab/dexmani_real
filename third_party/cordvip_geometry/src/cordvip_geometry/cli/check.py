@@ -92,7 +92,7 @@ def main(argv=None, *, workspace=None):
     add_sam_arguments(parser, workspace)
     args = parser.parse_args(argv)
     try:
-        args = resolve_sam_arguments(args, workspace)
+        args = resolve_sam_arguments(args)
     except ValueError as error:
         parser.error(str(error))
     checks = check_tracking_environment(

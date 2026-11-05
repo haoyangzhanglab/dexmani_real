@@ -129,6 +129,8 @@ python -m cordvip_geometry object generate \
 
 `object select` 的必需输入只有候选目录中的 `rgb.png` 和 `candidates.npz`，不依赖分割日志、候选 JPG 或原始照片副本。选择目录仅保存 `mask.png`、`foreground_rgba.png`、当前候选生成的 `overlay.png` 和简洁的 `selection.json`；附带来源文件不参与校验或复制。headless 下唯一候选可省略 `--instance`，多候选须指定索引。再次选择仍指向原候选目录，输出目录拒绝覆盖。
 
+普通选择保存允许全前景，空选择仍报错；保存后可重新读取用于首帧 mask。透明背景是 Hunyuan 生成入口的要求，全前景 RGBA 会在加载生成模型前被拒绝，不会自动补背景。
+
 现有苹果、香蕉、碗资产位于 [pnp_apple_banana](../assets/pointcloud_template/object/pnp_apple_banana)，分别按约 8 cm 直径、18 cm 两端直线距离、17 cm 碗口外径标定，每个物体 1024 点。具体尺度定义见各自的 `asset.json`；[预览图](../assets/pointcloud_template/object/pnp_apple_banana/preview.png)可用于快速检查。
 
 多个物体需要合计 1024 点时，使用 [allocate_points.py](../scripts/cordvip/allocate_points.py)，默认生成 task 内的 `sampled_1024/`。按闭合实体体积分配，更新固定点、法向、PLY 与资产元数据；具体命令见[脚本说明](../scripts/cordvip/README.md#为多物体分配总计-1024-点)。

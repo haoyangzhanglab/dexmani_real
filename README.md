@@ -35,11 +35,7 @@ CONFIG = replace(base,
 
 停稳阈值由 HOME、伺服准备与相机标定共用；`homing` 保留回零超时、速度和加速度。EEF 工作区容差允许最终验收超出名义边界，默认向外放宽 5 mm；键盘目标的 `workspace_command_margin_m` 仍向内收缩工作区。
 
-任务、路径、段数、时长、录制选择及 `--weights/--inference-steps/--seed/--device` 通过 CLI 指定。遥操作和键盘点动可在 Python 配置中设 `hand.enabled=False`；VR 遥操作还须使用 `--no-record` 关闭录制，实物手须移除或固定在配置的 HOME 姿态，供碰撞规划使用。Policy 要求启用 hand。Policy 配方从 checkpoint 恢复，其训练配置和运行快照可使用 YAML。
-
-POLICY 接受独立 checkpoint 文件，或只解析目录中的 `checkpoints/latest.pt`；支持 `~`，相对路径基于调用工作目录。
-
-Policy 默认仅终端输出；指定 `--output DIR` 时保存 `run_config.yaml` 和 `session_result.json`。需要完整 Raw 时使用 `python scripts/run_policy.py POLICY --record-raw`，未指定输出目录时使用 `rollouts/`。未录制时只启动模型实际输入和静态参数所需的传感器与标定。
+任务、路径、段数、时长和录制选择通过各入口的 CLI 指定。遥操作和键盘点动可在 Python 配置中设 `hand.enabled=False`；VR 遥操作还须使用 `--no-record` 关闭录制，实物手须移除或固定在配置的 HOME 姿态，供碰撞规划使用。策略启动与覆盖项见[策略部署](#策略部署)。
 
 遥操作录制选项由 CLI 提供：`--record/--no-record` 默认开启，`--episodes-dir` 默认 `episodes`，`--max-duration` 默认每段 60 秒。相对录制目录相对仓库根目录，绝对路径直接使用，再拼接 TASK。录制时 TASK 须满足下文任务标签规则，且不能是 `.`、`..` 或包含路径分隔符；允许 `.research` 和首尾空格。`--no-record` 不使用 TASK，也不校验录制目录规则。例如：
 
@@ -54,7 +50,7 @@ python scripts/collect_teleop.py --print-config
 python scripts/run_policy.py --print-config
 ```
 
-这些命令只打印声明配置的 JSON，不连接设备、不读取标定或加载 checkpoint。Policy 仅打印部署相关配置段；最终输入 recipe 从 checkpoint 恢复。HandConfig 构造时将 NumPy 整数转为 Python 整数，设备调用、JSON/YAML 归档使用同一表示；布尔和浮点不能用作整数配置。遥操作的打印配置和 Raw 快照中的 `collection` 包含最终 CLI 录制选项，仅作为归档表示。Python 入口传入 `runtime_config_json=None` 时省略该归档属性，CLI 录制仍保存配置 JSON。启用分支负责业务校验，实测相机事实在连接后记录；Policy 辅助快照的构造或序列化失败只记录日志。
+这些命令只打印声明配置的 JSON，不连接设备、不读取标定或加载 checkpoint。Policy 仅打印部署相关配置段；最终输入 recipe 从 checkpoint 恢复。HandConfig 构造时将 NumPy 整数转为 Python 整数，设备调用、JSON/YAML 归档使用同一表示；布尔和浮点不能用作整数配置。遥操作的打印配置和 Raw 快照中的 `collection` 包含最终 CLI 录制选项，仅作为归档表示。Python 入口传入 `runtime_config_json=None` 时省略该归档属性，CLI 录制仍保存配置 JSON。启用分支负责业务校验，实测相机事实在连接后记录。
 
 ## 常用实验路径
 
@@ -73,7 +69,7 @@ python scripts/keyboard_teleop.py
 
 Episode 可视化默认按实测 `arm_qpos`、`hand_qpos` 通过 FK 重建手部表面点云；在 3D 区域切换到 `Hand Point Cloud` 可查看手部点云、指尖和 EEF 锚点，`xArm-base` 显示相机点云及指尖、EEF 锚点。两者共用基座坐标系和时间轴。手部点数由 `CONFIG.hand_pointcloud.num_points` 指定；`--no-point-cloud` 只关闭相机点云，手部重建不依赖相机外参。
 
-VR 遥操作与策略会话：B 空闲时开始新段；S/C 停止并保存；D 停止并丢弃；Q 保存当前段并退出，但保留已有 D 意图；Esc 急停并结束会话。保存决定确定后，迟到 D 不再逆转结果。H 仅在空闲且收尾完成时回初始位，活动段请先 S；T 仅在空闲时复位触觉，操作者须确认无接触。准备或收尾期间的 B/H/T 不会排队启动下一段。
+VR 遥操作：B 空闲时开始新段；S/C 停止并保存；D 停止并丢弃；Q 保存当前段并退出，但保留已有 D 意图；Esc 急停并结束会话。保存决定确定后，迟到 D 不再逆转结果。H 仅在空闲且收尾完成时回初始位，活动段请先 S；T 仅在空闲时复位触觉，操作者须确认无接触。准备或收尾期间的 B/H/T 不会排队启动下一段。
 
 Policy 只使用终端提示；其他保留音频的入口使用系统 `aplay` 或 `paplay` 播放提示，播放器不可用和后台播放失败只记录 warning；音频关闭的普通异常（包括线程未及时退出）由运行入口记录 warning 和诊断信息，不改变实验退出结果。关闭期间的 KeyboardInterrupt 立即锁存急停并保持失败退出；已有运行或资源收尾失败也不会被音频处理覆盖。一个后台线程播放，待播槽只保留最新提示；允许合并、漏播和延迟，不保证 FIFO 或急停音效抢占。退出取消待播及尾音，不等待排空。提示音不能证明机器人已停止、物理到位或任务成功。
 
@@ -81,43 +77,47 @@ Policy 只使用终端提示；其他保留音频的入口使用系统 `aplay` �
 
 键盘点动使用 WASD、方向键、IJKL，R 回零，Q 退出；S/D 在该入口仍是方向键。启动及 HOME 后先完成伺服准备，再进入点动/hold。松键或 IK/约束拒绝时制动并 hold；有效候选不会只因名义 tick 已过而丢弃。IK 前后只比较方向键及 Q/R/Esc 的输入快照，无关键按下或释放不丢弃有效目标；Q/Esc 的取消仍由回调和实际发布边界执行。busy 期间仍维护按键释放，长按启动键不会穿过收尾自动启动。
 
-传感进程在尝试 start 前登记归属，启动后中断仍由统一收尾回收；明确无 PID 的对象不 join。关闭先统一请求退出，再逐个 join，仍存活才 terminate、再次 join，仍存活才 kill 并确认退出。退出码 0 为正常回收；仅与本次主动终止相符的 SIGTERM/SIGKILL 退出记 warning，关闭前已异常退出的进程仍报错。其他非零退出、清理调用异常及未确认退出仍报错，并继续收尾其余进程；未确认退出的句柄保留，确认回收后移出受管集合。成功回收不清除已有运行错误、停止失败或急停结果。Policy 按实际受管进程检查健康，静态参数相机关闭后不再参与检查。
-
-Policy 顺序启动：启动键盘、唯一模型线程一次加载 checkpoint、解析有效配置并构造观测、连接设备与所需传感器、真实快照预热、待命。模型加载与预热没有固定时间上限，等待可取消；取消后不会迟到连接设备。设备和模型支持正常多轮复用。连接后使用实测姿态初始化，不自动 hand HOME 或触觉清零；需要固定实验初姿时显式按 H。每段 B 后先确认停止并等待有效初值，在停止期间初始化 writer；writer ready 后重新等待新的关节反馈和有效控制输入，再准备 streaming，以最终当前观测建立锚点。一次读 CRC 可在准备预算内后续采样恢复，等待期间取消不会迟到激活。录制前须取得 aggregate、dense 各自完整的真实初值，缺少时不创建 writer；准备期持续无可用初值只结束本段，保持待命，可稍后再 B。零行不发布。正常 S/C/D 后完成记录和模型任务回收，再接纳下一段；无在途请求或正常回复后的普通取消，在停止确认、健康检查及资源收尾成功后回待命，可重新 B；在途取消结果不明则关闭当前 Owner，不自动恢复。Q/Esc 仍退出，真实设备及必要资源故障仍失败。
-
 Teleop 手部实测起点必须位于配置操作范围，范围外会列出关节及就位要求，只拒绝本段，不发送跳变目标。默认 distal 下限为拇指 10°、其余手指 5°；范围内起点未经裁剪建立首帧参考，10 ms、4 rad/s 时经过 mapper 的最终目标每轴变化不超过 0.04 rad。默认显式 HOME 目标在范围内部留出 5° 到位容差；自定义范围或 HOME 时也需留出余量，HOME 成功不豁免实测范围检查。
 
-输入模态、动作窗口和 RTC 能力取自已恢复模型，不改变录制的完整多模态 schema。控制周期使用 `execution.control_dt_s`，未填写时使用 checkpoint 保存值；两者均缺失时须明确填写。调度、运行打印与 Raw 录制共用该有效周期。点云/手点云 recipe 有保存值时沿用，缺失时使用 RealConfig 对应配置；缺少 fingertip link 名称时使用 XHand 固定顺序，实际 FK 检查链接。仅处理请求模态；原始计数 depth 仍必须有训练时的尺度和形状，不能用当前相机尺度代替。触觉输入按当前 Policy 的固定字段形状提供：finger_tactile_force 为 `(5, 3)`，taxel_tactile_force 为 `(5, 120, 3)`。sync 等待预测后顺序执行动作；async 按原观测时间锚点裁掉过期动作，可继续旧计划的完整有效尾部；映射跨过名义 tick 后，只要来源、完整预测窗口和实验时长仍有效便可提交，每次控制机会至多提交一个候选；RTC 使用未经设备投影的物理策略动作前缀，按实际提交进度裁剪接续，不承诺精确槽。两种异步模式都先接收已有可用结果，再判断耗尽；无有效旧尾部和新结果时结束本段，不重复末动作、不重新赋时或重新 bootstrap。
+## 策略部署
 
-记预测长度为 P、`action_steps` 为 A、`prefetch_steps` 为 d：sync 要求 `1 <= A <= P`；async/RTC 要求 `1 <= d <= A <= P` 且 `d < P`；prefetch_steps 默认 1，RTC guidance cap 默认 10.0，须为有限非负值（0 仍使用 RTC 调度），允许 `A+d>P`。RTC 当前长度 L 的名义窗口 W=min(A,L)，从 cursor>=max(0,W-d) 开始预取；早到等 W，迟到继续旧尾部，按请求后的成功提交数裁剪。短窗口的 delay 不超过实际前缀长度。EEF 前缀相同不保证未来 IK 分支相同。
+在上述 Real 环境中安装配套 `dexmani_policy` 及 checkpoint 所需模型依赖，确认设备与标定配置适合当前实验，保持 `hand.enabled=True`，从仓库根目录启动：
 
-history 首次有效观测重复填满 `n_obs_steps`，之后每个正常控制采样机会最多更新一次；sync 等待预测期间也正常更新，结果完成不额外采样或提前发送。请求冻结历史元组，快照只读。模型输入暂时缺帧或过期时暂停历史更新与新请求，已有动作仍可依靠有效设备反馈继续；完整 Raw 质量独立判断。预测等待与调度抖动可以使历史间隔不均，不因间隔清空重建；这放宽了模型输入的等间隔假设，与严格等间隔输入并不等价。来源与 Raw 采样时间保持原样。
+```bash
+python scripts/run_policy.py /path/to/checkpoint.pt
+```
 
-每段首预测 reset RNG。普通预热预测一次，RTC 再以前一次物理预测作为前缀预测一次，成功或失败后均恢复 RNG；预热重复引用同一真实观测快照，手部几何随观测编码重新计算。
+路径接受 checkpoint 文件，或含 `checkpoints/latest.pt` 的目录；支持 `~`，相对路径基于调用工作目录。默认设备为 `cuda:0`，默认使用 sync；需要 async/RTC 时见[高级部署说明](docs/policy_deployment.md)。输入模态与动作表示从 checkpoint 恢复。
 
-策略不增加首动作的两秒等待期限。每轮正式开始建立一次实验时长（默认 60 秒）；API 显式传入 `max_running_s=None` 时，首预测仍在运行期间可持续等待，S/Q/Esc 仍有效。普通 async 的首预测完成时若完整时间窗口已过期，仍立即结束本段；sync 和 RTC 的首结果不按预测年龄丢弃。发送后的目标由 arm owner 的租期约束，owner 停止即结束本段，迟到预测不能恢复。启动取消计数在键盘启用前捕获，贯穿长初始化；内部停止不算用户取消。
+等待终端提示就绪后，B 开始一段；S/C 停止并保存已启用的录制；D 停止并丢弃本段；Q 保存当前段并退出，保留已接纳的 D 意图；Esc 急停并退出。连接后不自动回初始位；需要固定实验初姿时，在空闲且上一段收尾完成后按 H，活动段请先 S。T 仅在空闲且手部无接触时复位触觉。
 
-每段结束先停止设备，再由 Session 完成录制和模型回收；正常段间等待 writer 时继续处理按键和设备反馈，Q/Esc 转入最终关闭，先 close 机器人再等待慢资源。writer 首次收尾请求固定保存决定和 60 秒等待预算，转入最终关闭不重置；登记和完成检查不等待帧队列腾空。arm 每次 close 都按 EXECUTOR_TIMEOUT_S（当前 3 秒）有界等待 owner，随后读取晚到故障，确认退出后关闭管道；不使用 terminate/kill 强制结束 SDK owner。writer 正常关闭后按已确定的保存意图发布，失败 Raw staging 保留，零行不发布。运行失败与容器发布状态独立；后续模型或 close 失败不会反向否定已发布数据。线程、进程和 Future 的超时不代表已退出，仍保留句柄并报告未完成。
+常用覆盖项：
 
-Policy Raw 直接使用结果的 episode 编号（如 `episode_002`），准备取消后允许编号空洞；既有数据不重命名。
+| 选择 | 默认来源与覆盖入口 |
+| --- | --- |
+| 控制周期、每次执行动作数 | 沿用 checkpoint；在 `--config` 指定的 Python 文件中设置 `CONFIG.execution.control_dt_s`、`CONFIG.execution.action_steps`。checkpoint 缺少周期时须明确填写 |
+| 每段时长、段数 | CLI `--max-duration 60`、`--num-episodes 20`；每段仍须按 B 开始 |
+| 录制与输出 | 默认仅终端输出；CLI `--record-raw` 开启完整 Raw，`--output DIR` 指定输出根目录；录制且未指定目录时使用 `rollouts/` |
+| 权重、推理步数 | 沿用 checkpoint；CLI `--weights ema` 或 `--weights raw`、`--inference-steps N` 覆盖 |
+| 推理设备、随机种子 | CLI `--device cuda:0`、`--seed 0`；种子每段重置 |
 
-`session_result.json` 保存会话起止时间、结束原因、episode 实际开始与持续时间、错误阶段和消息，以及录制路径、行数和截断原因。结果文件不参与设备复用判断。运行错误、急停或必要资源关闭未完成均非零退出；收尾失败或急停也会更新最终结束原因。辅助文件普通保存失败报告路径和 traceback，不改变控制与退出码；KeyboardInterrupt 等中断继续传播，不作为普通保存失败忽略。模型 load/warmup/reset/predict/close 在同一个工作线程串行；段间任务回收以短轮询服务反馈和 Q/Esc，段间回收和会话关闭各等待至多 65 秒，等待超时作为错误上报并保留实际任务句柄；超时不表示后台线程已退出，Python 进程退出仍可能等待该线程。正式开始的段才计入 --num-episodes。
+`--output` 或 `--record-raw` 会在输出根目录下建立会话目录，保存 `run_config.yaml` 与 `session_result.json`。配置文件写法见[安装与实验配置](#安装与实验配置)；调度约束、观测历史、IK、取消与资源收尾见[高级部署说明](docs/policy_deployment.md)。
 
 ## 数据、来源和执行语义
 
 Raw 任务标签须为非空、非全空白字符串，不含 NUL；允许换行与制表符，录制边界不改写输入。策略 task 只作为元信息，开启 Raw 时检查，不参与会话目录拼装。遥操作 TASK 同时用于目录，仅额外禁止 `.`、`..` 和路径分隔符；允许 `.research` 和首尾空格。Canonical 可合并不同任务标签，不另存标签或来源列表。
 
-Raw 使用 `data.h5` + `rgb.mp4`，默认在 `episodes/TASK/`；训练导出到 `datasets/TASK.zarr`，策略默认不创建目录或保存文件；显式 `--output DIR` 时在 DIR 下建立 `session_时间戳`，尝试保存 `run_config.yaml` 和 `session_result.json`；`--record-raw` 开启完整录制，未指定输出时才使用 `rollouts/`。辅助目录创建失败可继续无输出运行，Raw 目录或 writer 建立失败仍报错；回放只打印提交数和耗时，不生成审计文件或输出目录，可重复执行同一命令。RawReader 和 `visualize_episode.py --info` 允许诊断显式 `.tmp_*` 路径；导出只检查请求 episode 和解析后 episode 的 basename，拒绝实际 `.tmp_episode` 及其别名，允许普通 `.tmp_workspace` 祖先及用作批量输入的临时工作目录。回放接受显式指定的临时目录，文件锁冲突、损坏或目标无效仍报错。诊断不会发布或改名数据。
+Raw 使用 `data.h5` + `rgb.mp4`，遥操作默认保存在 `episodes/TASK/`；训练导出到 `datasets/TASK.zarr`。回放只打印提交数和耗时，不生成审计文件或输出目录，可重复执行同一命令。RawReader 和 `visualize_episode.py --info` 允许诊断显式 `.tmp_*` 路径；导出只检查请求 episode 和解析后 episode 的 basename，拒绝实际 `.tmp_episode` 及其别名，允许普通 `.tmp_workspace` 祖先及用作批量输入的临时工作目录。回放接受显式指定的临时目录，文件锁冲突、损坏或目标无效仍报错。诊断不会发布或改名数据。
 
 Raw 将实测 state 与提交尝试 action 分开保存。组合命令按设备顺序提交，真实故障保持原错并停止；单次手部写 CRC 仍是一次提交尝试，下一周期使用最新目标。送入 arm mailbox 只代表目标发布，不保证每个目标进入 SDK 或物理到位。手部 warm start、阻尼和滤波参考由控制线程在提交尝试正常返回后更新；同一 VR 帧每个控制 tick 仍运行手映射和速度限制。dt 使用本次计算时刻减上次提交尝试参考时刻，未提交的候选不推进参考或时间。SDK 调用正常返回也不证明手部物理执行。
 
 Canonical 默认导出 [13 个字段](dexmani_real/data/export.py)，保留既有单位、输出 dtype、EEF 9D 与 EEF action 21D；用 `--fields` 选择实际所需字段，例如 `python scripts/export_zarr.py episodes/TASK --output datasets/rgb_state.zarr --fields rgb joint_state action`。只读取、检查和计算所选依赖：RGB/状态/action 无需外参或 FK，状态/action 不解码视频。Raw 浮点字段可使用不同浮点精度，转换后的训练值仍须有限；单位和关节顺序在读取相应字段时校验，单独读取图像不依赖动作元数据。导出动作时 policy 等待行的 NaN 仍会被拒绝。sync Policy Raw 的同行 action 是本次提交尝试，不代表由同行观测推理得到。正常保存、可导出和可物理回放是不同条件。相机外参 `camera_T_xarm_base_from_color` 从 color optical 坐标变换到 xArm base，平移单位为米。
 
-`timing/rows` 使用主机单调时钟，单位 ns，缺失值为 -1；control_ns 是读取开始，observation_ns 是读取完成。臂、手、触觉、相机保留来源时间，缓存不续期；同行不表示硬件同步。启用录制始终采集完整 Raw：实测关节、动作提交尝试、RGB、depth、aggregate、dense、来源时间及元数据，不随策略输入变化。仅触觉超龄继续逐行录制并告警；其他录制质量失败或队列满结束本段。健康 writer 排空已接纳前缀，关闭成功后按主线程已确定的保存意图发布。收尾开始后到达的 D 不追溯丢弃旧段，已接纳 D 不被 Q 覆盖。实际 writer I/O 或传感进程故障退出会话。零行不发布；线程仍存活或关闭失败保留 staging 与真实句柄。Raw 动作表示提交尝试，不保证前缀包含最后一次实际提交。
+`timing/rows` 使用主机单调时钟，单位 ns，缺失值为 -1；control_ns 是读取开始，observation_ns 是读取完成。臂、手、触觉、相机保留来源时间，缓存不续期；同行不表示硬件同步。启用录制始终采集完整 Raw：实测关节、动作提交尝试、RGB、depth、aggregate、dense、来源时间及元数据，不随策略输入变化。Raw 动作表示提交尝试，不保证前缀包含最后一次实际提交。writer 收尾与保存决定见[高级部署说明](docs/policy_deployment.md#录制收尾与退出结果)。
 
-teleop/jog/sync/replay 从每轮开始计时，只等待剩余周期；慢计算降低实际频率，不补发积压 tick，sync 只在提交后推进动作游标。async 保留时间锚点，RTC 仅以成功提交次数推进消费，不按墙钟跳过动作。Canonical 对采样间隔超过名义周期 ±25%、读取跨下一周期给出警告。control/observation 必须为正且各自严格递增，observation 不早于本次 control；所选字段的动态来源时间非正、非因果、倒退或 camera_sequence 异常只汇总一次带定位的 warning。静态相机参数不要求逐帧相机时间有效。Canonical 保留统一名义 dt 和 episode_ends，不另存质量统计，也不重采样。实际时序可查 Raw 的 `timing/rows` 和 `RawReader.timestamps_s`。可导出不代表数据质量适合当前实验。
+teleop/jog/replay 从每轮开始计时，只等待剩余周期；慢计算降低实际频率，不补发积压 tick。Canonical 对采样间隔超过名义周期 ±25%、读取跨下一周期给出警告。control/observation 必须为正且各自严格递增，observation 不早于本次 control；所选字段的动态来源时间非正、非因果、倒退或 camera_sequence 异常只汇总一次带定位的 warning。静态相机参数不要求逐帧相机时间有效。Canonical 保留统一名义 dt 和 episode_ends，不另存质量统计，也不重采样。实际时序可查 Raw 的 `timing/rows` 和 `RawReader.timestamps_s`。可导出不代表数据质量适合当前实验。
 
-导出先验证所选字段的元数据、结构、dtype、计数和时间规则，再逐块读取相应原始数组并检查转换后的有限值。未选字段的坏值不影响导出；仅导出点云时，也按每段实际深度尺寸分块读取。前置验证成功不代表全部数值已通过；坏数值可能在转换开始后甚至末块才发现，整段及整批拒绝语义不变。需要 RGB 时逐帧解码并核对帧数；成功时导出全部行，不截断、切分、插值、补帧或重采样。批量遇到不合格 episode 明确失败；可通过 `--exclude EPISODE` 排除整段后重试，不自动跳过或改写 Raw。全部完成后才原子发布 Canonical；转换失败关闭资源并删除本次新建的 Canonical staging，清理失败另行记录且不覆盖原错；不删除源 Raw 或既有目标。
+导出先验证所选字段的元数据、结构、dtype、计数和时间规则，再逐块读取相应原始数组并检查转换后的有限值。未选字段的坏值不影响导出；仅导出点云时，也按每段实际深度尺寸分块读取。前置验证成功不代表全部数值已通过；坏数值可能在转换开始后甚至末块才发现，整段及整批拒绝语义不变。需要 RGB 时逐帧解码并核对帧数；成功时导出全部行，不截断、切分、插值、补帧或重采样。批量遇到不合格 episode 明确失败；可通过 `--exclude EPISODE` 排除整段后重试，不自动跳过或改写 Raw。排除名单可跨批次复用，不存在于当前输入的名称忽略，统计只计实际排除的唯一 episode。全部完成后才原子发布 Canonical；转换失败关闭资源并删除本次新建的 Canonical staging，清理失败另行记录且不覆盖原错；不删除源 Raw 或既有目标。
 
 物理回放只要求 `data.h5` 中非空有限的 `action_arm_joint_target (N,7)`、`action_hand_joint_target (N,12)`，以及 `meta` 的 `control_hz`、`joint_units=rad` 和当前设备顺序的 JSON joint names。接受实数数值 dtype；不要求 timing、历史实测起点、RGB-D、触觉或完成标签。连接前一次校验整段当前 arm/hand 配置范围；当前手部配置可窄于公共额定硬件范围。超过边界 1e-6 rad 的目标拒绝，容差内微小越界归一到配置边界，归一后的目标仍须通过公共硬限位。坏行不筛除或补值。
 
