@@ -60,6 +60,24 @@ def test_vr_start_and_policy_clipping_are_separate():
     np.testing.assert_allclose(controller.previous_eef_target.p, [.5, 0, .4])
 
 
+@pytest.mark.parametrize('offset,accepted', [(-5e-10, True), (5e-10, True), (2e-9, False)])
+def test_vr_start_keeps_existing_roundoff_allowance(offset, accepted):
+    solver = Mock()
+    solver.constraints.workspace = np.array([[0, 1], [-1, 1], [0, .5]])
+    solver.compute_eef_pose_base.return_value = Pose([.4, 0, .5+offset], [1., 0, 0, 0])
+    controller = VRController(SimpleNamespace(solver=solver), None, TeleopConfig(), np.eye(3))
+    row = SimpleNamespace(arm={'qpos': [np.zeros(7)]}, vr={
+        'wrist_pos': np.zeros(3), 'wrist_quat_wxyz': np.array([1., 0, 0, 0]),
+    })
+    if accepted:
+        controller.reset(row)
+        assert controller.previous_eef_target.p[2] == .5+offset
+    else:
+        with pytest.raises(StartPoseRejected):
+            controller.reset(row)
+        assert controller.anchor is None
+
+
 @pytest.fixture
 def ik_solver(monkeypatch):
     monkeypatch.setitem(sys.modules, 'mplib', SimpleNamespace(Pose=Pose))
@@ -149,40 +167,157 @@ def test_heading_spread_does_not_block_save(tmp_path):
         estimate_heading(np.zeros((60, 3)))
 
 
-@pytest.mark.parametrize('outside', [True, False])
-def test_jog_submission_keeps_measured_hold_and_commit_semantics(monkeypatch, outside):
-    from dexmani_real.config.teleop import KeyboardTeleopConfig
-    from dexmani_real.runtime import jog
+@pytest.fixture
+def jog_session(monkeypatch):
+    from dataclasses import replace
 
-    now_ns = 1000000000
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.control import constraints
+    from dexmani_real.runtime import jog
+    from dexmani_real.runtime.preflight import jog_bounds
+
+    runtime = RealConfig()
+    runtime = replace(runtime, hand=replace(runtime.hand, enabled=False))
+    now_ns = 1_000_000_000
     monkeypatch.setattr(jog.time, 'monotonic_ns', lambda: now_ns)
     row = SimpleNamespace(arm={'qpos': [np.zeros(7)], 'timestamp_ns': [now_ns]}, hand=None)
     monkeypatch.setattr(jog, 'read_observation', lambda *args: row)
-    solver = Mock()
-    solver.compute_eef_pose_base.return_value = Pose([.4, 0, .501 if outside else .3], [1., 0, 0, 0])
+    collision = Mock(rejection=Mock(return_value=None))
+    monkeypatch.setattr(constraints, 'CollisionModel', lambda **kwargs: collision)
+    solver = Mock(constraints=constraints.MotionConstraints(runtime.arm, runtime.environment))
     solver.solve.return_value = IKResult(qpos=np.full(7, .1))
-    controller = jog.CartesianJog(
-        solver, KeyboardTeleopConfig(),
-        (np.array([.255, -.495, .055]), np.array([.715, .495, .495])),
-    )
-    robot = Mock()
-    keys = Mock(snapshot=Mock(return_value=frozenset({'j'})))
+    controller = jog.CartesianJog(solver, runtime.keyboard_teleop, jog_bounds(runtime))
+    keys = Mock(snapshot=Mock(return_value=frozenset()))
     state = SimpleNamespace(motion_lock=threading.Lock(), requests_allow_motion=lambda: True,
                             stop_signal=threading.Event())
-    runtime = SimpleNamespace(arm=SimpleNamespace(feedback_max_age_s=.5),
-                              hand=SimpleNamespace(enabled=False, home_qpos_deg=np.zeros(12)))
-    if outside:
-        controller.step(robot, keys, state, runtime)
-        command = robot.send_action.call_args.args[0]
+    return SimpleNamespace(controller=controller, solver=solver, collision=collision,
+                           robot=Mock(), keys=keys, state=state, runtime=runtime, row=row)
+
+
+@pytest.mark.parametrize('z,key,delta,expected,solved', [
+    (.494, 'up', .008, [.4, 0, .495], True),
+    (.056, 'down', .008, [.4, 0, .055], True),
+    (.496, 'down', .008, [.4, 0, .488], True),
+    (.496, 'down', .0005, [.4, 0, .4955], True),
+    (.496, 'up', .008, [.4, 0, .496], False),
+    (.496, 'j', .008, [.4, 0, .496], True),
+    (.496, 'w', .008, [.408, 0, .496], True),
+    (.054, 'up', .008, [.4, 0, .062], True),
+    (.054, 'down', .008, [.4, 0, .054], False),
+    (.054, 'j', .008, [.4, 0, .054], True),
+    (.054, 'w', .008, [.408, 0, .054], True),
+])
+def test_jog_boundary_reentry_after_release(jog_session, z, key, delta, expected, solved):
+    from dataclasses import replace
+
+    s = jog_session
+    controller = s.controller
+    controller.config = replace(controller.config, delta_pos_m=delta)
+    previous = Pose([.4, 0, .495 if z > .3 else .055], [1., 0, 0, 0])
+    controller.command_pose, controller.command_qpos = previous, np.full(7, .05)
+    measured = Pose([.4, 0, z], [1., 0, 0, 0])
+    s.solver.compute_eef_pose_base.return_value = measured
+    s.collision.eef_position.return_value = measured.p
+
+    # 走真实松键分支：先发布减速保持，再清除上次目标参考。
+    def accept_hold(command, **kwargs):
         assert command.arm_hold
-        assert command.arm_qpos is None
-        solver.solve.assert_not_called()
-    else:
-        robot.send_action.side_effect = RuntimeError('submission failed')
-        with pytest.raises(RuntimeError, match='submission failed'):
-            controller.step(robot, keys, state, runtime)
+        assert controller.command_pose is previous
+
+    s.robot.send_action.side_effect = accept_hold
+    controller.step(s.robot, s.keys, s.state, s.runtime)
     assert controller.command_pose is None
     assert controller.command_qpos is None
+    s.solver.solve.assert_not_called()
+
+    s.keys.snapshot.return_value = frozenset({key})
+
+    def accept_target(command, **kwargs):
+        assert not command.arm_hold
+        assert controller.command_pose is None
+        assert controller.command_qpos is None
+
+    s.robot.send_action.side_effect = accept_target
+    controller.step(s.robot, s.keys, s.state, s.runtime)
+    np.testing.assert_allclose(controller.command_pose.p, expected, atol=1e-15, rtol=0)
+    assert s.robot.send_action.call_count == 2
+    assert s.solver.solve.called == solved
+    s.solver.compute_eef_pose_base.assert_called_once_with(s.row.arm['qpos'][0])
+    if solved:
+        args = s.solver.solve.call_args.args
+        np.testing.assert_array_equal(args[0].p, controller.command_pose.p)
+        np.testing.assert_array_equal(args[2], s.row.arm['qpos'][0])
+    else:
+        # 向外饱和仍保留原位目标，经过现有端点碰撞检查。
+        s.collision.rejection.assert_called_once_with(s.row.arm['qpos'][0])
+    command = s.robot.send_action.call_args.args[0]
+    np.testing.assert_array_equal(controller.command_qpos, command.arm_qpos)
+    if key in {'up', 'down'}:
+        np.testing.assert_array_equal(controller.command_pose.p[:2], measured.p[:2])
+    else:
+        assert controller.command_pose.p[2] == z
+
+
+@pytest.mark.parametrize('side', [0, 1])
+def test_jog_accepts_exact_endpoint_workspace_boundary(jog_session, side):
+    s = jog_session
+    z = s.solver.constraints.workspace_with_tolerance[2, side]
+    s.solver.compute_eef_pose_base.return_value = Pose([.4, 0, z], [1., 0, 0, 0])
+    s.keys.snapshot.return_value = frozenset({'up' if side == 0 else 'down'})
+    s.controller.step(s.robot, s.keys, s.state, s.runtime)
+    target = s.solver.solve.call_args.args[0]
+    assert target.p[2] > z if side == 0 else target.p[2] < z
+    np.testing.assert_array_equal(s.controller.command_pose.p, target.p)
+    assert not s.robot.send_action.call_args.args[0].arm_hold
+
+
+@pytest.mark.parametrize('side', [0, 1])
+@pytest.mark.parametrize('offset', [0., .001])
+def test_jog_start_outside_endpoint_workspace_brakes(jog_session, side, offset):
+    s = jog_session
+    boundary = s.solver.constraints.workspace_with_tolerance[2, side]
+    z = np.nextafter(boundary - offset if side == 0 else boundary + offset,
+                     -np.inf if side == 0 else np.inf)
+    s.solver.compute_eef_pose_base.return_value = Pose([.4, 0, z], [1., 0, 0, 0])
+    assert s.solver.constraints.endpoint_rejection(
+        s.row.arm['qpos'][0], position=np.array([.4, 0, z]),
+    ) == 'final_eef_workspace'
+    s.keys.snapshot.return_value = frozenset({'up' if z < .3 else 'down'})
+    s.controller.step(s.robot, s.keys, s.state, s.runtime)
+    assert s.robot.send_action.call_args.args[0].arm_hold
+    s.solver.solve.assert_not_called()
+    assert s.controller.command_pose is None
+    assert s.controller.command_qpos is None
+
+
+@pytest.mark.parametrize('committed', [False, True])
+def test_jog_submission_failure_preserves_reference(jog_session, committed):
+    s = jog_session
+    previous_pose = Pose([.4, 0, .495], [1., 0, 0, 0]) if committed else None
+    previous_qpos = np.full(7, .05) if committed else None
+    s.controller.command_pose, s.controller.command_qpos = previous_pose, previous_qpos
+    s.solver.compute_eef_pose_base.return_value = Pose([.4, 0, .496], [1., 0, 0, 0])
+    s.keys.snapshot.return_value = frozenset({'down'})
+    s.robot.send_action.side_effect = RuntimeError('submission failed')
+    with pytest.raises(RuntimeError, match='submission failed'):
+        s.controller.step(s.robot, s.keys, s.state, s.runtime)
+    assert s.solver.solve.call_args.args[0].p[2] < .495
+    assert s.controller.command_pose is previous_pose
+    assert s.controller.command_qpos is previous_qpos
+    if committed:
+        np.testing.assert_array_equal(previous_pose.p, [.4, 0, .495])
+        np.testing.assert_array_equal(previous_pose.q, [1., 0, 0, 0])
+
+
+@pytest.mark.parametrize('dx,drpy', [([0., 0, 0], [0., 0, 0]), ([0., 0, 0], [.03, 0, 0])])
+def test_jog_zero_translation_keeps_position_exactly(dx, drpy):
+    from dexmani_real.runtime.jog import jog_pose
+
+    start = Pose([.254, -.496, .496], [1., 0, 0, 0])
+    pose, changed = jog_pose(start, np.array(dx), np.array(drpy),
+                             np.array([.255, -.495, .055]), np.array([.715, .495, .495]))
+    np.testing.assert_array_equal(pose.p, start.p)
+    assert changed == bool(np.any(drpy))
 
 
 def test_wrist_combined_rotation_and_uncommitted_smoothing():

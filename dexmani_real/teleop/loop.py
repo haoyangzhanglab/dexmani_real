@@ -262,10 +262,9 @@ class TeleopLoop:
             if self.preparation_interrupted():
                 return
             self.robot.prepare_streaming(self.cancel_epoch)
-            row = self.start_observation()
-            if row is None:
+            if self.start_observation() is None:
                 return
-            self.try_begin(row)
+            self.try_begin()
         except OperationCancelled:
             self.robot.check()
             if (self.runtime_state.cancel_epoch == self.cancel_epoch
@@ -389,14 +388,8 @@ class TeleopLoop:
             if self.handle_operator_command(event):
                 break
 
-    def try_begin(self, row):
+    def try_begin(self):
         if self.preparation_interrupted():
-            return
-        try:
-            self.controller.reset(row)
-        except StartPoseRejected as exc:
-            logger.warning("%s", exc)
-            self.request_episode_end(str(exc))
             return
         with self.runtime_state.motion_lock:
             started_ns = (
@@ -430,6 +423,7 @@ class TeleopLoop:
                 try:
                     self.controller.reset(row)
                 except StartPoseRejected as exc:
+                    logger.warning("%s", exc)
                     self.request_episode_end(str(exc))
                     return
             result = self.controller.compute_target(row, control_ns=compute_start_ns)

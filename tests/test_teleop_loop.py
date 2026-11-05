@@ -5,9 +5,9 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from dexmani_real.control.actions import ActionResult
+from dexmani_real.control.actions import ActionResult, StartPoseRejected
 from dexmani_real.robot.commands import RobotCommand, RobotError
-from dexmani_real.teleop.loop import TeleopLoop
+from dexmani_real.teleop.loop import TeleopLoop, TeleopPhase
 
 
 @pytest.fixture
@@ -16,7 +16,10 @@ def loop(monkeypatch):
     monkeypatch.setattr('dexmani_real.teleop.loop.time.monotonic_ns', lambda: clock[0])
     loop = TeleopLoop.__new__(TeleopLoop)
     loop.cancel_epoch = 1
-    loop.runtime_state = SimpleNamespace(cancel_epoch=1, requests_allow_motion=lambda: True, stop_signal=threading.Event())
+    loop.runtime_state = SimpleNamespace(
+        cancel_epoch=1, requests_allow_motion=lambda: True,
+        stop_signal=threading.Event(), motion_lock=threading.RLock(),
+    )
     loop.runtime = SimpleNamespace(teleop=SimpleNamespace(target_max_age_s=.5))
     loop.controller = Mock(previous_eef_target='old_pose')
     loop.controller.compute_target.return_value = ActionResult(None, np.ones(12), 'geometry')
@@ -31,6 +34,8 @@ def loop(monkeypatch):
     loop.request_episode_end = Mock()
     loop.pending_termination_reason = None
     loop.poll_blocking_commands = Mock(return_value=False)
+    loop.preparation_interrupted = Mock(return_value=False)
+    loop.max_duration_s = 10
     return loop, clock
 
 
@@ -49,23 +54,6 @@ def test_hold_is_paired_and_does_not_renew(loop):
     assert obj.robot.send_action.call_count == 1
     assert obj.recorder.append.call_count == 1
     obj.request_episode_end.assert_called_with('target_expired')
-
-
-def test_first_wait_and_recovery(loop):
-    obj, clock = loop
-    obj.last_command = None
-    deadline = obj.target_deadline_ns
-    obj.execute_control_step('row')
-    obj.execute_control_step('row2')
-    assert obj.controller.reset.call_count == 2
-    obj.recorder.append.assert_not_called()
-    obj.robot.send_action.assert_not_called()
-    assert obj.target_deadline_ns == deadline
-    obj.controller.compute_target.return_value = ActionResult(np.ones(7), np.ones(12), eef_pose='new_pose')
-    obj.execute_control_step('row3')
-    assert obj.last_command is not None
-    assert obj.target_deadline_ns == clock[0] + 500000000
-    obj.controller.commit.assert_called_once()
 
 
 def test_partial_submission_is_recorded_without_commit(loop):
@@ -149,20 +137,32 @@ def test_deadline_crossed_during_compute_cannot_be_renewed(loop):
     obj.request_episode_end.assert_called_once_with('target_expired')
 
 
-def test_submission_cancel_records_attempt_without_advancing_reference(loop):
+@pytest.mark.parametrize('expired', [False, True])
+def test_submission_cancel_records_attempt_without_advancing_reference(loop, expired):
     from dexmani_real.robot.commands import OperationCancelled
 
-    obj, _ = loop
+    obj, clock = loop
     previous = obj.last_command
+    deadline = obj.target_deadline_ns
+    obj.controller.compute_target.return_value = ActionResult(np.ones(7), np.ones(12), eef_pose='new_pose')
     def cancel(*args, **kwargs):
-        obj.runtime_state.cancel_epoch += 1
+        if expired:
+            clock[0] = kwargs['expires_ns']
+            obj.runtime_state.stop_signal.set()
+        else:
+            obj.runtime_state.cancel_epoch += 1
         raise OperationCancelled('cancelled between arm and hand')
     obj.robot.send_action.side_effect = cancel
     obj.execute_control_step('cancelled')
     obj.controller.commit.assert_not_called()
     assert obj.last_command is previous
-    obj.recorder.append.assert_called_once_with('cancelled', previous)
+    assert obj.target_deadline_ns == deadline
+    attempted = obj.robot.send_action.call_args.args[0]
+    np.testing.assert_array_equal(attempted.arm_qpos, np.ones(7))
+    obj.recorder.append.assert_called_once_with('cancelled', attempted)
     obj.request_episode_end.assert_called_once()
+    if expired:
+        assert obj.runtime_state.stop_signal.is_set()
 
 
 def test_programming_error_is_not_an_ordinary_hold(loop):
@@ -187,19 +187,22 @@ def test_unsubmitted_start_reference_is_rebuilt_without_accumulated_dt(loop):
         reference.qpos = initial_qpos.copy()
         reference.timestamp_ns = timestamp_ns
     hand.reset.side_effect = reset
-    hand.retarget.side_effect = [None, None, np.ones(12)*.2]
+    hand.retarget.side_effect = [None, None, np.ones(12)*.2, np.ones(12)*.3]
     hand.rejection_reason = 'geometry'
     mapper = Mock()
     mapper.solver.constraints.workspace = np.array([[0, 1], [-1, 1], [0, 1]])
-    mapper.solver.compute_eef_pose_base.return_value = Pose([.4, 0, .3], [1, 0, 0, 0])
+    mapper.solver.compute_eef_pose_base.side_effect = lambda q: Pose([.4+q[0], 0, .3], [1, 0, 0, 0])
     mapper.map_eef.side_effect = lambda pose, h, *args: ActionResult(np.zeros(7), h, eef_pose=pose)
     obj.controller = VRController(mapper, hand, TeleopConfig(), np.eye(3))
-    obj.last_command = None
+    obj.phase = TeleopPhase.PREPARING
+    obj.try_begin()
+    assert obj.phase is TeleopPhase.ACTIVE
+    assert obj.controller.anchor is None
     deadline = obj.target_deadline_ns
-    for i in range(3):
-        clock[0] += 10000000
+    for i, wait_ns in enumerate((10000000, 100000000, 200000000)):
+        clock[0] += wait_ns
         row = SimpleNamespace(
-            arm={'qpos': [np.zeros(7)]}, hand={'qpos': [np.ones(12)*(.1*i)]},
+            arm={'qpos': [np.ones(7)*(.01*i)]}, hand={'qpos': [np.ones(12)*(.1*i)]},
             vr={'wrist_pos': np.array([.01*i, 0, 0]), 'wrist_quat_wxyz': np.array([1., 0, 0, 0]), 'landmarks': None},
             observation_timestamp_ns=clock[0]-1000000,
         )
@@ -207,17 +210,49 @@ def test_unsubmitted_start_reference_is_rebuilt_without_accumulated_dt(loop):
         assert reference.timestamp_ns == row.observation_timestamp_ns
         assert hand.retarget.call_args.kwargs['timestamp_ns'] - reference.timestamp_ns == 1000000
         np.testing.assert_array_equal(reference.qpos, row.hand['qpos'][0])
+        np.testing.assert_array_equal(obj.controller.anchor[0], row.vr['wrist_pos'])
         if i < 2:
             assert obj.target_deadline_ns == deadline
+            obj.robot.send_action.assert_not_called()
+            obj.recorder.append.assert_not_called()
+            obj.audio.play.assert_not_called()
     assert obj.last_command is not None
+    assert obj.target_deadline_ns == clock[0] + 500000000
     assert obj.robot.send_action.call_count == 1
+    obj.recorder.append.assert_called_once_with(row, obj.last_command)
+    np.testing.assert_allclose(obj.controller.previous_eef_target.p, [.42, 0, .3], atol=1e-15)
+    obj.audio.play.assert_called_once_with('begin')
     assert hand.commit.call_count == 1
+    anchor = obj.controller.anchor
+    clock[0] += 10000000
+    row.vr['wrist_pos'] = np.array([.03, 0, 0])
+    row.hand['qpos'][0] = np.ones(12)*.9
+    row.observation_timestamp_ns = clock[0]-1000000
+    obj.execute_control_step(row)
+    assert obj.controller.anchor is anchor
+    np.testing.assert_array_equal(reference.qpos, np.ones(12)*.2)
+    assert obj.controller.previous_eef_target.p[0] > .42
+    obj.audio.play.assert_called_once_with('begin')
+
+
+def test_start_pose_rejection_uses_first_control_observation(loop):
+    obj, _ = loop
+    obj.phase = TeleopPhase.PREPARING
+    obj.controller.reset.side_effect = StartPoseRejected('start_pose_outside_workspace')
+    obj.try_begin()
+    assert obj.phase is TeleopPhase.ACTIVE
+    obj.request_episode_end.assert_not_called()
+    obj.execute_control_step('latest_row')
+    obj.controller.reset.assert_called_once_with('latest_row')
+    obj.request_episode_end.assert_called_once_with('start_pose_outside_workspace')
+    obj.controller.compute_target.assert_not_called()
+    obj.robot.send_action.assert_not_called()
+    obj.recorder.append.assert_not_called()
+    obj.audio.play.assert_not_called()
 
 
 @pytest.mark.parametrize('failure', [OSError('finish failure'), KeyboardInterrupt()])
 def test_recording_finish_failure_releases_episode_state(loop, failure):
-    from dexmani_real.teleop.loop import TeleopPhase
-
     obj, _ = loop
     obj.phase = TeleopPhase.ACTIVE
     obj.runtime_state.quit_requested = obj.runtime_state.estop_request = False

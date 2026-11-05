@@ -61,7 +61,7 @@ class CartesianJog:
             elif keys.snapshot() & JOG_CONTROL_KEYS == pressed_keys:
                 target = result.qpos
         if rejection_reason is not None and rejection_reason != self.rejection_reason:
-            logger.warning("IK rejected target; braking and holding: %s", rejection_reason)
+            logger.warning("Jog target rejected; braking and holding: %s", rejection_reason)
         self.rejection_reason = rejection_reason
         if target is not None:
             issues = check_device_feedback(row, runtime)
@@ -73,7 +73,7 @@ class CartesianJog:
             expires_ns=time.monotonic_ns() + int(self.config.target_max_age_s * 1e9),
         )
         if target is not None:
-            self.command_pose, self.command_qpos = pose.copy(), command.arm_qpos
+            self.command_pose, self.command_qpos = pose, command.arm_qpos
         else:
             self.clear_reference()
 
@@ -82,8 +82,9 @@ class CartesianJog:
         if baseline_pose is None:
             baseline_qpos = measured_qpos
             baseline_pose = self.solver.compute_eef_pose_base(measured_qpos)
+            workspace = self.solver.constraints.workspace_with_tolerance
             reason = workspace_start_rejection(
-                baseline_pose.p, self.position_lower, self.position_upper,
+                baseline_pose.p, workspace[:, 0], workspace[:, 1],
             )
             if reason is not None:
                 return baseline_pose, IKResult(qpos=None, reason=reason)
@@ -125,10 +126,14 @@ def jog_pose(
     position_lower: np.ndarray,
     position_upper: np.ndarray,
 ) -> tuple[Pose, bool]:
-    position = np.clip(command_pose.p + dx, position_lower, position_upper)
+    p = command_pose.p
+    # 允许从内缩范围外逐步退回；无平移输入的轴保持原位。
+    lower = np.minimum(position_lower, p)
+    upper = np.maximum(position_upper, p)
+    position = np.clip(p + dx, lower, upper)
     rotating = bool(np.any(drpy != 0.0))
     changed = rotating or not np.array_equal(position, command_pose.p)
-    quaternion = command_pose.q.copy()
+    quaternion = command_pose.q
     if rotating:
         delta_quaternion = Rotation.from_euler("xyz", drpy).as_quat()[[3, 0, 1, 2]]
         quaternion = quat_multiply(delta_quaternion, quaternion)

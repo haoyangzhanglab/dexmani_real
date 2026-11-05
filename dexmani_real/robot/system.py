@@ -212,6 +212,8 @@ class Robot:
                 self.check_run()
                 # arm 发布可能等待邮箱锁；真正发送 hand 前仍须复核当前反馈。
                 self._check_hand_feedback()
+                if time.monotonic_ns() >= expires_ns:
+                    raise OperationCancelled("command expired before hand submission")
                 self.hand_stop_required = True
                 cast("XHand", self.hand)._send_action(command.hand_qpos)
             self.check_run()

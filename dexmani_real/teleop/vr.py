@@ -29,7 +29,7 @@ class VRController:
         arm_qpos = row.arm["qpos"][0].copy()
         pose = self.action_mapper.solver.compute_eef_pose_base(arm_qpos)
         workspace = self.action_mapper.solver.constraints.workspace
-        reason = workspace_start_rejection(pose.p, workspace[:, 0], workspace[:, 1])
+        reason = workspace_start_rejection(pose.p, workspace[:, 0] - 1e-9, workspace[:, 1] + 1e-9)
         if reason is not None:
             raise StartPoseRejected(reason)
         eef_rotation = Rotation.from_quat(pose.q[WXYZ_TO_XYZW])
