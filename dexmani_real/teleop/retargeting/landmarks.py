@@ -8,7 +8,6 @@ BONE_CHILDREN = np.arange(1, 21)
 BONE_PARENTS = BONE_CHILDREN - 1
 BONE_PARENTS[::4] = 0
 FINGER_CHAINS = np.arange(1, 21).reshape(5, 4)
-TIP_INDICES = np.array([4, 8, 12, 16, 20])
 
 
 class HandGeometryRejected(ValueError):
@@ -17,14 +16,43 @@ class HandGeometryRejected(ValueError):
 
 @dataclass(frozen=True)
 class HandTargets:
-    positions: np.ndarray
+    positions: np.ndarray  # (5, 3, 3): base / intermediate / tip
     directions: np.ndarray  # (5, 2, 3): proximal / terminal
-    activation: np.ndarray
-    pinch_distances: np.ndarray
-    thumb_base_observable: bool
+    activation: np.ndarray  # (4,): thumb–index/middle/ring/pinky
+    pinch_distances: np.ndarray  # (4,), m
 
 
-def prepare_landmarks(landmarks):
+@dataclass(frozen=True)
+class HandGeometry:
+    """中立几何；五指顺序为 Thumb/Index/Middle/Ring/Pinky，基部数组仅含前两指。"""
+
+    positions: np.ndarray  # (5, 3, 3), m
+    segments: np.ndarray  # (5, 2), m
+    normals: np.ndarray  # (5, 3)
+    base_origins: np.ndarray  # (2, 3), m
+    base_axes: np.ndarray  # (2, 3)
+    base_limits: np.ndarray  # (2, 2), rad
+    base_directions: np.ndarray  # (2, 3), perpendicular to base_axes
+
+
+def project_direction(vectors: np.ndarray, normals: np.ndarray) -> np.ndarray:
+    """输入为单位方向或骨长加权平均方向；退化不产生任意替代方向。"""
+    projected = vectors - np.sum(vectors * normals, axis=-1, keepdims=True) * normals
+    norms = np.linalg.norm(projected, axis=-1, keepdims=True)
+    if np.any(norms < 1e-6):
+        raise HandGeometryRejected("hand direction projection is degenerate")
+    return projected / norms
+
+
+def rotate_vectors(vectors: np.ndarray, axes: np.ndarray, angles: np.ndarray) -> np.ndarray:
+    cosine, sine = np.cos(angles)[..., None], np.sin(angles)[..., None]
+    return (
+        vectors * cosine + np.cross(axes, vectors) * sine
+        + axes * np.sum(axes * vectors, axis=-1, keepdims=True) * (1 - cosine)
+    )
+
+
+def prepare_landmarks(landmarks: np.ndarray) -> np.ndarray:
     """已准入的米制右手输入；输出掌系 (+X 掌侧、+Y 拇指侧、+Z 指向中指)。"""
     points = np.asarray(landmarks, dtype=np.float64)
     lengths = np.linalg.norm(points[BONE_CHILDREN] - points[BONE_PARENTS], axis=1)
@@ -43,7 +71,7 @@ def prepare_landmarks(landmarks):
     return centered @ np.column_stack((normal, side, forward))
 
 
-def hand_lengths(points):
+def hand_lengths(points: np.ndarray) -> np.ndarray:
     """三个真实指骨长度及掌宽；不使用随屈曲变化的 MCP→TIP 直线距离。"""
     lengths = np.linalg.norm(np.diff(points[FINGER_CHAINS], axis=1), axis=2)
     return np.r_[lengths.ravel(), np.linalg.norm(points[5] - points[17])]
@@ -65,49 +93,48 @@ class HandCalibration:
             raise ValueError("hand calibration bone lengths are unstable")
         return cls(median[:15].reshape(5, 3), float(median[15]))
 
-    def targets(
-        self, points, robot_points, config, *, robot_segments, robot_palm_width,
-        thumb_base_xy, thumb_base_radius,
-    ):
-        """校验标定骨长并映射三点/指：thumb MCP/IP/TIP；其余 MCP/PIP/TIP。"""
-        chains = points[FINGER_CHAINS]
-        bones = np.diff(chains, axis=1)
+    def targets(self, points: np.ndarray, geometry: HandGeometry, config) -> HandTargets:
+        """按 XHand 基部轨迹、局部屈曲平面及固定段长构造目标。"""
+        bones = np.diff(points[FINGER_CHAINS], axis=1)
         lengths = np.linalg.norm(bones, axis=2)
         measured = np.r_[lengths.ravel(), np.linalg.norm(points[5] - points[17])]
         reference = np.r_[self.bone_lengths.ravel(), self.palm_width]
         if np.max(np.abs(measured / reference - 1.0)) > config.bone_length_tolerance:
             raise HandGeometryRejected("hand bone lengths changed beyond the calibrated tolerance")
         unit_bones = bones / lengths[:, :, None]
-        base = unit_bones[0, 0, :2]
-        norm = np.linalg.norm(base)
-        observable = bool(norm > 1e-6)
-        targets = robot_points.copy()
-        # 拇指第一轴只改变 MCP 的 XY 方位；高度和轨迹半径由 URDF 固定。
-        if observable:
-            targets[0, 0, :2] = thumb_base_xy + base / norm * thumb_base_radius
-        # 否则沿用中立占位坐标；Objective 显式关闭不可辨识的拇指位置项。
-        targets[0, 1] = targets[0, 0] + bones[0, 1] * robot_segments[0, 0] / self.bone_lengths[0, 1]
-        targets[0, 2] = targets[0, 1] + bones[0, 2] * robot_segments[0, 1] / self.bone_lengths[0, 2]
-        targets[1:, 1] = (
-            targets[1:, 0] + bones[1:, 0]
-            * (robot_segments[1:, 0] / self.bone_lengths[1:, 0])[:, None]
+        base = project_direction(unit_bones[:2, 0], geometry.base_axes)
+        initial = geometry.base_directions
+        angles = np.arctan2(
+            np.sum(geometry.base_axes * np.cross(initial, base), axis=1),
+            np.sum(initial * base, axis=1),
         )
-        # 位置目标合并 PIP→DIP→TIP，末段方向另行保留。
-        targets[1:, 2] = (
-            targets[1:, 1] + (chains[1:, 3] - chains[1:, 1])
-            * (robot_segments[1:, 1] / self.bone_lengths[1:, 1:].sum(axis=1))[:, None]
+        angles = np.clip(angles, *geometry.base_limits.T)
+        targets = geometry.positions.copy()
+        normals = geometry.normals.copy()
+        rotated = rotate_vectors(
+            np.stack((targets[:2, 0] - geometry.base_origins, normals[:2]), axis=1),
+            geometry.base_axes[:, None], angles[:, None],
         )
-        directions = unit_bones[:, [0, 2]]
-        directions[0, 0] = unit_bones[0, 1]  # 拇指近段为 MCP→IP。
-        palm_scale = robot_palm_width / self.palm_width
-        distances = np.linalg.norm(points[TIP_INDICES[1:]] - points[4], axis=1) * palm_scale
+        targets[:2, 0] = geometry.base_origins + rotated[:, 0]
+        normals[:2] = rotated[:, 1]
+        proximal = unit_bones[:, 0].copy()
+        proximal[0] = unit_bones[0, 1]
+        distal = unit_bones[:, 2].copy()
+        # 除以总骨长使退化阈值无量纲；不改变合成向量的方向。
+        distal[1:] = np.sum(
+            self.bone_lengths[1:, 1:, None] * unit_bones[1:, 1:], axis=1,
+        ) / self.bone_lengths[1:, 1:].sum(axis=1)[:, None]
+        projected = project_direction(
+            np.stack((proximal, distal, unit_bones[:, 2]), axis=1), normals[:, None],
+        )
+        proximal, distal, terminal = projected[:, 0], projected[:, 1], projected[:, 2]
+        targets[:, 1] = targets[:, 0] + geometry.segments[:, 0, None] * proximal
+        targets[:, 2] = targets[:, 1] + geometry.segments[:, 1, None] * distal
+        directions = np.stack((proximal, terminal), axis=1)
+        distances = np.linalg.norm(targets[1:, 2] - targets[0, 2], axis=1)
         x = np.clip(
             (config.pinch_start_m - distances) / (config.pinch_start_m - config.pinch_full_m),
             0.0, 1.0,
         )
         activation = x * x * (3.0 - 2.0 * x)
-        # 距离接近不足以证明对掌；末段夹角 60→90 度逐渐启用辅助。
-        opposition = np.degrees(np.arccos(np.clip(unit_bones[1:, 2] @ unit_bones[0, 2], -1, 1)))
-        x = np.clip((opposition - 60.0) / 30.0, 0.0, 1.0)
-        activation *= x * x * (3.0 - 2.0 * x)
-        return HandTargets(targets, directions, activation, distances, observable)
+        return HandTargets(targets, directions, activation, distances)

@@ -97,6 +97,20 @@ class HandFK:
         if any(fid >= self.model.nframes for fid in self.fingertip_frame_ids):
             raise ValueError("fingertip frame is missing from the hand URDF")
 
+    def neutral_joint_geometry(self) -> tuple[np.ndarray, np.ndarray]:
+        """返回 SDK 顺序的中立轴心与手基座系转轴。"""
+        self.pin.computeJointJacobians(self.model, self.data, np.zeros(self.model.nq))
+        origins, axes = [], []
+        for name in XHAND_SDK_JOINT_NAMES:
+            jid = self.model.getJointId(name)
+            joint = self.model.joints[jid]
+            origins.append(self.data.oMi[jid].translation.copy())
+            jac = self.pin.getJointJacobian(
+                self.model, self.data, jid, self.pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+            )
+            axes.append(jac[3:, joint.idx_v].copy())
+        return np.array(origins), np.array(axes)
+
     def forward(self, qpos: np.ndarray, frame_ids: Sequence[int]) -> np.ndarray:
         q = np.asarray(qpos, dtype=np.float64)[self.sdk_to_urdf]
         self.pin.forwardKinematics(self.model, self.data, q)
@@ -106,7 +120,9 @@ class HandFK:
             for fid in frame_ids
         ])
 
-    def positions_and_jacobians(self, qpos: np.ndarray, frame_ids: Sequence[int]):
+    def positions_and_jacobians(
+        self, qpos: np.ndarray, frame_ids: Sequence[int],
+    ) -> tuple[np.ndarray, np.ndarray]:
         """手基座系位置及其对 SDK 顺序关节的解析导数；一次 FK 服务所有目标。"""
         q = np.asarray(qpos, dtype=np.float64)[self.sdk_to_urdf]
         self.pin.computeJointJacobians(self.model, self.data, q)

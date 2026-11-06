@@ -27,10 +27,8 @@ class HandObjective:
         self.position_weights = np.zeros((5, 3))
         self.position_weights[:, :2] = config.shape_weight
         self.position_weights[:, 2] = config.tip_weight
-        # 非拇指 MCP 大多固定；仅拟合可表达的 PIP/TIP，避免常数项影响停止判据。
-        self.position_weights[1:, 0] = 0.0
-        if not targets.thumb_base_observable:
-            self.position_weights[0] = 0.0
+        # Thumb/Index 基部可动；其余固定基座不产生常数损失。
+        self.position_weights[2:, 0] = 0.0
 
     def __call__(self, qpos, gradient):
         cfg, targets = self.config, self.targets
@@ -53,7 +51,7 @@ class HandObjective:
         length = np.linalg.norm(segments, axis=2)
         direction = segments / length[:, :, None]
         direction_error = direction - targets.directions
-        # 机构无法表达的侧摆/末节弯曲不应持续增大对其他关节的牵引。
+        # 限位与位置/方向折中仍会产生大残差；限制它们对其他关节的牵引。
         # 按弦长做径向 Huber，除以 delta 后大残差的斜率为 1；参考方向不变。
         losses, derivatives = huber(direction_error, cfg.direction_huber_delta)
         value += np.dot(self.direction_weights, np.sum(losses, axis=0)) / 5.0

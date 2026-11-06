@@ -15,8 +15,10 @@ from dexmani_real.robot.model import (
 )
 from dexmani_real.teleop.retargeting.landmarks import (
     HandCalibration,
+    HandGeometry,
     HandGeometryRejected,
     prepare_landmarks,
+    project_direction,
 )
 from dexmani_real.teleop.retargeting.objective import HandObjective
 
@@ -36,9 +38,10 @@ class HandRetargeter:
         config.validate()
         self.config = config
         self.fk = HandFK()
+        model = self.fk.model
         self.limits = np.column_stack((hand_config.qpos_min_rad, hand_config.qpos_max_rad))
         model_limits = np.column_stack((
-            self.fk.model.lowerPositionLimit, self.fk.model.upperPositionLimit,
+            model.lowerPositionLimit, model.upperPositionLimit,
         ))[self.fk.urdf_to_sdk]
         if np.any(self.limits[:, 0] < model_limits[:, 0] - 1e-6) or np.any(
             self.limits[:, 1] > model_limits[:, 1] + 1e-6,
@@ -48,16 +51,43 @@ class HandRetargeter:
             name for pair, tip in zip(FINGER_FRAME_NAMES, XHAND_FINGERTIP_LINK_NAMES)
             for name in (*pair, tip)
         ]
-        self.frame_ids = [self.fk.model.getFrameId(name) for name in names]
-        thumb_cmc_id = self.fk.model.getFrameId("right_hand_thumb_bend_link")
-        if max(*self.frame_ids, thumb_cmc_id) >= self.fk.model.nframes:
+        self.frame_ids = [model.getFrameId(name) for name in names]
+        if max(self.frame_ids) >= model.nframes:
             raise ValueError("XHand retargeting frames are missing from the URDF")
-        neutral = self.fk.forward(np.zeros(12), [*self.frame_ids, thumb_cmc_id])
-        self.robot_points = neutral[:15, :3, 3].reshape(5, 3, 3)
-        self.robot_segments = np.linalg.norm(np.diff(self.robot_points, axis=1), axis=2)
-        self.robot_palm_width = np.linalg.norm(self.robot_points[1, 0] - self.robot_points[4, 0])
-        self.thumb_base_xy = neutral[15, :2, 3]
-        self.thumb_base_radius = np.linalg.norm(self.robot_points[0, 0, :2] - self.thumb_base_xy)
+        neutral = self.fk.forward(np.zeros(12), self.frame_ids)
+        positions = neutral[:, :3, 3].reshape(5, 3, 3)
+        segments = np.linalg.norm(np.diff(positions, axis=1), axis=2)
+        origins, axes = self.fk.neutral_joint_geometry()
+        # 目标 Frame 的父关节就是屈曲关节；沿 URDF 链取基部，避免维护第二份关节表。
+        flex_joints = [
+            [model.frames[fid].parent for fid in self.frame_ids[start:start + 2]]
+            for start in range(0, len(self.frame_ids), 3)
+        ]
+        flex_indices = np.array([
+            [XHAND_SDK_JOINT_NAMES.index(model.names[jid]) for jid in pair]
+            for pair in flex_joints
+        ])
+        flex_axes = axes[flex_indices]
+        normals = flex_axes[:, 0]
+        if not np.allclose(np.cross(normals, flex_axes[:, 1]), 0, atol=1e-9):
+            raise ValueError("XHand flexion axes must be parallel")
+        if np.any(segments <= 0) or not np.allclose(
+            np.sum(np.diff(positions, axis=1) * normals[:, None], axis=2), 0, atol=1e-9,
+        ):
+            raise ValueError("XHand target segments must lie in their flexion planes")
+        base_indices = [
+            XHAND_SDK_JOINT_NAMES.index(model.names[model.parents[jid]])
+            for jid, _ in flex_joints[:2]
+        ]
+        base_axes, base_origins = axes[base_indices], origins[base_indices]
+        base_vectors = np.array([
+            positions[0, 0] - base_origins[0], positions[1, 1] - positions[1, 0],
+        ])
+        base_vectors /= np.linalg.norm(base_vectors, axis=1)[:, None]
+        self.geometry = HandGeometry(
+            positions, segments, normals, base_origins, base_axes,
+            model_limits[base_indices], project_direction(base_vectors, base_axes),
+        )
         self.optimizer = nlopt.opt(nlopt.LD_SLSQP, 12)
         self.optimizer.set_maxeval(config.max_evaluations)
         self.optimizer.set_maxtime(config.max_solve_time_s)
@@ -103,11 +133,7 @@ class HandRetargeter:
             return self.reference_qpos.copy()
         try:
             points = prepare_landmarks(landmarks)
-            targets = self.calibration.targets(
-                points, self.robot_points, self.config,
-                robot_segments=self.robot_segments, robot_palm_width=self.robot_palm_width,
-                thumb_base_xy=self.thumb_base_xy, thumb_base_radius=self.thumb_base_radius,
-            )
+            targets = self.calibration.targets(points, self.geometry, self.config)
         except HandGeometryRejected as exc:
             self.rejection_reason = str(exc)
             return None

@@ -156,6 +156,7 @@ EE 遥操作、策略和 jog 共用有界局部 IK，返回的是下一条可执
 | --- | --- |
 | 策略执行模式与录制行为 | [策略部署说明](docs/policy_deployment.md) |
 | VR 到 XHand 的映射与参数 | [手部重定向](docs/hand_retargeting.md) |
+| XHand 离线对照与验收限制 | [重定向实验记录](docs/xhand_retargeting_experiment_2026-11-06.md) |
 | 离线物体几何与位姿分析 | [CordVIP 脚本说明](scripts/cordvip/README.md)，[独立环境安装](third_party/cordvip_geometry/docs/usage.md) |
 | 物体网格与点云资产制作 | [物体重建流程](docs/object_reconstruction.md) |
 | 开发约定 | [AGENTS.md](AGENTS.md) |
