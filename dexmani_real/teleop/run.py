@@ -192,7 +192,7 @@ def run_teleop(
             logger.exception("teleop runtime cleanup failed")
         try:
             if loop is not None:
-                loop.finish_recording()
+                loop.finish_recording(wait=True)
         except BaseException as exc:
             primary_failure = primary_failure or exc
             if loop is not None:

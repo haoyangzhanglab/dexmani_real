@@ -291,7 +291,10 @@ def iter_canonical_blocks(
                     if not len(cloud):
                         raise ValueError(f"point_cloud unavailable at row {index}")
                     block["point_cloud"][offset] = cloud
+                    del cloud
+                del image
         yield block
+        del raw, block
     if images is not None and next(images, None) is not None:
         raise ValueError(f"{reader.path / 'rgb.mp4'}: unexpected RGB frame at row {frames}")
 
@@ -380,9 +383,9 @@ def export_zarr(
         staging = None
         if progress_callback:
             progress_callback(len(selected), len(selected))
-        return dict(
-            episode_count=len(ends), total_frames=ends[-1], excluded_episodes=sorted(excluded),
-        )
+        return {
+            "episode_count": len(ends), "total_frames": ends[-1], "excluded_episodes": sorted(excluded),
+        }
     finally:
         if staging is not None:
             try:
@@ -445,6 +448,8 @@ def append_episode(arrays, offset, blocks, frames):
                     raise ValueError(f"canonical {name}: nonfinite values at row {row}")
             arrays[name][offset + count : offset + count + rows] = values
         count += rows
+        # 同步写入完成后释放消费者引用，避免与下一块分配重叠。
+        del block, values
     if count != frames:
         raise ValueError(f"canonical row count mismatch: expected {frames}, wrote {count}")
 

@@ -26,7 +26,7 @@ from dexmani_real.runtime.observation import (
 )
 from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S, RunEndReason
 from dexmani_real.utils.log import error_detail
-from dexmani_real.utils.timing import sampling_clock_ns
+from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,14 @@ class TeleopLoop:
             self.audio.play("emergency")
         try:
             if failure is None and not self.runtime_state.quit_requested and not self.runtime_state.estop_request:
-                self.finish_recording()
+                while self.recorder is not None:
+                    self.poll_blocking_commands()
+                    if self.runtime_state.quit_requested or self.runtime_state.estop_request:
+                        break
+                    self.robot.service_feedback()
+                    if self.finish_recording(wait=False):
+                        break
+                    time.sleep(0.005)
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()
@@ -124,29 +131,38 @@ class TeleopLoop:
         if failure is not None and primary_failure is None:
             raise failure
 
-    def finish_recording(self):
+    def finish_recording(self, *, wait=True) -> bool:
+        """pending 返回 False；轮询完成时仍可能执行发布或目录删除。"""
         recorder = self.recorder
         if recorder is None:
-            return
-        published = recorder.finish(
-            save=not self.discard_requested,
-            reason=self.pending_termination_reason,
-            details=self.termination_details,
-        )
+            return True
+        finish_kwargs = {
+            "save": not self.discard_requested,
+            "reason": self.pending_termination_reason,
+            "details": self.termination_details,
+        }
+        if wait:
+            recorder.finish(**finish_kwargs)
+        else:
+            recorder.request_finish(**finish_kwargs)
+            if not recorder.poll_finish():
+                return False
+        published = recorder.published_path
         # finish 失败时保留 recorder，让会话收尾继续持有未释放的 writer。
         self.recorder = None
         request = recorder.finish_request
         if self.runtime_state.estop_request:
             self.audio.play("emergency")
-            return
+            return True
         if request.reason not in {"operator", "quit", "duration_complete"}:
-            return
+            return True
         if published is not None and recorder.recording_truncated_reason is None:
             logger.info("本段已保存。")
             self.audio.play("save")
         elif not request.save:
             logger.info("本段已丢弃。")
             self.audio.play("discard")
+        return True
 
     def request_episode_end(
         self, reason, *, run_end_reason=RunEndReason.CANCELLED,
@@ -374,6 +390,9 @@ class TeleopLoop:
         return False
 
     def handle_commands(self, commands: Sequence[str]):
+        if self.recorder is not None and self.recorder.finish_request is not None:
+            # 首次收尾请求已固定处置意图；此时只处理退出与急停。
+            commands = tuple(event for event in commands if event in ("q", "esc"))
         if "d" in commands and self.phase is not TeleopPhase.IDLE:
             self.discard_requested = True
         # 回调已置停止信号；先登记 D 意图，再按原优先级选择结束原因。
@@ -510,7 +529,8 @@ class TeleopLoop:
             return
         if self.next_tick_ns is not None and now_ns < self.next_tick_ns:
             return
-        self.next_tick_ns = now_ns + self.control_dt_ns
+        planned_ns = now_ns if self.next_tick_ns is None else self.next_tick_ns
+        self.next_tick_ns = next_tick_ns(planned_ns, self.control_dt_ns, now_ns)
         row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
         devices = check_device_feedback(row, self.runtime)
         if devices:

@@ -39,6 +39,7 @@ from dexmani_real.runtime.observation import (
 )
 from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S, RunEndReason
 from dexmani_real.utils.log import error_detail
+from dexmani_real.utils.timing import next_tick_ns
 
 logger = logging.getLogger(__name__)
 
@@ -479,7 +480,7 @@ class Rollout:
         if now < self.next_step_ns:
             self.poll_model()
             return
-        self.next_step_ns = now + self.dt_ns
+        self.next_step_ns = next_tick_ns(self.next_step_ns, self.dt_ns, now)
         row = attempted = None
         try:
             row = self.sample_observation()

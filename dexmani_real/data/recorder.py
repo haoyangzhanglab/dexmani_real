@@ -85,13 +85,13 @@ class EpisodeRecorder:
             status = "failed"
         else:
             status = "not_published"
-        return dict(
-            status=status,
-            path=str(published) if published is not None else None,
-            staging_path=str(staging) if staging is not None and published is None else None,
-            row_count=self.written_frames,
-            recording_truncated_reason=self.recording_truncated_reason,
-        )
+        return {
+            "status": status,
+            "path": str(published) if published is not None else None,
+            "staging_path": str(staging) if staging is not None and published is None else None,
+            "row_count": self.written_frames,
+            "recording_truncated_reason": self.recording_truncated_reason,
+        }
 
     def start(
         self,
@@ -207,7 +207,7 @@ class EpisodeRecorder:
             else:
                 shutil.rmtree(self.staging_path)
                 self.staging_path = None
-                if self.written_frames == 0:
+                if request.save and self.written_frames == 0:
                     logger.info("未录到数据，本段未发布。")
         except BaseException as exc:
             self.store_error(exc)
@@ -233,21 +233,25 @@ class EpisodeRecorder:
                 writer.open(metadata)
                 self.ready.set()
                 while self.error is None:
+                    finish = self.finish_request
+                    if finish is not None and not finish.save:
+                        break
                     try:
                         item = self.queue.get(timeout=0.05)
                     except Empty:
-                        # 单生产者已停止 append，取空后即可安全结束已接纳的前缀。
-                        finish = self.finish_request
+                        # 仅取帧前已登记的请求能保证生产者停止；超时后到达的
+                        # 请求留到下轮处理，避免漏掉超时后刚入队的最后一帧。
                         if finish is not None:
                             break
                         continue
                     writer.append_frame(*item)
                 if finish is not None and self.error is None:
-                    writer.finish(
-                        finish.reason,
-                        finish.details,
-                        recording_truncated_reason=finish.recording_truncated_reason,
-                    )
+                    if finish.save:
+                        writer.finish(
+                            finish.reason,
+                            finish.details,
+                            recording_truncated_reason=finish.recording_truncated_reason,
+                        )
                 else:
                     writer.flush()
             except BaseException as exc:
