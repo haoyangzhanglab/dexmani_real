@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import radians
 
 import numpy as np
 
@@ -35,8 +34,6 @@ class KeyboardTeleopConfig:
     delta_pos_m: float = 0.008
     delta_rpy_rad: float = 0.03
     workspace_command_margin_m: float = 0.005
-    ik_max_pose_error_pos_m: float = 0.002
-    ik_max_pose_error_rot_rad: float = radians(2.0)
 
     def validate(self) -> None:
         for name in ("target_max_age_s", "delta_pos_m", "delta_rpy_rad"):

@@ -9,6 +9,8 @@ from dexmani_real.geometry.pose import (
     XYZW_TO_WXYZ,
     Pose,
 )
+from dexmani_real.robot.commands import arm_reference_from_feedback
+from dexmani_real.runtime.ik_reference import IKReference, prepare_reference
 
 
 class VRController:
@@ -21,12 +23,12 @@ class VRController:
 
     def clear(self):
         self.anchor = None
-        self.previous_arm_command = None
+        self.ik_reference = None
         self.previous_eef_target = None
 
     def reset(self, row):
         self.clear()
-        arm_qpos = row.arm["qpos"][0].copy()
+        arm_qpos = self.action_mapper.solver.measured_reference(row.arm["qpos"][0])
         pose = self.action_mapper.solver.compute_eef_pose_base(arm_qpos)
         workspace = self.action_mapper.solver.constraints.workspace
         reason = workspace_start_rejection(pose.p, workspace[:, 0] - 1e-9, workspace[:, 1] + 1e-9)
@@ -43,7 +45,6 @@ class VRController:
 
         # 所有初始化成功后才发布新锚点；首帧 EMA 从同一个实测 FK 位姿开始。
         self.anchor = row.vr["wrist_pos"].copy(), pose.p, rotation_right
-        self.previous_arm_command = arm_qpos
         self.previous_eef_target = pose
 
     def _wrist_target(self, wrist_pos, wrist_quat_wxyz):
@@ -61,6 +62,11 @@ class VRController:
         return Pose(alpha_pos * position + (1.0 - alpha_pos) * previous.p, smoothed.as_quat()[XYZW_TO_WXYZ])
 
     def compute_target(self, row, *, control_ns) -> ActionResult:
+        reference = prepare_reference(
+            self.action_mapper.solver, self.ik_reference, row.arm["qpos"][0],
+            feedback_ns=int(row.arm["timestamp_ns"][0]), control_ns=control_ns,
+            period_s=1 / self.config.control_hz,
+        )
         target = self._wrist_target(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
         hand = None
         if self.hand_retargeter is not None:
@@ -68,14 +74,18 @@ class VRController:
                 row.vr["landmarks"], timestamp_ns=control_ns,
             )
             if hand is None:
+                # 无 arm 求解时仍检查参考，禁止失配目标进入普通重发。
+                self.action_mapper.solver.bounds(*reference)
                 return ActionResult(None, None, self.hand_retargeter.rejection_reason)
         return self.action_mapper.map_eef(
-            target, hand, row.arm["qpos"][0], self.previous_arm_command
+            target, hand, reference
         )
 
-    def commit(self, command, *, eef_pose, submit_end_ns):
+    def commit(self, command, *, eef_pose, submit_end_ns, measured_qpos):
         if self.hand_retargeter is not None:
             self.hand_retargeter.commit(command.hand_qpos, timestamp_ns=submit_end_ns)
-        self.previous_arm_command = command.arm_qpos
+        anchor = (arm_reference_from_feedback(measured_qpos, *self.action_mapper.solver.limits.T)
+                  if self.ik_reference is None else self.ik_reference.anchor)
+        self.ik_reference = IKReference(command.arm_qpos, anchor, submit_end_ns)
         # map_eef 交出的临时目标此后归控制器所有。
         self.previous_eef_target = eef_pose

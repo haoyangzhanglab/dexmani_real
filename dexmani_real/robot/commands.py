@@ -7,7 +7,7 @@ from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
 # 设备 owner 检查目标租期；它不代表物理停止延迟。
 COMMAND_LEASE_NS = 2_000_000_000
 # 当前关节范围内 float32 反馈的位置舍入容差（rad），不适用于外部目标。
-_FEEDBACK_POSITION_ROUNDOFF_RAD = 1e-6
+FEEDBACK_POSITION_ROUNDOFF_RAD = 1e-6
 
 
 @dataclass(frozen=True)
@@ -52,7 +52,7 @@ def arm_reference_from_feedback(qpos, lower, upper) -> np.ndarray:
     """由实测反馈生成规划起点；仅归一边界附近的 float32 微小越界。"""
     lower, upper = np.asarray(lower), np.asarray(upper)
     feedback = validate_arm_target(
-        qpos, lower - _FEEDBACK_POSITION_ROUNDOFF_RAD, upper + _FEEDBACK_POSITION_ROUNDOFF_RAD,
+        qpos, lower - FEEDBACK_POSITION_ROUNDOFF_RAD, upper + FEEDBACK_POSITION_ROUNDOFF_RAD,
     )
     return np.clip(feedback, lower, upper)
 
@@ -61,7 +61,7 @@ def hand_reference_from_feedback(qpos, lower, upper) -> np.ndarray:
     """仅归一实测手部参考的舍入越界，原反馈保持不变。"""
     lower, upper = np.asarray(lower), np.asarray(upper)
     feedback = validate_hand_target(
-        qpos, lower - _FEEDBACK_POSITION_ROUNDOFF_RAD, upper + _FEEDBACK_POSITION_ROUNDOFF_RAD,
+        qpos, lower - FEEDBACK_POSITION_ROUNDOFF_RAD, upper + FEEDBACK_POSITION_ROUNDOFF_RAD,
     )
     return np.clip(feedback, lower, upper)
 

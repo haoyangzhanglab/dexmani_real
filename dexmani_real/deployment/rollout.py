@@ -12,6 +12,7 @@ from typing import cast
 
 import numpy as np
 
+from dexmani_real.control.ik import IKReferenceError
 from dexmani_real.data.raw import snapshot_recording_metadata
 from dexmani_real.data.recorder import EpisodeRecorder
 from dexmani_real.deployment.schedule import (
@@ -29,6 +30,7 @@ from dexmani_real.robot.commands import (
     RobotCommand,
     arm_reference_from_feedback,
 )
+from dexmani_real.runtime.ik_reference import IKReference, prepare_reference
 from dexmani_real.runtime.observation import (
     check_device_feedback,
     check_observation,
@@ -88,7 +90,8 @@ class Rollout:
         self.last_slot = -1
         self.dt_ns = round(self.execution.control_dt_s * 1e9)
         self.started_ns = self.next_step_ns = 0
-        self.previous_arm = None
+        self.has_submitted = False
+        self.ik_reference = None
         self.first_prediction = True
         self.discard_requested = False
 
@@ -117,7 +120,9 @@ class Rollout:
         self.result.errors.extend(errors)
         self.plan = self.query = None
         self.history.clear()
-        self.previous_arm = self.run_deadline_ns = None
+        self.has_submitted = False
+        self.run_deadline_ns = None
+        self.ik_reference = None
 
     def finish_recording(self, *, wait=True) -> bool:
         result = self.result
@@ -228,9 +233,17 @@ class Rollout:
                 logger.warning("本轮未开始：%s；可稍后再次按 B。", self.preparation_issue)
                 return None
             time.sleep(0.005)
-        arm_reference_from_feedback(
-            row.arm["qpos"][0], self.runtime.arm.joint_limit_lower, self.runtime.arm.joint_limit_upper,
-        )
+        if self.policy_info.action_mode == "eef":
+            try:
+                self.action_mapper.solver.measured_reference(row.arm["qpos"][0])
+            except IKReferenceError as exc:
+                self.preparation_issue = str(exc)
+                logger.warning("本轮未开始：%s；请就位后再次按 B。", exc)
+                return None
+        else:
+            arm_reference_from_feedback(
+                row.arm["qpos"][0], self.runtime.arm.joint_limit_lower, self.runtime.arm.joint_limit_upper,
+            )
         return row
 
     def prepare(self, poll_operator):
@@ -317,7 +330,12 @@ class Rollout:
             decoded = self.action_mapper.map_joint(action[:7], action[7:], current)
         else:
             pose = Pose(action[:3], rot6d_to_quat_wxyz(action[3:9]))
-            decoded = self.action_mapper.map_eef(pose, action[9:], current, self.previous_arm)
+            reference = prepare_reference(
+                self.action_mapper.solver, self.ik_reference, current,
+                feedback_ns=int(row.arm["timestamp_ns"][0]), control_ns=time.monotonic_ns(),
+                period_s=self.execution.control_dt_s,
+            )
+            decoded = self.action_mapper.map_eef(pose, action[9:], reference)
         if decoded.rejection_reason is not None or decoded.arm_qpos is None:
             return None, f"action_rejected: {decoded.rejection_reason}"
         return RobotCommand(decoded.arm_qpos, decoded.hand_qpos), None
@@ -396,7 +414,11 @@ class Rollout:
         return False
 
     def prepare_command(self, action, row):
-        command, issue = self.map_command(action, row)
+        try:
+            command, issue = self.map_command(action, row)
+        except IKReferenceError as exc:
+            self.stop(str(exc))
+            return None
         if issue is not None:
             self.stop(issue)
             return None
@@ -443,6 +465,15 @@ class Rollout:
         else:
             self.step_async()
 
+    def commit_arm(self, command, row):
+        submitted_ns = time.monotonic_ns()
+        if self.policy_info.action_mode == "eef":
+            anchor = (arm_reference_from_feedback(
+                row.arm["qpos"][0], *self.action_mapper.solver.limits.T,
+            ) if self.ik_reference is None else self.ik_reference.anchor)
+            self.ik_reference = IKReference(command.arm_qpos, anchor, submitted_ns)
+        self.has_submitted = True
+
     def step_sync(self):
         now = time.monotonic_ns()
         if now < self.next_step_ns:
@@ -468,9 +499,9 @@ class Rollout:
                 return
             attempted = command
             self.robot.send_action(command, expires_ns=time.monotonic_ns() + COMMAND_LEASE_NS)
-            if self.previous_arm is None:
+            if not self.has_submitted:
                 logger.info("Policy first target submitted")
-            self.previous_arm = command.arm_qpos
+            self.commit_arm(command, row)
             self.cursor += 1
             if self.cursor == min(len(self.plan.actions), self.execution.action_steps):
                 self.plan = None
@@ -520,9 +551,9 @@ class Rollout:
                     return
             attempted = command
             self.robot.send_action(command, expires_ns=now + COMMAND_LEASE_NS)
-            if self.previous_arm is None:
+            if not self.has_submitted:
                 logger.info("Policy first target submitted")
-            self.previous_arm = command.arm_qpos
+            self.commit_arm(command, row)
             if self.execution.mode == "rtc":
                 self.cursor += 1
         finally:

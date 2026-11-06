@@ -56,8 +56,9 @@ class ActionMapper:
                 fixed_hand_qpos = np.deg2rad(hand.home_qpos_deg)
             solver = IKSolver(
                 MotionConstraints(arm, environment),
-                position_tolerance=motion.ik_max_pose_error_pos_m,
-                rotation_tolerance=motion.ik_max_pose_error_rot_rad,
+                target_speed=np.deg2rad(motion.ik_target_speed_deg_s),
+                device_speed=arm.max_joint_velocity_rad_per_s,
+                max_lead=np.deg2rad(motion.ik_max_lead_deg),
             )
         return cls(
             joint_limits=np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper)),
@@ -92,9 +93,8 @@ class ActionMapper:
         )
         return ActionResult(target, hand)
 
-    def map_eef(self, pose: Pose, hand, current_arm_qpos, previous_arm_command_qpos=None):
-        current = np.asarray(current_arm_qpos, dtype=np.float64)
-        previous = current if previous_arm_command_qpos is None else previous_arm_command_qpos
+    def map_eef(self, pose: Pose, hand, reference):
+        current, previous, anchor, h = reference
         hand = self.prepare_hand(hand)
         if self.solver is None:
             raise ValueError("EEF mapping requires an online IK solver")
@@ -104,7 +104,7 @@ class ActionMapper:
         result = self.solver.solve(
             pose,
             current,
-            previous,
+            previous, anchor, h=h,
             hand_qpos=hand if hand is not None else self.fixed_hand_qpos,
         )
         reason = None if result.qpos is not None else result.reason

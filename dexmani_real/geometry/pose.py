@@ -88,13 +88,6 @@ def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     )
 
 
-def compute_pose_error(target: Pose, actual: Pose) -> tuple[float, float]:
-    position_error = float(np.linalg.norm(target.p - actual.p))
-    q_dot = abs(float(np.dot(target.q, actual.q)))
-    rotation_error = 2.0 * np.arccos(np.clip(q_dot, 0.0, 1.0))
-    return position_error, rotation_error
-
-
 def rot6d_to_quat_wxyz(r6: np.ndarray) -> np.ndarray:
     from scipy.spatial.transform import Rotation
 

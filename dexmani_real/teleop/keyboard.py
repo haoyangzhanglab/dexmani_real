@@ -3,6 +3,8 @@
 import logging
 import time
 
+import numpy as np
+
 from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.ik import IKSolver
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
@@ -76,8 +78,9 @@ class KeyboardTeleop:
         constraints = MotionConstraints(self.runtime.arm, self.runtime.environment)
         solver = IKSolver(
             constraints,
-            position_tolerance=self.jog_config.ik_max_pose_error_pos_m,
-            rotation_tolerance=self.jog_config.ik_max_pose_error_rot_rad,
+            target_speed=np.deg2rad(self.runtime.motion.ik_target_speed_deg_s),
+            device_speed=self.runtime.arm.max_joint_velocity_rad_per_s,
+            max_lead=np.deg2rad(self.runtime.motion.ik_max_lead_deg),
         )
         self.jog = CartesianJog(solver, self.jog_config, self.bounds)
         startup_epoch = self.runtime_state.cancel_epoch
@@ -93,7 +96,7 @@ class KeyboardTeleop:
         print("WASD/arrows and IJKL: jog; R: hand then direct arm HOME; Q: exit; ESC: emergency stop")
         print(
             "Jog is ready. Release jog keys to brake and hold. "
-            "Rejected targets brake and hold; valid targets resume motion."
+            "Geometry rejection brakes and holds; invalid references end the session."
         )
         self.period_ns = sampling_clock_ns(self.jog_config.control_hz)
         self.tick_due_ns = time.monotonic_ns() + self.period_ns

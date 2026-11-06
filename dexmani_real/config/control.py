@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import isfinite, radians
+from math import isfinite
 
 import numpy as np
 
@@ -12,10 +12,10 @@ from dexmani_real.config.calibration_data import TABLE_PLANE_RELATIVE_PATH
 
 @dataclass(frozen=True)
 class MotionConfig:
-    """遥操作与策略 EEF 逆解的误差容差。"""
+    """共享 EEF 目标变化约束；默认值待真机验证。"""
 
-    ik_max_pose_error_pos_m: float = 0.02
-    ik_max_pose_error_rot_rad: float = radians(5.0)
+    ik_target_speed_deg_s: float = 75.0
+    ik_max_lead_deg: float = 10.0
 
 
 @dataclass(frozen=True)

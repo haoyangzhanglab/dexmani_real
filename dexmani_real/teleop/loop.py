@@ -8,6 +8,7 @@ from enum import Enum
 from typing import cast
 
 from dexmani_real.control.actions import StartPoseRejected
+from dexmani_real.control.ik import IKReferenceError
 from dexmani_real.data.raw import snapshot_recording_metadata
 from dexmani_real.data.recorder import (
     EpisodeRecorder,
@@ -452,12 +453,14 @@ class TeleopLoop:
             command = self.last_command if rejected else RobotCommand(result.arm_qpos, result.hand_qpos)
             self.robot.send_action(command, expires_ns=expires_ns)
             submit_end_ns = time.monotonic_ns()
-            self.controller.commit(command, eef_pose=eef_pose, submit_end_ns=submit_end_ns)
+            self.controller.commit(command, eef_pose=eef_pose, submit_end_ns=submit_end_ns, measured_qpos=row.arm["qpos"][0])
             self.last_command = command
             self.target_deadline_ns = expires_ns
             if first_target:
                 logger.info("Teleop first target submitted")
                 self.audio.play("begin")
+        except IKReferenceError as exc:
+            self.request_episode_end(str(exc))
         except OperationCancelled as exc:
             # 先检查 SDK/worker 故障，再即时登记已入队的终止意图。
             interrupted = self.poll_blocking_commands()
