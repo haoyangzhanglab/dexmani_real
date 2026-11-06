@@ -12,7 +12,7 @@ from dexmani_real.config.xhand import HandConfig
 from dexmani_real.robot.commands import (
     OperationCancelled,
     RobotError,
-    validate_hand_target,
+    hand_reference_from_feedback,
 )
 from dexmani_real.robot.model import (
     HAND_DOF,
@@ -146,8 +146,6 @@ class XHandError(RobotError):
 class XHand:
     def __init__(self, config: HandConfig):
         self.cfg = config
-        self.mechanical_lower = np.asarray(XHAND_RATED_QPOS_MIN_RAD, dtype=np.float64)
-        self.mechanical_upper = np.asarray(XHAND_RATED_QPOS_MAX_RAD, dtype=np.float64)
         self.connected_flag = False
         self.consecutive_write_crc = 0
         self.counts = dict.fromkeys(("read_crc", "write_crc", "aggregate", "dense", "overcurrent"), 0)
@@ -372,19 +370,14 @@ class XHand:
             timestamp_ns=query_started_ns,
         )
 
-    def send_action(self, action: np.ndarray) -> bool:
-        target = validate_hand_target(action, self.mechanical_lower, self.mechanical_upper)
-        return self._send_action(target)
-
-    def _send_action(self, target: np.ndarray) -> bool:
-        """Robot 的组合预检或本驱动的公开入口已验证目标。"""
+    def _send_action(self, target: np.ndarray) -> None:
+        """目标已由 Robot 的组合预检验证；连续写 CRC 仍会失败。"""
         confirmed = self._send_position(target) != COMMUNICATION_CRC_ERROR_CODE
         if not confirmed and self.consecutive_write_crc >= MAX_CONSECUTIVE_WRITE_CRC:
             raise XHandError(
                 "send", COMMUNICATION_CRC_ERROR_CODE,
                 f"{self.consecutive_write_crc} consecutive position write CRC replies; delivery unconfirmed",
             )
-        return confirmed
 
     def _send_position(self, target: np.ndarray) -> int:
         if self.control is None or self.command is None or not self.connected_flag:
@@ -394,14 +387,6 @@ class XHand:
             joint.mode = POSITION_MODE
             joint.position = float(value)
         return self.send_command()
-
-    def hold_current(self, qpos: np.ndarray) -> int:
-        measured = np.asarray(qpos, dtype=np.float64)
-        if measured.shape != HAND_JOINT_SHAPE or not np.all(np.isfinite(measured)):
-            raise ValueError("XHand.hold_current requires twelve finite joint positions")
-        return self._send_position(
-            np.clip(measured, XHAND_RATED_QPOS_MIN_RAD, XHAND_RATED_QPOS_MAX_RAD)
-        )
 
     def set_passive(self) -> int:
         if self.control is None or self.command is None or not self.connected_flag:
@@ -416,11 +401,22 @@ class XHand:
             return  # 命令初始化前没有可发送的运动；部分启动只需关闭连接。
         if not self.is_connected:
             raise RuntimeError("XHand disconnected before stop")
+        reference = None
+        if qpos is not None:
+            try:
+                reference = hand_reference_from_feedback(
+                    qpos, XHAND_RATED_QPOS_MIN_RAD, XHAND_RATED_QPOS_MAX_RAD,
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                logger.warning("XHand stop uses passive: invalid position feedback (%s)", exc)
         deadline = time.monotonic() + STOP_RETRY_TIMEOUT_S
         while time.monotonic() < deadline:
             now_ns = time.monotonic_ns()
             fresh = sample_is_fresh(timestamp_ns, STOP_FEEDBACK_MAX_AGE_S, now_ns)
-            status = self.hold_current(qpos) if qpos is not None and fresh else self.set_passive()
+            if reference is not None and not fresh:
+                logger.warning("XHand stop uses passive: position feedback stale")
+                reference = None
+            status = self._send_position(reference) if reference is not None else self.set_passive()
             if status != COMMUNICATION_CRC_ERROR_CODE:
                 return
             remaining = deadline - time.monotonic()

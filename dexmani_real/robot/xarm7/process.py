@@ -156,9 +156,22 @@ class ArmProcess:
             self.io.stop.clear()
 
     def request_operation(self, request: PrepareRequest | HomeRequest, *, service, abort, cancel_epoch):
+        """普通取消确认停止并消费回复后抛出；其他失败关闭 owner。"""
         deadline_ns = request.deadline_ns
         # 生命周期仅由一个父控制流程顺序调用；局部事实只决定异常收尾。
-        in_flight = False
+        submitted = False
+        reply_received = False
+
+        def receive_reply():
+            nonlocal reply_received
+            error = self.pipe.recv()
+            # recv 成功即已消费；取消回复本身也会抛出异常。
+            reply_received = True
+            if error is not None:
+                if isinstance(error, Exception) and self.fault:
+                    raise self._read_fault() from error
+                raise error
+
         try:
             self.resume(cancel_epoch, deadline_ns=deadline_ns)
             service()
@@ -166,20 +179,15 @@ class ArmProcess:
                 raise OperationCancelled("arm operation cancelled before submission")
             if time.monotonic_ns() >= deadline_ns:
                 raise TimeoutError("arm operation deadline expired before submission")
-            in_flight = True
             self.pipe.send(request)
+            submitted = True
             while not self.pipe.poll(0.005):
                 service()
                 if abort():
                     raise OperationCancelled("arm operation cancelled")
                 if time.monotonic_ns() >= deadline_ns or not self.is_connected:
                     raise TimeoutError("arm operation unresolved before deadline")
-            error = self.pipe.recv()
-            if error is not None:
-                if isinstance(error, Exception) and self.fault:
-                    raise self._read_fault() from error
-                raise error
-            in_flight = False
+            receive_reply()
             self.check_error()
             if abort():
                 raise OperationCancelled("arm operation cancelled")
@@ -187,11 +195,31 @@ class ArmProcess:
             if isinstance(failure, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()
             self.request_stop()
-            if isinstance(failure, OperationCancelled) and not in_flight:
+            if (isinstance(failure, OperationCancelled)
+                    and not self.io.emergency.is_set() and not self.io.closing.is_set()):
+                cleanup_deadline = time.monotonic() + EXECUTOR_TIMEOUT_S
                 try:
-                    self.wait_stopped()
-                    if not self.is_connected:
-                        raise RobotError("arm owner unavailable after cancellation")
+                    # 停止和消费本次回复共用预算，避免旧回复进入下一次操作。
+                    while True:
+                        service()
+                        self.check_error()
+                        if not self.is_connected:
+                            raise RobotError("arm owner unavailable after cancellation")
+                        if self.io.emergency.is_set():
+                            raise OperationCancelled("arm emergency stop during cancellation")
+                        remaining = cleanup_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("arm cancellation unresolved: stop or lifecycle reply missing")
+                        if self.io.stopped.is_set() and (not submitted or reply_received):
+                            break
+                        if submitted and not reply_received:
+                            if self.pipe.poll(min(0.005, remaining)):
+                                try:
+                                    receive_reply()
+                                except OperationCancelled:
+                                    pass  # 本次普通取消；真实错误仍向外传播。
+                        else:
+                            self.io.stopped.wait(min(0.005, remaining))
                 except BaseException as cleanup:
                     if isinstance(cleanup, KeyboardInterrupt):
                         self.runtime_state.request_emergency_stop()
@@ -226,9 +254,9 @@ class ArmProcess:
 
     def wait_stopped(self, *, deadline=None):
         deadline = time.monotonic() + EXECUTOR_TIMEOUT_S if deadline is None else deadline
-        if self.process is not None and self.process.is_alive():
-            if not self.io.stopped.wait(max(0, deadline - time.monotonic())):
-                raise TimeoutError("arm stop unresolved; SDK acceptance not confirmed")
+        if (self.process is not None and self.process.is_alive()
+                and not self.io.stopped.wait(max(0, deadline - time.monotonic()))):
+            raise TimeoutError("arm stop unresolved; SDK acceptance not confirmed")
         self.check_error()
 
     def close(self) -> None:

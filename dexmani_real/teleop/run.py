@@ -134,6 +134,8 @@ def run_teleop(
 
             robot.check_services = check_services
             robot.connect()
+            # 相机/VR 启动和标定期间保持停止，不撤销操作者的启动意图。
+            robot.stop()
             if record:
                 sensors.start(
                     ctx.Process(
@@ -242,7 +244,6 @@ def initialize_teleop(loop, vr_process, *, cancel_epoch) -> None:
     calibrate_hand(loop, cancel_epoch)
     if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
         raise OperationCancelled("teleop startup cancelled")
-    loop.runtime_state.stop_signal.set()
     print(
         "就绪：B 空闲时开始新段 | S/C 保存结束本段 | D 丢弃本段 | "
         "Q 保存并退出 | Esc 急停 | H 空闲时先手后臂回位 | "

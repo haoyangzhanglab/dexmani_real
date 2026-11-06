@@ -188,3 +188,115 @@ def test_tick_grid_and_action_order(monkeypatch, kind):
         assert obj.next_tick_ns is None
         step()
         assert planned() == 1000
+
+
+@pytest.mark.parametrize("hz", [0.2, 0.5, 30.0])
+@pytest.mark.parametrize("event", [None, "s", "q", "esc", "feedback_stale", "lease_expired", "slow_service"])
+def test_replay_deadlines_and_wait_interruptions(monkeypatch, hz, event):
+    import multiprocessing as mp
+
+    import dexmani_real.replay.run as replay
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.replay.trajectory import Trajectory
+    from dexmani_real.robot.commands import (
+        COMMAND_LEASE_NS,
+        OperationCancelled,
+        RobotError,
+    )
+    from dexmani_real.robot.system import Robot
+    from dexmani_real.robot.xarm7.protocol import ArmChannels
+    from dexmani_real.robot.xarm7.worker import ArmController
+    from dexmani_real.robot.xhand.feedback import XHandState
+
+    clock = [1_000_000_000]
+    monkeypatch.setattr("time.monotonic_ns", lambda: clock[0])
+    monkeypatch.setattr("time.monotonic", lambda: clock[0] / 1e9)
+    runtime = RealConfig()
+    trajectory = Trajectory(hz, np.zeros((2, 7)), np.zeros((2, 12)))
+    monkeypatch.setattr(replay, "load_trajectory", lambda *a: trajectory)
+    trajectory_reference = SimpleNamespace(step=lambda *a, **kw: np.zeros(7))
+    monkeypatch.setattr("dexmani_real.robot.xarm7.worker.ArmTrajectory", lambda *a: trajectory_reference)
+    robots, submitted, returned = [], [], []
+
+    class ReplayRobot(Robot):
+        def connect(self):
+            io = ArmChannels(mp.get_context("spawn"), stop_signal=self.runtime_state.stop_signal,
+                             emergency_signal=self.runtime_state.emergency_signal)
+            driver = Mock()
+            driver.read.return_value = np.zeros(7), np.zeros(7)
+            self.worker = ArmController(runtime.arm, io, Mock(), driver)
+            self.arm = SimpleNamespace(
+                check_error=lambda: None, is_connected=True, submit=io.publish_goal,
+                snapshot=lambda: self.worker.status.reshape(1).copy(),
+            )
+            self.hand = Mock(is_connected=True)
+
+            def sample():
+                if event == "feedback_stale" and submitted:
+                    return None
+                return XHandState(np.zeros(12), None, None, clock[0])
+
+            self.hand.get_state.side_effect = sample
+            self.connected = True
+            robots.append(self)
+            self.service_feedback()
+
+        def prepare_streaming(self, epoch):
+            self.worker.reference = trajectory_reference
+
+        def service_feedback(self):
+            # 第三次服务发生在首行 deadline 建立后、提交前。
+            self.services = getattr(self, "services", 0) + 1
+            if event == "slow_service" and self.services == 3:
+                clock[0] += 6_000_000_000
+            self.worker.read_feedback()
+            super().service_feedback()
+            self.worker.tick()
+
+        def send_action(self, command, *, expires_ns):
+            submitted.append((clock[0], expires_ns))
+            super().send_action(command, expires_ns=expires_ns)
+            clock[0] += 10_000_000  # 末行留驻从发送返回时刻开始。
+            returned.append(clock[0])
+
+    monkeypatch.setattr(replay, "Robot", ReplayRobot)
+    keys = Mock()
+
+    def poll(state, **kwargs):
+        if submitted and event in {"s", "q", "esc"}:
+            {"s": state.request_stop, "q": state.request_quit,
+             "esc": state.request_emergency_stop}[event]()
+        return [], state.stop_signal.is_set()
+
+    keys.poll.side_effect = poll
+    monkeypatch.setattr(replay, "Keyboard", lambda **kwargs: keys)
+    closed_at = []
+    monkeypatch.setattr(replay, "close_runtime", lambda *a, **kw: closed_at.append(clock[0]))
+
+    def sleep(seconds):
+        clock[0] += round(seconds * 1e9)
+        if event == "lease_expired" and submitted:
+            clock[0] = submitted[0][1] + 1
+
+    monkeypatch.setattr("time.sleep", sleep)
+    if event in {"esc", "feedback_stale", "lease_expired"}:
+        with pytest.raises((OperationCancelled, RobotError)) as error:
+            replay.run_replay("unused", runtime)
+        if event == "feedback_stale":
+            assert "hand feedback unavailable/stale" in str(error.value)
+        elif event == "lease_expired":
+            assert "device stopped" in str(error.value)
+            assert robots[0].worker.active is robots[0].worker.reference is None
+        assert robots[0].runtime_state.stop_signal.is_set()
+    else:
+        replay.run_replay("unused", runtime)
+    period_ns = round(1e9 / hz)
+    assert submitted[0][1] == max(submitted[0][0], 1_000_000_000 + period_ns) + COMMAND_LEASE_NS
+    if event is None or event == "slow_service":
+        assert len(submitted) == 2
+        assert submitted[1][0] == max(returned[0], 1_000_000_000 + period_ns)
+        assert submitted[1][1] == submitted[1][0] + COMMAND_LEASE_NS
+        assert closed_at == [returned[-1] + 500_000_000]
+        assert not robots[0].runtime_state.stop_signal.is_set()
+    elif event in {"s", "q", "esc", "lease_expired"}:
+        assert len(submitted) == 1

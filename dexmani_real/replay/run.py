@@ -46,14 +46,14 @@ def run_replay(episode_path: str | Path, runtime: RealConfig) -> None:
         if stopped:
             raise RobotError("replay device stopped without operator input")
 
-    def wait_until(deadline: float, robot: Robot, keyboard: Keyboard) -> None:
+    def wait_until(deadline_ns: int, robot: Robot, keyboard: Keyboard) -> None:
         while True:
             robot.service_feedback()
             check_input(robot, keyboard)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            if remaining_ns <= 0:
                 return
-            time.sleep(min(0.005, remaining))
+            time.sleep(min(0.005, remaining_ns / 1e9))
 
     try:
         robot = Robot(runtime.arm, runtime.hand, runtime_state=state)
@@ -95,17 +95,20 @@ def run_replay(episode_path: str | Path, runtime: RealConfig) -> None:
         for i, (arm, hand) in enumerate(
             zip(trajectory.action_arm_joint, trajectory.action_hand_joint)
         ):
-            iteration_start = time.monotonic()
+            last_row = i == len(trajectory) - 1
+            row_deadline_ns = time.monotonic_ns()
+            if not last_row:
+                row_deadline_ns += round(1e9 / trajectory.control_hz)
             robot.service_feedback()
             check_input(robot, keyboard)
+            submit_now_ns = time.monotonic_ns()
             robot.send_action(
-                RobotCommand(arm, hand), expires_ns=time.monotonic_ns() + COMMAND_LEASE_NS,
+                RobotCommand(arm, hand),
+                expires_ns=max(submit_now_ns, row_deadline_ns) + COMMAND_LEASE_NS,
             )
             sent_count += 1
             wait_until(
-                time.monotonic() + 0.5
-                if i == len(trajectory) - 1
-                else iteration_start + 1 / trajectory.control_hz,
+                time.monotonic_ns() + 500_000_000 if last_row else row_deadline_ns,
                 robot,
                 keyboard,
             )

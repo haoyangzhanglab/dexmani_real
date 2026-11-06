@@ -165,9 +165,10 @@ class ArmController:
             error = exc
             if not isinstance(exc, OperationCancelled):
                 self.fault(exc)
-            self.io.closing.set()
             # 无需等待可能阻塞在其他设备 SDK 内的父进程。
             self.stop()
+            if self.io.emergency.is_set() or self.io.fault.value:
+                self.io.closing.set()
 
         self.io.publish_status(self.status)
         try:

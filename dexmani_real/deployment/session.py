@@ -237,8 +237,11 @@ class PolicySession:
 
     def start_devices(self):
         needs = self.capture_needs
+        robot = cast(Robot, self.robot)
         self.check_startup()
-        self.robot.connect()
+        robot.connect()
+        # 后续初始化可能阻塞超过反馈 TTL；保持停止，由有界观测等待接纳新帧。
+        robot.stop()
         self.check_startup()
         if needs.camera_worker or self.observations.camera_static:
             self.sensors.start(
@@ -282,7 +285,6 @@ class PolicySession:
         self.save_run_config()
         self.warmup_policy()
         self.check_startup()
-        self.runtime_state.stop_signal.set()
 
     def close(self, *, failure=None):
         exit_signal = failure if isinstance(failure, SystemExit) else None
@@ -465,8 +467,6 @@ class PolicySession:
             if (self.runtime_state.cancel_epoch == cancel_epoch
                     and self.runtime_state.requests_allow_motion()):
                 raise
-            if robot.arm is None or not robot.arm.is_connected:
-                self.runtime_state.request_quit()
             logger.info("回初始位已中断：%s", exc)
         except HomeConfigurationError as exc:
             robot.check()

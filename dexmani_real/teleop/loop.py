@@ -286,8 +286,6 @@ class TeleopLoop:
             self.poll_blocking_commands()
             if self.pending_termination_reason is None:
                 self.request_episode_end("preparation_cancelled")
-            if not self.robot.arm.is_connected:
-                self.runtime_state.request_quit()
 
     def handle_operator_command(self, cmd: str):
         expected_cancel_epoch = None
@@ -369,8 +367,6 @@ class TeleopLoop:
                     if (self.runtime_state.cancel_epoch == expected_cancel_epoch
                             and self.runtime_state.requests_allow_motion()):
                         raise
-                    if not self.robot.arm.is_connected:
-                        self.runtime_state.request_quit()
                     logger.info("HOME cancelled: %s", exc)
                 except HomeConfigurationError as exc:
                     self.robot.check()

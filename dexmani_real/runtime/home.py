@@ -33,10 +33,8 @@ def _hand_home_motion(state, robot):
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
                 state.request_emergency_stop()
-            if failure is None:
+            if failure is None or isinstance(failure, OperationCancelled):
                 raise
-            if isinstance(failure, OperationCancelled):
-                raise exc
             logger.exception("HOME cleanup also failed")
 
 

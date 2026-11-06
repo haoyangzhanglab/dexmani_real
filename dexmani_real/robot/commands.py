@@ -30,7 +30,7 @@ class RobotCommand:
 
 
 class OperationCancelled(RuntimeError):
-    """本次运行已撤销。"""
+    """本次操作已撤销；普通取消不要求关闭设备会话。"""
 
 
 class RobotError(RuntimeError):

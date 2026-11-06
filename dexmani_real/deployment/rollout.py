@@ -162,12 +162,9 @@ class Rollout:
                 # 取消不能掩盖同时发生的设备或 worker 故障。
                 self.robot.check()
                 poll_operator()
-                if not self.started_ns:
-                    if (self.runtime_state.cancel_epoch == self.cancel_epoch
-                            and self.runtime_state.requests_allow_motion()):
-                        raise
-                    if not self.robot.arm.is_connected:
-                        self.runtime_state.request_quit()
+                if (not self.started_ns and self.runtime_state.cancel_epoch == self.cancel_epoch
+                        and self.runtime_state.requests_allow_motion()):
+                    raise
                 self.stop(str(exc))
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
