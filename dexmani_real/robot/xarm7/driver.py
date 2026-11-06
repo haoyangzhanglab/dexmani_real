@@ -38,8 +38,7 @@ def describe_controller_error(code: int) -> str:
 
 
 class XArm7:
-    def __init__(self, cfg: ArmConfig, *, api_factory=None) -> None:
-        self.api_factory = api_factory
+    def __init__(self, cfg: ArmConfig) -> None:
         self.cfg = cfg
         self.api: Any = None
         self._motion_configured = False
@@ -51,7 +50,7 @@ class XArm7:
         # SDK 的启停提示使用独立 logger；保留控制器告警和错误。
         logging.getLogger("origin.print").setLevel(logging.WARNING)
         self._motion_configured = False
-        self.api = (self.api_factory or XArmAPI)(
+        self.api = XArmAPI(
             self.cfg.ip, is_radian=True, report_type="real",
         )
         check_abort()

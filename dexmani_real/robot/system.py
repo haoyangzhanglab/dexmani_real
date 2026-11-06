@@ -233,21 +233,24 @@ class Robot:
                 raise RobotError("hand device unavailable")
             validate_hand_target(command.hand_qpos, self.hand_lower, self.hand_upper)
 
-    def send_hand_home(self, command, *, deadline_ns, cancel_requested) -> bool:
+    def send_hand_home(self, qpos, *, deadline_ns, cancel_requested) -> bool:
         """一次性绝对目标；arm 保持停止，由 HOME 期限及新反馈确认结果。"""
-        if command.arm_qpos is not None or command.arm_hold:
-            raise ValueError("hand HOME cannot carry an arm streaming target")
-        self.validate_command(command)
+        if not self.connected or self.hand is None or not self.hand.is_connected:
+            raise RobotError("hand device unavailable")
+        # 配置负责实验 HOME 范围；实际发送仍验证目标及硬件额定范围。
+        target = validate_hand_target(qpos, self.hand_lower, self.hand_upper)
         if cancel_requested():
             raise OperationCancelled("hand HOME cancelled before submission")
         self.check()
+        if cancel_requested():
+            raise OperationCancelled("hand HOME cancelled before submission")
         self._check_hand_feedback()
         if time.monotonic_ns() >= deadline_ns:
             raise TimeoutError("hand HOME budget exhausted before submission")
         self.hand_stop_required = True
         from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE
 
-        return cast("XHand", self.hand)._send_position(command.hand_qpos) != COMMUNICATION_CRC_ERROR_CODE
+        return self.hand._send_position(target) != COMMUNICATION_CRC_ERROR_CODE
 
     def home_arm(self, cancel_epoch, abort_check, *, deadline_ns):
         if abort_check():

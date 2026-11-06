@@ -1,11 +1,15 @@
 from collections import deque
+from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
+import numpy as np
 import pytest
 
 from dexmani_real.config.real import RealConfig
+from dexmani_real.config.xarm7 import ArmConfig
 from dexmani_real.robot.commands import OperationCancelled, RobotError
+from dexmani_real.robot.xarm7.driver import XArm7
 from dexmani_real.robot.xarm7.process import EXECUTOR_TIMEOUT_S, ArmProcess
 from dexmani_real.robot.xarm7.protocol import HomeRequest, PrepareRequest
 from dexmani_real.robot.xarm7.worker import ArmController
@@ -301,3 +305,33 @@ def test_preparation_cancellation_preserves_intent_and_fault(caller, event):
     assert state.stop_signal.is_set()
     assert state.quit_requested == (event == "q")
     assert state.estop_request == (event == "esc")
+
+
+@pytest.mark.parametrize("mass", [0, 1.1, -1, float("nan"), float("inf")])
+def test_bare_flange_mass(mass):
+    cfg = replace(ArmConfig(), tcp_load_mass_kg=mass)
+    if np.isfinite(mass) and mass >= 0:
+        cfg.validate()
+    else:
+        with pytest.raises(ValueError):
+            cfg.validate()
+
+
+@pytest.mark.parametrize("first_mode", [0, 1])
+def test_prepare_reuses_static_parameters_and_keeps_mode_enable(first_mode):
+    driver = XArm7(ArmConfig())
+    api = Mock()
+    api.get_err_warn_code.return_value = (0, (0, 0))
+    for name in (
+        "motion_enable", "set_mode", "set_state", "set_collision_sensitivity",
+        "set_tcp_load", "set_joint_maxacc",
+    ):
+        getattr(api, name).return_value = 0
+    driver.api = api
+    for mode in (first_mode, 1 - first_mode):
+        driver.prepare_motion(mode, check_abort=lambda: None)
+    assert api.set_state.call_args_list == [call(0), call(0)]
+    assert api.set_mode.call_args_list == [call(first_mode), call(1 - first_mode)]
+    api.set_collision_sensitivity.assert_called_once()
+    api.set_tcp_load.assert_called_once()
+    assert api.set_joint_maxacc.call_count == 2

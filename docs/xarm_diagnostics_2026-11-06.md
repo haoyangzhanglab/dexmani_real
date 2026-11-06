@@ -2,6 +2,8 @@
 
 实验日期：2026-11-06。本文整理已完成的实验，供代码与实验结果 review；不是新一轮测试记录。
 
+诊断工具及其控制链埋点现已移除；本文仅保留历史实验记录，已移除文件的链接指向实验版本。原始实验数据未删除。
+
 ## 1. 结论
 
 - **本次工况下，通信查询和 Ruckig 计算没有表现为明显瓶颈。** 保持与低速运动的有效发送频率约 98.6 Hz，稳定窗口没有通信超时，也没有超过 20 ms 的发送间隔。不能据此推断其他主机负载或动作配置下的表现。
@@ -199,11 +201,11 @@
 
 | 修改 | 目的 |
 | --- | --- |
-| [诊断 CLI](../scripts/tools/diagnose_xarm.py) 与 [记录/统计模块](../dexmani_real/robot/xarm7/diagnostics.py) | 默认只读；复用 owner；内存记录、结束后输出原始数据、统计和曲线 |
+| [诊断 CLI](https://github.com/haoyangzhanglab/dexmani_real/blob/60968d9bda6cc2f8b10b0a1854e940602987afc0/scripts/tools/diagnose_xarm.py) 与 [记录/统计模块](https://github.com/haoyangzhanglab/dexmani_real/blob/60968d9bda6cc2f8b10b0a1854e940602987afc0/dexmani_real/robot/xarm7/diagnostics.py) | 默认只读；复用 owner；内存记录、结束后输出原始数据、统计和曲线 |
 | driver API factory、process/owner 可选诊断参数 | 默认关闭；普通运行不分配诊断缓冲、不写诊断文件 |
 | [负载校验](../dexmani_real/config/xarm7.py) 允许零值 | 如实描述本次裸法兰；继续拒绝负数和非有限值，仓库默认负载不变 |
 | 删除准备末尾第二次 `set_state(0)` | 基于状态审计与同组复测减少冗余 SDK 交互 |
-| [诊断测试](../tests/test_xarm_diagnostics.py) 与 [README 用法](../README.md#xarm-真机诊断) | 覆盖只读边界、错误传播、时间统计、取消/中断收尾及参数复用 |
+| [诊断测试](https://github.com/haoyangzhanglab/dexmani_real/blob/60968d9bda6cc2f8b10b0a1854e940602987afc0/tests/test_xarm_diagnostics.py) 与 [README 用法](https://github.com/haoyangzhanglab/dexmani_real/blob/60968d9bda6cc2f8b10b0a1854e940602987afc0/README.md#xarm-真机诊断) | 覆盖只读边界、错误传播、时间统计、取消/中断收尾及参数复用 |
 
 没有修改伺服/反馈频率、流式超时、停稳阈值、轨迹参数默认值、IK 超前量或反馈架构。诊断运动的低速参数只用于显式诊断配置。
 
@@ -237,7 +239,7 @@ PYTHONDONTWRITEBYTECODE=1 /home/zhanghaoyang/miniconda3/envs/real_robot/bin/pyth
 
 - `baseline_read_1` 受保持短测重叠影响而排除，正式只读基线为 `read_1`～`read_3`。
 - 初版 `set_state` 参数记录漏读 SDK 以关键字转发的参数。`lifecycle_15`、`hold_1`、`motion_1` 等早期 raw 的 `value` 不能用于区分状态 0/4；调用起止仍有效，可与 `stop_handle` 对齐。后续已修复并补充回归，原始数据未覆写。
-- 部分早期源码 hash 在导出时生成，存在采集期间诊断后处理代码修订的限制；驱动前后快照用于核对控制改动。当前工具已改为采样前记录源码 hash。
+- 部分早期源码 hash 在导出时生成，存在采集期间诊断后处理代码修订的限制；驱动前后快照用于核对控制改动。该实验版本工具已改为采样前记录源码 hash。
 - 审计中的额外状态查询会影响时序；带查询的生命周期审计没有并入通信性能基线。相应审计脚本副本与数据一同保留。
 - “所有测试会话 completed”表示已执行脚本完成，不能替代对每项物理行为、采样分辨率及上述数据缺陷的审查。
 

@@ -6,7 +6,7 @@ from contextlib import contextmanager
 
 import numpy as np
 
-from dexmani_real.robot.commands import OperationCancelled, RobotCommand
+from dexmani_real.robot.commands import OperationCancelled
 from dexmani_real.utils.timing import sample_is_fresh
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ def home_hand(state, robot, *, cancel_epoch, cancel_requested):
     except (ValueError, TypeError) as exc:
         raise HomeConfigurationError(f"hand HOME configuration: {exc}") from exc
     target = np.deg2rad(hand.home_qpos_deg)
-    deadline = time.monotonic_ns() + int(hand.home_timeout_s * 1e9)
+    deadline_ns = time.monotonic_ns() + int(hand.home_timeout_s * 1e9)
     tolerance = np.deg2rad(hand.home_tolerance_deg)
 
     def cancelled():
@@ -73,19 +73,41 @@ def home_hand(state, robot, *, cancel_epoch, cancel_requested):
         raise OperationCancelled("home interrupted")
     with _hand_home_motion(state, robot):
         robot.stop()
-        robot.service_feedback()
-        command = RobotCommand(hand_qpos=target)
-        retry_pending = not robot.send_hand_home(command, deadline_ns=deadline, cancel_requested=cancelled)
+        # 停止态允许等待关节反馈恢复；采样机会不代表获得了有效新帧。
+        while True:
+            if cancelled():
+                raise OperationCancelled("home interrupted")
+            if time.monotonic_ns() >= deadline_ns:
+                raise TimeoutError("hand HOME initial feedback timed out")
+            robot.service_feedback()
+            if cancelled():
+                raise OperationCancelled("home interrupted")
+            now_ns = time.monotonic_ns()
+            if now_ns >= deadline_ns:
+                raise TimeoutError("hand HOME initial feedback timed out")
+            feedback = robot.hand_feedback.snapshot()
+            if feedback is not None and sample_is_fresh(
+                int(feedback["timestamp_ns"][0]), hand.feedback_max_age_s, now_ns,
+            ):
+                break
+            time.sleep(min(0.01, (deadline_ns - now_ns) / 1e9))
+        retry_pending = not robot.send_hand_home(target, deadline_ns=deadline_ns, cancel_requested=cancelled)
 
         # 只有提交完成之后的新样本才能确认到达。
         last_sample_ns = time.monotonic_ns()
         consecutive = 0
-        while time.monotonic_ns() < deadline:
+        while True:
             if cancelled():
                 raise OperationCancelled("home interrupted")
+            if time.monotonic_ns() >= deadline_ns:
+                break
             sampled = robot.service_feedback()
+            if cancelled():
+                raise OperationCancelled("home interrupted")
+            if time.monotonic_ns() >= deadline_ns:
+                break
             if retry_pending and sampled:
-                robot.send_hand_home(command, deadline_ns=deadline, cancel_requested=cancelled)
+                robot.send_hand_home(target, deadline_ns=deadline_ns, cancel_requested=cancelled)
                 retry_pending = False
                 last_sample_ns = time.monotonic_ns()
             feedback = robot.hand_feedback.snapshot()
@@ -104,8 +126,8 @@ def home_hand(state, robot, *, cancel_epoch, cancel_requested):
                     if consecutive >= HOME_CONSECUTIVE_SAMPLES:
                         if cancelled():
                             raise OperationCancelled("home interrupted")
-                        if time.monotonic_ns() < deadline:
+                        if time.monotonic_ns() < deadline_ns:
                             return
                         break
-            time.sleep(0.01)
+            time.sleep(min(0.01, max(0, deadline_ns - time.monotonic_ns()) / 1e9))
         raise TimeoutError("hand home convergence timed out")

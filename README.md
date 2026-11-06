@@ -84,6 +84,8 @@ python scripts/collect_teleop.py TASK
 
 遥操作和策略部署在连接成功后先内部停止，再启动传感器、标定与预热；内部停止不撤销用户操作。初始化阻塞后的读 CRC 不刷新缓存时间，后续有效帧由现有有界观测等待接纳；正式运动前仍检查反馈新鲜度。HOME 普通取消后保持停止，停止处理及本次回复均确认后保留会话，可再次显式 H/B；Q 退出，急停、真实故障或取消收尾超时仍关闭。停止确认仅表示 SDK 停止处理完成，不证明物理停稳。
 
+手部 HOME 的停止、初始关节反馈等待、目标发送、至多一次 CRC 补发和到位确认共用 `hand.home_timeout_s`。CRC 不刷新关节缓存时间；等待期间继续检查取消和故障，触觉缺失不阻止 HOME。到位须由最后一次提交完成后的三个不同新鲜关节样本确认。阻塞 SDK 调用无法被该期限强制中断，返回后会复核取消和超时；最终停止收尾仍执行。
+
 XHand 普通停止仅用新鲜、机械范围内的实测位置保持；容差内的微小舍入越界可归一，明显越界、无效或陈旧反馈改为 passive 请求。判断不使用实验收窄的操作范围，也不修改原始反馈；passive 不等于物理硬停止。
 
 ### 查看数据
@@ -155,32 +157,3 @@ EE 遥操作、策略和 jog 共用有界局部 IK，返回的是下一条可执
 | 开发约定 | [AGENTS.md](AGENTS.md) |
 
 CordVIP 当前用于离线分析，尚未接入主包的策略观测。完整命令行选项请查看各脚本的 `--help`。
-
-## xArm 真机诊断
-
-`python scripts/tools/diagnose_xarm.py` 默认只读采样，断开时不发送停止命令。
-使用 `--config` 读取可信实验配置，`--max-duration` 设置稳定采样秒数（默认 90），
-`--output` 指定新的结果目录。省略输出路径时写入 `logs/xarm_diagnostics/`。
-
-```bash
-python scripts/tools/diagnose_xarm.py --case read --max-duration 90
-python scripts/tools/diagnose_xarm.py --case hold --config /path/to/experiment.py
-python scripts/tools/diagnose_xarm.py --case lifecycle --config /path/to/experiment.py --cycles 15
-python scripts/tools/diagnose_xarm.py --case motion --config /path/to/experiment.py \
-  --joint 1 --amplitude-deg 2 --speed-deg-s 1 --cycles 15
-```
-
-控制工况必须显式提供符合实物末端负载、重心与碰撞设置的实验配置；
-裸法兰允许配置 0 kg，关闭手部通信不等于卸下手。运动前操作者确认所选关节的
-正负幅度空间；工具不会执行仓库默认 HOME，而以实测起点加半幅度构造 HOME。
-诊断运动使用 5°/s² 加速度及 50°/s³ jerk，HOME 使用同样的速度和加速度限制。
-`--cycles` 对 lifecycle 表示新连接组数，对 motion 表示 HOME 完成/取消组数；
-该部分及预热、停止观察时间不计入 `--max-duration`。
-
-输出包含 `raw.npz`、`summary.json` 和 `response.png`。数据使用同机单调时钟，
-稳定窗口与整次运行分别统计；后者包含准备和停止，不可作为稳定频率。
-计时是主机 API 调用时间，SDK 成功和停止确认都不证明物理到位。
-20 ms 是流式通信超时，不是整个反馈函数的总预算；100 Hz 是计划频率。
-实测停止时间受反馈间隔、查询时间和连续停稳判据限制。
-测试异常仍保存已完成记录，`measurement_complete` 与 `dropped_events` 表明数据是否完整。
-所有工况应串行运行；本工具不会自动排除其他控制程序或主机负载。
