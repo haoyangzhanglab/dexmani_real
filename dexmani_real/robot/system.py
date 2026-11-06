@@ -72,6 +72,8 @@ class Robot:
             raise OperationCancelled("device operation cancelled")
 
     def connect(self):
+        if self.arm is not None or self.hand is not None:
+            raise RobotError("robot still owns devices; close the old connection before reconnecting")
         cancel_epoch = self.runtime_state.cancel_epoch
 
         def cancelled():
@@ -314,12 +316,14 @@ class Robot:
         self.runtime_state.stop_signal.set()
         # 首次停止失败由操作结果保留；这里只收集本次关闭失败。
         errors = []
-        try:
-            self.stop_hand(passive=True)
-        except BaseException as exc:
-            if isinstance(exc, KeyboardInterrupt):
-                self.runtime_state.request_emergency_stop()
-            errors.append(("hand_passive_stop", exc))
+        # disconnect 失败仍持有句柄，但驱动已撤销读写；重试关闭只释放资源。
+        if self.hand is not None and self.hand.is_connected:
+            try:
+                self.stop_hand(passive=True)
+            except BaseException as exc:
+                if isinstance(exc, KeyboardInterrupt):
+                    self.runtime_state.request_emergency_stop()
+                errors.append(("hand_passive_stop", exc))
         if self.arm is not None:
             try:
                 self.arm.close()

@@ -42,7 +42,7 @@ class ArmConfig:
     tcp_load_mass_kg: float = 1.1
     tcp_load_cog_mm: tuple[float, float, float] = (16.3, 7.9, 109.5)
 
-    # J1–J7，位置和关节范围均使用 rad。
+    # J1–J7，位置和关节范围均使用 rad；运行范围只能在本设备有效限位内收窄。
     home_qpos: tuple[float, ...] = (0.0, 0.041888, 0.001745, 0.417134, -3.138102, 1.195551, 0.0)
     joint_limit_lower: tuple[float, ...] = XARM7_HARD_LOWER
     joint_limit_upper: tuple[float, ...] = XARM7_HARD_UPPER
@@ -83,7 +83,7 @@ class ArmConfig:
         if not np.isfinite(joint_values).all() or np.any(lower >= upper):
             raise ValueError("arm joint limits must be finite and ordered")
         if np.any(lower < XARM7_HARD_LOWER) or np.any(upper > XARM7_HARD_UPPER):
-            raise ValueError("operational arm limits must be inside mechanical limits")
+            raise ValueError("operational arm limits must be inside device effective limits")
         if not isinstance(self.ip, str) or not self.ip.strip():
             raise ValueError("arm ip must be non-empty")
         if type(self.collision_sensitivity) is not int or not 0 <= self.collision_sensitivity <= 5:

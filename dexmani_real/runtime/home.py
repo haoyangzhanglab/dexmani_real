@@ -106,20 +106,20 @@ def home_hand(state, robot, *, cancel_epoch, cancel_requested):
                 raise OperationCancelled("home interrupted")
             if time.monotonic_ns() >= deadline_ns:
                 break
-            if retry_pending and sampled:
-                robot.send_hand_home(target, deadline_ns=deadline_ns, cancel_requested=cancelled)
-                retry_pending = False
-                last_sample_ns = time.monotonic_ns()
             feedback = robot.hand_feedback.snapshot()
             if feedback is not None:
                 sample = feedback[0]
                 stamp = int(sample["timestamp_ns"])
-                if stamp > last_sample_ns:
+                fresh = sample_is_fresh(stamp, hand.feedback_max_age_s, time.monotonic_ns())
+                if retry_pending and sampled and fresh:
+                    robot.send_hand_home(target, deadline_ns=deadline_ns, cancel_requested=cancelled)
+                    retry_pending = False
+                    last_sample_ns = time.monotonic_ns()
+                    consecutive = 0
+                    # 本轮 snapshot 来自补发前，不能用于确认最新提交到位。
+                elif stamp > last_sample_ns:
                     last_sample_ns = stamp
-                    if (
-                        sample_is_fresh(stamp, hand.feedback_max_age_s, time.monotonic_ns())
-                        and np.max(np.abs(sample["qpos"] - target)) <= tolerance
-                    ):
+                    if fresh and np.max(np.abs(sample["qpos"] - target)) <= tolerance:
                         consecutive += 1
                     else:
                         consecutive = 0

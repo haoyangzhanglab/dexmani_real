@@ -1,6 +1,8 @@
-"""机器人模型、SDK 关节顺序和额定机械限位。"""
+"""机器人模型、SDK 关节顺序和设备有效限位。"""
 
 from __future__ import annotations
+
+from math import pi
 
 from dexmani_real import ASSET_DIR
 
@@ -10,9 +12,6 @@ ARM_DOF = 7
 HAND_DOF = 12
 HAND_FINGER_COUNT = 5
 XHAND_TACTILE_SENSOR_FINGER_IDS: tuple[int, ...] = (2, 5, 7, 9, 11)
-XHAND_TACTILE_SENSOR_INDEX_BY_FINGER_ID = {
-    finger_id: index for index, finger_id in enumerate(XHAND_TACTILE_SENSOR_FINGER_IDS)
-}
 XHAND_FINGERTIP_LINK_NAMES: tuple[str, ...] = (
     "right_hand_thumb_rota_tip",
     "right_hand_index_rota_tip",
@@ -54,23 +53,16 @@ XARM7_XHAND_RIGHT_URDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand_right.urdf"
 XARM7_XHAND_SRDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand.srdf"
 
 
+# 本项目 XS1305 的有效控制边界（rad），非所有 xArm7 的通用机械范围。
+# 来源：xArm-Python-SDK v1.18.4，xarm/x3/xarm.py 的型号选择及
+# xarm/core/config/x_config.py 的 JOINT_LIMITS[7][71305]；不含 SDK 判断容差。
 XARM7_HARD_LOWER = (
-    -6.28318530718,
-    -2.059,
-    -6.28318530718,
-    -0.19198,
-    -6.28318530718,
-    -1.69297,
-    -6.28318530718,
+    -2 * pi, -2.042035, -2 * pi, -0.10472,
+    -2 * pi, -1.692969, -2 * pi,
 )
 XARM7_HARD_UPPER = (
-    6.28318530718,
-    2.0944,
-    6.28318530718,
-    3.927,
-    6.28318530718,
-    3.14159265359,
-    6.28318530718,
+    2 * pi, 2.024581, 2 * pi, 3.92699,
+    2 * pi, pi, 2 * pi,
 )
 
 # 只有这些轴允许 2π 等价角，运行限位仍可能窄于一整圈。

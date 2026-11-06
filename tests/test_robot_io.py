@@ -575,3 +575,239 @@ def test_hand_home_blocking_completion_rechecks_cancel_before_timeout(home_robot
         h.run()
     assert len(h.submissions) == 1
     assert h.state.stop_signal.is_set()
+
+
+@pytest.mark.parametrize("index,value,valid", [(1, 2.08, False), (3, -0.15, False), (1, 2.0, True), (3, -0.1, True)])
+def test_device_limits_reject_before_submission(startup_robot, index, value, valid):
+    from dexmani_real.robot.commands import RobotCommand
+
+    runtime, state, robot = startup_robot
+    robot.connect()
+    state.stop_signal.clear()
+    target = np.array(runtime.arm.home_qpos)
+    target[index] = value
+    command = RobotCommand(arm_qpos=target)
+    if valid:
+        robot.send_action(command, expires_ns=10_000_000_000)
+        robot.arm.submit.assert_called_once()
+    else:
+        with pytest.raises(ValueError, match="joint limits"):
+            robot.send_action(command, expires_ns=10_000_000_000)
+        robot.arm.submit.assert_not_called()
+        robot.hand.control.send_command.assert_not_called()
+
+
+def test_arm_operational_limits_and_home():
+    from dataclasses import replace
+
+    from dexmani_real.config.xarm7 import ArmConfig
+
+    cfg = ArmConfig()
+    cfg.validate()
+    cfg.validate_home()
+    for index, value in ((1, 2.08), (3, -0.15)):
+        home = list(cfg.home_qpos)
+        home[index] = value
+        with pytest.raises(ValueError, match="home_qpos"):
+            replace(cfg, home_qpos=tuple(home)).validate_home()
+    lower, upper = list(cfg.joint_limit_lower), list(cfg.joint_limit_upper)
+    lower[1], upper[1] = -1.0, 1.0
+    narrow = replace(cfg, joint_limit_lower=tuple(lower), joint_limit_upper=tuple(upper))
+    narrow.validate()
+    narrow.validate_home()
+    home = list(cfg.home_qpos)
+    home[1] = 1.5
+    replace(cfg, home_qpos=tuple(home)).validate_home()
+    with pytest.raises(ValueError, match="home_qpos"):
+        replace(narrow, home_qpos=tuple(home)).validate_home()
+    for field, direction in (("joint_limit_lower", -1), ("joint_limit_upper", 1)):
+        bounds = list(getattr(cfg, field))
+        bounds[1] += direction * 0.001
+        with pytest.raises(ValueError, match="device effective limits"):
+            replace(cfg, **{field: tuple(bounds)}).validate()
+
+
+@pytest.mark.parametrize("relative", ["robots/xarm7/xarm7_glb.urdf", "robots/xhand/xarm7_xhand_right.urdf"])
+def test_local_arm_model_limits(relative):
+    import xml.etree.ElementTree as ET
+    from math import pi
+
+    from dexmani_real import ASSET_DIR
+    from dexmani_real.config.xarm7 import ArmConfig
+
+    expected = np.array([
+        (-2*pi, -2.042035, -2*pi, -0.10472, -2*pi, -1.692969, -2*pi),
+        (2*pi, 2.024581, 2*pi, 3.92699, 2*pi, pi, 2*pi),
+    ])
+    cfg = ArmConfig()
+    np.testing.assert_array_equal((cfg.joint_limit_lower, cfg.joint_limit_upper), expected)
+    root = ET.parse(ASSET_DIR / relative).getroot()
+    limits = [root.find(f"joint[@name='joint{i}']/limit") for i in range(1, 8)]
+    actual = [[float(limit.attrib[key]) for limit in limits] for key in ("lower", "upper")]
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-11)
+
+
+@pytest.mark.parametrize("outcome", ["recover", "second_crc", "timeout", "cancel", "fault", "repeated"])
+def test_hand_home_slow_crc_write_waits_for_fresh_retry(home_robot, hand, clock, outcome):
+    h = home_robot
+    assert h.robot.hand_config.feedback_max_age_s == 0.5
+    assert h.robot.hand_config.home_timeout_s == 2.0
+    start = clock.ns
+    initial_stamp = int(h.robot.hand_feedback.snapshot()["timestamp_ns"][0])
+    normal = hand.control.read_state.return_value
+    original_send = hand.control.send_command.side_effect
+    writes, reads, completed = [], [], []
+    failure = XHandError("read", 12345, "device failed")
+
+    def send(*args):
+        # submissions 在 send_hand_home 入口记录；据此排除初始和收尾 stop。
+        if len(h.submissions) > len(writes):
+            writes.append(clock.ns)
+            if len(writes) == 1:
+                clock.sleep(0.6)
+            else:
+                assert reads[-1] > start + 600_000_000
+                clock.sleep(0.02)
+            completed.append(clock.ns)
+            return SimpleNamespace(error_code=CRC if len(writes) == 1 or outcome == "second_crc" else 0,
+                                   error_message="reply")
+        return original_send(*args)
+
+    def read(*args):
+        reads.append(clock.ns)
+        if len(reads) == 1 or outcome in {"timeout", "cancel", "fault"}:
+            assert len(h.submissions) == 1
+            assert int(h.robot.hand_feedback.snapshot()["timestamp_ns"][0]) == initial_stamp
+            if outcome == "cancel":
+                h.state.request_stop()
+            if outcome == "fault":
+                raise failure
+            return SimpleNamespace(error_code=CRC, error_message="CRC"), None
+        if outcome == "repeated" and len(reads) > 2:
+            return SimpleNamespace(error_code=CRC, error_message="CRC"), None
+        return normal
+
+    hand.control.send_command.side_effect = send
+    hand.control.read_state.side_effect = read
+    if outcome in {"recover", "second_crc"}:
+        h.run()
+        assert len(writes) == len(h.submissions) == 2
+        assert sum(stamp > completed[-1] for stamp in reads) >= 3
+    else:
+        error_type = OperationCancelled if outcome == "cancel" else XHandError if outcome == "fault" else TimeoutError
+        with pytest.raises(error_type) as caught:
+            h.run()
+        if outcome == "fault":
+            assert caught.value is failure
+        if outcome in {"timeout", "repeated"}:
+            assert clock.ns == start + 2_000_000_000
+        assert len(writes) == len(h.submissions) == (2 if outcome == "repeated" else 1)
+    assert h.robot.arm.wait_stopped.call_count == 2
+    assert not h.robot.hand_stop_required
+    assert h.state.stop_signal.is_set()
+
+
+def test_xhand_handle_ownership_through_real_connect_disconnect(hand, clock, monkeypatch):
+    import sys
+
+    controls = [Mock(), Mock()]
+    for control in controls:
+        control.open_serial.return_value = SimpleNamespace(error_code=0)
+        control.list_hands_id.return_value = [hand.cfg.device_id]
+        control.read_state.return_value = hand.control.read_state.return_value
+    constructor = Mock(side_effect=controls)
+    sdk = SimpleNamespace(
+        XHandControl=constructor,
+        HandCommand_t=lambda: SimpleNamespace(finger_command=[SimpleNamespace() for _ in range(12)]),
+    )
+    monkeypatch.setitem(sys.modules, "xhand_controller", SimpleNamespace(xhand_control=sdk))
+    device = XHand(hand.cfg)
+    device.connect()
+    with pytest.raises(RuntimeError, match="disconnect the old connection"):
+        device.connect()
+    assert constructor.call_count == 1
+    failure = RuntimeError("close failed")
+    controls[0].close_device.side_effect = [failure, None]
+    with pytest.raises(RuntimeError) as caught:
+        device.disconnect()
+    assert caught.value is failure
+    assert device.control is controls[0] and not device.is_connected
+    with pytest.raises(RuntimeError, match="disconnect the old connection"):
+        device.connect()
+    assert constructor.call_count == 1
+    device.disconnect()
+    assert device.control is None
+    device.connect()
+    assert device.control is controls[1] and device.is_connected
+    assert constructor.call_count == 2
+    device.disconnect()
+
+
+def test_xhand_crc_warnings_are_rate_limited(hand, clock, caplog):
+    hand.control.read_state.return_value = (SimpleNamespace(error_code=CRC), None)
+    stamp = clock.ns
+    for _ in range(3):
+        assert hand.get_state() is None
+    assert caplog.text.count("read CRC") == 1
+    assert clock.ns == stamp
+    clock.sleep(1)
+    assert hand.get_state() is None
+    assert caplog.text.count("read CRC") == 2
+
+
+@pytest.mark.parametrize("code,aggregate,dense", [(0, True, True), (1501018, False, False), (1501019, True, False), (1501035, True, True)])
+def test_hand_tactile_channels_remain_independent(hand, code, aggregate, dense):
+    raw = hand.control.read_state.return_value[1]
+    force = SimpleNamespace(fx=1., fy=2., fz=3.)
+    raw.sensor_data = [SimpleNamespace(calc_force=force, raw_force=[force] * 120) for _ in range(5)]
+    hand.control.read_state.return_value = (SimpleNamespace(error_code=code, error_message="reply"), raw)
+    sample = hand.get_state()
+    assert sample.qpos.shape == (12,)
+    assert (sample.tactile_aggregate is not None) == aggregate
+    assert (sample.tactile_dense is not None) == dense
+    hand.control.read_state.assert_called_once_with(hand.cfg.device_id, True)
+
+
+@pytest.mark.parametrize("failed_close", [False, True])
+def test_robot_preserves_owned_devices_until_close_succeeds(startup_robot, hand, monkeypatch, failed_close):
+    _, _, robot = startup_robot
+    robot.connect()
+    arm = robot.arm
+    constructor = Mock()
+    monkeypatch.setattr("dexmani_real.robot.xarm7.process.ArmProcess", constructor)
+    if failed_close:
+        failure = RuntimeError("close failed")
+        hand.control.close_device.side_effect = [failure, None]
+        with pytest.raises(RuntimeError) as caught:
+            robot.close()
+        assert caught.value is failure
+        assert robot.arm is None and robot.hand is hand
+        assert hand.control is not None and not hand.is_connected
+    with pytest.raises(RobotError, match="close the old connection"):
+        Robot.connect(robot)  # fixture 的 connect 仅用于安装假设备。
+    constructor.assert_not_called()
+    assert robot.hand is hand
+    if not failed_close:
+        assert robot.arm is arm
+    sends = hand.control.send_command.call_count
+    robot.close()
+    assert robot.arm is robot.hand is None
+    assert not robot.connected and not robot.hand_stop_required
+    if failed_close:
+        assert hand.control is None
+        # 第一次 close 已请求停止；再次关闭不能伪造新的停止失败。
+        assert len(hand.sent) == sends
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("passive stop failed"), KeyboardInterrupt()])
+def test_robot_close_preserves_stop_failure_and_still_disconnects(startup_robot, hand, failure):
+    _, state, robot = startup_robot
+    robot.connect()
+    control = hand.control
+    control.send_command.side_effect = failure
+    with pytest.raises(type(failure)) as caught:
+        robot.close()
+    assert caught.value is failure
+    control.close_device.assert_called_once()
+    assert robot.hand is robot.arm is None
+    assert state.estop_request == isinstance(failure, KeyboardInterrupt)

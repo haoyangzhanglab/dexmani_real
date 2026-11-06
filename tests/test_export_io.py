@@ -168,3 +168,46 @@ def test_previous_block_released_before_next_read(monkeypatch):
     )
     export.append_episode(arrays, 0, blocks, 3)
     assert all(ref() is None for ref in refs.values())
+
+
+@pytest.mark.parametrize("case", ["valid", "j2", "j4", "narrow", "roundoff", "outside_roundoff"])
+def test_replay_respects_device_and_operational_limits(tmp_path, case):
+    import json
+    from dataclasses import replace
+
+    import h5py
+
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.replay.trajectory import load_trajectory
+    from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
+
+    runtime = RealConfig()
+    target = np.array(runtime.arm.home_qpos)
+    target[1] = 2.0
+    if case == "j2":
+        target[1] = 2.08
+    elif case == "j4":
+        target[3] = -0.15
+    elif case == "narrow":
+        upper = list(runtime.arm.joint_limit_upper)
+        upper[1] = 1.0
+        runtime = replace(runtime, arm=replace(runtime.arm, joint_limit_upper=tuple(upper)))
+    elif case in {"roundoff", "outside_roundoff"}:
+        target[1] = runtime.arm.joint_limit_upper[1] + (0.5e-6 if case == "roundoff" else 2e-6)
+    with h5py.File(tmp_path / "data.h5", "w") as data:
+        meta = data.create_group("meta").attrs
+        meta["joint_units"] = "rad"
+        meta["control_hz"] = 10
+        meta["arm_joint_names"] = json.dumps(XARM7_JOINT_NAMES)
+        meta["hand_joint_names"] = json.dumps(XHAND_SDK_JOINT_NAMES)
+        data["action_arm_joint_target"] = target[None]
+        data["action_hand_joint_target"] = np.deg2rad(runtime.hand.home_qpos_deg)[None]
+    if case in {"j2", "j4", "narrow", "outside_roundoff"}:
+        with pytest.raises(ValueError, match="configured absolute limits"):
+            load_trajectory(tmp_path, runtime)
+    else:
+        trajectory = load_trajectory(tmp_path, runtime)
+        expected = target.copy()
+        if case == "roundoff":
+            expected[1] = runtime.arm.joint_limit_upper[1]
+        np.testing.assert_array_equal(trajectory.action_arm_joint[0], expected)

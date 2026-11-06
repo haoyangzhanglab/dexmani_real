@@ -148,7 +148,6 @@ class XHand:
         self.cfg = config
         self.connected_flag = False
         self.consecutive_write_crc = 0
-        self.counts = dict.fromkeys(("read_crc", "write_crc", "aggregate", "dense", "overcurrent"), 0)
         self.next_warning_ns: dict[str, int] = {}
         self.control: Any = None
         self.command: Any = None
@@ -160,8 +159,8 @@ class XHand:
 
     def connect(self, *, cancel_requested=lambda: False) -> XHandState:
         """设备发现与首帧读取共用期限；命令与上层缓存使用同一份实测状态。"""
-        if self.connected_flag:
-            raise RuntimeError("XHand is already connected")
+        if self.control is not None:
+            raise RuntimeError("XHand still owns a device handle; disconnect the old connection before reconnecting")
         from xhand_controller import xhand_control
 
         self.sdk = xhand_control
@@ -170,9 +169,9 @@ class XHand:
                 raise OperationCancelled("XHand connection cancelled")
             self.command = None
             self.consecutive_write_crc = 0
-            self.counts = dict.fromkeys(self.counts, 0)
             self.next_warning_ns.clear()
             self.tactile_reset_metadata = {}
+            self.control = self.sdk.XHandControl()
             self.open_device()
             self.connected_flag = True
             deadline_ns = time.monotonic_ns() + int(CONNECT_TIMEOUT_S * 1e9)
@@ -207,7 +206,6 @@ class XHand:
             raise
 
     def open_device(self) -> None:
-        self.control = self.sdk.XHandControl()
         device_name = self.cfg.device_name
         if device_name is None:
             devices = self.control.enumerate_devices(SDK_PROTOCOL[self.cfg.comm_type])
@@ -225,7 +223,6 @@ class XHand:
             raise XHandError("connect", error.error_code, error.error_message)
 
     def disconnect(self) -> None:
-        had_control = self.control is not None
         connected_ethercat = self.connected_flag and self.cfg.comm_type == "ethercat"
         errors = []
         try:
@@ -247,8 +244,6 @@ class XHand:
                         errors.append(exc)
         finally:
             self.connected_flag = False
-            if had_control:
-                logger.info("XHand event counts: %s", self.counts)
         if errors:
             failure = next((error for error in errors if isinstance(error, KeyboardInterrupt)), errors[0])
             for error in errors:
@@ -309,7 +304,6 @@ class XHand:
         error, raw_state = self.control.read_state(self.cfg.device_id, True)
         code = int(error.error_code)
         if code == COMMUNICATION_CRC_ERROR_CODE:
-            self.counts["read_crc"] += 1
             self.warn_limited("read_crc", "XHand read CRC; payload discarded")
             return None
         if code not in NONFATAL_SDK_CODES:
@@ -359,7 +353,6 @@ class XHand:
                 except (AttributeError, TypeError, ValueError, OverflowError) as exc:
                     reason = f"invalid payload ({type(exc).__name__})"
             if values is None:
-                self.counts[name] += 1
                 self.warn_limited(name, "XHand tactile %s unavailable: %s", name, reason)
             tactile[name] = values
 
@@ -433,7 +426,6 @@ class XHand:
             raise XHandError("send", code, error.error_message)
         if code == COMMUNICATION_CRC_ERROR_CODE:
             self.consecutive_write_crc += 1
-            self.counts["write_crc"] += 1
             self.warn_limited("write_crc", "XHand write CRC; target delivery unconfirmed")
         else:
             self.consecutive_write_crc = 0
@@ -448,7 +440,6 @@ class XHand:
             self.next_warning_ns[key] = now_ns + 1_000_000_000
 
     def warn_overcurrent(self, operation: str, message: str) -> None:
-        self.counts["overcurrent"] += 1
         self.warn_limited("overcurrent", "XHand 过流告警（继续运行）：%s code=%d msg=%s",
                           operation, OVERCURRENT_WARNING_CODE, message)
 
