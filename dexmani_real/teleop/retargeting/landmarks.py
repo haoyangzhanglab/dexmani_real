@@ -20,10 +20,9 @@ class HandGeometryRejected(ValueError):
 
 @dataclass(frozen=True)
 class HandTargets:
-    requested_qpos: np.ndarray  # (12,), SDK order, before operating-limit projection
-    projected_qpos: np.ndarray  # (12,), witness configuration for all geometric targets
-    positions: np.ndarray  # (5, 3, 3): base / intermediate / tip
-    directions: np.ndarray  # (5, 2, 3): proximal / terminal
+    requested_qpos: np.ndarray  # (12,), SDK order; may exceed operating limits
+    positions: np.ndarray  # (5, 3, 3): requested FK base / intermediate / tip
+    directions: np.ndarray  # (5, 2, 3): requested FK proximal / terminal
     activation: np.ndarray  # (4,): thumb–index/middle/ring/pinky
     pinch_distances: np.ndarray  # (4,), m
 
@@ -113,7 +112,7 @@ class HandCalibration:
         self, points: np.ndarray, geometry: HandGeometry, config: HandRetargetingConfig,
         *, fk: HandFK, frame_ids: Sequence[int],
     ) -> HandTargets:
-        """解析整指角度、独立投影到操作范围，再由同一 FK 构型生成所有目标。"""
+        """由未裁剪请求的 FK 生成全部目标；安全边界由求解器约束。"""
         bones = np.diff(points[FINGER_CHAINS], axis=1)
         lengths = np.linalg.norm(bones, axis=2)
         measured = np.r_[lengths.ravel(), np.linalg.norm(points[5] - points[17])]
@@ -151,11 +150,10 @@ class HandCalibration:
         requested = np.empty(12)
         requested[geometry.base_indices] = angles
         requested[geometry.flex_indices] = flex
-        # 先选离操作区间最近的 2π 分支，再独立投影；不重算下游角度。
+        # 选择离操作区间最近的 2π 分支；保留越限请求的任务空间信息。
         center = geometry.limits.mean(axis=1)
         requested = center + np.arctan2(np.sin(requested - center), np.cos(requested - center))
-        projected = np.clip(requested, *geometry.limits.T)
-        targets = fk.forward(projected, frame_ids)[:, :3, 3].reshape(5, 3, 3)
+        targets = fk.forward(requested, frame_ids)[:, :3, 3].reshape(5, 3, 3)
         segments = np.diff(targets, axis=1)
         directions = segments / np.linalg.norm(segments, axis=2)[:, :, None]
         distances = np.linalg.norm(targets[1:, 2] - targets[0, 2], axis=1)
@@ -164,4 +162,7 @@ class HandCalibration:
             0.0, 1.0,
         )
         activation = x * x * (3.0 - 2.0 * x)
-        return HandTargets(requested, projected, targets, directions, activation, distances)
+        return HandTargets(
+            requested_qpos=requested, positions=targets, directions=directions,
+            activation=activation, pinch_distances=distances,
+        )

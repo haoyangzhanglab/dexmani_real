@@ -83,13 +83,13 @@ def test_base_rotations_and_planes(hand, angle):
                 p[k + 1 : k + 4] - p[k], g.base_axes[f], np.array(angle),
             )
     t = r.calibration.targets(p, g, r.config, fk=r.fk, frame_ids=r.frame_ids)
-    clipped = np.clip([angle, 0.5 * np.arctan2(np.sin(2*angle), np.cos(2*angle))], *g.limits[g.base_indices].T)
+    requested = np.array([angle, 0.5 * np.arctan2(np.sin(2*angle), np.cos(2*angle))])
     q = np.zeros(12)
-    q[[0, 3]] = clipped
+    q[[0, 3]] = requested
     robot = r.fk.forward(q, r.frame_ids)[:, :3, 3].reshape(5, 3, 3)
     np.testing.assert_allclose(t.positions[:2, 0], robot[:2, 0], atol=1e-12)
     normals = g.flex_axes[:, 0].copy()
-    normals[:2] = rotate_vectors(normals[:2], g.base_axes, clipped)
+    normals[:2] = rotate_vectors(normals[:2], g.base_axes, requested)
     np.testing.assert_allclose(
         np.sum(t.directions * normals[:, None], axis=2), 0, atol=1e-12
     )
@@ -163,13 +163,20 @@ def test_projection_and_calibration_rejections(hand):
 @pytest.mark.parametrize(
     "term", ["position", "direction", "pinch", "temporal", "total"]
 )
-def test_analytical_gradient(hand, term):
+@pytest.mark.parametrize("residual", ["large", "small", "bent"])
+def test_analytical_gradient(hand, term, residual):
     r, p = hand
+    if residual == "small":
+        p = synthetic_landmarks(r, np.deg2rad(HandConfig().home_qpos_deg))
+    elif residual == "bent":
+        lengths = r.calibration.bone_lengths[2]
+        p[11] = p[10] + lengths[1] * np.array([0.6, 0, 0.8])
+        p[12] = p[11] + lengths[2] * np.array([1, 0, 0])
     targets = r.calibration.targets(p, r.geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)
     targets = replace(
         targets,
         activation=np.ones(4),
-        pinch_distances=np.array([0.01, 0.03, 0.06, 0.09]),
+        pinch_distances=targets.pinch_distances if residual == "small" else np.array([0.01, 0.03, 0.06, 0.09]),
     )
     weights = {
         "shape_weight": 0.0,
@@ -192,6 +199,8 @@ def test_analytical_gradient(hand, term):
     rng = np.random.default_rng(42)
     for _ in range(5):
         q = rng.uniform(*r.limits.T)
+        if residual == "small":
+            q = targets.requested_qpos + rng.normal(0, 1e-3, 12)
         previous = rng.uniform(*r.limits.T)
         obj = HandObjective(r.fk, r.frame_ids, targets, previous, 0.0625, cfg)
         grad = np.empty(12)
@@ -318,9 +327,9 @@ def test_random_full_pipeline_reconstruction(hand):
 
 @pytest.mark.parametrize('offset', [-1e-6, 0, 1e-6])
 @pytest.mark.parametrize('bound', [0, 1])
-def test_operating_limit_projection(hand, offset, bound):
+def test_requested_geometry_ignores_operating_limit_clipping(hand, offset, bound):
     r, _ = hand
-    # 收窄全部操作范围，以合法机构构型检查独立裁剪而非硬件范围裁剪。
+    # 收窄操作范围，确认边界内外的请求几何均由原始构型生成。
     limits = r.limits.copy()
     limits[:, 0] += 0.03
     limits[:, 1] -= 0.03
@@ -329,10 +338,8 @@ def test_operating_limit_projection(hand, offset, bound):
     p = synthetic_landmarks(r, q)
     r.calibrate([hand_lengths(p)] * 25)
     t = r.calibration.targets(p, geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)
-    expected_q = np.clip(q, *limits.T)
     np.testing.assert_allclose(t.requested_qpos, q, atol=1e-12)
-    np.testing.assert_allclose(t.projected_qpos, expected_q, atol=1e-12)
-    expected = r.fk.forward(expected_q, r.frame_ids)[:, :3, 3].reshape(5, 3, 3)
+    expected = r.fk.forward(q, r.frame_ids)[:, :3, 3].reshape(5, 3, 3)
     np.testing.assert_allclose(t.positions, expected, atol=1e-12)
     np.testing.assert_allclose(np.linalg.norm(np.diff(t.positions, axis=1), axis=2), geometry.segments, atol=1e-12)
 
@@ -343,3 +350,100 @@ def test_index_plane_unobservable_is_rejected(hand):
     p[6:9] = p[5] + np.cumsum(lengths)[:, None] * r.geometry.base_axes[1]
     with pytest.raises(HandGeometryRejected, match='index flexion plane'):
         r.calibration.targets(p, r.geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)
+
+
+def test_requested_thumb_geometry_survives_clipping(hand):
+    r, _ = hand
+    q = np.deg2rad(HandConfig().home_qpos_deg)
+    q[:3] = [0.7, 0.8, -0.3]
+    p = synthetic_landmarks(r, q)
+    r.calibrate([hand_lengths(p)] * 25)
+    t = r.calibration.targets(p, r.geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)
+    np.testing.assert_allclose(t.requested_qpos, q, atol=1e-12)
+    clipped_qpos = np.clip(t.requested_qpos, *r.limits.T)
+    assert clipped_qpos[2] == r.limits[2, 0]
+    requested = r.fk.forward(q, r.frame_ids)[:, :3, 3].reshape(5, 3, 3)
+    clipped = r.fk.forward(clipped_qpos, r.frame_ids)[:, :3, 3].reshape(5, 3, 3)
+    np.testing.assert_allclose(t.positions, requested, atol=1e-12)
+    np.testing.assert_allclose(t.directions, np.diff(requested, axis=1)/r.geometry.segments[:, :, None], atol=1e-12)
+    assert np.linalg.norm(t.directions[0, 1]-np.diff(clipped, axis=1)[0, 1]/r.geometry.segments[0, 1]) > 0.1
+    np.testing.assert_allclose(t.pinch_distances, np.linalg.norm(requested[1:, 2]-requested[0, 2], axis=1))
+    assert np.linalg.norm(t.positions[0, 2]-clipped[0, 2]) > 0.01
+    assert np.max(abs(t.pinch_distances-np.linalg.norm(clipped[1:, 2]-clipped[0, 2], axis=1))) > 0.001
+
+
+def test_terminal_direction_follows_requested_fk(hand):
+    r, _ = hand
+    p = synthetic_landmarks(r, np.deg2rad(HandConfig().home_qpos_deg))
+    lengths = r.calibration.bone_lengths[2]
+    p[11] = p[10] + lengths[1] * np.array([0.6, 0, 0.8])
+    p[12] = p[11] + lengths[2] * np.array([1, 0, 0])
+    t = r.calibration.targets(p, r.geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)
+    composite = (t.positions[2, 2]-t.positions[2, 1])/r.geometry.segments[2, 1]
+    np.testing.assert_allclose(t.directions[2, 1], composite, atol=1e-12)
+    assert np.linalg.norm(t.directions[2, 1]-[1, 0, 0]) > 0.2
+    # main 的目标公式是 FK(clip(q))；范围内请求的全部目标保持一致。
+    clipped_qpos = np.clip(t.requested_qpos, *r.limits.T)
+    np.testing.assert_allclose(clipped_qpos, t.requested_qpos, atol=1e-12)
+    before = r.fk.forward(clipped_qpos, r.frame_ids)[:, :3, 3].reshape(5, 3, 3)
+    np.testing.assert_allclose(t.positions, before, atol=1e-12)
+    np.testing.assert_allclose(t.directions, np.diff(before, axis=1)/r.geometry.segments[:, :, None], atol=1e-12)
+    distances = np.linalg.norm(before[1:, 2]-before[0, 2], axis=1)
+    np.testing.assert_allclose(t.pinch_distances, distances, atol=1e-12)
+    x = np.clip((r.config.pinch_start_m-distances)/(r.config.pinch_start_m-r.config.pinch_full_m), 0, 1)
+    np.testing.assert_allclose(t.activation, x*x*(3-2*x), atol=1e-12)
+
+
+@pytest.mark.parametrize('distal', [0.5, -0.3])
+@pytest.mark.parametrize('other_distal', [0.6, -0.2])
+def test_bounded_ik_tracks_requested_geometry(hand, monkeypatch, distal, other_distal):
+    from dexmani_real.teleop.retargeting.landmarks import prepare_landmarks
+
+    r, _ = hand
+    q = np.array([0.6, 0.5, distal, 0.1, 0.7, 0.8, 0.4, 0.6, 0.5, 0.4, 0.3, 0.5])
+    q[[5, 7, 9, 11]] = other_distal
+    p = synthetic_landmarks(r, q)
+    r.calibrate([hand_lengths(p)] * 25)
+    targets = r.calibration.targets(prepare_landmarks(p), r.geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)
+    original = HandObjective.__call__
+    evaluations = 0
+
+    def checked(obj, candidate, gradient):
+        nonlocal evaluations
+        assert np.all(candidate >= r.optimizer.get_lower_bounds()-1e-9)
+        assert np.all(candidate <= r.optimizer.get_upper_bounds()+1e-9)
+        evaluations += 1
+        return original(obj, candidate, gradient)
+
+    monkeypatch.setattr(HandObjective, '__call__', checked)
+    r.reset(np.deg2rad(HandConfig().home_qpos_deg), timestamp_ns=1)
+    for i in range(100):
+        stamp = 1 + (i+1)*62500000
+        command = r.retarget(p, timestamp_ns=stamp)
+        assert command is not None
+        assert np.all(command >= r.limits[:, 0]) and np.all(command <= r.limits[:, 1])
+        r.commit(command, timestamp_ns=stamp)
+    assert evaluations > 0
+    actual = r.fk.forward(command, r.frame_ids)[:, :3, 3].reshape(5, 3, 3)
+    error = np.linalg.norm(actual[:, 2]-targets.positions[:, 2], axis=1)
+    if distal > 0 and other_distal > 0:
+        assert error.max() < 0.001
+        direction = np.diff(actual, axis=1)/r.geometry.segments[:, :, None]
+        angles = np.arccos(np.clip(np.sum(direction*targets.directions, axis=2), -1, 1))
+        assert angles.max() < np.deg2rad(1)
+    if distal < 0:
+        assert error[0] > 0.001
+        assert targets.requested_qpos[2] < r.limits[2, 0]
+    if other_distal < 0:
+        assert np.all(error[1:] > 0.001)
+        assert np.all(targets.requested_qpos[[5, 7, 9, 11]] < r.limits[[5, 7, 9, 11], 0])
+
+
+def test_palm_frame_rigid_transform_invariance(hand):
+    from dexmani_real.teleop.retargeting.landmarks import prepare_landmarks
+
+    r, _ = hand
+    q = np.deg2rad(HandConfig().home_qpos_deg)
+    p = synthetic_landmarks(r, q)
+    rotation = r.fk.pin.exp3(np.array([0.2, -0.4, 0.7]))
+    np.testing.assert_allclose(prepare_landmarks(p @ rotation.T + [1, 2, 3]), prepare_landmarks(p), atol=1e-14)
