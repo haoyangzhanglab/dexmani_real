@@ -25,7 +25,7 @@ def hand():
     r = HandRetargeter(HandRetargetingConfig(), HandConfig())
     p = np.zeros((21, 3))
     g = r.geometry
-    p[1] = g.base_origins[0]
+    p[1] = r.fk.neutral_joint_geometry()[0][g.base_indices[0]]
     p[2:5] = g.positions[0]
     for i in range(1, 5):
         a, b, c = g.positions[i]
@@ -76,14 +76,19 @@ def test_base_rotations_and_planes(hand, angle):
         k = 1 + 4 * f
         v = p[k + 1] - p[k]
         changed = rotate_vectors(v[None], g.base_axes[f : f + 1], np.array([angle]))[0]
-        p[k + 1 : k + 4] += changed - v
-    t = r.calibration.targets(p, g, r.config)
-    clipped = np.clip([angle, angle], *g.base_limits.T)
+        if f == 0:
+            p[k + 1 : k + 4] += changed - v
+        else:
+            p[k + 1 : k + 4] = p[k] + rotate_vectors(
+                p[k + 1 : k + 4] - p[k], g.base_axes[f], np.array(angle),
+            )
+    t = r.calibration.targets(p, g, r.config, fk=r.fk, frame_ids=r.frame_ids)
+    clipped = np.clip([angle, 0.5 * np.arctan2(np.sin(2*angle), np.cos(2*angle))], *g.limits[g.base_indices].T)
     q = np.zeros(12)
     q[[0, 3]] = clipped
     robot = r.fk.forward(q, r.frame_ids)[:, :3, 3].reshape(5, 3, 3)
     np.testing.assert_allclose(t.positions[:2, 0], robot[:2, 0], atol=1e-12)
-    normals = g.normals.copy()
+    normals = g.flex_axes[:, 0].copy()
     normals[:2] = rotate_vectors(normals[:2], g.base_axes, clipped)
     np.testing.assert_allclose(
         np.sum(t.directions * normals[:, None], axis=2), 0, atol=1e-12
@@ -101,9 +106,9 @@ def test_distal_calibration_spread_and_pinch(hand):
     l = r.calibration.bone_lengths[2]
     p[k + 2] = p[k + 1] + l[1] * np.array([0.6, 0, 0.8])
     p[k + 3] = p[k + 2] + l[2] * np.array([1.0, 0, 0])
-    t = r.calibration.targets(p, g, r.config)
+    t = r.calibration.targets(p, g, r.config, fk=r.fk, frame_ids=r.frame_ids)
     expected = project_direction(
-        np.array([l[1] * 0.6 + l[2], 0, l[1] * 0.8]), g.normals[2]
+        np.array([l[1] * 0.6 + l[2], 0, l[1] * 0.8]), g.flex_axes[2, 0]
     )
     np.testing.assert_allclose(
         (t.positions[2, 2] - t.positions[2, 1]) / g.segments[2, 1], expected
@@ -111,7 +116,7 @@ def test_distal_calibration_spread_and_pinch(hand):
     noisy = p.copy()  # 修改只作用于中指骨链。
     noisy[k + 2] = p[k + 1] + 1.1 * (p[k + 2] - p[k + 1])
     noisy[k + 3] = noisy[k + 2] + 0.9 * (p[k + 3] - p[k + 2])
-    nt = r.calibration.targets(noisy, g, r.config)
+    nt = r.calibration.targets(noisy, g, r.config, fk=r.fk, frame_ids=r.frame_ids)
     np.testing.assert_allclose(t.positions, nt.positions, atol=1e-12)
     for f in [2, 3, 4]:
         k = 1 + 4 * f
@@ -122,7 +127,7 @@ def test_distal_calibration_spread_and_pinch(hand):
             / np.linalg.norm(spread, axis=1)[:, None]
         )
         p[k + 1 : k + 4] = p[k] + np.cumsum(spread, axis=0)
-    spread_target = r.calibration.targets(p, g, r.config)
+    spread_target = r.calibration.targets(p, g, r.config, fk=r.fk, frame_ids=r.frame_ids)
     np.testing.assert_allclose(t.positions, spread_target.positions, atol=1e-12)
     d = np.linalg.norm(t.positions[1:, 2] - t.positions[0, 2], axis=1)
     np.testing.assert_allclose(t.pinch_distances, d)
@@ -133,7 +138,7 @@ def test_distal_calibration_spread_and_pinch(hand):
             pinch_start_m=float(d[0] + x * 0.01),
             pinch_full_m=float(d[0] - (1 - x) * 0.01),
         )
-        assert r.calibration.targets(p, g, cfg).activation[0] == pytest.approx(
+        assert r.calibration.targets(p, g, cfg, fk=r.fk, frame_ids=r.frame_ids).activation[0] == pytest.approx(
             x * x * (3 - 2 * x)
         )
 
@@ -145,7 +150,7 @@ def test_projection_and_calibration_rejections(hand):
     bad = p.copy()
     bad[4] += 1
     with pytest.raises(HandGeometryRejected, match="tolerance"):
-        r.calibration.targets(bad, r.geometry, r.config)
+        r.calibration.targets(bad, r.geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)
     with pytest.raises(ValueError, match="requires"):
         HandCalibration.from_measurements([hand_lengths(p)] * 24, r.config)
     samples = np.array([hand_lengths(p)] * 25)
@@ -160,7 +165,7 @@ def test_projection_and_calibration_rejections(hand):
 )
 def test_analytical_gradient(hand, term):
     r, p = hand
-    targets = r.calibration.targets(p, r.geometry, r.config)
+    targets = r.calibration.targets(p, r.geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)
     targets = replace(
         targets,
         activation=np.ones(4),
@@ -268,10 +273,73 @@ def test_reachable_target_reconstruction_and_base_degeneracy(hand):
     for f in range(1, 5):
         a, b, c = robot[f]
         p[1 + 4 * f : 5 + 4 * f] = [a, b, b + 0.4 * (c - b), c]
-    target = r.calibration.targets(p, r.geometry, r.config)
+    target = r.calibration.targets(p, r.geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)
     np.testing.assert_allclose(target.positions, robot, atol=1e-12)
     length = np.linalg.norm(p[2] - p[1])
     displacement = length * r.geometry.base_axes[0] - (p[2] - p[1])
     p[2:5] += displacement
     with pytest.raises(HandGeometryRejected, match="degenerate"):
-        r.calibration.targets(p, r.geometry, r.config)
+        r.calibration.targets(p, r.geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)
+
+
+def synthetic_landmarks(r, q):
+    """固定人体掌锚点，只从机器人取骨段方向；掌系变换应为恒等。"""
+    pos = r.fk.forward(q, r.frame_ids)[:, :3, 3].reshape(5, 3, 3)
+    p = np.zeros((21, 3))
+    p[1] = r.fk.neutral_joint_geometry()[0][r.geometry.base_indices[0]]
+    p[2:5] = pos[0]
+    for f, side in zip(range(1, 5), [0.03, 0, -0.015, -0.03]):
+        a, b, c = pos[f]
+        anchor = np.array([0, side, 0.09])
+        p[1+4*f:5+4*f] = np.array([a, b, b+0.4*(c-b), c]) + anchor-a
+    return p
+
+
+def test_random_full_pipeline_reconstruction(hand):
+    from dexmani_real.teleop.retargeting.landmarks import prepare_landmarks
+
+    r, _ = hand
+    rng = np.random.default_rng(20261106)
+    qs = rng.uniform(*r.limits.T, size=(1000, 12))
+    qs[:3] = [r.limits[:, 0], r.limits[:, 1], r.limits.mean(axis=1)]
+    qs[3:6, 4] = np.pi/2 + np.array([-1e-8, 0, 1e-8])
+    p = synthetic_landmarks(r, qs[0])
+    r.calibrate([hand_lengths(p)] * 25)
+    for q in qs:
+        p = synthetic_landmarks(r, q)
+        np.testing.assert_allclose(prepare_landmarks(p), p, atol=1e-14)
+        t = r.calibration.targets(p, r.geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)
+        np.testing.assert_allclose(t.requested_qpos, q, atol=1e-12)
+        expected = r.fk.forward(q, r.frame_ids)[:, :3, 3].reshape(5, 3, 3)
+        np.testing.assert_allclose(t.positions, expected, atol=1e-12)
+        np.testing.assert_allclose(np.linalg.norm(np.diff(t.positions, axis=1), axis=2), r.geometry.segments, atol=1e-12)
+        np.testing.assert_allclose(t.directions, np.diff(expected, axis=1)/r.geometry.segments[:, :, None], atol=1e-12)
+
+
+@pytest.mark.parametrize('offset', [-1e-6, 0, 1e-6])
+@pytest.mark.parametrize('bound', [0, 1])
+def test_operating_limit_projection(hand, offset, bound):
+    r, _ = hand
+    # 收窄全部操作范围，以合法机构构型检查独立裁剪而非硬件范围裁剪。
+    limits = r.limits.copy()
+    limits[:, 0] += 0.03
+    limits[:, 1] -= 0.03
+    geometry = replace(r.geometry, limits=limits)
+    q = limits[:, bound] + offset
+    p = synthetic_landmarks(r, q)
+    r.calibrate([hand_lengths(p)] * 25)
+    t = r.calibration.targets(p, geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)
+    expected_q = np.clip(q, *limits.T)
+    np.testing.assert_allclose(t.requested_qpos, q, atol=1e-12)
+    np.testing.assert_allclose(t.projected_qpos, expected_q, atol=1e-12)
+    expected = r.fk.forward(expected_q, r.frame_ids)[:, :3, 3].reshape(5, 3, 3)
+    np.testing.assert_allclose(t.positions, expected, atol=1e-12)
+    np.testing.assert_allclose(np.linalg.norm(np.diff(t.positions, axis=1), axis=2), geometry.segments, atol=1e-12)
+
+
+def test_index_plane_unobservable_is_rejected(hand):
+    r, p = hand
+    lengths = r.calibration.bone_lengths[1]
+    p[6:9] = p[5] + np.cumsum(lengths)[:, None] * r.geometry.base_axes[1]
+    with pytest.raises(HandGeometryRejected, match='index flexion plane'):
+        r.calibration.targets(p, r.geometry, r.config, fk=r.fk, frame_ids=r.frame_ids)

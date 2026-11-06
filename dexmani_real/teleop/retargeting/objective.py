@@ -51,7 +51,7 @@ class HandObjective:
         length = np.linalg.norm(segments, axis=2)
         direction = segments / length[:, :, None]
         direction_error = direction - targets.directions
-        # 限位与位置/方向折中仍会产生大残差；限制它们对其他关节的牵引。
+        # 速率边界和时间阻尼仍会产生跟踪残差；保留既有稳健损失。
         # 按弦长做径向 Huber，除以 delta 后大残差的斜率为 1；参考方向不变。
         losses, derivatives = huber(direction_error, cfg.direction_huber_delta)
         value += np.dot(self.direction_weights, np.sum(losses, axis=0)) / 5.0

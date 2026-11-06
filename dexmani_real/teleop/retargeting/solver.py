@@ -85,8 +85,10 @@ class HandRetargeter:
         ])
         base_vectors /= np.linalg.norm(base_vectors, axis=1)[:, None]
         self.geometry = HandGeometry(
-            positions, segments, normals, base_origins, base_axes,
-            model_limits[base_indices], project_direction(base_vectors, base_axes),
+            positions=positions, segments=segments, base_axes=base_axes,
+            base_indices=np.array(base_indices), flex_indices=flex_indices,
+            flex_axes=flex_axes, limits=self.limits,
+            base_directions=project_direction(base_vectors, base_axes),
         )
         self.optimizer = nlopt.opt(nlopt.LD_SLSQP, 12)
         self.optimizer.set_maxeval(config.max_evaluations)
@@ -133,7 +135,9 @@ class HandRetargeter:
             return self.reference_qpos.copy()
         try:
             points = prepare_landmarks(landmarks)
-            targets = self.calibration.targets(points, self.geometry, self.config)
+            targets = self.calibration.targets(
+                points, self.geometry, self.config, fk=self.fk, frame_ids=self.frame_ids,
+            )
         except HandGeometryRejected as exc:
             self.rejection_reason = str(exc)
             return None

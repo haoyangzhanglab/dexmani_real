@@ -1,8 +1,12 @@
 """HTS 右手 21 点：掌坐标、固定骨长标定和 XHand 的降维几何目标。"""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
+
+from dexmani_real.config.teleop import HandRetargetingConfig
+from dexmani_real.geometry.kinematics import HandFK
 
 BONE_CHILDREN = np.arange(1, 21)
 BONE_PARENTS = BONE_CHILDREN - 1
@@ -16,6 +20,8 @@ class HandGeometryRejected(ValueError):
 
 @dataclass(frozen=True)
 class HandTargets:
+    requested_qpos: np.ndarray  # (12,), SDK order, before operating-limit projection
+    projected_qpos: np.ndarray  # (12,), witness configuration for all geometric targets
     positions: np.ndarray  # (5, 3, 3): base / intermediate / tip
     directions: np.ndarray  # (5, 2, 3): proximal / terminal
     activation: np.ndarray  # (4,): thumb–index/middle/ring/pinky
@@ -28,10 +34,11 @@ class HandGeometry:
 
     positions: np.ndarray  # (5, 3, 3), m
     segments: np.ndarray  # (5, 2), m
-    normals: np.ndarray  # (5, 3)
-    base_origins: np.ndarray  # (2, 3), m
     base_axes: np.ndarray  # (2, 3)
-    base_limits: np.ndarray  # (2, 2), rad
+    base_indices: np.ndarray  # (2,), SDK order
+    flex_indices: np.ndarray  # (5, 2), SDK order
+    flex_axes: np.ndarray  # (5, 2, 3), neutral hand-base axes
+    limits: np.ndarray  # (12, 2), operating limits, rad
     base_directions: np.ndarray  # (2, 3), perpendicular to base_axes
 
 
@@ -42,6 +49,13 @@ def project_direction(vectors: np.ndarray, normals: np.ndarray) -> np.ndarray:
     if np.any(norms < 1e-6):
         raise HandGeometryRejected("hand direction projection is degenerate")
     return projected / norms
+
+
+def signed_angle(initial: np.ndarray, target: np.ndarray, axis: np.ndarray) -> np.ndarray:
+    return np.arctan2(
+        np.sum(axis * np.cross(initial, target), axis=-1),
+        np.sum(initial * target, axis=-1),
+    )
 
 
 def rotate_vectors(vectors: np.ndarray, axes: np.ndarray, angles: np.ndarray) -> np.ndarray:
@@ -83,7 +97,9 @@ class HandCalibration:
     palm_width: float
 
     @classmethod
-    def from_measurements(cls, measurements, config):
+    def from_measurements(
+        cls, measurements: Sequence[np.ndarray] | np.ndarray, config: HandRetargetingConfig,
+    ) -> "HandCalibration":
         values = np.asarray(measurements, dtype=np.float64)
         if len(values) < config.calibration_samples:
             raise ValueError(f"hand calibration requires {config.calibration_samples} frames")
@@ -93,8 +109,11 @@ class HandCalibration:
             raise ValueError("hand calibration bone lengths are unstable")
         return cls(median[:15].reshape(5, 3), float(median[15]))
 
-    def targets(self, points: np.ndarray, geometry: HandGeometry, config) -> HandTargets:
-        """按 XHand 基部轨迹、局部屈曲平面及固定段长构造目标。"""
+    def targets(
+        self, points: np.ndarray, geometry: HandGeometry, config: HandRetargetingConfig,
+        *, fk: HandFK, frame_ids: Sequence[int],
+    ) -> HandTargets:
+        """解析整指角度、独立投影到操作范围，再由同一 FK 构型生成所有目标。"""
         bones = np.diff(points[FINGER_CHAINS], axis=1)
         lengths = np.linalg.norm(bones, axis=2)
         measured = np.r_[lengths.ravel(), np.linalg.norm(points[5] - points[17])]
@@ -102,39 +121,47 @@ class HandCalibration:
         if np.max(np.abs(measured / reference - 1.0)) > config.bone_length_tolerance:
             raise HandGeometryRejected("hand bone lengths changed beyond the calibrated tolerance")
         unit_bones = bones / lengths[:, :, None]
-        base = project_direction(unit_bones[:2, 0], geometry.base_axes)
-        initial = geometry.base_directions
-        angles = np.arctan2(
-            np.sum(geometry.base_axes * np.cross(initial, base), axis=1),
-            np.sum(initial * base, axis=1),
-        )
-        angles = np.clip(angles, *geometry.base_limits.T)
-        targets = geometry.positions.copy()
-        normals = geometry.normals.copy()
-        rotated = rotate_vectors(
-            np.stack((targets[:2, 0] - geometry.base_origins, normals[:2]), axis=1),
-            geometry.base_axes[:, None], angles[:, None],
-        )
-        targets[:2, 0] = geometry.base_origins + rotated[:, 0]
-        normals[:2] = rotated[:, 1]
         proximal = unit_bones[:, 0].copy()
         proximal[0] = unit_bones[0, 1]
         distal = unit_bones[:, 2].copy()
-        # 除以总骨长使退化阈值无量纲；不改变合成向量的方向。
+        # 归一化权重使退化阈值无量纲，并保留两段标定骨长的比例。
         distal[1:] = np.sum(
             self.bone_lengths[1:, 1:, None] * unit_bones[1:, 1:], axis=1,
         ) / self.bone_lengths[1:, 1:].sum(axis=1)[:, None]
-        projected = project_direction(
-            np.stack((proximal, distal, unit_bones[:, 2]), axis=1), normals[:, None],
+        base = project_direction(unit_bones[0, 0], geometry.base_axes[0])
+        angles = np.empty(2)
+        angles[0] = signed_angle(geometry.base_directions[0], base, geometry.base_axes[0])
+        # 两段共同确定无向屈曲平面，避免近端跨 90° 时方位翻转。
+        index = np.stack((proximal[1], distal[1]))
+        c = index @ geometry.base_directions[1]
+        s = index @ np.cross(geometry.base_axes[1], geometry.base_directions[1])
+        x, y = np.sum(c * c - s * s), 2 * np.sum(c * s)
+        if np.hypot(x, y) < 1e-12:
+            raise HandGeometryRejected("index flexion plane is degenerate")
+        angles[1] = 0.5 * np.arctan2(y, x)
+        directions = np.stack((proximal, distal), axis=1)
+        directions[:2] = rotate_vectors(
+            directions[:2], geometry.base_axes[:, None], -angles[:, None],
         )
-        proximal, distal, terminal = projected[:, 0], projected[:, 1], projected[:, 2]
-        targets[:, 1] = targets[:, 0] + geometry.segments[:, 0, None] * proximal
-        targets[:, 2] = targets[:, 1] + geometry.segments[:, 1, None] * distal
-        directions = np.stack((proximal, terminal), axis=1)
+        directions = project_direction(directions, geometry.flex_axes[:, :1])
+        neutral = np.diff(geometry.positions, axis=1) / geometry.segments[:, :, None]
+        # 平行轴使远段绝对角可直接减去近端旋转；保留反向轴符号。
+        flex = signed_angle(neutral, directions, geometry.flex_axes)
+        flex[:, 1] -= np.sum(geometry.flex_axes[:, 0] * geometry.flex_axes[:, 1], axis=1) * flex[:, 0]
+        requested = np.empty(12)
+        requested[geometry.base_indices] = angles
+        requested[geometry.flex_indices] = flex
+        # 先选离操作区间最近的 2π 分支，再独立投影；不重算下游角度。
+        center = geometry.limits.mean(axis=1)
+        requested = center + np.arctan2(np.sin(requested - center), np.cos(requested - center))
+        projected = np.clip(requested, *geometry.limits.T)
+        targets = fk.forward(projected, frame_ids)[:, :3, 3].reshape(5, 3, 3)
+        segments = np.diff(targets, axis=1)
+        directions = segments / np.linalg.norm(segments, axis=2)[:, :, None]
         distances = np.linalg.norm(targets[1:, 2] - targets[0, 2], axis=1)
         x = np.clip(
             (config.pinch_start_m - distances) / (config.pinch_start_m - config.pinch_full_m),
             0.0, 1.0,
         )
         activation = x * x * (3.0 - 2.0 * x)
-        return HandTargets(targets, directions, activation, distances)
+        return HandTargets(requested, projected, targets, directions, activation, distances)
