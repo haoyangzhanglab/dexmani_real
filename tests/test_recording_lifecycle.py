@@ -58,8 +58,10 @@ def capture(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("save", [True, False])
-def test_save_and_discard(capture, save):
+def test_save_and_discard(capture, monkeypatch, save):
     rec, release, closing, closed = capture
+    get = Mock(wraps=rec.queue.get)
+    monkeypatch.setattr(rec.queue, "get", get)
     request = rec.request_finish(save=save, reason="operator")
     assert rec.request_finish(save=not save, reason="quit") is request
     staging = rec.staging_path
@@ -70,6 +72,9 @@ def test_save_and_discard(capture, save):
     assert rec.writer.frames == (list(range(5)) if save else [0])
     assert rec.writer.finish.call_count == int(save)
     rec.writer.flush.assert_not_called()
+    # writer.close 尚被阻塞，此时不包含 finally 中丢弃队列的调用。
+    assert get.call_count == (5 if save else 0)
+    assert all(call.kwargs == {"block": False} for call in get.call_args_list)
     closed.set()
     rec.thread.join(3)
     assert rec.poll_finish() and rec.queue.empty()
@@ -217,6 +222,8 @@ def test_finish_arriving_after_empty_queue_observation(capture, monkeypatch, sav
 
     def get(*args, **kwargs):
         nonlocal injected
+        if rec.finish_request is None:
+            assert kwargs == {"timeout": 0.05}
         try:
             return original_get(*args, **kwargs)
         except Empty:

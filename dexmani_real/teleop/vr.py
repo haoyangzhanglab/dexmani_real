@@ -64,7 +64,7 @@ class VRController:
     def compute_target(self, row, *, control_ns) -> ActionResult:
         reference = prepare_reference(
             self.action_mapper.solver, self.ik_reference, row.arm["qpos"][0],
-            feedback_ns=int(row.arm["timestamp_ns"][0]), control_ns=control_ns,
+            control_ns=control_ns,
             period_s=1 / self.config.control_hz,
         )
         target = self._wrist_target(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])

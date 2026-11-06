@@ -19,7 +19,7 @@ from dexmani_real.runtime.preflight import (
 )
 from dexmani_real.runtime.state import SessionState
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.timing import sampling_clock_ns
+from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ class KeyboardTeleop:
                 if remaining_ns > 0:
                     time.sleep(min(0.005, remaining_ns / 1e9))
             now_ns = time.monotonic_ns()
-            self.tick_due_ns = now_ns + self.period_ns
+            self.tick_due_ns = next_tick_ns(self.tick_due_ns, self.period_ns, now_ns)
             self.robot.service_feedback()
             self.keys.allow_start()
             events = self.keys.poll(self.runtime_state, timeout=0)[0]

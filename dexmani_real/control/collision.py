@@ -51,7 +51,6 @@ class CollisionModel:
             self.add_obstacle(f"obstacle_{index}", Box(*box.size_xyz_m), placement, robot_count)
 
         self.geometry_data = self.geometry.createData()
-        self.eef_frame_id = self.model.getFrameId("custom_eef_link")
         self.hand_qpos = None
 
     def add_obstacle(self, name, shape, placement, robot_count):
@@ -86,10 +85,6 @@ class CollisionModel:
             "environment_collision" if pair.second in self.environment_names else "self_collision"
         )
         return f"{kind}: {self.link_name(pair.first)}/{self.link_name(pair.second)}"
-
-    # 以下查询共用最近一次 rejection 更新的运动学。
-    def eef_position(self):
-        return self.pin.updateFramePlacement(self.model, self.data, self.eef_frame_id).translation
 
     def link_name(self, geom_id):
         if geom_id in self.environment_names:

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from dexmani_real.control.actions import ActionResult
+from dexmani_real.control.ik import IKReferenceError
 from dexmani_real.robot.commands import RobotCommand, RobotError
 from dexmani_real.teleop.loop import TeleopLoop
 
@@ -41,9 +42,6 @@ def loop(monkeypatch):
     loop.preparation_interrupted = Mock(return_value=False)
     loop.max_duration_s = 10
     return loop, clock
-
-
-from dexmani_real.control.ik import IKReferenceError
 
 
 def row():
@@ -92,7 +90,7 @@ def test_cancel_does_not_commit(loop):
     obj.controller.commit.assert_not_called()
 
 
-def test_vr_reference_begins_only_on_commit():
+def test_vr_reference_begins_only_on_commit(monkeypatch):
     from dexmani_real.config.real import RealConfig
     from dexmani_real.control.actions import ActionMapper
     from dexmani_real.teleop.vr import VRController
@@ -120,8 +118,11 @@ def test_vr_reference_begins_only_on_commit():
         },
     )
     controller.reset(obs)
+    bounds = Mock(wraps=mapper.solver.bounds)
+    monkeypatch.setattr(mapper.solver, "bounds", bounds)
     controller.compute_target(obs, control_ns=10000000)
     assert controller.ik_reference is None
+    assert bounds.call_args.args[-1] == 1 / cfg.teleop.control_hz
     command = RobotCommand(q.copy(), np.deg2rad(cfg.hand.home_qpos_deg))
     controller.commit(
         command,
@@ -135,6 +136,50 @@ def test_vr_reference_begins_only_on_commit():
         controller.compute_target(obs, control_ns=30000000)
     controller.clear()
     assert controller.ik_reference is None
+    obs.arm["qpos"] = [q]
+    controller.reset(obs)
+    controller.compute_target(obs, control_ns=20000000)
+    assert bounds.call_args.args[-1] == 1 / cfg.teleop.control_hz
+
+
+def test_policy_eef_preparation_budget_and_rejection(monkeypatch):
+    from dexmani_real.deployment.rollout import Rollout
+    from dexmani_real.runtime.ik_reference import IKReference
+
+    obj = Rollout.__new__(Rollout)
+    obj.policy_info = SimpleNamespace(action_mode="eef")
+    obj.execution = SimpleNamespace(control_dt_s=0.1)
+    q = np.zeros(7)
+    obj.action_mapper = Mock()
+    obj.action_mapper.solver.measured_reference.return_value = q
+    obj.action_mapper.map_eef.return_value = ActionResult(None, None, "collision")
+    now_ns = 100_000_000
+    monkeypatch.setattr("dexmani_real.deployment.rollout.time.monotonic_ns", lambda: now_ns)
+    action = np.r_[np.zeros(3), [1, 0, 0, 0, 1, 0], np.zeros(12)]
+    observation = row()
+    for ref, expected in [
+        (None, 0.1),
+        (IKReference(q + 0.01, q, now_ns - 1_000_000), 0.001),
+        (None, 0.1),
+    ]:
+        obj.ik_reference = ref
+        command, reason = obj.map_command(action, observation)
+        assert command is None and reason == "action_rejected: collision"
+        assert obj.action_mapper.map_eef.call_args.args[2][-1] == expected
+        assert obj.ik_reference is ref
+
+
+@pytest.mark.parametrize("age_ns,valid", [(0, True), (1, True), (-1, False), (500_000_000, False)])
+def test_device_feedback_time_boundary(age_ns, valid):
+    from dexmani_real.runtime.observation import check_device_feedback
+
+    now = 1_000_000_000
+    runtime = SimpleNamespace(
+        arm=SimpleNamespace(feedback_max_age_s=0.5),
+        hand=SimpleNamespace(enabled=False),
+    )
+    observation = SimpleNamespace(arm={"timestamp_ns": [now - age_ns]})
+    assert (check_device_feedback(observation, runtime, now_ns=now) == []) == valid
 
 
 @pytest.mark.parametrize("mode", ["sync", "async", "rtc"])

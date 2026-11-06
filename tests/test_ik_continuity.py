@@ -57,6 +57,59 @@ def hand():
     return np.deg2rad(RealConfig().hand.home_qpos_deg)
 
 
+@pytest.fixture
+def reference_solver():
+    solver = IKSolver.__new__(IKSolver)
+    solver.limits = np.tile([-1.0, 1.0], (7, 1))
+    return solver
+
+
+@pytest.mark.parametrize("control_ns", [0, 1, 100_000_000, 10_000_000_000])
+@pytest.mark.parametrize("period_s", [1 / 30, 1 / 60])
+def test_first_reference_uses_nominal_period(reference_solver, control_ns, period_s):
+    q = np.zeros(7)
+    q[0] = 1 + 5e-7
+    measured, command, anchor, h = prepare_reference(
+        reference_solver, None, q, control_ns=control_ns, period_s=period_s
+    )
+    assert h == period_s
+    assert command is measured and anchor is measured
+    assert measured[0] == 1 and q[0] > 1
+
+
+@pytest.mark.parametrize("elapsed", [-1, 0, 1_000_000, 100_000_000, 10_000_000_000])
+def test_committed_reference_budget(reference_solver, elapsed):
+    q = np.zeros(7)
+    ref = IKReference(q + 0.01, q - 0.01, 100)
+    if elapsed < 0:
+        with pytest.raises(ValueError, match="clock moved backwards"):
+            prepare_reference(
+                reference_solver, ref, q, control_ns=100 + elapsed, period_s=1 / 30
+            )
+    else:
+        measured, command, anchor, h = prepare_reference(
+            reference_solver, ref, q, control_ns=100 + elapsed, period_s=1 / 30
+        )
+        np.testing.assert_array_equal(measured, q)
+        assert command is ref.command and anchor is ref.anchor
+        assert h == min(elapsed * 1e-9, 1 / 30)
+    assert ref.submitted_ns == 100
+    np.testing.assert_array_equal(ref.command, q + 0.01)
+    np.testing.assert_array_equal(ref.anchor, q - 0.01)
+
+
+@pytest.mark.parametrize("committed", [False, True])
+@pytest.mark.parametrize("invalid", ["outside", "nan", "shape"])
+def test_prepare_reference_validates_measured(reference_solver, committed, invalid):
+    q = np.zeros(7)
+    ref = IKReference(q.copy(), q.copy(), 100) if committed else None
+    q[0] = 1.01 if invalid == "outside" else np.nan
+    if invalid == "shape":
+        q = np.zeros(6)
+    with pytest.raises(IKReferenceError if invalid == "outside" else ValueError):
+        prepare_reference(reference_solver, ref, q, control_ns=101, period_s=1 / 30)
+
+
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("hz", [16, 30, 60])
 def test_static_continuity(solver, case, hz):
@@ -119,25 +172,80 @@ def test_frozen_feedback_activates_lead(solver):
         )
 
 
-def test_time_cap_and_zero_budget_geometry(solver):
+@pytest.mark.parametrize("h", [0, 0.02])
+@pytest.mark.parametrize("reason", ["environment_collision", "final_eef_workspace"])
+def test_actual_endpoint_rejection(solver, h, reason):
+    from dexmani_real.config.control import StaticCollisionBox
+    from dexmani_real.control.collision import CollisionModel
+
     q = np.array(RealConfig().arm.home_qpos)
-    reference = IKReference(q, q, 100)
-    for elapsed in (1, 100_000_000, 10_000_000_000):
-        args = prepare_reference(
-            solver,
-            reference,
-            q,
-            feedback_ns=100,
-            control_ns=100 + elapsed,
-            period_s=1 / 30,
+    pose = solver.compute_eef_pose_base(q)
+    assert solver.solve(pose, q, q, q, h=h, hand_qpos=hand()).qpos is not None
+    if reason == "environment_collision":
+        solver.constraints.collision_model = CollisionModel(
+            static_boxes=[StaticCollisionBox(tuple(pose.p), (0.5, 0.5, 0.5))]
         )
-        assert args[-1] == min(elapsed * 1e-9, 1 / 30)
-    solver.constraints.endpoint_rejection = Mock(return_value="collision")
-    result = solver.solve(
-        solver.compute_eef_pose_base(q), q, q, q, h=0, hand_qpos=hand()
+    else:
+        solver.constraints.workspace_with_tolerance[0, 1] = pose.p[0] - 0.01
+    result = solver.solve(pose, q, q, q, h=h, hand_qpos=hand())
+    assert result.qpos is None and result.reason.startswith(reason)
+    np.testing.assert_array_equal(solver.constraints.collision_model.hand_qpos, hand())
+
+
+def test_jog_reference_commit_failure_rejection_and_restart(reference_solver, monkeypatch):
+    import threading
+
+    from dexmani_real.control.ik import IKResult
+    from dexmani_real.robot.commands import RobotError
+    from dexmani_real.runtime.jog import CartesianJog
+
+    cfg = RealConfig()
+    q = np.zeros(7)
+    workspace = np.tile([-1.0, 1.0], (3, 1))
+    reference_solver.constraints = SimpleNamespace(workspace_with_tolerance=workspace)
+    reference_solver.compute_eef_pose_base = Mock(return_value=Pose(np.zeros(3), [1, 0, 0, 0]))
+    reference_solver.solve = Mock(return_value=IKResult(qpos=q + 0.01))
+    jog = CartesianJog(reference_solver, cfg.keyboard_teleop, workspace.T)
+    clock = [100_000_000]
+    obs = SimpleNamespace(arm={"qpos": [q], "timestamp_ns": [clock[0]]}, hand=None)
+    monkeypatch.setattr("dexmani_real.runtime.jog.read_observation", lambda *a: obs)
+    monkeypatch.setattr("dexmani_real.runtime.jog.check_device_feedback", lambda *a: [])
+    monkeypatch.setattr("dexmani_real.runtime.jog.time.monotonic_ns", lambda: clock[0])
+    robot, keys = Mock(), Mock()
+    keys.snapshot.return_value = {"w"}
+    state = SimpleNamespace(
+        motion_lock=threading.RLock(), stop_signal=threading.Event(),
+        requests_allow_motion=lambda: True,
     )
-    assert result.qpos is None
-    solver.constraints.endpoint_rejection.assert_called_once()
+
+    jog.propose({"w"}, q, hand_qpos=hand(), control_ns=clock[0])
+    assert jog.ik_reference is None
+    assert reference_solver.solve.call_args.kwargs["h"] == 1 / cfg.keyboard_teleop.control_hz
+    jog.step(robot, keys, state, cfg)
+    ref = jog.ik_reference
+    assert ref.submitted_ns == clock[0]
+    np.testing.assert_array_equal(ref.command, q + 0.01)
+    np.testing.assert_array_equal(ref.anchor, q)
+
+    clock[0] += 1_000_000
+    robot.send_action.side_effect = RobotError("submission failed")
+    with pytest.raises(RobotError):
+        jog.step(robot, keys, state, cfg)
+    assert jog.ik_reference is ref
+    assert reference_solver.solve.call_args.kwargs["h"] == 0.001
+
+    reference_solver.solve.return_value = IKResult(qpos=None, reason="collision")
+    assert jog.propose({"w"}, q, hand_qpos=hand(), control_ns=clock[0]).qpos is None
+    assert jog.ik_reference is ref
+    robot.send_action.side_effect = None
+    jog.step(robot, keys, state, cfg)
+    assert robot.send_action.call_args.args[0].arm_hold
+    assert jog.ik_reference is None
+
+    reference_solver.solve.return_value = IKResult(qpos=q + 0.01)
+    jog.propose({"w"}, q, hand_qpos=hand(), control_ns=clock[0])
+    assert reference_solver.solve.call_args.kwargs["h"] == 1 / cfg.keyboard_teleop.control_hz
+    assert jog.ik_reference is None
 
 
 def test_budget_and_bad_candidate(solver, monkeypatch):
@@ -189,7 +297,6 @@ def test_actual_coordinates_near_limits(solver, side):
 def test_jog_uses_accepted_fk_and_clears_on_hold(solver, monkeypatch):
     import threading
 
-    from dexmani_real.runtime.ik_reference import IKReference
     from dexmani_real.runtime.jog import CartesianJog
 
     cfg = RealConfig()
@@ -216,7 +323,7 @@ def test_jog_uses_accepted_fk_and_clears_on_hold(solver, monkeypatch):
     accepted_pose = solver.compute_eef_pose_base(command.arm_qpos)
     solve = Mock(wraps=solver.solve)
     monkeypatch.setattr(solver, "solve", solve)
-    jog.propose({"w"}, q, hand_qpos=hand(), feedback_ns=1, control_ns=200000000)
+    jog.propose({"w"}, q, hand_qpos=hand(), control_ns=200000000)
     np.testing.assert_allclose(
         solve.call_args.args[0].p,
         accepted_pose.p + [cfg.keyboard_teleop.delta_pos_m, 0, 0],
@@ -257,8 +364,9 @@ def test_speed_cap_and_feedback_roundoff(solver):
 
 def test_jog_reference_failure_does_not_hold_or_reset(solver, monkeypatch):
     import threading
-    from dexmani_real.runtime.jog import CartesianJog
+
     from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.runtime.jog import CartesianJog
 
     cfg = RealConfig()
     jog = CartesianJog(solver, cfg.keyboard_teleop, solver.constraints.workspace.T)

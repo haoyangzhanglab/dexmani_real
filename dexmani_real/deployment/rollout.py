@@ -333,7 +333,7 @@ class Rollout:
             pose = Pose(action[:3], rot6d_to_quat_wxyz(action[3:9]))
             reference = prepare_reference(
                 self.action_mapper.solver, self.ik_reference, current,
-                feedback_ns=int(row.arm["timestamp_ns"][0]), control_ns=time.monotonic_ns(),
+                control_ns=time.monotonic_ns(),
                 period_s=self.execution.control_dt_s,
             )
             decoded = self.action_mapper.map_eef(pose, action[9:], reference)

@@ -15,13 +15,6 @@ def workspace_start_rejection(position, lower, upper):
     return None
 
 
-def joint_target_rejection(q, limits):
-    lower, upper = limits.T
-    if np.any(q < lower) or np.any(q > upper):
-        return "operational_limits"
-    return None
-
-
 def wrap_nearest_equivalent(qpos, reference, joint_limit_lower, joint_limit_upper):
     result = np.asarray(qpos, dtype=np.float64).copy()
     lower = np.asarray(joint_limit_lower)[EQUIVALENT_JOINTS]
@@ -49,19 +42,10 @@ class MotionConstraints:
         tolerance = environment.eef_workspace_tolerance_m
         self.workspace_with_tolerance = self.workspace + (-tolerance, tolerance)
 
-    def rejection(self, target, *, collision_hand_qpos):
-        reason = joint_target_rejection(target, self.limits)
-        if reason is not None:
-            return reason
-        self.collision_model.set_hand_qpos(collision_hand_qpos)
-        return self.endpoint_rejection(target)
-
-    def endpoint_rejection(self, target, *, position=None):
+    def endpoint_rejection(self, target, *, position):
         reason = self.collision_model.rejection(target)
         if reason is not None:
             return reason
-        if position is None:
-            position = self.collision_model.eef_position()
         if np.any(position < self.workspace_with_tolerance[:, 0]) or np.any(
             position > self.workspace_with_tolerance[:, 1]
         ):

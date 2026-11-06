@@ -65,7 +65,6 @@ class CartesianJog:
                 result = self.propose(
                     pressed_keys,
                     row.arm["qpos"][0],
-                    feedback_ns=int(row.arm["timestamp_ns"][0]),
                     control_ns=time.monotonic_ns(),
                     hand_qpos=(
                         row.hand["qpos"][0]
@@ -109,17 +108,16 @@ class CartesianJog:
             self.clear_reference()
 
     def propose(
-        self, pressed_keys, measured_qpos, *, hand_qpos, feedback_ns, control_ns
+        self, pressed_keys, measured_qpos, *, hand_qpos, control_ns
     ) -> IKResult:
-        measured, previous, anchor, h = prepare_reference(
+        measured, command, anchor, h = prepare_reference(
             self.solver,
             self.ik_reference,
             measured_qpos,
-            feedback_ns=feedback_ns,
             control_ns=control_ns,
             period_s=1 / self.config.control_hz,
         )
-        baseline_pose = self.solver.compute_eef_pose_base(previous)
+        baseline_pose = self.solver.compute_eef_pose_base(command)
         if self.ik_reference is None:
             workspace = self.solver.constraints.workspace_with_tolerance
             reason = workspace_start_rejection(
@@ -140,7 +138,7 @@ class CartesianJog:
             self.position_upper,
         )
         return self.solver.solve(
-            pose, measured, previous, anchor, h=h, hand_qpos=hand_qpos
+            pose, measured, command, anchor, h=h, hand_qpos=hand_qpos
         )
 
 

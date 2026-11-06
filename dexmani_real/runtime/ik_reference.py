@@ -19,15 +19,17 @@ def prepare_reference(
     reference: IKReference | None,
     measured: np.ndarray,
     *,
-    feedback_ns: int,
     control_ns: int,
     period_s: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """首帧给一个名义周期；后续按成功提交后的间隔分配，至多一个周期。"""
     measured = solver.measured_reference(measured)
-    command = measured if reference is None else reference.command
-    anchor = measured if reference is None else reference.anchor
-    stamp = feedback_ns if reference is None else reference.submitted_ns
-    if control_ns < stamp:
-        raise ValueError("IK monotonic clock moved backwards")
-    h = min((control_ns - stamp) * 1e-9, period_s)
+    if reference is None:
+        command = anchor = measured
+        h = period_s
+    else:
+        command, anchor = reference.command, reference.anchor
+        if control_ns < reference.submitted_ns:
+            raise ValueError("IK monotonic clock moved backwards")
+        h = min((control_ns - reference.submitted_ns) * 1e-9, period_s)
     return measured, command, anchor, h

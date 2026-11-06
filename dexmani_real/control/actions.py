@@ -94,7 +94,7 @@ class ActionMapper:
         return ActionResult(target, hand)
 
     def map_eef(self, pose: Pose, hand, reference):
-        current, previous, anchor, h = reference
+        measured, command, anchor, h = reference
         hand = self.prepare_hand(hand)
         if self.solver is None:
             raise ValueError("EEF mapping requires an online IK solver")
@@ -103,8 +103,8 @@ class ActionMapper:
         pose.p = np.clip(pose.p, workspace[:, 0], workspace[:, 1])
         result = self.solver.solve(
             pose,
-            current,
-            previous, anchor, h=h,
+            measured,
+            command, anchor, h=h,
             hand_qpos=hand if hand is not None else self.fixed_hand_qpos,
         )
         reason = None if result.qpos is not None else result.reason

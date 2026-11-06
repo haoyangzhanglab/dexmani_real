@@ -237,7 +237,11 @@ class EpisodeRecorder:
                     if finish is not None and not finish.save:
                         break
                     try:
-                        item = self.queue.get(timeout=0.05)
+                        item = (
+                            self.queue.get(timeout=0.05)
+                            if finish is None
+                            else self.queue.get_nowait()
+                        )
                     except Empty:
                         # 仅取帧前已登记的请求能保证生产者停止；超时后到达的
                         # 请求留到下轮处理，避免漏掉超时后刚入队的最后一帧。
@@ -245,20 +249,19 @@ class EpisodeRecorder:
                             break
                         continue
                     writer.append_frame(*item)
-                if finish is not None and self.error is None:
-                    if finish.save:
-                        writer.finish(
-                            finish.reason,
-                            finish.details,
-                            recording_truncated_reason=finish.recording_truncated_reason,
-                        )
-                else:
+                if finish is None or self.error is not None:
                     writer.flush()
-            except BaseException as exc:
+                elif finish.save:
+                    writer.finish(
+                        finish.reason,
+                        finish.details,
+                        recording_truncated_reason=finish.recording_truncated_reason,
+                    )
+            except BaseException as exc:  # noqa: BLE001 — writer 线程的失败由控制线程读取并抛出。
                 self.store_error(exc)
             finally:
                 writer.close()
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 — 关闭失败也必须回传，不能发布不完整录制。
             self.store_error(exc, stage="writer_close")
         finally:
             self.ready.set()
