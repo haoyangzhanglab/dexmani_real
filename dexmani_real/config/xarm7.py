@@ -109,8 +109,8 @@ class ArmConfig:
                 f"max_joint_acceleration_deg_per_s2={self.max_joint_acceleration_deg_per_s2} "
                 f"resolves to {max_acc_rad} rad/s², outside the SDK command range [0.01, 20]"
             )
-        if not isfinite(self.tcp_load_mass_kg) or self.tcp_load_mass_kg <= 0:
-            raise ValueError("tcp_load_mass_kg must be finite and positive")
+        if not isfinite(self.tcp_load_mass_kg) or self.tcp_load_mass_kg < 0:
+            raise ValueError("tcp_load_mass_kg must be finite and nonnegative")
         cog = np.asarray(self.tcp_load_cog_mm, dtype=np.float64)
         if cog.shape != (3,) or not np.isfinite(cog).all():
             raise ValueError("tcp_load_cog_mm must be a finite (3,) vector")

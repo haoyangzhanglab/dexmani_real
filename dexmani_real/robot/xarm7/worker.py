@@ -22,7 +22,8 @@ STANDSTILL_DWELL_S = 0.30
 
 
 class ArmController:
-    def __init__(self, cfg, io, pipe, driver):
+    def __init__(self, cfg, io, pipe, driver, diagnostics=None):
+        self.diagnostics = diagnostics
         self.cfg, self.io, self.pipe, self.driver = cfg, io, pipe, driver
         self.status = np.zeros((), dtype=ARM_STATE_DTYPE)
         self.active = None
@@ -58,6 +59,8 @@ class ArmController:
         started = time.monotonic_ns()
         try:
             q, v = self.driver.read()
+            if self.diagnostics is not None:
+                self.diagnostics.record("feedback", started, q=q, v=v)
             self.status["qpos"] = q
             self.status["qvel"] = v
             # 来源时间采用查询开始时刻，不能替换为缓存读取时间。
@@ -123,6 +126,8 @@ class ArmController:
         check_abort()
 
     def stop(self):
+        if self.diagnostics is not None:
+            self.diagnostics.record("stop_handle")
         self.io.stop.set()
         self.active = self.reference = None
         try:
@@ -134,6 +139,8 @@ class ArmController:
             self.io.stopped.set()  # 处理结束；停止失败仍保存在 fault。
 
     def operation(self, message: PrepareRequest | HomeRequest):
+        if self.diagnostics is not None:
+            self.diagnostics.record("operation_start")
         self.io.stopped.clear()
         kind = "home" if isinstance(message, HomeRequest) else "prepare"
         error = None
@@ -172,6 +179,8 @@ class ArmController:
 
         self.io.publish_status(self.status)
         try:
+            if self.diagnostics is not None:
+                self.diagnostics.record("operation_end", error=repr(error) if error else "")
             self.pipe.send(error)
         except (BrokenPipeError, EOFError):
             self.io.closing.set()
@@ -209,7 +218,10 @@ class ArmController:
                 raise RuntimeError("arm moved after standstill preparation")
             self.reference = ArmTrajectory(self.cfg, q, v)
         self.active = goal
-        q = self.reference.step(
+        if self.diagnostics is not None:
+            self.diagnostics.record("adopt", q=goal["q_goal"], value=int(goal["expires_ns"]), code=int(goal["hold"]))
+        step = self.reference.step if self.diagnostics is None else self.diagnostics.wrap("ruckig", self.reference.step)
+        q = step(
             goal["q_goal"] if not goal["hold"] else None,
             hold=bool(goal["hold"]),
         )
@@ -221,6 +233,8 @@ class ArmController:
             self.io.stop.set()
             return None
         started = time.monotonic_ns()
+        if self.diagnostics is not None:
+            self.diagnostics.record("reference", q=q, value=started - int(self.status["timestamp_ns"]))
         self.driver.servo(q)
         return started
 
@@ -260,6 +274,8 @@ class ArmController:
                         feedback_due, feedback_period, time.monotonic_ns(),
                     )
                 if time.monotonic_ns() >= tick:
+                    if self.diagnostics is not None:
+                        self.diagnostics.record("tick", value=tick)
                     sent_ns = self.tick()
                     tick = (sent_ns if sent_ns is not None else time.monotonic_ns()) + period
                 # 停止可中断等待，目标仅在计划的伺服时刻生效。
@@ -285,8 +301,9 @@ class ArmController:
             self.pipe.close()
 
 
-def run_arm(cfg, io, pipe, startup_deadline_ns):
+def run_arm(cfg, io, pipe, startup_deadline_ns, diagnostics=None):
     configure_logging()
     from dexmani_real.robot.xarm7.driver import XArm7
 
-    ArmController(cfg, io, pipe, XArm7(cfg)).run(startup_deadline_ns)
+    driver = XArm7(cfg, api_factory=diagnostics.api_factory if diagnostics is not None else None)
+    ArmController(cfg, io, pipe, driver, diagnostics).run(startup_deadline_ns)

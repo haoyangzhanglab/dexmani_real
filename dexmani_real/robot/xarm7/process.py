@@ -29,7 +29,9 @@ class ArmProcess:
         cfg,
         *,
         runtime_state: "SessionState",
+        diagnostics=None,
     ):
+        self.diagnostics = diagnostics
         self.runtime_state = runtime_state
         self.cfg = cfg
         self.ctx = mp.get_context("spawn")
@@ -84,7 +86,7 @@ class ArmProcess:
         check_startup()
         self.process = self.ctx.Process(
             target=run_arm,
-            args=(self.cfg, self.io, self.child_pipe, startup_deadline_ns),
+            args=(self.cfg, self.io, self.child_pipe, startup_deadline_ns, self.diagnostics),
             name="xarm-owner",
             daemon=False,
         )

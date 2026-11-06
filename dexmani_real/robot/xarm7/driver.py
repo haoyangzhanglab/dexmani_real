@@ -38,7 +38,8 @@ def describe_controller_error(code: int) -> str:
 
 
 class XArm7:
-    def __init__(self, cfg: ArmConfig) -> None:
+    def __init__(self, cfg: ArmConfig, *, api_factory=None) -> None:
+        self.api_factory = api_factory
         self.cfg = cfg
         self.api: Any = None
         self._motion_configured = False
@@ -50,7 +51,7 @@ class XArm7:
         # SDK 的启停提示使用独立 logger；保留控制器告警和错误。
         logging.getLogger("origin.print").setLevel(logging.WARNING)
         self._motion_configured = False
-        self.api = XArmAPI(
+        self.api = (self.api_factory or XArmAPI)(
             self.cfg.ip, is_radian=True, report_type="real",
         )
         check_abort()
@@ -143,8 +144,6 @@ class XArm7:
         acceleration = (self.cfg.homing.max_acceleration_rad_per_s2 if mode == 0
                         else self.cfg.max_joint_acceleration_rad_per_s2)
         check_sdk_return_code(self.api.set_joint_maxacc(acceleration, is_radian=True), "set_joint_maxacc")
-        check_abort()
-        check_sdk_return_code(self.api.set_state(0), "final preparation set_state(0)")
         check_abort()
         # 静态参数只在本 SDK 会话首次完整准备成功后复用。
         self._motion_configured = True
