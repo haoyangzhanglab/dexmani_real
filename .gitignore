@@ -2,7 +2,6 @@
 /episodes/
 /datasets/
 /rollouts/
-/replay_results/
 /logs/
 *.log
 
