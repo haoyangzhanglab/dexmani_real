@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """将 Raw episode 的所选字段导出为 Canonical Zarr。"""
+# Usage: python scripts/export_zarr.py episodes/pnp_apple_banana --output datasets/pnp_apple_banana.cordvip.zarr \
+#   --fields joint_state action hand_pointcloud object_pointcloud
 
 from __future__ import annotations
 
@@ -11,7 +13,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from dexmani_real.config.real import load_config
-from dexmani_real.data.export import FIELD_INPUTS, ExportConfig, export_zarr
+from dexmani_real.data.export import FIELD_INPUTS, ExportConfig, export_zarr, resolve_fields
 from dexmani_real.utils.table_plane import load_table_plane
 
 
@@ -99,7 +101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_path = (
         args.output if args.output is not None else default_output_path(args.input_root)
     )
-    fields = tuple(FIELD_INPUTS) if args.fields is None else args.fields
+    fields = resolve_fields(args.fields)
     processing = load_processing_config(args.config, fields)
     from dexmani_real.utils.log import configure_logging
 

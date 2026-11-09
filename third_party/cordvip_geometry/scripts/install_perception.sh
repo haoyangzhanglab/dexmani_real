@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Usage: conda activate real_robot; bash third_party/cordvip_geometry/scripts/install_perception.sh
 # Incremental setup for the existing real_robot environment; never opens devices.
 set -euo pipefail
 
@@ -18,6 +19,7 @@ Preserve the existing base environment, fetch missing official source checkouts
 at recorded revisions, install incremental requirements, and build
 nvdiffrast and FoundationPose mycpp. No model downloads or device access.
 Existing source directories and local edits are reused without checkout or reset.
+Applies the small FoundationPose tracking-cache patch; conflicts fail explicitly.
 System Boost (system/program_options) and OpenMP development files are required.
 The workspace defaults to the current directory; --workspace must be the first option.
 Logs and environment snapshots are saved under its reports/cordvip_install/.
@@ -95,6 +97,13 @@ checkout_source Grounded-SAM-2 https://github.com/IDEA-Research/Grounded-SAM-2.g
 checkout_source Hunyuan3D-2.1 https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git 82920d643c0dc2f7bfd7255f45f62d386edfe60c
 checkout_source FoundationPose https://github.com/NVlabs/FoundationPose.git a1b694b83e633c2cb6115b9063d940a687759392
 checkout_source nvdiffrast https://github.com/NVlabs/nvdiffrast.git 253ac4fcea7de5f396371124af597e6cc957bfae
+
+# 幂等应用单姿态跟踪缓存优化；遇到冲突直接失败，不重置已有源码。
+cordvip_fp_patch="$cordvip_library/scripts/foundationpose_tracking_cache.patch"
+if ! git apply --directory=third_party/FoundationPose --reverse --check "$cordvip_fp_patch" 2>/dev/null; then
+    git apply --directory=third_party/FoundationPose --check "$cordvip_fp_patch"
+    git apply --directory=third_party/FoundationPose "$cordvip_fp_patch"
+fi
 
 python -m pip install \
     --constraint "$cordvip_log_dir/base_constraints.txt" \

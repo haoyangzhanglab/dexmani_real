@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 
-from .foundationpose import MIN_DEPTH_PIXELS, PoseTracker, prepare_tracking_frame
+from .foundationpose import MIN_DEPTH_PIXELS, PoseTracker, PoseRegistrationError, prepare_tracking_frame
 from .geometry import (
     RectificationMaps,
     transform_points,
@@ -128,17 +128,8 @@ class SceneTracker:
         min_matched_pixels=30,
         min_matched_fraction=0.15,
         initial_selections=None,
+        max_reregistrations=0,
     ):
-        _validate_tracking_parameters(
-            has_models=bool(assets), pixel_stride=pixel_stride,
-            depth_tolerance_m=depth_tolerance_m, min_matched_pixels=min_matched_pixels,
-            min_matched_fraction=min_matched_fraction,
-        )
-        for name in assets:
-            validate_object_name(name)
-        if initial_selections is not None:
-            for name in initial_selections:
-                validate_object_name(name)
         self.segmenter = segmenter
         self.assets = assets
         self.initial_selections = initial_selections
@@ -148,6 +139,8 @@ class SceneTracker:
         self.min_matched_fraction = min_matched_fraction
         self.trackers, self.renderers = {}, {}
         self.lost_objects = {}
+        self.max_reregistrations = max_reregistrations
+        self.registration_attempts = {}
         self.directions = self.maps = None
         self._camera: tuple[np.ndarray, tuple[int, int], str, tuple[float, ...]]
         shared = None
@@ -179,6 +172,7 @@ class SceneTracker:
         depth_tolerance_m=0.015,
         min_matched_pixels=30,
         min_matched_fraction=0.15,
+        max_reregistrations=0,
     ):
         """一次加载资产与模型，退出时释放 SAM 子进程。"""
         _validate_tracking_parameters(
@@ -237,12 +231,32 @@ class SceneTracker:
                     depth_tolerance_m=depth_tolerance_m,
                     min_matched_pixels=min_matched_pixels,
                     min_matched_fraction=min_matched_fraction,
+                    max_reregistrations=max_reregistrations,
                 )
                 try:
                     yield tracker
                 finally:
                     tracker.trackers.clear()
                     tracker.renderers.clear()
+
+    def reset(self):
+        """重置场景状态，保留模型权重和固定资产。"""
+        self.segmenter.reset()
+        self.maps = self.directions = None
+        self.lost_objects.clear()
+        self.registration_attempts.clear()
+        for tracker in self.trackers.values():
+            tracker.estimator.pose_last = None
+
+    def detect_masks(self, frame, prompts):
+        candidates = self.segmenter.predict(frame.rgb, ". ".join(prompts.values()) + ".")
+        masks = {}
+        for name, prompt in prompts.items():
+            matches = [item for item in candidates if item["label"].strip().lower().rstrip(".") == prompt.strip().lower().rstrip(".")]
+            if len(matches) != 1:
+                raise ValueError(f"{name}: 首帧候选数 {len(matches)}，无法无歧义初始化")
+            masks[name] = matches[0]["mask"]
+        return masks
 
     def step(self, frame, *, initial_masks=None):
         """输入原 color 网格，按调用顺序处理每一帧。"""
@@ -266,7 +280,7 @@ class SceneTracker:
                 for name in initial_masks:
                     validate_object_name(name)
         elif initial_masks is not None:
-            raise ValueError("Create a new tracker to initialize another scene")
+            raise ValueError("Call reset() before initializing another scene")
         if not first:
             K, shape, model, distortion = self._camera
             if (
@@ -317,7 +331,8 @@ class SceneTracker:
         poses, model_z_by_object = {}, {}
         prepared_frame = None
         for name, tracker in self.trackers.items():
-            if name in self.lost_objects:
+            recovering = name in self.lost_objects
+            if recovering and self.registration_attempts.get(name, 0) >= self.max_reregistrations:
                 continue
             cloud = measured[name]
             mask = masks[name]
@@ -335,13 +350,19 @@ class SceneTracker:
                     "Insufficient independently segmented depth; pose lost"
                 )
                 continue
-            if not first and prepared_frame is None:
+            if not first and not recovering and prepared_frame is None:
                 prepared_frame = prepare_tracking_frame(rgb, depth_m, K)
-            poses[name] = (
-                tracker.register(rgb, depth_m, K, mask)
-                if first
-                else tracker.track(K, mask, prepared_frame=prepared_frame)
-            )
+            if recovering:
+                self.registration_attempts[name] = self.registration_attempts.get(name, 0) + 1
+            try:
+                poses[name] = (
+                    tracker.register(rgb, depth_m, K, mask)
+                    if first or recovering
+                    else tracker.track(K, mask, prepared_frame=prepared_frame)
+                )
+            except PoseRegistrationError as error:
+                self.lost_objects[name] = str(error)
+                continue
             model_z_by_object[name] = self.renderers[name].render(
                 cloud.observed_pixel_indices,
                 poses[name],
@@ -362,6 +383,9 @@ class SceneTracker:
                 self.lost_objects[name] = "Semantic depth/model disagreement; pose lost"
                 pose = None
             pose_valid = pose is not None
+            if pose_valid:
+                self.lost_objects.pop(name, None)
+                self.registration_attempts.pop(name, None)
             objects[name] = {
                 "cloud": cloud,
                 "pose": pose,

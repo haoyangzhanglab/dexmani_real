@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """真机策略评估；--print-config 仅打印配置，不连接设备。"""
+# Usage: python scripts/run_policy.py CHECKPOINT --enable_hoi_pcd
+# 普通策略省略 --enable_hoi_pcd；HOI Checkpoint 必须带有匹配的任务与模板信息。
 
 from __future__ import annotations
 
@@ -84,6 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable full Raw recording and evaluation results",
     )
+    parser.add_argument("--enable_hoi_pcd", action="store_true")
     research = parser.add_argument_group("Policy inference")
     research.add_argument("--weights", choices=("ema", "raw"), default=None)
     research.add_argument(
@@ -118,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     return run_policy(
         args.policy,
         runtime,
+        enable_hoi_pcd=args.enable_hoi_pcd,
         weights=args.weights,
         inference_steps=args.inference_steps,
         device=args.device,

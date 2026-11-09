@@ -26,9 +26,11 @@
 
 ## Python API
 
-`RGBDFrame` 统一表达图像、米制深度和相机标定；`SceneTracker` 管理对象资产与模型，并通过 `step` 按输入顺序生成场景结果。`model_points` 根据有效位姿变换物体模板，得到相机或指定目标坐标系下的模型点。
+`RGBDFrame` 统一表达图像、米制深度和相机标定；`SceneTracker.open()` 加载资产、校验参数并管理模型生命周期，`step()` 按输入顺序生成场景结果。`reset()` 清除场景状态并保留模型；`detect_masks()` 批量检测且拒绝有歧义的类别。HOI 离线入口跨 Episode 复用模型，每段重新初始化，每次丢失最多三次重新注册；在线不自动重新注册。`model_points` 根据有效位姿变换物体模板，得到相机或指定目标坐标系下的模型点。
 
-`track_raw` 将 DexMani Real 的 Raw 逐行转换为跟踪输入，可附加同一行实测关节对应的手部几何。它返回内存结果，保存由调用方负责；宿主也可直接提供相机帧。该接口目前未接入主包的控制循环、Raw writer 或策略观测。
+`track_raw` 将 DexMani Real 的 Raw 逐行转换为跟踪输入，可附加同一行实测关节对应的手部几何。它返回内存结果，保存由调用方负责；宿主也可直接提供相机帧。HOI 离线入口按 camera_sequence 去重并写入 Raw 内部 /hoi；在线 Worker 复用同一跟踪核心，不修改 RawWriter。
+
+安装脚本幂等应用 `scripts/foundationpose_tracking_cache.patch`，使单姿态跟踪复用 CUDA allocator 缓存；多候选注册保留释放行为。已有 checkout 可在宿主仓库根目录先用 `git apply --directory=third_party/FoundationPose --reverse --check third_party/cordvip_geometry/scripts/foundationpose_tracking_cache.patch` 检查是否已应用；未应用时先 `--check` 再 `git apply`，不覆盖冲突。正式链路使用现有 SAM2/FP，TensorRT 仅作后续 Benchmark。实测结论和限制见[当前实现与性能结论](../../../docs/object_reconstruction.md#当前实现与性能结论)。
 
 ## 输出与查看
 

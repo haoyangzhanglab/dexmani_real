@@ -64,8 +64,9 @@ def session_directory(root: Path) -> Path:
 class PolicySession:
     def __init__(
         self, runtime, policy, *, weights, inference_steps, output_root, device, seed,
-        max_running_s, num_episodes, record_raw, camera_calibration_path,
+        max_running_s, num_episodes, record_raw, camera_calibration_path, enable_hoi_pcd=False,
     ):
+        self.enable_hoi_pcd = enable_hoi_pcd
         self.runtime, self.policy = runtime, policy
         self.weights, self.inference_steps = weights, inference_steps
         self.info = self.observations = None
@@ -174,6 +175,8 @@ class PolicySession:
         )
         self.model.load()
         self.info = self.wait_model()
+        from dexmani_real.deployment.preflight import validate_hoi_deployment
+        self.hoi_inputs = validate_hoi_deployment(self.info, self.enable_hoi_pcd)
         self.runtime = resolve_deployment_config(self.info, self.runtime)
         self.observations = ObservationBuilder(self.info, self.runtime)
         self.record_needs = (
@@ -216,9 +219,10 @@ class PolicySession:
         channels = (
             SensorChannels(
                 self.process_context, camera=self.runtime.camera,
-                depth_enabled=needs.point_cloud or "depth" in needs.camera_fields,
+                depth_enabled=needs.hoi or needs.point_cloud or "depth" in needs.camera_fields,
+                hoi=needs.hoi,
                 pointcloud_num_points=self.runtime.pointcloud.num_points if needs.point_cloud else None,
-                pointcloud_camera_fields=needs.camera_fields,
+                camera_fields=needs.camera_fields,
             ) if camera_required else None
         )
         self.sensors = SensorWorkers(channels)
@@ -254,13 +258,29 @@ class PolicySession:
                 timeout_s=CAMERA_READY_TIMEOUT_S,
                 may_start=self.startup_allowed,
             )
-            needs_extrinsics = needs.point_cloud or "camera_extrinsic" in self.info.observation_fields
+            needs_extrinsics = needs.hoi or needs.point_cloud or "camera_extrinsic" in self.info.observation_fields
             self.camera_snapshot = snapshot_camera_parameters(
                 self.sensors.channels, self.camera_calibration_path,
                 require_extrinsics=needs_extrinsics,
                 include_extrinsics=needs_extrinsics or self.record_raw,
             )
         self.observations.configure_camera(self.camera_snapshot)
+        if needs.hoi:
+            from dexmani_real.perception.hoi_worker import run_hoi_worker
+            sensors = cast(SensorWorkers, self.sensors)
+            channels = sensors.channels
+            sensors.start(self.process_context.Process(
+                name="hoi", target=run_hoi_worker,
+                args=(channels, self.camera_snapshot, *self.hoi_inputs),
+            ), ring=channels.hoi_ring, may_start=self.startup_allowed)
+            deadline = time.monotonic() + 120
+            while not channels.hoi_ready.value:
+                self.check_startup()
+                self.check_services()
+                if time.monotonic() > deadline:
+                    raise TimeoutError("HOI model startup timeout")
+                time.sleep(0.01)
+
         if needs.point_cloud:
             from dexmani_real.perception.worker import run_pointcloud_worker
 
@@ -283,7 +303,8 @@ class PolicySession:
             self.sensors.channels = None
         self.check_startup()
         self.save_run_config()
-        self.warmup_policy()
+        if not needs.hoi:
+            self.warmup_policy()
         self.check_startup()
 
     def close(self, *, failure=None):

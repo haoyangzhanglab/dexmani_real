@@ -28,7 +28,7 @@ def episode_blueprint(
                 rrb.Spatial3DView(origin="/", contents=spatial, name="xArm-base"),
                 rrb.Spatial3DView(origin="/", contents=["/pcd/**"], name="Point Cloud"),
                 rrb.Spatial3DView(
-                    origin="/", contents=["/hand_pointcloud/**", "/fingertips/**", "/eef/**"],
+                    origin="/", contents=["/hand_pointcloud/**", "/object_pointcloud/**", "/fingertips/**", "/eef/**"],
                     name="Hand Point Cloud",
                 ),
                 active_tab=0,

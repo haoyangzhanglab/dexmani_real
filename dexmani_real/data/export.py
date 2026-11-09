@@ -62,19 +62,22 @@ FIELD_INPUTS = {
     "camera_extrinsic": (),
     "point_cloud": ("rgb", "depth"),
 }
+DEFAULT_FIELDS = tuple(FIELD_INPUTS)
+FIELD_INPUTS["object_pointcloud"] = ("object_pointcloud",)
+
 SOURCE_FIELDS = {
     "arm_ns": {"joint_state", "eef_pose", "fingertip_xyz", "hand_pointcloud"},
     "hand_ns": {"joint_state", "fingertip_xyz", "hand_pointcloud"},
     "tactile_aggregate_ns": {"finger_tactile_force"},
     "tactile_dense_ns": {"taxel_tactile_force"},
-    "camera_ns": {"rgb", "depth", "point_cloud"},
+    "camera_ns": {"rgb", "depth", "point_cloud", "object_pointcloud"},
 }
 ARM_FK_FIELDS = {"action_ee", "eef_pose", "fingertip_xyz", "hand_pointcloud"}
 HAND_FK_FIELDS = {"fingertip_xyz", "hand_pointcloud"}
 
 
 def resolve_fields(fields):
-    selected = set(FIELD_INPUTS if fields is None else fields)
+    selected = set(DEFAULT_FIELDS if fields is None else fields)
     if not selected or selected - FIELD_INPUTS.keys():
         raise ValueError(f"fields must be nonempty and selected from {tuple(FIELD_INPUTS)}")
     return tuple(name for name in FIELD_INPUTS if name in selected)
@@ -129,6 +132,7 @@ def export_camera(reader, fields):
 
 def canonical_array_specs(fields, processing, camera):
     shapes = {
+        "object_pointcloud": (1024, 3),
         "joint_state": (19,), "action": (19,), "action_ee": (21,),
         "finger_tactile_force": (5, 3), "taxel_tactile_force": (5, 120, 3),
         "fingertip_xyz": (5, 3), "eef_pose": (9,),
@@ -251,6 +255,13 @@ def iter_canonical_blocks(
         count = end - start
         raw = {name: reader[name][start:end] for name in inputs - {"rgb"}}
         block = {}
+        if "object_pointcloud" in fields:
+            valid = reader["object_pointcloud_valid"][start:end]
+            valid &= np.isfinite(raw["object_pointcloud"]).all(axis=(1, 2))
+            if not valid.all():
+                row = start + int(np.flatnonzero(~valid)[0])
+                raise ValueError(f"object_pointcloud invalid at row {row}; use --exclude {reader.path.name}")
+            block["object_pointcloud"] = raw["object_pointcloud"]
         if "joint_state" in fields:
             block["joint_state"] = np.concatenate((raw["arm_qpos"], raw["hand_qpos"]), axis=1, dtype=np.float32)
         if "action" in fields:
@@ -351,6 +362,8 @@ def export_zarr(
                             control_hz=reader.control_hz,
                         )
                     else:
+                        if "object_pointcloud" in fields and reader.hoi_metadata != root.attrs["hoi_pcd"]:
+                            raise ValueError("HOI task/template mismatch; use --exclude")
                         if not np.isclose(reader.dt, root.attrs["dt"], rtol=1e-6, atol=0):
                             raise ValueError("one canonical store requires uniform dt")
                         if "depth" in fields and not depth_scales_match(camera["depth_scale_m"], root.attrs["depth_scale_m_per_unit"]):
@@ -361,6 +374,8 @@ def export_zarr(
                                 if shape != arrays[name].shape[1:]:
                                     raise ValueError(f"inconsistent {name} shape")
 
+                    if "object_pointcloud" in fields and index == 0:
+                        root.attrs["hoi_pcd"] = reader.hoi_metadata
                     blocks = iter_canonical_blocks(
                         reader,
                         processing,

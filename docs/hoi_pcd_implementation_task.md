@@ -1,6 +1,6 @@
 # HOI 物体点云五阶段实施任务书
 
-> **状态：** 设计与当前源码完成静态 Review；本文件是待实施任务书，不代表功能已经实现或通过实机验证。
+> **状态：** 五阶段初版接口已接入，部分 CPU/Mock 与短序列 GPU 链路已验证；本任务书的完整验收清单尚未全部完成，尤其未通过真机验证。实际测试范围见 object_reconstruction.md。
 >
 > **仓库：** `haoyangzhanglab/dexmani_real`；配套训练仓库 `haoyangzhanglab/dexmani_policy`。
 >
@@ -32,9 +32,9 @@
 | `dexmani_policy` 已支持 `object_pointcloud` 和 CordViP `pc_dim: 3`；Real 部署端尚不生产该字段 | `dexmani_policy/configs/cordvip.yaml`、`dexmani_real/deployment/observation.py` |
 | 现有重建 Mesh 被 `.gitignore` 排除，GitHub 克隆后可能缺失 | 根目录 `.gitignore`；模板 `asset.json` 仍引用 `mesh/mesh_m.obj` |
 
-## 1. 唯一数据契约（先实现并测试）
+## 1. 数据布局（先实现并测试）
 
-### 1.1 任务级资产契约
+### 1.1 任务级资产
 
 资产路径沿用 `assets/pointcloud_template/object/<task>/`：
 
@@ -50,15 +50,15 @@
   banana/ ...
   bowl/ ...
   hoi/
-    template.npz           # points_local, normals_local, object_ids, offsets
-    manifest.json          # 任务对象顺序、分配、尺度来源、哈希、版本
+    template.npz           # points_local, offsets
+    manifest.json          # task_name, object_names, template_sha256
 ```
 
 `template.npz` 存的是**多个物体各自局部坐标系的点**；不得把未变换的点直接当作统一坐标系下的场景点云。
 
 `manifest.json` 为唯一任务级资产清单；**不要**再生成多个功能重叠的 `allocation.json`/`metadata.json`/`recipe.json`。`asset.json` 继续保留，因为现有加载器依赖它。
 
-### 1.2 Raw 增强契约（物理文件不变）
+### 1.2 Raw 增强字段（物理文件不变）
 
 一个 Episode 仍只有原有 `data.h5` 和 `rgb.mp4`。在 `data.h5` 内新增如下 HDF5 Group：
 
@@ -70,7 +70,7 @@
 | `/hoi/object_pose_valid` | `bool[T,M]` | 各物体位姿是否有效 |
 | `/hoi/model_supported_fraction` | `float32[T,M]` | 现有模型深度一致性支持比例，**不是校准置信度** |
 
-`T=RawReader.num_frames`，`M=manifest 中对象数量`。Group 属性至少包含：`schema_version=1`、`task_name`、`template_sha256`、`object_names_json`、`coordinate_frame=xarm_base`、`units=m`、`tracking_backend`、跟踪参数/代码版本、完成标记。相机内外参和原始时间戳以已保存的 Raw `meta` 和 `timing/rows` 为权威来源，不重复写一套时钟。
+`T=RawReader.num_frames`，`M=manifest 中对象数量`。Group 属性为 `task_name`、`object_names`、`template_sha256`、`offsets`、`complete`。单位、坐标系和点数采用上述固定接口，不再传递自定义 schema、来源证明或另一份 recipe。相机内外参和原始时间戳以已保存的 Raw `meta` 和 `timing/rows` 为权威来源，不重复写一套时钟。
 
 **无效帧：** `object_pointcloud` 写有限的全零占位，`object_pointcloud_valid=False`，对应无效物体位姿写 NaN 并明确 `object_pose_valid=False`。**占位数据绝不能用于可视化或训练。** `valid=True` 的帧必须所有坐标有限、全部必需物体位姿有效。采用明确的布尔掩码而非靠是否存在零值推断有效性。
 
@@ -88,9 +88,9 @@ P_task^B(t) = concatenate(P_1^B(t), ..., P_M^B(t))  # (1024,3)
 
 将 **这一个纯几何函数**放在适当的共享模块（可选 `dexmani_real/geometry/hoi.py`），并在阶段 3 的 HDF5 生成及阶段 5 的 HOI Worker 中复用。固定索引不重采样、不均值中心化、不混用 camera/base frame。对于 FoundationPose 内部 Mesh 居中，确保输出 `T_CO` 是针对原始 Mesh 坐标系的位姿；用**非零原点偏移的非对称 Mesh**单测验证。
 
-### 1.4 同一版本保证
+### 1.4 同一模板保证
 
-`manifest` 哈希应覆盖任务对象顺序、每物体资产 Mesh 与采样点字节、实测尺度、点数分配和几何 schema。Raw `/hoi`、Zarr 属性与 Checkpoint 均绑定该版本。启动推理时从 Checkpoint 中的 `task_name + template_sha256` 查找并校验资产；失配、缺 Mesh、单位错误均在运动开始前报错。不可在线自动重新重建替换旧资产。
+一个 `template_sha256` 覆盖任务对象顺序、冻结模板文件和实际跟踪 Mesh；尺度已应用到米制几何中。Raw `/hoi`、Zarr 与 Checkpoint 共用 `task_name`、`object_names`、`template_sha256`，不再建立逐文件哈希或额外版本清单。启动时校验任务和模板，再把已加载模板传给 Worker；失配、缺 Mesh、非法尺度均在运动开始前报错。不可在线自动重新重建替换资产。
 
 ## 2. 五阶段具体实施
 
@@ -101,7 +101,7 @@ P_task^B(t) = concatenate(P_1^B(t), ..., P_M^B(t))  # (1024,3)
 **输入：** 物体子目录下 `reference.jpg`，可选任务 `task.json`（提示词、明确的尺度标定参数；已有合法 `asset.json` 可复用）。Prompt 可从目录名生成，但不能凭图片自动假定公制尺度。
 
 **完成条件：**
-- [ ] 自动发现任务物体，并缓存已有相同输入/权重/参数的重建结果；重复运行幂等。
+- [ ] 自动发现任务物体，直接复用已发布的合法资产；重复运行幂等且不依赖模型权重。图片和构建参数仅用于新资产，已发布资产不另建构建指纹或自动替换。
 - [ ] 同一图像的分割候选无歧义时自动选择；歧义时保存诊断并显式要求少量人工确认，不静默选择错误物体。
 - [ ] 只接受实测长度及其明确对应的 Mesh 测量方式；首版优先沿用已有 `scale_to_meters` 或 `size_axis + size_meters` 接口，不发明尚未实现的直径 API。
 - [ ] 输出米制 Mesh、固定 1024 个表面点、法向和来源元数据；验证 Mesh 有效、尺度为正、数据有限且法向归一化。
@@ -121,7 +121,7 @@ N_i      = deterministic_largest_remainder(quota_i)
 sum(N_i) == 1024
 ```
 
-从每物体已有的 `points.npy (1024,3)` 中按确定性索引选取 `N_i` 个点（例如确定性 FPS；不新增依赖）。同索引选取法向，保存 `template.npz`、`manifest.json`，并提供物体颜色映射所需 `object_ids` / `offsets`。只保存**最终冻结模板**，不复制 Mesh、图片或每物体 `asset.json` 到 `hoi/`。
+从每物体已有的 `points.npy (1024,3)` 中按确定性索引选取 `N_i` 个点（例如确定性 FPS；不新增依赖）。`template.npz` 只保存最终的 `points_local` 与分段 `offsets`；物体顺序在 `manifest.json`，不再保存未使用的法向、对象 ID 或源索引副本。单物体法向仍保留在原资产中。不复制 Mesh、图片或每物体 `asset.json` 到 `hoi/`。
 
 **完成条件：**
 - [ ] 严格恰好 1024 点、`float32`、所有点有限，物体顺序稳定。
@@ -141,13 +141,13 @@ sum(N_i) == 1024
 3. 优先沿用当前 SAM2 每帧 Mask 引导与 FoundationPose 深度一致性检查。**不能在改为 Mask-free tracking 时又继续假设每帧有真实语义 Mask 来计算支持比例。**
 4. 对重复 `camera_sequence` 的 Raw 行只做一次视觉跟踪，保留逐 Raw 行的结果与原始相机采集时间；手部 FK 仍可按每行实测关节独立计算。
 5. 在跟踪丢失时标记无效，不再无限复用旧位姿；恢复方案优先使用现有 Mask + `register` 做有界重新注册。不要在首次实现中引入复杂滤波网络。
-6. 在 RawReader 关闭后，以 `h5py.File(..., "r+")` 在 HDF5 **临时 staging Group** 中分块写点云和姿态；逐项校验 shape、dtype、帧数、哈希、有效性，再将完成 Group 发布为 `/hoi`。对已有同版本完整 `/hoi` 幂等跳过；版本不同默认拒绝覆盖。任何显式重建/替换必须保证失败时旧有效标注仍可恢复；不能将 HDF5 Group move 夸大为断电级原子事务。
+6. 在 RawReader 关闭后，以 `h5py.File(..., "r+")` 在 HDF5 **临时 staging Group** 中分块写点云和姿态；检查数组结构和输出有限性后发布为 `/hoi`。已有同模板完整标注由批处理入口跳过，写入函数直接拒绝覆盖。Raw 打开时仅检查完成状态和数组结构，数值在显示或导出时按需检查。不实现覆盖或迁移分支，不能将 HDF5 Group move 夸大为断电级原子事务。
 7. 大规模 Episode 不应把全部 `T×1024×3` 点云常驻内存：先收集轻量位姿/状态，再按块生成和写入点云。
 8. 异常样本输出明确日志和汇总计数；不要把所有异常吞掉，也不额外默认保存每帧 RGB/Mask/点云副本。
 
 **可视化仅修改现有入口：**
 - `dexmani_real/utils/visualization/rerun.py`：在现有 **Hand Point Cloud** 标签页的 `Spatial3DView.contents` 加入 `"/object_pointcloud/**"`；保留标签页名称与其他布局。
-- `scripts/visualize_episode.py`：使用同一个 RawReader，有字段则读取 `/hoi/object_pointcloud` 和 `/hoi/object_pointcloud_valid`；按 `object_ids/offsets`（来自任务 Manifest 或 HDF5 内记录的稳定点段信息）给物体着色，调用已有 `log_points("object_pointcloud", ...)`。
+- `scripts/visualize_episode.py`：使用同一个 RawReader，有字段则读取 `/hoi/object_pointcloud` 和 `/hoi/object_pointcloud_valid`；按 HDF5 的 `offsets` 给物体着色，调用已有 `log_points("object_pointcloud", ...)`。
 - 如果没有 `/hoi`，**完全跳过** HOI 绘制，旧视窗与旧功能不变；若当前帧 valid=False，`log_points("object_pointcloud", None)` 清除上一帧点；不对无效占位点绘制。
 - 保持原命令 `python scripts/visualize_episode.py episodes/<task>/<episode>` 与 `--info` 可用；无需 `view_hoi.py` 或新的 Rerun 窗口。可选 `--no-point-cloud` 仍只控制原有场景点云，不应误伤手部与 HOI。
 
@@ -164,10 +164,10 @@ sum(N_i) == 1024
 
 - [ ] 将 `object_pointcloud` 加入**显式可选**的 `--fields` 候选，并设置唯一 Raw 依赖 `/hoi/object_pointcloud`；训练数据形状 `float32[T,1024,3]`。
 - [ ] **保留原来的 13 个默认导出字段。** 目前 `resolve_fields(None)` 会枚举 `FIELD_INPUTS`；新增可选项时必须单独固定旧默认列表，否则历史任务默认导出将被破坏。
-- [ ] 通过 `RawReader` 在块导出时检查 `/hoi` 完整标记、全帧 valid、模板哈希、单位和坐标系；缺失或无效时明确指出 Episode/行及 `--exclude` 解决方式，**不将零占位导出训练**。
+- [ ] 通过 `RawReader` 检查 `/hoi` 完成状态和数组结构，块导出时检查 valid 与有限坐标；缺失或无效时明确指出 Episode/行及 `--exclude` 解决方式，**不将零占位导出训练**。
 - [ ] 多 Episode 必须具有相同物体 Manifest 哈希、顺序、采样点和字段规范，否则拒绝合并；不要静默重新分配点数。
 - [ ] HDF5 → Zarr 直接按块拷贝，**仅导出 HOI + state/action/hand 时不应为 HOI 重新解码 RGB 视频**。
-- [ ] Zarr 属性写入 `hoi_pcd` recipe（task、schema、template hash、1024、xarm_base/m、object order）。
+- [ ] Zarr 的 `hoi_pcd` 属性直接保存三个模板字段：`task_name`、`object_names`、`template_sha256`。
 - [ ] 保持已有 `hand_pointcloud` 的 FK、形状和训练 `pc_dim:3` 语义；`dexmani_policy` 当前 CordViP Dataset 已支持 `object_pointcloud`。
 - [ ] 对所有任务样本继续用现有 `episode_ends` 管理训练边界；第一版可明确拒绝包含无效帧的整个 Episode，不在没有完整数据语义时悄悄拆分或插值。
 
@@ -186,7 +186,7 @@ python scripts/export_zarr.py episodes/pnp_apple_banana \
 **入口：** 原地扩展 `scripts/run_policy.py`、`dexmani_real/deployment/{run,session,observation,preflight}.py`、`runtime/observation.py` 与 `ipc/sensors.py`；新增一个 `perception/hoi_worker.py` 是合理的独立职责。
 
 - [ ] **只有当 Checkpoint 要求 `object_pointcloud` 且显式传入 `--enable_hoi_pcd` 时启动**。Checkpoint 要求但没开开关，或开关已开但模型不使用，均在设备运动前明确报错。
-- [ ] 从配套 `dexmani_policy` 的 `training/common/data.py`、`deployment/metadata.py` 扩展 `hoi_pcd` recipe 传递；先查现有 checkpoint 机制，避免新增配置层。模型加载时校验任务、资产 Mesh、哈希、坐标系和点数；缺失直接拒绝。
+- [ ] 配套 `dexmani_policy` 的 `training/common/data.py`、`deployment/metadata.py` 直接传递三个 `hoi_pcd` 字段，复用现有 Checkpoint 机制。部署前校验任务与模板，模板数据只加载一次；缺失直接拒绝。
 - [ ] 复用**同一现有 RealSense Camera Ring**。HOI 需求必须将 RGB+对齐深度、内参、米制深度尺度、外参加入相机启动依赖，即使模型不使用普通 `point_cloud`。
 - [ ] 一个 HOI Worker 处理所有物体，加载 Mesh、任务模板和跟踪模型一次。只处理新的相机序列，优先最新帧，不把旧相机帧排队形成假新鲜点云。
 - [ ] 每个 Episode 按 B 后重置 SAM2 跟踪状态和 FoundationPose 位姿（复用模型权重），从该轮新的 RGB-D 帧初始化全部必需对象，验证后**再允许动作执行**。现有 `PolicySession.warmup_policy()` 在按 B 前执行：必须针对 HOI 路径调整真实观测 Warmup 时机；没有有效 HOI 时不能用虚构零点云触发正式动作。
@@ -214,7 +214,7 @@ python scripts/run_policy.py <checkpoint> --enable_hoi_pcd
 | Rerun | `scripts/visualize_episode.py`、`dexmani_real/utils/visualization/rerun.py` | 原视窗自动叠加，旧 Raw 跳过 |
 | Zarr | `dexmani_real/data/export.py`、`scripts/export_zarr.py` | 新增显式可选字段并保持旧默认行为 |
 | 在线 | `dexmani_real/perception/hoi_worker.py` + 现有 IPC/Runtime/Deployment | 一个 Worker + Ring + 质量/时钟/安全检查 |
-| Checkpoint | 配套 `dexmani_policy` 的 data/metadata 代码 | 传递资产 Recipe，复用现有 `object_pointcloud` 模态 |
+| Checkpoint | 配套 `dexmani_policy` 的 data/metadata 代码 | 传递模板信息，复用现有 `object_pointcloud` 模态 |
 
 **不要新增：** Episode 外 `annotations/`、`poses.npz` Sidecar、`view_hoi.py`、新 GUI、新 Zarr Writer、复杂 PoseBackend Registry、ROS2 服务、无限增长的状态管理框架。只有实测证明收益时才增加可选后端接口。
 

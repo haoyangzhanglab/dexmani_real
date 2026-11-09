@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
+from dexmani_real.data.hoi import HOI_FIELDS, validate_hoi
 from dexmani_real.geometry.camera import (
     CameraIntrinsics,
     CameraSnapshot,
@@ -361,6 +362,9 @@ class RawReader:
         self.data_file = h5py.File(self.path / "data.h5", "r")
         try:
             self.num_frames = len(self.data_file["timing/rows"])
+            self.hoi_metadata = None
+            if "hoi" in self.data_file:
+                self.hoi_metadata = validate_hoi(self.data_file["hoi"], self.num_frames)
         except BaseException:
             try:
                 self.close()
@@ -382,7 +386,10 @@ class RawReader:
     def fields(self):
         import h5py
 
-        names = {key for key, value in self.data_file.items() if isinstance(value, h5py.Dataset)}
+        names = {key for key, value in self.data_file.items()
+                 if isinstance(value, h5py.Dataset) and key not in HOI_FIELDS}
+        if self.hoi_metadata is not None:
+            names.update(HOI_FIELDS)
         if self.rgb_path.is_file():
             names.add("rgb")
         return frozenset(names)
@@ -405,7 +412,8 @@ class RawReader:
                 and self.meta["arm_action_semantics"] != ARM_ACTION_SEMANTICS
             ):
                 raise ValueError(f"Raw arm_action_semantics: expected {ARM_ACTION_SEMANTICS}")
-            array = self.data_file[name]
+            path = f"hoi/{name}" if name in HOI_FIELDS else name
+            array = self.data_file[path]
             spec = (
                 ((), TIMING_ROW_DTYPE) if name == "timing/rows"
                 else ROBOT_DATASET_SPECS.get(name, VR_DATASET_SPECS.get(name))

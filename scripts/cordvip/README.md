@@ -1,6 +1,6 @@
 # CordVIP 离线几何入口
 
-本目录连接 DexMani Real 的物体资产、Raw 数据与独立的 `cordvip_geometry` 几何核心，提供重建、点数分配和跟踪三个实验入口。当前用于离线分析，尚未接入主包策略观测。
+本目录连接 DexMani Real 的物体资产、Raw 数据与独立的 `cordvip_geometry` 几何核心，提供单物体重建、任务构建、点数分配、Raw 增强和独立跟踪入口。HOI 通过显式开关接入主包策略观测。
 
 ## 数据流
 
@@ -15,9 +15,13 @@
 | 入口 | 职责 |
 | --- | --- |
 | [reconstruct_object.py](reconstruct_object.py) | 串联物体分割、网格生成、尺度校准和资产准备。 |
-| [allocate_points.py](allocate_points.py) | 按闭合物体的实体体积分配固定的总点数，生成多物体采样资产。 |
+| [build_task.py](build_task.py) | 按任务构建单物体资产；已有合法资产直接复用，无需加载模型或读取权重。 |
+| [allocate_points.py](allocate_points.py) | 按表面积与每对象最低 64 点冻结总计 1024 点模板。 |
+| [annotate_episodes.py](annotate_episodes.py) | 批量 Episode 共享模型，每段重新初始化，按相机序列去重并写入原 Raw HDF5 内部。 |
 | [track_object.py](track_object.py) | 按 Raw 行顺序处理单物体或多物体场景，保存分割、实测点、位姿及可选手部几何。 |
 
-重建与跟踪脚本调用子包的 CLI；点数分配脚本复用子包的资产读写与表面采样。模型算法集中在子包中，脚本负责衔接实验输入与输出。
+重建与跟踪脚本调用子包的 CLI；点数分配从已有单物体点云选择固定索引，不重新采样 Mesh。模型算法集中在子包中，脚本负责衔接实验输入与输出。
 
 重建流程见[物体重建](../../docs/object_reconstruction.md)，内部模块与结果含义见[几何核心架构](../../third_party/cordvip_geometry/docs/usage.md)。
+
+五阶段 HOI 命令、模板格式和真实验证限制见[物体重建说明](../../docs/object_reconstruction.md#hoi-五阶段流程)。任务分配输出为 task/hoi/template.npz 和 manifest.json。

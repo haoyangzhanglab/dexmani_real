@@ -101,3 +101,30 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
         runtime.environment.validate()
     validate_control_rate(runtime, 1.0 / cast(float, execution.control_dt_s))
     return runtime
+
+
+def validate_hoi_deployment(info, enabled):
+    """显式启用与模型需求一致，资产失配在设备连接前失败。"""
+    from pathlib import Path
+    import sys
+
+    required = "object_pointcloud" in info.observation_fields
+    if required != enabled:
+        raise ValueError("object_pointcloud Checkpoint 与 --enable_hoi_pcd 必须同时启用")
+    if not required:
+        return None
+    if "point_cloud" in info.observation_fields:
+        raise ValueError("首版不支持 HOI 与 point_cloud 混合输入")
+    if info.hoi_pcd is None:
+        raise ValueError("Checkpoint 缺少 HOI 任务与模板信息")
+    name = info.hoi_pcd["task_name"]
+    if Path(name).name != name or name in (".", "..") or name != info.task_name:
+        raise ValueError("Checkpoint HOI 任务名不匹配")
+    root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(root / "third_party/cordvip_geometry/src"))
+    from dexmani_real.geometry.hoi import load_task_template
+    task = root / "assets/pointcloud_template/object" / name
+    template, manifest = load_task_template(task)
+    if info.hoi_pcd != manifest:
+        raise ValueError("Checkpoint HOI 任务或模板哈希不匹配")
+    return task, template

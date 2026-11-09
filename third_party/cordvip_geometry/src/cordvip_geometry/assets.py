@@ -118,6 +118,7 @@ def load_asset(path):
     metadata = json.loads((path / "asset.json").read_text())
     if metadata.get("units") != "m" or metadata.get("frame") != "object":
         raise ValueError("资产必须使用 object frame 和米制单位")
+    validate_asset_parameters(metadata["scale_to_meters"])
     files = {}
     for name in ("mesh", "points", "normals"):
         file = (path / metadata[f"{name}_file"]).resolve()

@@ -14,6 +14,7 @@ from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.runtime.observation import ObservationNeeds
 
 FIELD_DEPENDENCIES = {
+    "object_pointcloud": ("hoi",),
     "joint_state": ("arm", "hand"),
     "eef_pose": ("arm", "arm_fk"),
     "fingertip_xyz": ("arm", "hand", "arm_fk", "hand_fk", "fingertips"),
@@ -39,6 +40,7 @@ class ObservationBuilder:
             source for name in self.fields for source in FIELD_DEPENDENCIES[name]
         )
         self.needs = ObservationNeeds(
+            hoi="hoi" in self.dependencies,
             camera_fields=tuple(name for name in ("rgb", "depth") if name in self.dependencies),
             point_cloud="cloud" in self.dependencies,
             required_tactile=tuple(c for c in ("aggregate", "dense") if c in self.dependencies),
@@ -70,6 +72,8 @@ class ObservationBuilder:
                 values[name] = row.hand["tactile_aggregate"][0].copy()
             elif name == "taxel_tactile_force":
                 values[name] = row.hand["tactile_dense"][0].copy()
+            elif name == "object_pointcloud":
+                values[name] = row.hoi["object_pointcloud"]
             elif name == "point_cloud":
                 values[name] = row.point_cloud
             elif name in {"rgb", "depth"}:

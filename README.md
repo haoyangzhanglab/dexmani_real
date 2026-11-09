@@ -42,7 +42,7 @@ flowchart LR
 
 [scripts](scripts/) 提供采集、部署、导出、回放和标定入口；[utils](dexmani_real/utils/) 提供标定、可视化等辅助功能；[assets](assets/) 保存机器人模型与几何模板。
 
-CordVIP 是独立的离线物体几何工具，用于资产重建和位姿分析，尚未接入主包的策略观测。
+CordVIP 提供五阶段 HOI 物体点云流程：资产构建、任务模板冻结、Raw 内离线增强与现有 Viewer、显式 Zarr 导出、独立 Worker 在线策略输入。接口、命令和已验证范围见[物体重建](docs/object_reconstruction.md#hoi-五阶段流程)。
 
 ## 主题文档
 

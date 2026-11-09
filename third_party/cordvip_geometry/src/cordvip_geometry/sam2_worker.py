@@ -216,7 +216,7 @@ class GroundedSAM2:
             raise ValueError(
                 "Initial mask empty after overlap exclusion; select distinct instances"
             )
-        self.detector = self.processor = self._detection_rgb = None
+        self._detection_rgb = None
         self.image_predictor.reset_predictor()
         gc.collect()
         torch.cuda.empty_cache()
@@ -269,7 +269,12 @@ def main():
                 reply: dict[str, Any] = {}
                 output = {}
                 operation = request["operation"]
-                if operation == "predict":
+                if operation == "reset":
+                    engine.state = {}
+                    engine.index = -1
+                    engine._detection_rgb = None
+                    engine.image_predictor.reset_predictor()
+                elif operation == "predict":
                     output, reply["labels"] = engine.predict(
                         arrays["rgb"],
                         request["text"],

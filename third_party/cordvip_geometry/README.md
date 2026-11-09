@@ -1,6 +1,6 @@
 # cordvip_geometry
 
-物体资产准备、Raw 逐行处理与宿主 RGB-D 跟踪共用同一个几何核心。Grounding DINO 检测目标，SAM2.1 生成首帧候选 mask，人工选择后继续传播；也可直接加载已有首帧 mask。有米制 mesh 的对象使用 FoundationPose++ 估计位姿，无资产的对象输出分割与实测点云。
+物体资产准备、Raw 逐行处理与宿主 RGB-D 跟踪共用同一个几何核心。Grounding DINO 检测目标，SAM2.1 生成首帧候选 mask，人工选择后继续传播；也可直接加载已有首帧 mask。有米制 mesh 的对象使用 Mask 引导 FoundationPose 估计位姿，无资产的对象输出分割与实测点云。
 
 ## 安装与命令
 
@@ -14,7 +14,7 @@ python -m cordvip_geometry check
 
 源码固定放在 `third_party/Grounded-SAM-2`、`FoundationPose`、`Hunyuan3D-2.1`；权重默认位于 `third_party/weights`，可用 `--models-dir` 指定。SAM 默认 small，可指定 large 或完整自训配置/权重配对；`--sam-python` 选择独立解释器。模型只从本地加载，GPU 通过 `CUDA_VISIBLE_DEVICES` 选择。
 
-常用脚本是[物体重建](../../scripts/cordvip/reconstruct_object.py)、[体积点数分配](../../scripts/cordvip/allocate_points.py)和[Raw 追踪](../../scripts/cordvip/track_object.py)。入口职责见[脚本说明](../../scripts/cordvip/README.md)，模块与数据流见[几何核心架构](docs/usage.md)。
+常用脚本是[物体重建](../../scripts/cordvip/reconstruct_object.py)、[任务点数分配](../../scripts/cordvip/allocate_points.py)和[Raw 追踪](../../scripts/cordvip/track_object.py)。入口职责见[脚本说明](../../scripts/cordvip/README.md)，模块与数据流见[几何核心架构](docs/usage.md)。
 
 `object select --segmentation-dir DIR --instance 0 --headless --output NEW_DIR` 仅需候选目录的 `rgb.png` 和 `candidates.npz`，输出 `mask.png`、`foreground_rgba.png`、`overlay.png` 与简洁的 `selection.json`。唯一候选可省略 `--instance`，多候选需明确索引。再次选择仍使用原候选目录，不依赖分割日志、预览或原始照片副本。
 
@@ -44,6 +44,7 @@ mask 支持 `1/L/P` PNG 及 bool/uint8 单通道 NPY，尺寸须与 RGB 一致�
 - 生成 mesh 在导出前简化到最多 20,000 面；已有高面数资产在跟踪初始化时简化一次，位姿与模型深度比较共用该网格。
 - 无 asset 的对象只要求有效 RGB 与去畸变后非空 mask；首帧和后续帧均允许零深度或少量有效深度，输出 `OBSERVED_ONLY`、实际实测点及其 `observed_valid`，没有深度时点集为空。
 - 有 asset 的对象保留位姿初始化、跟踪与模型匹配所需的深度条件，混合场景逐对象判断。模型深度只查询当前实测像素；深度支持不足时 pose 失效，独立实测点仍保留，无效 pose 的模型点为空。
-- 点数分配脚本按闭合实体体积采样，总计 1024 点；当前示例在 `pnp_apple_banana/sampled_1024`，分配为 432 / 324 / 268。
 
 核心模块与数据关系见[架构与数据流](docs/usage.md#架构与数据流)。
+
+五阶段 HOI 命令、模板格式和真实验证限制见[物体重建说明](../../docs/object_reconstruction.md#hoi-五阶段流程)。任务分配输出为 task/hoi/template.npz 和 manifest.json。

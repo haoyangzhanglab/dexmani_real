@@ -12,13 +12,14 @@ from dexmani_real.utils.timing import sample_is_fresh
 @dataclass(frozen=True)
 class ObservationNeeds:
     camera_fields: tuple[str, ...] = ()
+    hoi: bool = False
     point_cloud: bool = False
     vr: bool = False
     required_tactile: tuple[str, ...] = ()
 
     @property
     def camera_worker(self):
-        return bool(self.camera_fields) or self.point_cloud
+        return bool(self.camera_fields) or self.point_cloud or self.hoi
 
     def union(self, other):
         return ObservationNeeds(
@@ -26,6 +27,7 @@ class ObservationNeeds:
                 name for name in ("rgb", "depth")
                 if name in self.camera_fields or name in other.camera_fields
             ),
+            hoi=self.hoi or other.hoi,
             point_cloud=self.point_cloud or other.point_cloud,
             vr=self.vr or other.vr,
             required_tactile=tuple(
@@ -45,6 +47,7 @@ class Observation:
     observation_timestamp_ns: int
     pointcloud_timestamp_ns: int = 0
     control_timestamp_ns: int = -1
+    hoi: dict | None = None
 
 
 def read_observation(channels, robot, *, needs=ObservationNeeds()):
@@ -55,20 +58,29 @@ def read_observation(channels, robot, *, needs=ObservationNeeds()):
         fields = ("timestamp_ns", "source_camera_sequence", "point_cloud", *needs.camera_fields)
         cloud_result = channels.pointcloud_ring.read(fields=fields)
     cloud = cloud_result[0] if cloud_result else None
+    hoi = None
+    if needs.hoi:
+        fields = ("episode_id", "timestamp_ns", "source_camera_sequence", "valid",
+                  "object_pointcloud", *needs.camera_fields)
+        result = channels.hoi_ring.read(fields=fields)
+        request = channels.hoi_request.read()
+        if result is not None and request is not None and result[0]["episode_id"] == request[0]["episode_id"]:
+            hoi = result[0]
     camera = None
     if needs.camera_fields:
-        if needs.point_cloud:
-            if cloud is not None:
+        if needs.hoi or needs.point_cloud:
+            source = hoi if needs.hoi else cloud
+            if source is not None:
                 camera = {
-                    "timestamp_ns": int(cloud["timestamp_ns"]),
-                    "ring_sequence": int(cloud["source_camera_sequence"]),
-                    **{name: cloud[name] for name in needs.camera_fields},
+                    "timestamp_ns": int(source["timestamp_ns"]),
+                    "ring_sequence": int(source["source_camera_sequence"]),
+                    **{name: source[name] for name in needs.camera_fields},
                 }
         else:
             camera = read_camera_frame(channels, fields=needs.camera_fields)
     vr = read_vr_frame(channels) if needs.vr else None
     return Observation(
-        arm=state.arm, hand=state.hand,
+        arm=state.arm, hand=state.hand, hoi=hoi,
         camera=camera, vr=vr,
         point_cloud=cloud["point_cloud"] if cloud is not None else None,
         observation_timestamp_ns=time.monotonic_ns(), control_timestamp_ns=control_ns,
@@ -78,7 +90,7 @@ def read_observation(channels, robot, *, needs=ObservationNeeds()):
 
 def sources_available(row, needs):
     """只区分尚无完整快照；已有快照的过期仍由 TTL 检查负责。"""
-    return (not needs.vr or row.vr is not None) and (
+    return (not needs.hoi or row.hoi is not None) and (not needs.vr or row.vr is not None) and (
         not needs.camera_fields or row.camera is not None
     ) and (not needs.point_cloud or row.point_cloud is not None)
 
@@ -127,7 +139,7 @@ def check_observation(row, runtime, needs, *, now_ns=None, allow_tactile_hold=Fa
             issues.append("camera_source_unavailable_or_unmatched")
         else:
             stamp = int(row.camera["timestamp_ns"])
-            if not needs.point_cloud and not sample_is_fresh(
+            if not (needs.point_cloud or needs.hoi) and not sample_is_fresh(
                 stamp, runtime.camera.max_frame_age_s, now,
             ):
                 issues.append("camera_source_stale")
@@ -138,6 +150,13 @@ def check_observation(row, runtime, needs, *, now_ns=None, allow_tactile_hold=Fa
             stamp = row.pointcloud_timestamp_ns
             if not sample_is_fresh(stamp, runtime.camera.max_frame_age_s, now):
                 issues.append("pointcloud_stale")
+    if needs.hoi:
+        if row.hoi is None:
+            issues.append("hoi_unavailable")
+        elif not row.hoi['valid']:
+            issues.append("hoi_pose_invalid")
+        elif not sample_is_fresh(int(row.hoi['timestamp_ns']), runtime.camera.max_frame_age_s, now):
+            issues.append("hoi_stale")
     if needs.vr:
         if row.vr is None:
             issues.append("vr_unavailable")

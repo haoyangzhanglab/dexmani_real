@@ -16,6 +16,7 @@ def run_policy(
     policy,
     runtime,
     *,
+    enable_hoi_pcd=False,
     weights=None,
     inference_steps=None,
     device="cuda:0",
@@ -43,6 +44,7 @@ def run_policy(
     return PolicySession(
         runtime,
         policy,
+        enable_hoi_pcd=enable_hoi_pcd,
         weights=weights,
         inference_steps=inference_steps,
         device=device,

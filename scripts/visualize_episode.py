@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""
-    离线查看 Raw episode 的观测与点云，或输出数据概要。
-    python scripts/visualize_episode.py episodes/pnp_apple_banana/episode_20261101_165909
-"""
+"""离线查看 Raw episode 的观测与点云，或输出数据概要。"""
+# Usage: python scripts/visualize_episode.py episodes/pnp_apple_banana/episode_20261101_165909
+# 已有 /hoi 时自动叠加物体点云；追加 --info 仅输出数据概要。
 
 from __future__ import annotations
 
@@ -86,6 +85,16 @@ class EpisodeVisualizer:
         try:
             self.reader = RawReader(episode_path)
             self.timestamps_s = self.reader.timestamps_s
+            self.object_colors = None
+            if self.reader.hoi_metadata is not None:
+                import colorsys
+                offsets = self.reader.data_file["hoi"].attrs["offsets"]
+                self.object_colors = np.concatenate([
+                    np.tile(np.asarray(colorsys.hsv_to_rgb(i * 0.61803398875 % 1, 0.75, 1)) * 255,
+                            (int(count), 1))
+                    for i, count in enumerate(np.diff(offsets))
+                ]).astype(np.uint8)
+
             self.reader.require_fields(
                 "rgb",
                 "depth",
@@ -197,6 +206,11 @@ class EpisodeVisualizer:
         depth = self.log_camera(step_idx, rgb)
         self.log_pointcloud(rgb, depth)
         self.log_hand_geometry(step_idx)
+        if self.reader.hoi_metadata is not None:
+            points = self.reader["object_pointcloud"][step_idx] if self.reader["object_pointcloud_valid"][step_idx] else None
+            if points is not None and not np.isfinite(points).all():
+                raise ValueError(f"object_pointcloud contains nonfinite coordinates at row {step_idx}")
+            log_points("object_pointcloud", points, colors=self.object_colors)
 
     def log_hand_geometry(self, step_idx: int) -> None:
         arm = self.state["arm_qpos"][step_idx]

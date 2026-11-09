@@ -123,6 +123,10 @@ class SAM2Client:
             raise ValueError("SAM2 expects RGB uint8 [H,W,3]")
         return rgb
 
+    def reset(self):
+        self._call("reset")
+        self._ids = self._shape = None
+
     def predict(self, rgb, text, *, box_threshold=0.3, text_threshold=0.25):
         if self._ids is not None:
             raise RuntimeError("Text detection must precede fixed-ID tracking")

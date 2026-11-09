@@ -1,12 +1,18 @@
-"""共享模型权重的 FoundationPose++ 位姿跟踪。"""
+"""共享模型权重的 Mask 引导 FoundationPose 位姿跟踪。"""
 
 import importlib
+import logging
 import sys
 from pathlib import Path
 
 import numpy as np
 
 from .geometry import simplify_mesh, validate_pose
+
+
+class PoseRegistrationError(RuntimeError):
+    """注册未建立位姿，不能使用推测或历史位姿。"""
+
 
 MIN_DEPTH_PIXELS = 4
 
@@ -56,7 +62,12 @@ class PoseTracker:
                     "FoundationPose requires CUDA; input validation alone does not run tracking"
                 )
             sys.path.insert(0, str(root))
-            estimator_module = importlib.import_module("estimater")
+            # 上游 Utils 导入会重设 root logging，恢复宿主级别以免逐帧刷屏。
+            log_level = logging.getLogger().level
+            try:
+                estimator_module = importlib.import_module("estimater")
+            finally:
+                logging.getLogger().setLevel(log_level)
             import nvdiffrast.torch as dr
 
             estimator_type = estimator_module.FoundationPose
@@ -86,6 +97,7 @@ class PoseTracker:
             np.random.set_state(random_state)
 
     def register(self, rgb, depth_m, intrinsics, mask):
+        self.estimator.pose_last = None
         pose = self.estimator.register(
             K=intrinsics,
             rgb=rgb,
@@ -94,7 +106,7 @@ class PoseTracker:
             iteration=5,
         )
         if self.estimator.pose_last is None:
-            raise RuntimeError(
+            raise PoseRegistrationError(
                 "FoundationPose registration did not initialize tracking"
             )
         return validate_pose(pose)

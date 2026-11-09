@@ -56,7 +56,8 @@ class SensorChannels:
         depth_enabled: bool = True,
         vr: bool = False,
         pointcloud_num_points: int | None = None,
-        pointcloud_camera_fields: tuple[str, ...] = (),
+        camera_fields: tuple[str, ...] = (),
+        hoi: bool = False,
     ):
         self.camera_ring = (
             SharedRing(ctx, camera_dtype(camera.height, camera.width, depth_enabled=depth_enabled), 5)
@@ -66,11 +67,26 @@ class SensorChannels:
         self.vr_ring = SharedRing(ctx, VR_DTYPE, 8) if vr else None
         self.pointcloud_ring = (
             SharedRing(
-                ctx, pointcloud_dtype(pointcloud_num_points, camera, pointcloud_camera_fields), 8,
+                ctx, pointcloud_dtype(pointcloud_num_points, camera, camera_fields), 8,
             )
             if pointcloud_num_points is not None
             else None
         )
+
+        self.hoi_ring = self.hoi_request = self.hoi_ready = None
+        if hoi:
+            fields: list[tuple] = [
+                ("episode_id", "u8"), ("timestamp_ns", "u8"), ("source_camera_sequence", "u8"),
+                ("valid", "?"), ("object_pointcloud", "f4", (1024, 3)),
+            ]
+            if camera_fields:
+                image_dtype = cast(SharedRing, self.camera_ring).dtype
+                fields.extend((name, image_dtype[name]) for name in camera_fields)
+            self.hoi_ring = SharedRing(ctx, np.dtype(fields), 3)
+            self.hoi_request = SharedRing(ctx, np.dtype([
+                ("episode_id", "u8"), ("after_ns", "u8"), ("after_sequence", "u8"),
+            ]), 3)
+            self.hoi_ready = ctx.RawValue("b", False)
 
         self.is_running = ctx.RawValue("b", True)
         self.camera_depth_scale = ctx.RawValue("d", 0.0) if camera is not None and depth_enabled else None

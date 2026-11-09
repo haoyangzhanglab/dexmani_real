@@ -32,6 +32,7 @@ from dexmani_real.robot.commands import (
 )
 from dexmani_real.runtime.ik_reference import IKReference, prepare_reference
 from dexmani_real.runtime.observation import (
+    ObservationNeeds,
     check_device_feedback,
     check_observation,
     missing_tactile_channels,
@@ -199,7 +200,7 @@ class Rollout:
         return valid
 
     def start_observation(self, poll_operator=lambda: None, *, after_ns=None):
-        until = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
+        until = time.monotonic_ns() + int((120.0 if self.model_needs.hoi else INITIAL_STATE_TIMEOUT_S) * 1e9)
         while True:
             poll_operator()
             if not self.preparation_valid():
@@ -250,10 +251,31 @@ class Rollout:
         if not self.preparation_valid():
             raise OperationCancelled("cancelled before preparation")
         self.robot.stop()
+        if self.model_needs.hoi:
+            channels = self.sensors.channels
+            channels.hoi_request.write(episode_id=self.result.index, after_ns=time.monotonic_ns(),
+                                       after_sequence=channels.camera_ring.latest_sequence)
         # 全模态初值先于 writer；等待与资源初始化期间设备保持停止。
-        if self.start_observation(poll_operator) is None:
+        row = self.start_observation(poll_operator)
+        if row is None:
             self.stop(self.preparation_issue)
             return
+        if self.model_needs.hoi:
+            kwargs = ({"rtc_delay": self.execution.prefetch_steps, "rtc_guidance_cap": self.execution.rtc_guidance_cap}
+                      if self.execution.mode == "rtc" else {})
+            self.model.warmup((self.observations.project(row),) * self.policy_info.n_obs_steps, **kwargs)
+            warmup_deadline = time.monotonic() + 120
+            while self.model.future is not None:
+                if time.monotonic() >= warmup_deadline:
+                    raise TimeoutError("HOI policy warmup timeout")
+                poll_operator()
+                self.robot.service_feedback()
+                if not self.preparation_valid():
+                    raise OperationCancelled("HOI warmup cancelled")
+                future = self.model.poll()
+                if future is not None:
+                    future.result()
+                time.sleep(0.005)
         poll_operator()
         if not self.preparation_valid():
             raise OperationCancelled("cancelled before recorder start")
@@ -426,6 +448,13 @@ class Rollout:
         issues = check_device_feedback(row, self.runtime)
         if issues:
             raise RuntimeError("device feedback: " + "; ".join(issues))
+        if self.model_needs.hoi:
+            needs = ObservationNeeds(hoi=True)
+            latest = read_observation(self.sensors.channels, self.robot, needs=needs)
+            issues = check_observation(latest, self.runtime, needs)
+            if issues:
+                self.stop("HOI before submission: " + "; ".join(issues))
+                return None
         return command
 
     def record_row(self, row, attempted_command):
@@ -458,6 +487,13 @@ class Rollout:
             return
         if self.runtime_state.stop_signal.is_set():
             raise OperationCancelled("device stopped")
+        if self.model_needs.hoi:
+            needs = ObservationNeeds(hoi=True)
+            row = read_observation(self.sensors.channels, self.robot, needs=needs)
+            issues = check_observation(row, self.runtime, needs)
+            if issues:
+                self.stop("HOI admission: " + "; ".join(issues))
+                return
         if self.execution.mode == "sync":
             self.step_sync()
         else:

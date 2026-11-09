@@ -1,126 +1,88 @@
-"""按 task 内各闭合物体的实体体积分配总计 1024 个表面点。"""
+"""按表面积冻结任务级 1024 点模板，不复制原始资产。"""
 
+# Usage: python scripts/cordvip/allocate_points.py assets/pointcloud_template/object/pnp_apple_banana
 import argparse
-import shutil
+import json
 import sys
-from numbers import Integral
+import tempfile
 from pathlib import Path
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
-
-from cordvip_geometry.assets import load_asset, write_asset_samples
-from cordvip_geometry.io import output_path, write_json
-
-TOTAL_POINTS = 1024
-SEED = 0
+from cordvip_geometry.assets import load_asset
+from dexmani_real.geometry.hoi import template_digest, task_objects, load_task_template
 
 
-def allocate_counts(volumes, total=TOTAL_POINTS):
-    volumes = np.asarray(volumes, dtype=np.float64)
-    if (
-        volumes.ndim != 1
-        or not len(volumes)
-        or not np.isfinite(volumes).all()
-        or np.any(volumes <= 0)
-    ):
-        raise ValueError("每个物体的体积必须为有限正数")
-    if (
-        isinstance(total, bool)
-        or not isinstance(total, Integral)
-        or total < len(volumes)
-    ):
-        raise ValueError("总点数必须是足以给每个物体至少一个点的正整数")
-    quota = (total - len(volumes)) * volumes / volumes.sum()
-    counts = np.floor(quota).astype(int) + 1
-    remainder = total - int(counts.sum())
+def allocate_counts(areas):
+    areas = np.asarray(areas, dtype=np.float64)
+    if areas.ndim != 1 or not len(areas) or not np.isfinite(areas).all() or np.any(areas <= 0):
+        raise ValueError("表面积必须为非空有限正数数组")
+    remaining = 1024 - 64 * len(areas)
+    if remaining < 0:
+        raise ValueError("1024 点、每物体至少 64 点，最多支持 16 个物体")
+    quota = remaining * (areas / areas.sum())
+    counts = np.floor(quota).astype(int) + 64
     order = np.argsort(-(quota - np.floor(quota)), kind="stable")
-    counts[order[:remainder]] += 1
+    counts[order[: 1024 - counts.sum()]] += 1
     return counts
 
 
-def write_ply(path, points, normals):
-    with path.open("x", encoding="ascii") as stream:
-        stream.write(f"ply\nformat ascii 1.0\nelement vertex {len(points)}\n")
-        for name in ("x", "y", "z", "nx", "ny", "nz"):
-            stream.write(f"property float {name}\n")
-        stream.write("end_header\n")
-        np.savetxt(stream, np.column_stack((points, normals)), fmt="%.9g")
+def select_indices(points, count):
+    points = np.asarray(points, dtype=np.float64)
+    selected = np.empty(count, dtype=np.int64)
+    distances = np.full(len(points), np.inf)
+    index = 0
+    for i in range(count):
+        selected[i] = index
+        distances = np.minimum(distances, np.sum((points - points[index]) ** 2, axis=1))
+        distances[selected[: i + 1]] = -1
+        index = int(np.argmax(distances))
+    return selected
 
 
-def allocate_task(task, output=None):
-    task = Path(task).expanduser().resolve()
-    directories = sorted(path.parent for path in task.glob("*/asset.json"))
-    if not directories:
-        raise ValueError(f"{task}: 没有包含 asset.json 的物体子目录")
-    output = output_path(
-        output or task / f"sampled_{TOTAL_POINTS}",
-        protected=directories,
-    )
-    objects = []
-    for directory in directories:
-        mesh, _, _, metadata = load_asset(directory)
-        volume = float(mesh.volume)
-        if not mesh.is_volume or not np.isfinite(volume):
-            raise ValueError(
-                f"{directory.name}: mesh 必须是朝向一致、体积为正的闭合实体"
-            )
-        objects.append((directory, mesh, metadata, volume))
-    counts = allocate_counts([volume for _, _, _, volume in objects])
-    output.mkdir(parents=True, exist_ok=False)
-    allocation = {}
-    for (source, mesh, metadata, volume), count in zip(objects, counts):
-        count = int(count)
-        destination = output / source.name
-        excluded = {"asset.json", metadata["points_file"], metadata["normals_file"]}
-        if metadata.get("pointcloud_file"):
-            excluded.add(metadata["pointcloud_file"])
-        excluded = {(source / relative).resolve() for relative in excluded}
-        destination.mkdir()
-        for path in source.rglob("*"):
-            copied = destination / path.relative_to(source)
-            if path.is_dir():
-                copied.mkdir(parents=True, exist_ok=True)
-            elif path.resolve() not in excluded:
-                copied.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, copied)
-        points, normals = write_asset_samples(
-            destination,
-            mesh,
-            metadata,
-            num_points=count,
-            seed=SEED,
+def allocate_task(task):
+    task = Path(task).resolve()
+    output = task / "hoi"
+    if output.exists():
+        load_task_template(task)
+        return output
+    names = [obj["name"] for obj in task_objects(task)]
+    loaded = [load_asset(task / name) for name in names]
+    counts = allocate_counts([mesh.area for mesh, _, _, _ in loaded])
+    points, meshes = [], []
+    for name, (_, p, _, metadata), count in zip(names, loaded, counts):
+        if len(p) != 1024:
+            raise ValueError(f"{name}: 单物体必须有 1024 个点")
+        indices = select_indices(p, int(count))
+        points.append(p[indices])
+        meshes.append(task / name / metadata["mesh_file"])
+    with tempfile.TemporaryDirectory(prefix=".hoi-", dir=task) as temporary:
+        staging = Path(temporary)
+        np.savez(
+            staging / "template.npz",
+            points_local=np.concatenate(points),
+            offsets=np.r_[0, np.cumsum(counts)].astype(np.int64),
         )
-        write_ply(destination / "pointcloud.ply", points, normals)
-        if "source_mesh" in metadata:
-            metadata["source_mesh"] = str((source / metadata["source_mesh"]).resolve())
-        metadata["pointcloud_file"] = "pointcloud.ply"
-        write_json(destination / "asset.json", metadata)
-        allocation[source.name] = {"volume_m3": volume, "num_points": count}
-        print(f"{source.name:20} {volume * 1e6:12.3f} cm³  {count:4d} points")
-    write_json(
-        output / "allocation.json",
-        {
-            "source_task": str(task),
-            "total_points": TOTAL_POINTS,
-            "volume_method": "mesh",
-            "objects": allocation,
-        },
-    )
-    print(f"总计 {int(counts.sum())} points；资产目录：{output}")
+        manifest = dict(
+            task_name=task.name,
+            object_names=names,
+            template_sha256=template_digest(staging / "template.npz", names, meshes),
+        )
+        (staging / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+            + "\n"
+        )
+        staging.rename(output)
     return output
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("task", type=Path, help="包含各物体资产子目录的 task 目录")
-    parser.add_argument(
-        "--output", type=Path, help="新输出目录，默认 task/sampled_1024"
-    )
+    parser.add_argument("task", type=Path)
     args = parser.parse_args(argv)
-    allocate_task(args.task, args.output)
+    print(allocate_task(args.task))
     return 0
 
 
