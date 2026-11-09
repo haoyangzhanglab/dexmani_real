@@ -37,13 +37,15 @@ def record_raw(tmp_path, camera_snapshot):
     return record
 
 
-@pytest.mark.parametrize("gaps,expected", [
+SEGMENT_CASES = [
     ((), [0]), ((0, 0), [0]), ((3,), [0]), ((0, 3), [0]),
     ((1,), [0, 1]), ((1, 1, 1), [0, 1]), ((1, 2), [0, 1, 2]),
-])
-def test_saved_segments_and_training_boundaries(record_raw, tmp_path, runtime, gaps, expected):
-    from dexmani_policy.datasets.episode_store import EpisodeStore
-    from dexmani_policy.datasets.sampler import SequenceSampler
+]
+
+
+@pytest.mark.parametrize("gaps,expected", SEGMENT_CASES)
+def test_saved_segments_and_export_boundaries(record_raw, tmp_path, runtime, gaps, expected):
+    import zarr
 
     from dexmani_real.data.export import ExportConfig, export_zarr
     from dexmani_real.data.raw import RawReader
@@ -52,18 +54,52 @@ def test_saved_segments_and_training_boundaries(record_raw, tmp_path, runtime, g
     path = record_raw(gaps=gaps)
     with RawReader(path) as reader:
         assert reader.segment_starts.tolist() == expected
+        assert reader.num_frames == 3
     if len(expected) == 1:
         assert len(load_trajectory(path, runtime)) == 3
+    else:
+        with pytest.raises(ValueError, match="--segment"):
+            load_trajectory(path, runtime)
+    ends = expected[1:] + [3]
+    for segment, (start, end) in enumerate(zip(expected, ends, strict=True)):
+        assert len(load_trajectory(path, runtime, segment=segment)) == end - start
     output = tmp_path / "out.zarr"
     result = export_zarr(path, output, processing=ExportConfig(), fields=["joint_state", "action"])
+    exported = zarr.open_group(str(output), mode="r")
+    assert exported["meta/episode_ends"][:].tolist() == ends
+    assert all(len(exported["data"][field]) == 3 for field in ("joint_state", "action"))
+    assert result["raw_episode_count"] == 1
+    assert result["episode_count"] == len(expected)
+    assert result["total_frames"] == 3
+
+
+@pytest.mark.policy_integration
+@pytest.mark.parametrize("gaps,expected", SEGMENT_CASES)
+def test_policy_sampling_respects_exported_segments(record_raw, tmp_path, gaps, expected):
+    from dexmani_policy.datasets.episode_store import EpisodeStore
+    from dexmani_policy.datasets.sampler import SequenceSampler
+
+    from dexmani_real.data.export import ExportConfig, export_zarr
+
+    path = record_raw(gaps=gaps)
+    output = tmp_path / "out.zarr"
+    export_zarr(path, output, processing=ExportConfig(), fields=["joint_state", "action", "depth"])
     store = EpisodeStore(output)
     assert store.episode_ends.tolist() == expected[1:] + [3]
-    assert result["episode_count"] == len(expected)
+    assert store.n_episodes == len(expected)
     sampler = SequenceSampler(store, 3, pad_before=2, pad_after=2,
                               episode_mask=np.ones(len(expected), dtype=bool))
+    windows = []
     for i in range(len(sampler)):
         rows = sampler.sample_source_rows(i)
+        assert rows.shape == (3,)
+        assert np.all((0 <= rows) & (rows < 3))
         assert len(set(np.searchsorted(store.episode_ends, rows, side="right"))) == 1
+        np.testing.assert_array_equal(sampler.sample_sequence(i)["depth"][:, 0, 0], rows + 1)
+        windows.append(rows.tolist())
+    for start, end in zip(expected, store.episode_ends, strict=True):
+        assert [start] * 3 in windows
+        assert [end - 1] * 3 in windows
 
 
 def test_jitter_is_single_segment(record_raw, tmp_path, runtime, caplog):
@@ -77,31 +113,7 @@ def test_jitter_is_single_segment(record_raw, tmp_path, runtime, caplog):
     assert "不重采样" in caplog.text
 
 
-@pytest.mark.parametrize("marked", [False, True])
-def test_legacy_recording_requires_evidence(record_raw, tmp_path, runtime, marked):
-    import h5py
-
-    from dexmani_real.data.export import ExportConfig, export_zarr
-    from dexmani_real.replay.trajectory import load_trajectory
-
-    path = record_raw(gaps=(0,) if marked else (), stamps=(1_000_000_000, 1_500_000_000))
-    with h5py.File(path / "data.h5", "r+") as data:
-        del data["timing/segment_starts"]
-    if marked:
-        with pytest.raises(ValueError, match="insufficient information"):
-            load_trajectory(path, runtime)
-        with pytest.raises(ValueError, match="insufficient information"):
-            export_zarr(path, tmp_path / "out.zarr", processing=ExportConfig(), fields=["action"])
-        assert not (tmp_path / "out.zarr").exists()
-    else:
-        assert len(load_trajectory(path, runtime)) == 2
-        result = export_zarr(path, tmp_path / "out.zarr", processing=ExportConfig(), fields=["action"])
-        assert result["episode_count"] == 1
-    with h5py.File(path / "data.h5") as data:
-        assert "timing/segment_starts" not in data
-
-
-@pytest.mark.parametrize("starts", [[], 0, "bad", [1], [0, 0], [0, 2, 1], [0, 3], [0, -1], [0.0], [False], [[0]]])
+@pytest.mark.parametrize("starts", [None, [], 0, "bad", [1], [0, 0], [0, 2, 1], [0, 3], [0, -1], [0.0], [False], [[0]]])
 def test_bad_segment_structure_rejected_before_devices(record_raw, tmp_path, runtime, monkeypatch, starts):
     import h5py
 
@@ -111,7 +123,8 @@ def test_bad_segment_structure_rejected_before_devices(record_raw, tmp_path, run
     path = record_raw()
     with h5py.File(path / "data.h5", "r+") as data:
         del data["timing/segment_starts"]
-        data["timing"].create_dataset("segment_starts", data=starts if isinstance(starts, str) else np.asarray(starts))
+        if starts is not None:
+            data["timing"].create_dataset("segment_starts", data=starts if isinstance(starts, str) else np.asarray(starts))
     robot = Mock(side_effect=AssertionError("hardware must not be constructed"))
     monkeypatch.setattr("dexmani_real.replay.run.Robot", robot)
     with pytest.raises(ValueError, match="segment_starts"):

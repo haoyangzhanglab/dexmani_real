@@ -6,7 +6,7 @@ from contextlib import contextmanager
 
 import numpy as np
 
-from dexmani_real.robot.commands import OperationCancelled
+from dexmani_real.robot.commands import HomeTimeout, OperationCancelled
 from dexmani_real.utils.timing import sample_is_fresh
 
 logger = logging.getLogger(__name__)
@@ -78,13 +78,13 @@ def home_hand(state, robot, *, cancel_epoch, cancel_requested):
             if cancelled():
                 raise OperationCancelled("home interrupted")
             if time.monotonic_ns() >= deadline_ns:
-                raise TimeoutError("hand HOME initial feedback timed out")
+                raise HomeTimeout("hand HOME initial feedback timed out")
             robot.service_feedback()
             if cancelled():
                 raise OperationCancelled("home interrupted")
             now_ns = time.monotonic_ns()
             if now_ns >= deadline_ns:
-                raise TimeoutError("hand HOME initial feedback timed out")
+                raise HomeTimeout("hand HOME initial feedback timed out")
             feedback = robot.hand_feedback.snapshot()
             if feedback is not None and sample_is_fresh(
                 int(feedback["timestamp_ns"][0]), hand.feedback_max_age_s, now_ns,
@@ -130,4 +130,4 @@ def home_hand(state, robot, *, cancel_epoch, cancel_requested):
                             return
                         break
             time.sleep(min(0.01, max(0, deadline_ns - time.monotonic_ns()) / 1e9))
-        raise TimeoutError("hand home convergence timed out")
+        raise HomeTimeout("hand HOME convergence timed out")

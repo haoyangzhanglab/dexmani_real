@@ -10,6 +10,7 @@ import numpy as np
 from dexmani_real.robot.commands import (
     CommandExpired,
     FeedbackUnavailable,
+    HomeTimeout,
     OperationCancelled,
     RobotError,
     validate_arm_target,
@@ -255,7 +256,7 @@ class Robot:
             raise OperationCancelled("hand HOME cancelled before submission")
         self._check_hand_feedback()
         if time.monotonic_ns() >= deadline_ns:
-            raise TimeoutError("hand HOME budget exhausted before submission")
+            raise HomeTimeout("hand HOME budget exhausted before submission")
         self.hand_stop_required = True
         from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE
 

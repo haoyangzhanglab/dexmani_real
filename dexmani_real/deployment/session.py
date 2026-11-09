@@ -22,6 +22,7 @@ from dexmani_real.deployment.rollout import Rollout, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import (
     FeedbackUnavailable,
+    HomeTimeout,
     OperationCancelled,
     RobotError,
 )
@@ -477,6 +478,7 @@ class PolicySession:
         return None
 
     def run_home(self, cancel_epoch) -> bool:
+        """处理空闲态 HOME 请求；返回是否已处理，不表示回位成功。"""
         home_allowed = (
             self.episode is None
             and self.runtime_state.cancel_epoch == cancel_epoch
@@ -499,7 +501,7 @@ class PolicySession:
                 cancel_epoch=cancel_epoch,
                 cancel_requested=self.home_abort_requested,
             )
-        except FeedbackUnavailable as exc:
+        except (FeedbackUnavailable, HomeTimeout) as exc:
             # 底层 HOME 已确认停止；这里检查硬故障并保留操作指令优先级。
             robot.check()
             self.poll_operator()

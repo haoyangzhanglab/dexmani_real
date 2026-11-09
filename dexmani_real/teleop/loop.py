@@ -17,6 +17,7 @@ from dexmani_real.data.recorder import (
 from dexmani_real.robot.commands import (
     CommandExpired,
     FeedbackUnavailable,
+    HomeTimeout,
     OperationCancelled,
     RobotCommand,
 )
@@ -378,7 +379,7 @@ class TeleopLoop:
                         cancel_epoch=expected_cancel_epoch,
                         cancel_requested=self.poll_blocking_commands,
                     )
-                except FeedbackUnavailable as exc:
+                except (FeedbackUnavailable, HomeTimeout) as exc:
                     # hand HOME 的 finally、arm 生命周期协议已完成停止收尾。
                     interrupted = self.poll_blocking_commands()
                     if (interrupted or self.runtime_state.cancel_epoch != expected_cancel_epoch

@@ -414,14 +414,8 @@ class RawReader:
 
     @property
     def segment_starts(self) -> np.ndarray:
-        reason = self.meta.get("recording_truncated_reason")
         if "timing/segment_starts" not in self.data_file:
-            if reason:
-                raise ValueError(
-                    f"Raw {self.path}: recording_truncated_reason={reason}, but segment_starts is missing; "
-                    "insufficient information to locate interruptions"
-                )
-            return np.array([0] if self.num_frames else [], dtype=np.int64)
+            raise ValueError(f"Raw {self.path}: missing timing/segment_starts")
         starts = np.asarray(self.data_file["timing/segment_starts"][()])
         if (starts.ndim != 1 or starts.dtype.kind not in "iu"
                 or (self.num_frames == 0 and starts.size != 0)
@@ -429,6 +423,7 @@ class RawReader:
                 or np.any(starts[1:] <= starts[:-1])
                 or np.any(starts >= self.num_frames)):
             raise ValueError(f"Raw {self.path}: invalid timing/segment_starts")
+        reason = self.meta.get("recording_truncated_reason")
         if reason:
             logger.warning("%s: %s；按已记录的连续区间使用。", self.path, reason)
         return starts

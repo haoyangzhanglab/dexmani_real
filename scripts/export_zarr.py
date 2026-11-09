@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Validate structure and timing first, numeric values during chunk conversion. "
             "Warn on source-clock diagnostics; reject missing/nonfinite selected data. "
             "Export recorded continuous segments as separate episodes without resampling. "
-            "Legacy omissions without segment boundaries require explicit exclusion. "
+            "Recorded segment boundaries are required for every episode. "
             "Publish only after all episodes succeed; "
             "use --exclude and retry."
         )

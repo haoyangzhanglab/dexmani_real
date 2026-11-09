@@ -86,7 +86,12 @@ HOI Episode 结束时，`Rollout.stop()` 通过原请求通道发布一次 `epis
 - 已验证既有资产复用及一个物体的真实 Hunyuan 新建资产 GPU 流程（1024 点和法向、重复运行缓存命中）。未执行完整任务数据质量评估、Rerun GUI 人工检查、策略与感知并发性能或真机运动测试。8 帧通过不代表遮挡场景精度或真机安全性能已证明。
 - GPU 运行期间上游 Warp 输出驱动 API 告警，但上述实验正常完成；不以此宣称其他 CUDA 扩展路径均可用。
 
-测试：`PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_hoi.py tests/test_freshness.py -q`。测试写入使用临时目录，不修改历史 Raw、冻结资产或机器人配置。
+测试写入使用临时目录，不修改 Raw、冻结资产或机器人配置。本地回归与需要 `dexmani_policy` 的训练集成测试分别运行；集成测试缺少依赖时明确失败：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider -q tests/test_hoi.py tests/test_freshness.py -m "not policy_integration"
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider -q tests/test_hoi.py -m policy_integration
+```
 
 ### 当前实现与性能结论
 

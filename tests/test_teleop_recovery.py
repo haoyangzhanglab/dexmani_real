@@ -1,4 +1,4 @@
-"""软暂停的控制、取消和设备协议回归；不连接 SDK。"""
+"""HOME、软暂停及设备协议的控制与取消回归；不连接 SDK。"""
 
 from dataclasses import replace
 from types import SimpleNamespace
@@ -10,6 +10,7 @@ from test_freshness import make_rollout, make_teleop, observation
 
 from dexmani_real.robot.commands import (
     FeedbackUnavailable,
+    HomeTimeout,
     OperationCancelled,
     RobotCommand,
     RobotError,
@@ -37,7 +38,7 @@ def live_keyboard(loop):
 
 
 @pytest.fixture(params=["teleop", "policy"])
-def home_session(request, clock, runtime):
+def home_session(request, clock, runtime, monkeypatch):
     from test_freshness import hand_sample
 
     from dexmani_real.deployment.session import PolicySession
@@ -57,9 +58,193 @@ def home_session(request, clock, runtime):
     robot.connected = True
     robot.arm = Mock(is_connected=True)
     robot.hand = Mock(is_connected=True)
+    robot.hand.get_state.side_effect = lambda: hand_sample(clock.now_ns)
+    robot.hand._send_position.return_value = 0
     robot.hand_feedback.consume(hand_sample(clock.now_ns))
     robot.feedback_next_ns = clock.now_ns + 1_000_000_000
+    monkeypatch.setattr("time.sleep", lambda seconds: setattr(clock, "now_ns", clock.now_ns + round(seconds * 1e9)))
     return mode, owner
+
+
+def configure_home_timeout(robot, clock, monkeypatch, stage):
+    from test_freshness import hand_sample
+
+    from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE
+
+    deadline_ns = clock.now_ns + int(robot.hand_config.home_timeout_s * 1e9)
+    robot.feedback_next_ns = clock.now_ns
+    if stage in ("initial_before_sample", "initial_after_sample"):
+        robot.hand_feedback.latest = None
+
+        def missing_feedback():
+            if stage == "initial_after_sample":
+                clock.now_ns = deadline_ns
+
+        monkeypatch.setattr(robot.hand.get_state, "side_effect", missing_feedback)
+    elif stage == "convergence":
+        def unconverged_feedback():
+            sample = hand_sample(clock.now_ns)
+            sample.qpos[1] += np.deg2rad(10)
+            return sample
+
+        monkeypatch.setattr(robot.hand.get_state, "side_effect", unconverged_feedback)
+    else:
+        assert stage in ("submission", "retry_submission")
+        if stage == "retry_submission":
+            monkeypatch.setattr(robot.hand._send_position, "side_effect", [COMMUNICATION_CRC_ERROR_CODE, 0])
+        check_feedback = robot._check_hand_feedback
+
+        def expire_after_feedback_check():
+            check_feedback()
+            if stage == "submission" or robot.hand._send_position.called:
+                clock.now_ns = deadline_ns
+
+        monkeypatch.setattr(robot, "_check_hand_feedback", expire_after_feedback_check)
+    return deadline_ns
+
+
+@pytest.mark.parametrize("stage,reason,submissions", [
+    ("initial_before_sample", "initial feedback timed out", 0),
+    ("initial_after_sample", "initial feedback timed out", 0),
+    ("convergence", "convergence timed out", 1),
+    ("submission", "budget exhausted before submission", 0),
+    ("retry_submission", "budget exhausted before submission", 1),
+])
+def test_home_budget_exhaustion_waits_for_new_request(
+    home_session, clock, monkeypatch, caplog, stage, reason, submissions,
+):
+    mode, owner = home_session
+    robot, keyboard, state = owner.robot, owner.keyboard, owner.runtime_state
+    caplog.set_level("INFO")
+    initial_epoch = state.cancel_epoch
+    with monkeypatch.context() as injection:
+        deadline_ns = configure_home_timeout(robot, clock, injection, stage)
+        if mode == "teleop":
+            owner.handle_operator_command("h")
+            assert owner.phase is TeleopPhase.IDLE
+            assert "home_done" not in [c.args[0] for c in owner.audio.play.call_args_list]
+        else:
+            assert owner.run_home(keyboard.accept_operation(state))
+            assert owner.episode is None
+        assert clock.now_ns == deadline_ns
+        assert f"本次 HOME 未完成：hand HOME {reason}" in caplog.text
+        assert "已回初始位" not in caplog.text
+        assert robot.arm.wait_stopped.call_count == 2
+        assert robot.hand.stop.call_count == int(submissions > 0)
+        assert robot.hand._send_position.call_count == submissions
+        assert not robot.hand_stop_required
+        assert state.stop_signal.is_set()
+        assert not state.quit_requested and not state.estop_request
+        assert state.cancel_epoch == initial_epoch
+        assert robot.connected
+        robot.arm.home.assert_not_called()
+        robot.arm.prepare.assert_not_called()
+        robot.arm.close.assert_not_called()
+        robot.hand.disconnect.assert_not_called()
+        assert keyboard.accept_operation(state) is None
+
+    # 反馈恢复及空闲服务不能重发旧请求；下一次运动必须来自新的 H。
+    clock.now_ns += 500_000_000
+    robot.service_idle()
+    assert robot.hand._send_position.call_count == submissions
+    robot.arm.home.assert_not_called()
+    assert state.stop_signal.is_set()
+    keyboard.allow_start()
+    keyboard.handle_key("h", True)
+    if mode == "teleop":
+        owner.handle_commands(keyboard.poll(state, timeout=0)[0])
+        assert owner.phase is TeleopPhase.IDLE
+        assert [c.args[0] for c in owner.audio.play.call_args_list].count("home_done") == 1
+    else:
+        assert owner.poll_operator() is None
+        assert owner.episode is None
+    assert robot.hand._send_position.call_count == submissions + 1
+    robot.arm.home.assert_called_once()
+    assert "已回初始位" in caplog.text
+    assert state.cancel_epoch == initial_epoch
+
+
+@pytest.mark.parametrize("key", ["s", "q", "esc"])
+def test_home_timeout_preserves_operator_priority(home_session, clock, monkeypatch, caplog, key):
+    mode, owner = home_session
+    robot, keyboard, state = owner.robot, owner.keyboard, owner.runtime_state
+    configure_home_timeout(robot, clock, monkeypatch, "initial_before_sample")
+    initial_epoch = state.cancel_epoch
+    caplog.set_level("INFO")
+
+    def stopped():
+        if robot.arm.wait_stopped.call_count == 2:
+            # 已抛出真实业务超时，在 finally 收尾时同时收到操作者命令。
+            keyboard.handle_key(key, True)
+
+    robot.arm.wait_stopped.side_effect = stopped
+    if mode == "teleop":
+        owner.handle_operator_command("h")
+        assert owner.phase is TeleopPhase.IDLE
+        assert "home_done" not in [c.args[0] for c in owner.audio.play.call_args_list]
+    else:
+        assert owner.run_home(keyboard.accept_operation(state))
+        assert owner.episode is None
+    assert "initial feedback timed out" in caplog.text
+    assert "本次 HOME 未完成" not in caplog.text
+    assert "已回初始位" not in caplog.text
+    assert robot.arm.wait_stopped.call_count == 2
+    robot.arm.home.assert_not_called()
+    robot.hand._send_position.assert_not_called()
+    assert state.stop_signal.is_set()
+    assert state.quit_requested == (key == "q")
+    assert state.estop_request == (key == "esc")
+    assert state.cancel_epoch == initial_epoch + int(key in ("s", "q"))
+    keyboard.allow_start()
+    assert (keyboard.accept_operation(state) is not None) == (key == "s")
+
+
+@pytest.mark.parametrize("failure", ["hand_stop", "arm_stop", "fault"])
+def test_home_timeout_does_not_hide_stop_failure_or_fault(home_session, clock, monkeypatch, caplog, failure):
+    mode, owner = home_session
+    robot = owner.robot
+    configure_home_timeout(robot, clock, monkeypatch, "convergence")
+    error = RobotError("device fault") if failure == "fault" else TimeoutError("stop unconfirmed")
+    if failure == "hand_stop":
+        robot.hand.stop.side_effect = error
+    elif failure == "arm_stop":
+        robot.arm.wait_stopped.side_effect = [None, error]
+    else:
+        def stopped():
+            if robot.arm.wait_stopped.call_count == 2:
+                robot.arm.check_error.side_effect = error
+
+        robot.arm.wait_stopped.side_effect = stopped
+    with pytest.raises(type(error)) as caught:
+        if mode == "teleop":
+            owner.handle_operator_command("h")
+        else:
+            owner.run_home(owner.keyboard.accept_operation(owner.runtime_state))
+    assert caught.value is error
+    if failure != "fault":
+        assert isinstance(caught.value.__context__, HomeTimeout)
+    assert robot.arm.wait_stopped.call_count == 2
+    robot.arm.home.assert_not_called()
+    assert owner.runtime_state.stop_signal.is_set()
+    assert "本次 HOME 未完成" not in caplog.text
+
+
+@pytest.mark.parametrize("home_session", ["teleop"], indirect=True)
+def test_jog_home_timeout_leaves_original_exit_boundary(home_session, clock, runtime, monkeypatch):
+    from dexmani_real.teleop.keyboard import KeyboardTeleop
+
+    _, owner = home_session
+    jog = KeyboardTeleop(runtime)
+    jog.robot, jog.runtime_state = owner.robot, owner.runtime_state
+    jog.prepare_jog = Mock()
+    configure_home_timeout(jog.robot, clock, monkeypatch, "initial_before_sample")
+    with pytest.raises(HomeTimeout) as caught:
+        jog.run_home(jog.runtime_state.cancel_epoch)
+    assert isinstance(caught.value, OperationCancelled)
+    assert not isinstance(caught.value, TimeoutError)
+    jog.prepare_jog.assert_not_called()
+    jog.robot.arm.home.assert_not_called()
+    assert jog.runtime_state.stop_signal.is_set()
 
 
 @pytest.mark.parametrize("key", [None, "s", "q", "esc"])
@@ -113,17 +298,17 @@ def test_home_real_cleanup_does_not_hide_failures(home_session, failure):
             robot.arm.check_error.side_effect = RobotError("device fault")
         raise FeedbackUnavailable("feedback stale") if failure in ("stop", "fault") else error_type("injected")
 
-    robot.send_hand_home = fail_submission
+    robot.hand._send_position.side_effect = fail_submission
     with pytest.raises(error_type):
         if mode == "teleop":
             owner.handle_operator_command("h")
         else:
             owner.run_home(keyboard.accept_operation(owner.runtime_state))
     robot.arm.home.assert_not_called()
-    robot.hand._send_position.assert_not_called()
+    robot.hand._send_position.assert_called_once()
 
 
-def test_arm_home_feedback_failure_drains_reply_before_next_operation(home_session, clock, monkeypatch, caplog):
+def test_arm_home_feedback_failure_drains_reply_before_next_operation(home_session, clock, caplog):
     from test_freshness import hand_sample
 
     from dexmani_real.robot.xarm7.process import ArmProcess
@@ -135,7 +320,6 @@ def test_arm_home_feedback_failure_drains_reply_before_next_operation(home_sessi
     arm.process = Mock()
     arm.io.ready.set()
     arm.io.stopped.set()
-    monkeypatch.setattr("time.sleep", lambda seconds: setattr(clock, "now_ns", clock.now_ns + round(seconds * 1e9)))
     robot.read_hand = lambda: robot.hand_feedback.consume(hand_sample(clock.now_ns))
     robot.feedback_next_ns = clock.now_ns
     service_feedback = robot.service_feedback

@@ -130,13 +130,14 @@ def test_template_rejects_task_name_mismatch(task):
         load_task_template(task)
 
 
-def make_raw(path):
+def make_raw(path, *, segment_starts=(0,)):
     path.mkdir()
     with h5py.File(path / "data.h5", "w") as f:
         rows = np.zeros(2, dtype=TIMING_ROW_DTYPE)
         rows["control_ns"] = [1000000000, 1100000000]
         rows["observation_ns"] = rows["control_ns"] + 1000
         f.create_dataset("timing/rows", data=rows)
+        f.create_dataset("timing/segment_starts", data=np.asarray(segment_starts, dtype=np.int64))
         f.create_group("meta").attrs["control_hz"] = 10
         f["meta"].attrs["task_label"] = "task"
 
@@ -175,7 +176,7 @@ def test_raw_export(task, tmp_path):
 
     template, manifest = load_task_template(task)
     episode = tmp_path / "episode_1"
-    make_raw(episode)
+    make_raw(episode, segment_starts=(0, 1))
     with RawReader(episode) as reader:
         assert "object_pointcloud" not in reader.fields
     with pytest.raises(ValueError, match="missing fields"):
@@ -194,8 +195,6 @@ def test_raw_export(task, tmp_path):
         assert reader.hoi_metadata["template_sha256"] == manifest["template_sha256"]
     assert len(resolve_fields(None)) == 13
     assert "object_pointcloud" not in resolve_fields(None)
-    with h5py.File(episode / "data.h5", "r+") as data:
-        data["timing"].create_dataset("segment_starts", data=np.array([0, 1], np.int64))
     result = export_zarr(
         episode, tmp_path / "out.zarr", processing=ExportConfig(), fields=["object_pointcloud"]
     )
@@ -584,7 +583,7 @@ def test_worker_geometry_and_source(task, monkeypatch, camera_fields, transition
     )
 
 
-def test_viewer_valid_invalid_and_old_raw(monkeypatch):
+def test_viewer_valid_invalid_and_absent_hoi(monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import Mock
     import rerun as rr
@@ -1009,6 +1008,7 @@ def training_data(task, tmp_path):
     return cfg, root, manifest
 
 
+@pytest.mark.policy_integration
 @pytest.mark.parametrize("variant", ["canonical", "uppercase_hash", "extra_metadata"])
 def test_training_metadata_reaches_deployment(task, training_data, tmp_path, monkeypatch, variant):
     import shutil
@@ -1045,6 +1045,7 @@ def test_training_metadata_reaches_deployment(task, training_data, tmp_path, mon
     assert template["points_local"].shape == (1024, 3)
 
 
+@pytest.mark.policy_integration
 @pytest.mark.parametrize("field,value", [
     ("hoi_pcd", ...), ("hoi_pcd", None),
     ("task_name", ...), ("task_name", "wrong"), ("task_name", "  "), ("task_name", 123),
@@ -1068,6 +1069,7 @@ def test_training_rejects_invalid_manifest(training_data, field, value):
         build_dataset(cfg)
 
 
+@pytest.mark.policy_integration
 @pytest.mark.parametrize("shape,dtype,error", [
     ((8, 512, 3), np.float32, "float32"), ((8, 1024, 6), np.float32, "float32"),
     ((8, 3), np.float32, "shape"), ((8, 1024, 3), np.float64, "float32"),
@@ -1083,6 +1085,7 @@ def test_training_rejects_invalid_object_points(training_data, shape, dtype, err
         build_dataset(cfg)
 
 
+@pytest.mark.policy_integration
 @pytest.mark.parametrize("metadata", [..., None, {"task_name": "wrong"}])
 def test_non_hoi_training_ignores_manifest(training_data, metadata):
     from dexmani_policy.training.common.data import build_dataset
@@ -1098,6 +1101,7 @@ def test_non_hoi_training_ignores_manifest(training_data, metadata):
     assert dataset[0]["obs"]["joint_state"].shape == (3, 19)
 
 
+@pytest.mark.policy_integration
 @pytest.mark.parametrize("field,value", [
     ("task_name", "other"), ("object_names", ["bowl", "apple"]), ("template_sha256", "0" * 64),
 ])

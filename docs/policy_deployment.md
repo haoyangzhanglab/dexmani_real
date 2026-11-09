@@ -67,16 +67,23 @@ Raw 录制是独立消费者，仍要求两个触觉通道各出现过一次有�
 - 要求录制时，Recorder 或输出目录初始化失败不会启动无录制实验；资源回收后可再次按 B。动作字段始终表示提交尝试，不保证 Arm／Hand 原子执行或物理到位。
 - Raw 时间不重写，MP4 PTS 使用相对首行的控制时间，RGB／Depth／状态仍逐行对应。质量拒绝、队列满、Teleop 暂停和调度器明确跳槽，会在下一条成功接收的数据前记录断点。`/timing/segment_starts` 是已保存行的起始索引，非空录制从 0 开始，严格递增且小于行数；没有内部中断时为 `[0]`。首行前及末行后的缺失不产生空区间，`recording_truncated_reason` 仅保留诊断摘要。
 - 导出逐 Raw 文件解码一次，保留所有有效行，各连续区间分别形成 Zarr `meta/episode_ends` 边界，训练窗口不能跨断点。返回统计中的 `raw_episode_count` 是输入 Raw 数，`episode_count` 是输出连续区间数。区间内使用标称频率语义；普通周期抖动仅告警，不推断断点，也不重采样或宣称严格等间隔。时间倒退、非法数组和所选字段的非有限值仍拒绝。
-- 没有 `segment_starts` 的历史 Raw，若无已知缺失摘要则按单段读取并诊断时间；若只有缺失摘要而无法定位断点，则明确报告信息不足，可在导出时用 `--exclude` 排除。不会修改历史 Raw 或猜测断点位置。成功关闭的部分 Raw 可按区间使用，失败 staging 仍不发布。
+- 导出与回放要求 Raw 含有有效的 `timing/segment_starts`，缺失时直接拒绝，不根据缺失摘要或时间间隔推断区间；批量导出可用 `--exclude` 排除不符合要求的文件。成功关闭的部分 Raw 可按已记录区间使用，失败 staging 仍不发布。
 
 Teleop 增加软暂停：VR 缺失／过期、明确的反馈暂不可用或命令过期先停止两设备并确认，再等待有效输入。恢复通过既有 Arm 准备协议清空邮箱和旧伺服参考，使用准备完成后的新 Arm／Hand 反馈及有效 VR 重新锚定。暂停期间不提交动作、不续租，不重置 Episode 时长。S/C/D 结束当前 Episode，Q 保存退出，Esc 急停锁存；这些指令在暂停和恢复准备期间仍优先。来源不明的停止不自动恢复，停止未确认或真实 SDK 故障仍终止会话。
 
 回放与导出共用 RawReader 的动作语义、关节顺序、行数、区间及控制时间校验；时间诊断包含 Raw 路径，便于定位批量导出中的来源。单段 Raw 保持原用法；多段必须通过 `python scripts/replay_episode.py <episode> --segment 0` 明确选择一个区间，编号从 0 开始。未选择或编号无效时，会在连接设备前列出可选区间及行范围。所选区间仍按标称频率回放，起始姿态以该区间首行检查，不自动跨段或添加过渡动作；实际提交仍检查配置限位和当前反馈。文件里的目标是提交尝试，不能由此推断原实验已执行成功。
 
-Teleop 与 Policy 的 HOME 遇到明确的 `FeedbackUnavailable` 时，复用底层停止确认并检查设备健康，结束本次 HOME 后保留 Session，不自动重试或继续后续回位动作。S/Q/Esc 仍优先；停止失败、硬故障、程序错误及其他取消／超时继续按原路径处理。
+Teleop 与 Policy 的 HOME 遇到明确的 `FeedbackUnavailable`，或手部 HOME 自身预算耗尽（`HomeTimeout`）时，本次操作未完成；仅在底层停止收尾成功且检查无硬故障后保留空闲 Session。手部未完成时不继续机械臂 HOME，不报告成功或启动 Episode。操作者可重新按 H，或按原流程用 B 启动下一段；新请求仍须经过原有准备及反馈检查，不自动重试或恢复运动。S/Q/Esc 仍优先，不清除取消上下文、退出请求或急停。停止未确认、设备故障、程序错误及底层普通 `TimeoutError` 继续退出或报错；键盘 Jog 保持原有退出边界。
 
 Policy 不做同段自动恢复。明确的关节反馈暂不可用只结束本 Episode；设备停止、录制资源和在途预测均正确收尾后才允许下一轮。普通模型 History 恢复、有限 Action Chunk、prediction exhausted 和 HOI 保护保持原规则。
 
 Teleop 自动恢复尚未完成实机验收。SDK 接受停止请求不等于物理停稳；Arm 准备检查实测停稳，Hand 不提供等价证明。最小实机验收包括：输入中断停止旧目标、恢复使用新反馈重新锚定、反馈异常与真实故障区分、暂停及准备期间 S/Q/Esc 优先。Mock 测试不代表运动安全保证。
+
+本地录制、导出、回放和 HOME 回归不需要训练仓库；Policy 采样集成测试单独选择，缺少 `dexmani_policy` 或其依赖时会明确失败，不自动跳过：
+
+```bash
+python -m pytest -p no:cacheprovider -q tests/test_recording.py tests/test_teleop_recovery.py tests/test_freshness.py -m "not policy_integration"
+python -m pytest -p no:cacheprovider -q tests/test_recording.py -m policy_integration
+```
 
 返回[项目架构](../README.md)。

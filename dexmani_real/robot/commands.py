@@ -30,11 +30,15 @@ class RobotCommand:
 
 
 class OperationCancelled(RuntimeError):
-    """本次操作已撤销；普通取消不要求关闭设备会话。"""
+    """本次操作未完成；确认停止且无硬故障时可保留设备会话。"""
 
 
 class FeedbackUnavailable(OperationCancelled):
     """可信反馈暂不可用；恢复前仍须确认停止并重新准备。"""
+
+
+class HomeTimeout(OperationCancelled):
+    """HOME 主动判定本次预算耗尽；操作未完成，仍须确认停止。"""
 
 
 class CommandExpired(OperationCancelled):
