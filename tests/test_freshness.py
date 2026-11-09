@@ -408,15 +408,15 @@ def make_rollout(runtime, needs, clock, *, record_raw=False):
 ])
 def test_history_admission_and_rejection_logging(clock, runtime, caplog, modality, needs):
     rollout = make_rollout(runtime, needs, clock)
+    rollout.observations.project.side_effect = lambda row: {"stamp": row.observation_timestamp_ns}
     row = observation(clock.now_ns)
     ttl = runtime.hand.feedback_max_age_s if needs.required_tactile else runtime.camera.max_frame_age_s
     assert rollout.update_history(row)
     clock.now_ns += int(ttl * 1e9) - 1
     assert rollout.update_history(row)
-    before = tuple(rollout.history)
     clock.now_ns += 1
     assert not rollout.update_history(row)
-    assert tuple(rollout.history) == before
+    assert not rollout.history
     assert rollout.observations.project.call_count == 2
     assert len(caplog.records) == 1
     assert modality in caplog.text
@@ -425,9 +425,30 @@ def test_history_admission_and_rejection_logging(clock, runtime, caplog, modalit
     assert len(caplog.records) == 1
     row = observation(clock.now_ns)
     assert rollout.update_history(row)
+    assert list(rollout.history) == [{"stamp": row.observation_timestamp_ns}] * 2
+    assert rollout.model_input_issues == ()
     clock.now_ns += int(ttl * 1e9)
     assert not rollout.update_history(row)
     assert len(caplog.records) == 2
+
+
+@pytest.mark.parametrize("hoi", [False, True])
+def test_rollout_stop_publishes_inactive_once(clock, runtime, hoi):
+    from dexmani_real.runtime.state import RunEndReason
+
+    rollout = make_rollout(runtime, ObservationNeeds(hoi=hoi), clock)
+    channels = rollout.sensors.channels
+    channels.camera_ring.latest_sequence = 7
+    rollout.stop("duration_timeout", run_end_reason=RunEndReason.DURATION_COMPLETE)
+    clock.now_ns += 1
+    rollout.stop("repeated stop")
+    assert rollout.result.termination_reason == "duration_complete"
+    if hoi:
+        channels.hoi_request.write.assert_called_once_with(
+            episode_id=0, after_ns=clock.now_ns - 1, after_sequence=7,
+        )
+    else:
+        channels.hoi_request.write.assert_not_called()
 
 
 def test_joint_policy_does_not_require_camera_or_tactile(clock, runtime):
@@ -455,7 +476,6 @@ def test_stale_inputs_preserve_finite_chunks_without_new_inference(clock, runtim
              else ObservationNeeds(required_tactile=("aggregate",)))
     rollout = make_rollout(runtime, needs, clock)
     assert rollout.update_history(observation(clock.now_ns))
-    history = tuple(rollout.history)
     rollout.first_prediction = False
     rollout.plan = ActionChunk(np.ones((2, 19)), 0)
     source = observation(clock.now_ns - 500_000_000)
@@ -477,7 +497,7 @@ def test_stale_inputs_preserve_finite_chunks_without_new_inference(clock, runtim
         assert rollout.robot.send_action.call_args.kwargs["expires_ns"] == clock.now_ns + COMMAND_LEASE_NS
         clock.now_ns += rollout.dt_ns
     assert rollout.robot.send_action.call_count == 2
-    assert tuple(rollout.history) == history
+    assert not rollout.history
     rollout.step()
     rollout.model.predict.assert_not_called()
     assert rollout.robot.send_action.call_count == 2
@@ -486,6 +506,42 @@ def test_stale_inputs_preserve_finite_chunks_without_new_inference(clock, runtim
     else:
         assert rollout.finished
         assert rollout.result.termination_details == "prediction exhausted"
+
+
+@pytest.mark.parametrize("mode", ["sync", "async", "rtc"])
+def test_recovered_prediction_uses_only_new_history(clock, runtime, monkeypatch, mode):
+    from dexmani_real.deployment.schedule import ActionChunk
+
+    runtime = replace(runtime, execution=replace(runtime.execution, mode=mode))
+    rollout = make_rollout(runtime, ObservationNeeds(camera_fields=("rgb",)), clock)
+    rollout.observations.project.side_effect = lambda row: {"stamp": row.camera["timestamp_ns"]}
+    old_stamp = clock.now_ns
+    assert rollout.update_history(observation(old_stamp))
+    rollout.first_prediction = False
+    plan = rollout.plan = ActionChunk(np.ones((4, 19)), 0)
+    stale = observation(old_stamp - 500_000_000).camera
+    monkeypatch.setattr(rollout, "sample_observation", lambda: (
+        replace(observation(clock.now_ns), camera=stale), observation(clock.now_ns),
+    ))
+    rollout.step()
+    assert not rollout.history and rollout.plan is plan
+    rollout.model.predict.assert_not_called()
+
+    monkeypatch.setattr(rollout, "sample_observation", lambda: (
+        observation(clock.now_ns), observation(clock.now_ns),
+    ))
+    recovered_stamps = []
+    for _ in range(3):
+        clock.now_ns += rollout.dt_ns
+        recovered_stamps.append(clock.now_ns)
+        rollout.step()
+        if rollout.model.predict.called:
+            break
+    rollout.model.predict.assert_called_once()
+    rows = rollout.model.predict.call_args.args[0]
+    expected = ([recovered_stamps[0]] + recovered_stamps)[-2:]
+    assert [row["stamp"] for row in rows] == expected
+    assert old_stamp not in [row["stamp"] for row in rows]
 
 
 @pytest.mark.parametrize("mode", ["sync", "async", "rtc"])
@@ -805,11 +861,18 @@ def test_separate_hoi_age_budget(clock, runtime, age, valid, expected):
         assert check_observation(row, overridden, ObservationNeeds(hoi=True)) == ['hoi_stale']
 
 
+@pytest.mark.parametrize("hoi", [False, True])
 @pytest.mark.parametrize('age', [0, -1, float('nan'), float('inf'), True, None, '0.25'])
-def test_invalid_hoi_age_config(runtime, age):
+def test_invalid_hoi_age_config(runtime, age, hoi):
     from dexmani_real.deployment.preflight import validate_execution_config
-    with pytest.raises(ValueError, match='hoi_max_age_s'):
-        validate_execution_config(SimpleNamespace(future_steps=4), replace(runtime.execution, hoi_max_age_s=age))
+
+    info = SimpleNamespace(future_steps=4, observation_fields=("object_pointcloud",) if hoi else ("joint_state",))
+    execution = replace(runtime.execution, hoi_max_age_s=age)
+    if hoi:
+        with pytest.raises(ValueError, match='hoi_max_age_s'):
+            validate_execution_config(info, execution)
+    else:
+        validate_execution_config(info, execution)
 
 
 @pytest.mark.parametrize('hoi,images,record', [

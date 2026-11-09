@@ -130,6 +130,10 @@ class Rollout:
         self.has_submitted = False
         self.run_deadline_ns = None
         self.ik_reference = None
+        if self.model_needs.hoi:
+            channels = self.sensors.channels
+            channels.hoi_request.write(episode_id=0, after_ns=ended_ns,
+                                       after_sequence=channels.camera_ring.latest_sequence)
 
     def finish_recording(self, *, wait=True) -> bool:
         result = self.result
@@ -442,6 +446,7 @@ class Rollout:
             logger.warning("策略暂缓新推理：%s", "; ".join(issues))
         self.model_input_issues = issues
         if issues:
+            self.history.clear()
             return False
         projected = self.observations.project(row)
         if not self.history:

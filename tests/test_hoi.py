@@ -269,10 +269,11 @@ def test_hoi_reads_only_requested_same_source_images(camera_fields, monkeypatch)
             np.testing.assert_array_equal(row.camera["rgb"], rgb)
         else:
             assert row.camera is None
-        channels.hoi_request.write(episode_id=2, after_ns=30, after_sequence=1)
-        row = read_observation(channels, robot, needs=needs)
-        assert row.hoi is None and row.camera is None
-        assert check_observation(row, runtime, needs, now_ns=30) == ["hoi_unavailable"]
+        for episode_id in (0, 2):
+            channels.hoi_request.write(episode_id=episode_id, after_ns=30, after_sequence=1)
+            row = read_observation(channels, robot, needs=needs)
+            assert row.hoi is None and row.camera is None
+            assert check_observation(row, runtime, needs, now_ns=30) == ["hoi_unavailable"]
     # 普通策略仍直接读取最新相机帧。
     row = read_observation(channels, robot, needs=ObservationNeeds(camera_fields=camera_fields))
     if camera_fields:
@@ -307,6 +308,7 @@ def test_stale_hoi_does_not_enter_history(monkeypatch):
     assert rollout.update_history(row)
     monkeypatch.setattr("time.monotonic_ns", lambda: 1_250_000_000)
     assert not rollout.update_history(row)
+    assert not rollout.history
     assert rollout.observations.project.call_count == 2
 
 
@@ -326,7 +328,9 @@ def test_invalid_hoi_discards_plan(mode, failure):
     rollout.cancel_epoch = rollout.runtime_state.cancel_epoch
     rollout.robot = Mock()
     rollout.robot.read_state.return_value = SimpleNamespace(arm=None, hand=None)
-    rollout.sensors = SimpleNamespace(channels=SimpleNamespace(hoi_ring=Mock(), hoi_request=Mock()))
+    rollout.sensors = SimpleNamespace(channels=SimpleNamespace(
+        hoi_ring=Mock(), hoi_request=Mock(), camera_ring=SimpleNamespace(latest_sequence=1),
+    ))
     rollout.sensors.channels.hoi_ring.read.return_value = (
         {
             "episode_id": 0 if failure == "previous_episode" else 1,
@@ -368,8 +372,8 @@ def test_invalid_hoi_discards_plan(mode, failure):
 
 
 @pytest.mark.parametrize("camera_fields", [(), ("rgb", "depth")])
-@pytest.mark.parametrize("restart_episode", [False, True])
-def test_worker_geometry_and_source(task, monkeypatch, camera_fields, restart_episode):
+@pytest.mark.parametrize("transition", ["none", "next_episode", "inactive"])
+def test_worker_geometry_and_source(task, monkeypatch, camera_fields, transition):
     import multiprocessing as mp
     import signal
     from contextlib import contextmanager
@@ -393,6 +397,8 @@ def test_worker_geometry_and_source(task, monkeypatch, camera_fields, restart_ep
     poses = np.tile(np.eye(4), (2, 1, 1))
     poses[:, :3, 3] = [0.1, 0.2, 0.3]
     calls = []
+    opened_trackers = []
+    restart_episode = transition != "none"
 
     class Tracker:
         def reset(self):
@@ -405,7 +411,9 @@ def test_worker_geometry_and_source(task, monkeypatch, camera_fields, restart_ep
         def step(self, frame, initial_masks=None):
             calls.append("step")
             if restart_episode and calls.count("step") == 1:
-                channels.hoi_request.write(episode_id=3, after_ns=30, after_sequence=1)
+                channels.hoi_request.write(
+                    episode_id=0 if transition == "inactive" else 3, after_ns=30, after_sequence=1,
+                )
                 channels.camera_ring.write(
                     timestamp_ns=40,
                     rgb=np.ones((4, 4, 3), np.uint8),
@@ -420,10 +428,37 @@ def test_worker_geometry_and_source(task, monkeypatch, camera_fields, restart_ep
 
     @contextmanager
     def opened(*args, **kwargs):
-        yield Tracker()
+        tracker = Tracker()
+        opened_trackers.append(tracker)
+        yield tracker
+
+    camera_read = channels.camera_ring.read
+
+    def read_active_camera(*args, **kwargs):
+        assert channels.hoi_request.read()[0]["episode_id"] != 0
+        return camera_read(*args, **kwargs)
+
+    sleeps = []
+
+    def idle(seconds):
+        assert transition == "inactive" and seconds == 0.005
+        assert calls == ["reset", "detect", "step"]
+        assert channels.hoi_ring.read() is None
+        sleeps.append(seconds)
+        assert len(sleeps) <= 2
+        if len(sleeps) == 2:
+            channels.hoi_request.write(
+                episode_id=3, after_ns=50, after_sequence=channels.camera_ring.latest_sequence,
+            )
+        channels.camera_ring.write(
+            timestamp_ns=40 + 10 * len(sleeps), rgb=np.ones((4, 4, 3), np.uint8),
+            depth=np.ones((4, 4), np.uint16),
+        )
 
     monkeypatch.setattr(SceneTracker, "open", opened)
     monkeypatch.setattr(signal, "signal", lambda *args: None)
+    monkeypatch.setattr(channels.camera_ring, "read", read_active_camera)
+    monkeypatch.setattr("time.sleep", idle)
     write = channels.hoi_ring.write
 
     def finish(**payload):
@@ -448,9 +483,11 @@ def test_worker_geometry_and_source(task, monkeypatch, camera_fields, restart_ep
     )
     run_hoi_worker(channels, camera, task, template)
     result = channels.hoi_ring.read()[0]
+    assert len(opened_trackers) == 1
+    assert len(sleeps) == (2 if transition == "inactive" else 0)
     assert result["episode_id"] == (3 if restart_episode else 2)
-    assert result["timestamp_ns"] == (40 if restart_episode else 20)
-    assert result["source_camera_sequence"] == (2 if restart_episode else 1)
+    assert result["timestamp_ns"] == (60 if transition == "inactive" else 40 if restart_episode else 20)
+    assert result["source_camera_sequence"] == (4 if transition == "inactive" else 2 if restart_episode else 1)
     assert calls == ["reset", "detect", "step"] * (2 if restart_episode else 1)
     assert set(result.dtype.names) & {"rgb", "depth"} == set(camera_fields)
     if camera_fields:
@@ -596,7 +633,7 @@ def test_build_reuses_published_assets_without_models(tmp_path, monkeypatch):
         builder.build_task(task)
 
 
-def test_batch_annotation_reuses_models_and_deduplicates_frames(task, tmp_path, monkeypatch):
+def test_batch_annotation_reuses_models_and_deduplicates_frames(task, tmp_path, monkeypatch, capsys):
     from contextlib import contextmanager
     from types import SimpleNamespace
 
@@ -621,6 +658,9 @@ def test_batch_annotation_reuses_models_and_deduplicates_frames(task, tmp_path, 
     calls = []
 
     class Tracker:
+        registration_attempts = {}
+        max_reregistrations = 3
+
         def reset(self):
             calls.append("reset")
 
@@ -635,6 +675,8 @@ def test_batch_annotation_reuses_models_and_deduplicates_frames(task, tmp_path, 
                     name: {
                         "pose_valid": True,
                         "pose": np.eye(4),
+                        "state": "TRACKING",
+                        "error": None,
                         "cloud": SimpleNamespace(model_supported_fraction=1.0),
                     }
                     for name in ("apple", "bowl")
@@ -650,6 +692,9 @@ def test_batch_annotation_reuses_models_and_deduplicates_frames(task, tmp_path, 
     monkeypatch.setattr(annotation.SceneTracker, "open", opened)
     annotation.annotate_episodes(episodes, task)
     assert calls == ["open", "detect", "step", "reset", "detect", "step", "close"]
+    output = capsys.readouterr().out
+    assert output.count("TRACKING=2, POSE_LOST=0") == 4
+    assert output.count("耗尽=False") == 4
     for episode in episodes:
         with RawReader(episode) as reader:
             np.testing.assert_array_equal(
@@ -658,6 +703,76 @@ def test_batch_annotation_reuses_models_and_deduplicates_frames(task, tmp_path, 
     calls.clear()
     annotation.annotate_episodes(episodes, task)
     assert calls == []
+
+
+@pytest.mark.parametrize("attempts,recovered", [(1, False), (3, False), (0, True)])
+def test_annotation_diagnostics(task, tmp_path, monkeypatch, capsys, attempts, recovered):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    spec = importlib.util.spec_from_file_location("annotate", ROOT / "scripts/cordvip/annotate_episodes.py")
+    annotation = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(annotation)
+    episode = tmp_path / "episode"
+    make_raw(episode)
+    timing = np.zeros(6, dtype=TIMING_ROW_DTYPE)
+    timing["camera_sequence"] = [1, 2, 2, 3, 4, 4]
+    timing["camera_ns"] = np.array([10, 20, 20, 30, 40, 40]) * 1_000_000
+    timing["arm_ns"] = timing["camera_ns"] - np.arange(1, 7) * 1_000_000
+    timing["arm_ns"][-1] = -1
+    timing["hand_ns"] = -1
+    with h5py.File(episode / "data.h5", "r+") as data:
+        del data["timing/rows"]
+        data.create_dataset("timing/rows", data=timing)
+        data["meta"].attrs["task_label"] = task.name
+    monkeypatch.setattr(RawReader, "read_camera", lambda self: SimpleNamespace(T_xarm_base_from_color=np.eye(4)))
+    monkeypatch.setattr(annotation, "iter_raw_rows", lambda *args: iter((None, row) for row in timing))
+
+    class Tracker:
+        steps = 0
+        max_reregistrations = 3
+        registration_attempts = {"apple": attempts}
+
+        def detect_masks(self, *args):
+            return {}
+
+        def step(self, *args, **kwargs):
+            self.steps += 1
+            objects = {}
+            for name in ("apple", "bowl"):
+                valid = name == "bowl" or self.steps == 1 or (recovered and self.steps == 4)
+                objects[name] = dict(
+                    pose_valid=valid, pose=np.eye(4) if valid else None,
+                    state="TRACKING" if valid else "POSE_LOST",
+                    error=None if valid else "empty mask" if self.steps == 2 else "depth gate",
+                    cloud=SimpleNamespace(model_supported_fraction=float(valid)),
+                )
+            return {"objects": objects}
+
+    tracker = Tracker()
+
+    @contextmanager
+    def opened(*args, **kwargs):
+        assert kwargs["max_reregistrations"] == 3
+        yield tracker
+
+    monkeypatch.setattr(annotation.SceneTracker, "open", opened)
+    annotation.annotate_episodes([episode], task)
+    assert tracker.steps == 4
+    output = capsys.readouterr().out
+    apple_line = next(line for line in output.splitlines() if "apple:" in line)
+    assert f"有效 {3 if recovered else 1}/6" in apple_line
+    assert "首次丢失 Raw 行(0-based)=1" in apple_line
+    assert f"TRACKING={3 if recovered else 1}, POSE_LOST={3 if recovered else 5}" in apple_line
+    assert f"末态={'TRACKING' if recovered else 'POSE_LOST'}" in apple_line
+    assert "最近失败原因=depth gate" in apple_line
+    assert f"当前连续重注册={attempts}/3, 耗尽={attempts == 3}" in apple_line
+    assert "bowl: 有效 6/6; 首次丢失 Raw 行(0-based)=None" in output
+    assert "P50/P95/Max(ms)=3.000/4.800/5.000, 有效样本=5/6" in output
+    assert "P50/P95/Max(ms)=不可用, 有效样本=0/6（非硬件同步误差）" in output
+    with RawReader(episode) as reader:
+        np.testing.assert_array_equal(reader["object_pose_valid"][:, 0], [True, False, False, False, recovered, recovered])
+        np.testing.assert_array_equal(reader["timing/rows"][:], timing)
 
 
 def test_manifest_order_change_rejected(task):
@@ -736,38 +851,55 @@ def test_policy_metadata(task):
     assert info.to_dict()["hoi_pcd"] == manifest
 
 
-def test_training_carries_template_metadata(task, tmp_path):
+@pytest.mark.parametrize("defect", [
+    "none", "missing", "task", "points", "channels", "rank", "dtype", "non_hoi", "non_hoi_metadata",
+])
+def test_training_carries_template_metadata(task, tmp_path, defect):
     import zarr
+    from hydra.errors import InstantiationException
     from omegaconf import OmegaConf
     from dexmani_policy.training.common.data import build_dataset
 
     _, manifest = load_task_template(task)
+    needs_hoi = defect not in ("non_hoi", "non_hoi_metadata")
     path = tmp_path / "training.zarr"
     root = zarr.open_group(str(path), mode="w")
     data = root.create_group("data")
-    data.create_dataset("object_pointcloud", data=np.zeros((8, 1024, 3), np.float32))
+    shape = {"points": (8, 512, 3), "channels": (8, 1024, 6), "rank": (8, 3)}.get(defect, (8, 1024, 3))
+    dtype = np.float64 if defect == "dtype" else np.float32
+    data.create_dataset("object_pointcloud", data=np.zeros(shape, dtype))
+    data.create_dataset("joint_state", data=np.zeros((8, 19), np.float32))
     data.create_dataset("action", data=np.zeros((8, 19), np.float32))
     root.create_group("meta").create_dataset("episode_ends", data=np.array([8], np.int64))
-    root.attrs["hoi_pcd"] = manifest
+    if defect not in ("missing", "non_hoi"):
+        root.attrs["hoi_pcd"] = manifest
     cfg = OmegaConf.create(
         {
-            "task_name": "task",
+            "task_name": "wrong" if defect in ("task", "non_hoi_metadata") else "task",
             "agent": {"action_dim": 19},
             "dataset": {
                 "_target_": "dexmani_policy.datasets.demonstration.DemonstrationDataset",
                 "zarr_path": str(path),
-                "sensor_modalities": ["object_pointcloud"],
+                "sensor_modalities": ["object_pointcloud" if needs_hoi else "joint_state"],
                 "obs_horizon": 3,
                 "horizon": 4,
                 "pc_dim": 3,
             },
         }
     )
-    _, description = build_dataset(cfg)
+    if needs_hoi and defect != "none":
+        error = InstantiationException if defect == "rank" else ValueError
+        message = {"missing": "hoi_pcd", "task": "task", "rank": "shape"}.get(defect, "float32")
+        with pytest.raises(error, match=message):
+            build_dataset(cfg)
+        return
+    dataset, description = build_dataset(cfg)
+    if not needs_hoi:
+        assert "hoi_pcd" not in description["deployment_metadata"]
+        assert dataset[0]["obs"]["joint_state"].shape == (3, 19)
+        return
     assert description["deployment_metadata"]["hoi_pcd"] == manifest
-    cfg.task_name = "wrong"
-    with pytest.raises(ValueError, match="task"):
-        build_dataset(cfg)
+    assert dataset[0]["obs"]["object_pointcloud"].shape == (3, 1024, 3)
 
 
 @pytest.mark.parametrize('failure', ['missing', 'ambiguous', 'invalid', 'program', 'cuda', 'ipc'])

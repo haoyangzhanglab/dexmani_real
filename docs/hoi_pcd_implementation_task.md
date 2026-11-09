@@ -4,7 +4,7 @@
 >
 > **仓库：** `haoyangzhanglab/dexmani_real`；配套训练仓库 `haoyangzhanglab/dexmani_policy`。
 >
-> **Review 基线：** `dexmani_real/main@f3a4f4380733b0d861b1c4d632c827177341f4fa`；开始编码时先核实最新 HEAD。
+> **阅读约定：** 下列清单保留验收目标，勾选状态不代表实现进度；当前行为与实测范围见 [object_reconstruction.md](object_reconstruction.md)。
 >
 > **总体目标：** 最少人工介入，利用已有 CordVIP 几何能力，让任务完整物体点云经历 **资产构建 → 任务点数分配 → Raw 离线增强/现有可视化 → Zarr 导出 → 真机实时推理** 五个独立阶段。优先正确性、可复现性、已有接口复用和少量清晰代码。
 
@@ -27,12 +27,12 @@
 | 多物体 Mask、RGB-D 实测点、FoundationPose 位姿、深度一致性检查已有 | `cordvip_geometry/{sam2,sam2_worker,tracking,model_depth,foundationpose}.py` |
 | 离线 Raw 读取已有，`RawWriter` 不保存派生场景点云 | `dexmani_real/data/{raw,recorder}.py` |
 | Raw Viewer 已使用 Rerun，在 `Hand Point Cloud` 标签显示手部 | `scripts/visualize_episode.py` + `dexmani_real/utils/visualization/rerun.py` |
-| 当前 `RawReader.fields` 只枚举 HDF5 **根层 Dataset**；Group 内字段需要显式可选入口 | `dexmani_real/data/raw.py` |
-| Zarr 原有字段由 `FIELD_INPUTS` 枚举，默认导出全部现有字段 | `dexmani_real/data/export.py` + `scripts/export_zarr.py` |
-| `dexmani_policy` 已支持 `object_pointcloud` 和 CordViP `pc_dim: 3`；Real 部署端尚不生产该字段 | `dexmani_policy/configs/cordvip.yaml`、`dexmani_real/deployment/observation.py` |
+| `RawReader.fields` 枚举根层 Dataset，并在 `/hoi` 完整合法时提供派生字段别名 | `dexmani_real/data/raw.py` |
+| Zarr 默认保持原有 13 个字段，`object_pointcloud` 仅显式导出 | `dexmani_real/data/export.py` + `scripts/export_zarr.py` |
+| `dexmani_policy` 支持 `object_pointcloud` 和 CordViP `pc_dim: 3`；Real 已通过 HOI Worker 生产该字段 | `dexmani_policy/configs/cordvip.yaml`、`dexmani_real/deployment/observation.py` |
 | 现有重建 Mesh 被 `.gitignore` 排除，GitHub 克隆后可能缺失 | 根目录 `.gitignore`；模板 `asset.json` 仍引用 `mesh/mesh_m.obj` |
 
-## 1. 数据布局（先实现并测试）
+## 1. 数据布局
 
 ### 1.1 任务级资产
 
@@ -126,12 +126,12 @@ sum(N_i) == 1024
 **完成条件：**
 - [ ] 严格恰好 1024 点、`float32`、所有点有限，物体顺序稳定。
 - [ ] 同一输入、种子与配置多次运行的模板和哈希逐字节一致。
-- [ ] 旧 `sampled_1024` 不自动覆盖；新 Manifest 指向正确的原始资产与固定模板。
+- [ ] 已冻结模板不自动覆盖；Manifest 绑定实际 Mesh、物体顺序与固定模板。
 - [ ] 不在逐帧跟踪、Zarr 导出或策略推理时再次 FPS。
 
 ### 阶段 3 — 离线增强 Raw Episode（含现有可视化）
 
-**入口建议：** 新增 `scripts/cordvip/annotate_episodes.py --task <task>`；支持 `--episode <path>` 仅处理单段。任务自动扫描 `episodes/<task>/episode_*`，直接在各 Episode 的 `data.h5` 写入 `/hoi`。无额外文件夹、不修改 `rgb.mp4`。
+**入口：** `scripts/cordvip/annotate_episodes.py --task <task>`；支持 `--episode <path>` 仅处理单段。任务自动扫描 `episodes/<task>/episode_*`，直接在各 Episode 的 `data.h5` 写入 `/hoi`。无额外文件夹、不修改 `rgb.mp4`。
 
 **算法：** 复用 `cordvip_geometry.SceneTracker`、`track_raw`/`RGBDFrame`、SAM2、FoundationPose、模型深度验证；不要重写一套跟踪器。优先同帧一次 Grounding DINO 多类检测及共享 SAM2 图片特征，但需正确识别多实例、跨帧维持固定 object ID。
 
@@ -143,7 +143,7 @@ sum(N_i) == 1024
 5. 在跟踪丢失时标记无效，不再无限复用旧位姿；恢复方案优先使用现有 Mask + `register` 做有界重新注册。不要在首次实现中引入复杂滤波网络。
 6. 在 RawReader 关闭后，以 `h5py.File(..., "r+")` 在 HDF5 **临时 staging Group** 中分块写点云和姿态；检查数组结构和输出有限性后发布为 `/hoi`。已有同模板完整标注由批处理入口跳过，写入函数直接拒绝覆盖。Raw 打开时仅检查完成状态和数组结构，数值在显示或导出时按需检查。不实现覆盖或迁移分支，不能将 HDF5 Group move 夸大为断电级原子事务。
 7. 大规模 Episode 不应把全部 `T×1024×3` 点云常驻内存：先收集轻量位姿/状态，再按块生成和写入点云。
-8. 异常样本输出明确日志和汇总计数；不要把所有异常吞掉，也不额外默认保存每帧 RGB/Mask/点云副本。
+8. 终端按 Raw 行输出逐物体有效数、首次丢失行、状态数、最近失败原因和重注册耗尽情况；重复相机帧不重复跟踪。主机记录时间戳差另输出 P50/P95/Max，不能当作硬件同步误差。异常继续传播，不保存额外诊断文件。
 
 **可视化仅修改现有入口：**
 - `dexmani_real/utils/visualization/rerun.py`：在现有 **Hand Point Cloud** 标签页的 `Spatial3DView.contents` 加入 `"/object_pointcloud/**"`；保留标签页名称与其他布局。
@@ -189,8 +189,8 @@ python scripts/export_zarr.py episodes/pnp_apple_banana \
 - [ ] 配套 `dexmani_policy` 的 `training/common/data.py`、`deployment/metadata.py` 直接传递三个 `hoi_pcd` 字段，复用现有 Checkpoint 机制。部署前校验任务与模板，模板数据只加载一次；缺失直接拒绝。
 - [ ] 复用**同一现有 RealSense Camera Ring**。HOI 需求必须将 RGB+对齐深度、内参、米制深度尺度、外参加入相机启动依赖，即使模型不使用普通 `point_cloud`。
 - [ ] 一个 HOI Worker 处理所有物体，加载 Mesh、任务模板和跟踪模型一次。只处理新的相机序列，优先最新帧，不把旧相机帧排队形成假新鲜点云。
-- [ ] 每个 Episode 按 B 后重置 SAM2 跟踪状态和 FoundationPose 位姿（复用模型权重），从该轮新的 RGB-D 帧初始化全部必需对象，验证后**再允许动作执行**。现有 `PolicySession.warmup_policy()` 在按 B 前执行：必须针对 HOI 路径调整真实观测 Warmup 时机；没有有效 HOI 时不能用虚构零点云触发正式动作。
-- [ ] 工作中按共享函数变换模板生成 `float32[1024,3]` 并通过独立 Ring 发布；Ring 保留 **来源相机时间戳和 `source_camera_sequence`**，TTL 不以发布时刻重置。需要与 RGB/普通点云同时输入时，必须按相机序列对齐或明确拒绝不支持的组合，不能悄悄混用不同帧。
+- [ ] 每个 Episode 按 B 后重置 SAM2 跟踪状态和 FoundationPose 位姿（复用模型权重），从该轮新的 RGB-D 帧初始化全部必需对象，验证后**再允许动作执行**。HOI Warmup 在 `Rollout.prepare()` 获得本轮有效观测后执行；非 HOI 路径沿用启动时 Warmup。结束时发送 `episode_id=0`，Worker 暂停相机读取和跟踪但保留模型；下一轮正整数 ID 重新初始化。
+- [ ] 工作中按共享函数变换模板生成 `float32[1024,3]` 并通过独立 Ring 发布；Ring 保留 **来源相机时间戳和 `source_camera_sequence`**，HOI 使用独立的 250 ms 默认 TTL，仅对使用该模态的模型校验配置。模型图像由同一 HOI 快照携带，Raw 独立读取最新相机；当前拒绝 HOI 与普通 `point_cloud` 同时输入。
 - [ ] 在 `read_observation`/`check_observation` 纳入 HOI 的缺失、过期、无效位姿和 Worker 退出检查；关键观测失效后禁止继续提交动作，并使现有控制调度停止/取消剩余动作计划，不单纯跳过下一次预测。
 - [ ] 默认采用已有 Mask 引导 FoundationPose 和现有模型深度匹配；如果将来测试无 Mask `track_one()`，必须同步设计新的质量校验方式，而不是保留依赖每帧 SAM2 Mask 的旧检查却假设它有效。
 - [ ] `NVIDIA foundation-pose-inference-library` 作为**隔离 Benchmark 候选**，不作为首版必需依赖；若升级需验证显卡驱动/CUDA/TensorRT、Mesh 中心坐标、原始点云位姿及真实遮挡精度。其 tracking score 不可直接视为逐帧可信度。

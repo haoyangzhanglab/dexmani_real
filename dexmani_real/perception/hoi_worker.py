@@ -32,7 +32,7 @@ def run_hoi_worker(shared, camera, task, template):
         shared.hoi_ready.value = True
         while shared.is_running.value:
             request = shared.hoi_request.read()
-            if request is None:
+            if request is None or int(request[0]["episode_id"]) == 0:
                 time.sleep(0.005)
                 continue
             command = request[0]
