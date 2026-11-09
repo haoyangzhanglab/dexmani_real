@@ -43,6 +43,10 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
     action_steps = execution.action_steps
     if type(action_steps) is not int or not 1 <= action_steps <= prediction_steps:
         raise ValueError("execution requires integer 1 <= A_exec <= policy future_steps")
+    if info.requires_prev_action and (
+        execution.mode != "sync" or action_steps != info.n_action_steps
+    ):
+        raise ValueError("ODE requires sync execution with action_steps == n_action_steps")
     if execution.mode != "sync":
         prefetch_steps = execution.prefetch_steps
         if (

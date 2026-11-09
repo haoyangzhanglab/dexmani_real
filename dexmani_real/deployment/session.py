@@ -214,7 +214,7 @@ class PolicySession:
             except OSError:
                 logger.exception("输出目录创建失败：%s；要求录制的实验将在 B 时重试。", self.output_root)
         print(
-            f"执行：{self.info.checkpoint_path.name} ({self.info.weights}) | NFE={self.info.inference_steps} | "
+            f"执行：{self.info.checkpoint_path.name} ({self.info.weights}) | inference_steps={self.info.inference_steps} | "
             f"A_exec={self.runtime.execution.action_steps} | {self.runtime.execution.mode} | "
             f"{1.0 / self.runtime.execution.control_dt_s:g} Hz"
         )

@@ -101,6 +101,7 @@ class Rollout:
         self.has_submitted = False
         self.ik_reference = None
         self.first_prediction = True
+        self.prev_action: np.ndarray | None = None
         self.discard_requested = False
 
     @property
@@ -131,6 +132,7 @@ class Rollout:
         self.has_submitted = False
         self.run_deadline_ns = None
         self.ik_reference = None
+        self.prev_action = None
         if self.model_needs.hoi:
             channels = self.sensors.channels
             channels.hoi_request.write(episode_id=0, after_ns=ended_ns,
@@ -371,6 +373,8 @@ class Rollout:
             "delay_steps": min(self.execution.prefetch_steps, len(prefix)),
             "rtc_guidance_cap": self.execution.rtc_guidance_cap,
         }
+        if self.policy_info.requires_prev_action:
+            kwargs["prev_action"] = self.prev_action
         rows = tuple(self.history)
         self.check_motion()
         self.model.predict(rows, reset_episode=self.first_prediction, **kwargs)
@@ -380,10 +384,10 @@ class Rollout:
 
     def map_command(self, action, row):
         mode = self.policy_info.action_mode
-        current = row.arm["qpos"][0]
         if mode == "joint":
-            decoded = self.action_mapper.map_joint(action[:7], action[7:], current)
+            decoded = self.action_mapper.map_joint(action[:7], action[7:])
         else:
+            current = row.arm["qpos"][0]
             pose = Pose(action[:3], rot6d_to_quat_wxyz(action[3:9]))
             reference = prepare_reference(
                 self.action_mapper.solver, self.ik_reference, current,
@@ -568,6 +572,8 @@ class Rollout:
                 return
             attempted = command
             self.robot.send_action(command, expires_ns=time.monotonic_ns() + COMMAND_LEASE_NS)
+            if self.policy_info.requires_prev_action:
+                self.prev_action = np.concatenate((command.arm_qpos, command.hand_qpos))
             if not self.has_submitted:
                 logger.info("Policy first target submitted")
             self.commit_arm(command, row)

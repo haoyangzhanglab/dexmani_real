@@ -1,11 +1,8 @@
-"""关节等价角、运行限位与运动目标端点约束。"""
+"""运行限位与运动目标端点约束。"""
 
 import numpy as np
 
 from dexmani_real.control.collision import CollisionModel
-from dexmani_real.robot.model import XARM7_EQUIVALENT_JOINT_MASK
-
-EQUIVALENT_JOINTS = np.asarray(XARM7_EQUIVALENT_JOINT_MASK, dtype=bool)
 
 
 def workspace_start_rejection(position, lower, upper):
@@ -13,23 +10,6 @@ def workspace_start_rejection(position, lower, upper):
     if np.any(position < lower) or np.any(position > upper):
         return "实测末端超出允许的起点范围；请手动就位或调整范围后重试"
     return None
-
-
-def wrap_nearest_equivalent(qpos, reference, joint_limit_lower, joint_limit_upper):
-    result = np.asarray(qpos, dtype=np.float64).copy()
-    lower = np.asarray(joint_limit_lower)[EQUIVALENT_JOINTS]
-    upper = np.asarray(joint_limit_upper)[EQUIVALENT_JOINTS]
-    q = result[EQUIVALENT_JOINTS]
-    ref = np.asarray(reference)[EQUIVALENT_JOINTS]
-    period = 2 * np.pi
-    k_min = np.ceil((lower - q) / period)
-    k_max = np.floor((upper - q) / period)
-    nearest = np.clip(np.rint((ref - q) / period), k_min, k_max)
-    # 仅归一合法分支的浮点舍入；无可用等价分支时保留原值，由调用方裁剪或拒绝。
-    result[EQUIVALENT_JOINTS] = np.where(
-        k_min <= k_max, np.clip(q + nearest * period, lower, upper), q
-    )
-    return result
 
 
 class MotionConstraints:

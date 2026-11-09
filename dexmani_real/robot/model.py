@@ -65,10 +65,6 @@ XARM7_HARD_UPPER = (
     2 * pi, pi, 2 * pi,
 )
 
-# 只有这些轴允许 2π 等价角，运行限位仍可能窄于一整圈。
-XARM7_EQUIVALENT_JOINT_MASK = (True, False, True, False, True, False, True)
-
-
 XHAND_RATED_QPOS_MIN_RAD: tuple[float, ...] = (
     0.0,
     -0.698,

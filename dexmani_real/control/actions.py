@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.control.constraints import MotionConstraints, wrap_nearest_equivalent
+from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.ik import IKSolver
 from dexmani_real.geometry.pose import Pose
 
@@ -45,7 +45,7 @@ class ActionMapper:
 
     @classmethod
     def for_mode(cls, mode, *, arm, hand, motion, environment):
-        """joint 只投影关节意图；EEF 使用几何约束。"""
+        """joint 裁剪绝对关节目标；EEF 使用几何约束。"""
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
         solver = None
@@ -70,27 +70,24 @@ class ActionMapper:
         )
 
     def prepare_hand(self, hand):
-        if self.hand_enabled:
-            if hand is None:
-                raise ValueError("hand-enabled action mapping requires a hand intent")
-        elif hand is not None:
-            raise ValueError("hand-disabled action mapping must not include a hand intent")
-        if hand is not None:
-            hand = project_hand_command(
-                hand, qpos_min_rad=self.hand_lower, qpos_max_rad=self.hand_upper
-            )
-        return hand
+        if not self.hand_enabled:
+            if hand is not None:
+                raise ValueError("hand-disabled action mapping must not include a hand intent")
+            return None
+        if hand is None:
+            raise ValueError("hand-enabled action mapping requires a hand intent")
+        target = np.asarray(hand, dtype=np.float64)
+        if target.shape != (12,) or not np.isfinite(target).all():
+            raise ValueError("hand preparation requires a finite (12,) target")
+        return np.clip(target, self.hand_lower, self.hand_upper)
 
-    def map_joint(self, arm, hand, current_arm_qpos):
-        """将关节意图投影到运行范围，不执行几何筛选。"""
-        current = np.asarray(current_arm_qpos, dtype=np.float64)
+    def map_joint(self, arm, hand):
+        """裁剪绝对关节目标，保留角度分支，不执行几何筛选。"""
+        target = np.asarray(arm, dtype=np.float64)
+        if target.shape != (7,) or not np.isfinite(target).all():
+            raise ValueError("arm preparation requires a finite (7,) target")
         hand = self.prepare_hand(hand)
-        target = project_arm_command(
-            arm,
-            current,
-            joint_lower_rad=self.joint_limits[:, 0],
-            joint_upper_rad=self.joint_limits[:, 1],
-        )
+        target = np.clip(target, self.joint_limits[:, 0], self.joint_limits[:, 1])
         return ActionResult(target, hand)
 
     def map_eef(self, pose: Pose, hand, reference):
@@ -114,17 +111,3 @@ class ActionMapper:
             rejection_reason=reason,
             eef_pose=pose,
         )
-
-
-def project_arm_command(target_arm_qpos, reference_arm_qpos, *, joint_lower_rad, joint_upper_rad):
-    equivalent = wrap_nearest_equivalent(
-        target_arm_qpos, reference_arm_qpos, joint_lower_rad, joint_upper_rad
-    )
-    return np.clip(equivalent, joint_lower_rad, joint_upper_rad)
-
-
-def project_hand_command(target_hand_qpos, *, qpos_min_rad, qpos_max_rad):
-    target = np.asarray(target_hand_qpos, dtype=np.float64)
-    if target.shape != (12,) or not np.isfinite(target).all():
-        raise ValueError("hand preparation requires a finite (12,) target")
-    return np.clip(target, qpos_min_rad, qpos_max_rad)

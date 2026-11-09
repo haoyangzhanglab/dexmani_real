@@ -93,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--inference-steps",
         type=positive_int,
         default=None,
-        help="override saved inference step count (NFE)",
+        help="override saved inference steps; ODE uses substeps per control period",
     )
     research.add_argument(
         "--seed", type=nonnegative_int, default=0, help="fixed inference seed reset each episode"
