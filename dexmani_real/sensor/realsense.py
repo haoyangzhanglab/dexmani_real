@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 WARMUP_FRAMES = 10
+# 来源停止产帧的设备超时；消费者另用 CameraConfig.max_frame_age_s。
 SOURCE_STALL_TIMEOUT_NS = 2_000_000_000
 
 

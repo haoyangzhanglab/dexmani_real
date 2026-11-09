@@ -58,6 +58,7 @@ def run_vr(shared, config: VRConfig) -> None:
             except ValueError as exc:
                 logger.warning("Invalid VR hand frame rejected: %s", exc)
                 continue
+            # 完整观测取两部分主机接收时间的较早者，不能用组帧或发布时刻续期。
             # IPC 写入失败属于 worker 故障，不能当作坏包跳过。
             shared.vr_ring.write(
                 wrist_pos=wrist_pos,

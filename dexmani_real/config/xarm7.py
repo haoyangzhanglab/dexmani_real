@@ -53,7 +53,8 @@ class ArmConfig:
 
     servo_hz: float = 100.0
     feedback_hz: float = 25.0
-    feedback_max_age_s: float = 4 / 30
+    # 主机 SDK 查询起点的时效预算；默认覆盖 25 Hz 反馈的四个周期。
+    feedback_max_age_s: float = 4 / 25
 
     # HOME、伺服准备与相机标定共用的实测停稳阈值。
     standstill_position_tolerance_rad: float = 0.002618

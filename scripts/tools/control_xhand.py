@@ -28,7 +28,6 @@ from dexmani_real.robot.model import (
 from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE, XHand
 from dexmani_real.robot.xhand.feedback import XHandState
 from dexmani_real.utils.log import configure_logging
-from dexmani_real.utils.timing import sample_is_fresh
 
 logger = logging.getLogger("dexmani_real.tools.control_xhand")
 
@@ -137,9 +136,8 @@ class XHandDiagnostic(XHand):
             self.check_active(deadline_ns)
             state = self.get_state()
             now_ns = self.check_active(deadline_ns)
-            if state is not None and sample_is_fresh(
-                state.timestamp_ns, self.cfg.feedback_max_age_s, now_ns,
-            ):
+            # get_state 的来源时间是本轮查询起点，返回前的固定期限检查已覆盖其年龄。
+            if state is not None:
                 return state
             time.sleep(min(FEEDBACK_POLL_INTERVAL_S, (deadline_ns - now_ns) / 1e9))
 

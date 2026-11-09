@@ -64,7 +64,8 @@ class HandConfig:
         300, 300,       # 小指
     )
 
-    feedback_max_age_s: float = 0.5
+    # 关节及策略必需触觉共用的主机查询时效预算，不保证物理采样年龄。
+    feedback_max_age_s: float = 0.20
     home_timeout_s: float = 2.0
     home_tolerance_deg: float = 5.0
 

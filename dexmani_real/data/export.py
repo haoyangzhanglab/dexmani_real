@@ -186,18 +186,18 @@ def validate_export_episode(reader: RawReader, fields):
         if not used_by.intersection(fields):
             continue
         values = rows[name]
-        bad = (values < 0) | (values > observation)
+        bad = (values <= 0) | (values > observation)
         bad[1:] |= np.diff(values) < 0
         row = first_bad(bad)
         if row is not None:
             diagnostics.append(f"{name} invalid/regressed at row {row}")
         if name.startswith("tactile_"):
-            row = first_bad(observation - values > TACTILE_AGE_WARNING_NS)
+            row = first_bad((values > 0) & (observation - values > TACTILE_AGE_WARNING_NS))
             if row is not None:
                 diagnostics.append(f"{name} held beyond {TACTILE_AGE_WARNING_NS / 1e9:g}s at row {row}")
     if SOURCE_FIELDS["camera_ns"].intersection(fields):
         sequence = rows["camera_sequence"]
-        bad = sequence < 0
+        bad = sequence <= 0
         bad[1:] |= np.diff(sequence) < 0
         row = first_bad(bad)
         if row is not None:

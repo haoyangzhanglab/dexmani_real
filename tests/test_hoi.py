@@ -230,7 +230,7 @@ def test_hoi_reads_only_requested_same_source_images(camera_fields, monkeypatch)
     from unittest.mock import Mock
     from dexmani_real.config.sensor import CameraConfig
     from dexmani_real.ipc.sensors import SensorChannels
-    from dexmani_real.runtime.observation import ObservationNeeds, read_observation
+    from dexmani_real.runtime.observation import ObservationNeeds, check_observation, read_observation
 
     channels = SensorChannels(
         mp.get_context("spawn"),
@@ -254,6 +254,7 @@ def test_hoi_reads_only_requested_same_source_images(camera_fields, monkeypatch)
     assert set(channels.hoi_ring.dtype.names) & {"rgb", "depth"} == set(camera_fields)
     channels.camera_ring.write(timestamp_ns=30, rgb=rgb + 1, depth=depth + 1)
     robot = SimpleNamespace(read_state=lambda: SimpleNamespace(arm=None, hand=None))
+    runtime = SimpleNamespace(camera=CameraConfig())
     with monkeypatch.context() as patch:
         patch.setattr(
             channels.camera_ring, "read", Mock(side_effect=AssertionError("异步相机帧不应被读取"))
@@ -261,6 +262,7 @@ def test_hoi_reads_only_requested_same_source_images(camera_fields, monkeypatch)
         needs = ObservationNeeds(hoi=True, camera_fields=camera_fields)
         row = read_observation(channels, robot, needs=needs)
         assert row.hoi["timestamp_ns"] == 20
+        assert check_observation(row, runtime, needs, now_ns=30) == []
         assert set(row.hoi) & {"rgb", "depth"} == set(camera_fields)
         if camera_fields:
             assert row.camera["timestamp_ns"] == 20 and row.camera["ring_sequence"] == 9
@@ -270,6 +272,7 @@ def test_hoi_reads_only_requested_same_source_images(camera_fields, monkeypatch)
         channels.hoi_request.write(episode_id=2, after_ns=30, after_sequence=1)
         row = read_observation(channels, robot, needs=needs)
         assert row.hoi is None and row.camera is None
+        assert check_observation(row, runtime, needs, now_ns=30) == ["hoi_unavailable"]
     # 普通策略仍直接读取最新相机帧。
     row = read_observation(channels, robot, needs=ObservationNeeds(camera_fields=camera_fields))
     if camera_fields:
@@ -297,6 +300,7 @@ def test_stale_hoi_does_not_enter_history(monkeypatch):
         project=Mock(return_value={"points": np.ones((1024, 3))})
     )
     rollout.history = deque(maxlen=2)
+    rollout.model_input_issues = ()
     monkeypatch.setattr("time.monotonic_ns", lambda: 1_100_000_000)
     assert rollout.update_history(row)
     monkeypatch.setattr("time.monotonic_ns", lambda: 1_120_000_000)

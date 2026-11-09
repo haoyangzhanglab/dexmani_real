@@ -28,7 +28,7 @@ HAND_STATE_DTYPE = np.dtype(
 
 @dataclass
 class XHandState:
-    """关节可信；触觉为完整有效帧或 None；时间为 SDK 查询起点，单位 ns。"""
+    """关节可信；触觉为完整有效帧或 None；时间为主机 SDK 查询起点，非硬件采样时刻。"""
 
     qpos: np.ndarray
     tactile_aggregate: np.ndarray | None

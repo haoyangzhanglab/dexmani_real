@@ -14,8 +14,10 @@ class TeleopConfig:
     ema_alpha_pos: float = 0.95
     ema_alpha_rot: float = 0.85
     vr_pos_scale: float = 0.7
+    # 暂定的 VR 来源掉线容忍度；生产频率未知，不能由 control_hz 推导。
     vr_stale_threshold_s: float = 0.5
-    target_max_age_s: float = 0.5
+    # 命令目标租约，与来源观测 TTL 独立。
+    target_max_age_s: float = 0.25
 
     def validate(self) -> None:
         if not (0.0 <= self.ema_alpha_pos <= 1.0 and 0.0 <= self.ema_alpha_rot <= 1.0):
@@ -30,7 +32,8 @@ class TeleopConfig:
 @dataclass(frozen=True)
 class KeyboardTeleopConfig:
     control_hz: float = 30.0
-    target_max_age_s: float = 0.5
+    # 点动及 braking/hold 目标每个控制步续租。
+    target_max_age_s: float = 0.25
     delta_pos_m: float = 0.008
     delta_rpy_rad: float = 0.03
     workspace_command_margin_m: float = 0.005

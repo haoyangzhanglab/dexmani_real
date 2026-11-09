@@ -134,14 +134,13 @@ def check_observation(row, runtime, needs, *, now_ns=None, allow_tactile_hold=Fa
             stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0]) if row.hand is not None else 0
             if not sample_is_fresh(stamp, runtime.hand.feedback_max_age_s, now):
                 issues.append(f"hand_tactile_{channel}_timestamp_ns_unavailable_or_stale")
-    if needs.camera_fields:
+    # read_observation 已让派生快照携带所需同源图像，只检查对应点云/HOI 来源。
+    if needs.camera_fields and not (needs.point_cloud or needs.hoi):
         if row.camera is None:
             issues.append("camera_source_unavailable_or_unmatched")
         else:
             stamp = int(row.camera["timestamp_ns"])
-            if not (needs.point_cloud or needs.hoi) and not sample_is_fresh(
-                stamp, runtime.camera.max_frame_age_s, now,
-            ):
+            if not sample_is_fresh(stamp, runtime.camera.max_frame_age_s, now):
                 issues.append("camera_source_stale")
     if needs.point_cloud:
         if row.point_cloud is None:

@@ -57,6 +57,7 @@ PASSIVE_MODE = 0
 POSITION_MODE = 3
 STOP_RETRY_INTERVAL_S = 0.01
 STOP_RETRY_TIMEOUT_S = 0.25
+# 停止时能否用实测位置保持的阈值，独立于普通目标的反馈 TTL。
 STOP_FEEDBACK_MAX_AGE_S = 4 / 30
 MAX_CONSECUTIVE_WRITE_CRC = 5
 
@@ -300,7 +301,7 @@ class XHand:
         if self.control is None or not self.connected_flag:
             raise RobotError("XHand is not connected")
         query_started_ns = time.monotonic_ns()
-        # 本机 SDK 1.5.2 没有缓存帧序号/来源时间，保留主动读取以免旧缓存续期。
+        # SDK 1.5.2 无可靠的硬件采样序号/时间；主动查询起点不能证明物理采样年龄。
         error, raw_state = self.control.read_state(self.cfg.device_id, True)
         code = int(error.error_code)
         if code == COMMUNICATION_CRC_ERROR_CODE:

@@ -20,8 +20,8 @@ from dexmani_real.robot.commands import (
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime
+from dexmani_real.runtime.observation import check_device_feedback
 from dexmani_real.runtime.state import SessionState
-from dexmani_real.utils.timing import sample_is_fresh
 
 logger = logging.getLogger(__name__)
 
@@ -73,13 +73,9 @@ def run_replay(episode_path: str | Path, runtime: RealConfig) -> None:
         check_input(robot, keyboard)
         current = robot.read_state()
         check_input(robot, keyboard)
-        now = time.monotonic_ns()
-        for name, frame, age in (
-            ("arm", current.arm, runtime.arm.feedback_max_age_s),
-            ("hand", current.hand, runtime.hand.feedback_max_age_s),
-        ):
-            if frame is None or not sample_is_fresh(int(frame["timestamp_ns"][0]), age, now):
-                raise RobotError(f"replay {name} feedback stale at start")
+        issues = check_device_feedback(current, runtime)
+        if issues:
+            raise RobotError("replay start feedback: " + "; ".join(issues))
         if any(
             np.max(np.abs(frame["qpos"][0] - target)) > np.deg2rad(10)
             for frame, target in (

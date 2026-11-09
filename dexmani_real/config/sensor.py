@@ -12,6 +12,7 @@ class CameraConfig:
     width: int = 640
     height: int = 480
     fps: int = 30
+    # 消费者从首次主机接收时刻计龄；点云处理也消耗这份预算。
     max_frame_age_s: float = 4 / 30
     l515_visual_preset: int = 5
     l515_confidence_threshold: int | None = None

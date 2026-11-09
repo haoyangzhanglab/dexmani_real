@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
 TACTILE_UNITS = "sdk_native_unknown_physical_scale"
 TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
+# 录制/导出的 Hold 诊断阈值，不是运行时必需触觉的 TTL。
 TACTILE_AGE_WARNING_NS = 500_000_000
 
 
@@ -54,8 +55,8 @@ VR_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
 }
 
 
-# 时间字段单位 ns；采集端使用主机单调时钟。
-# 缺失用 -1，触觉时间为最后一份完整通道帧的来源时间。
+# 时间字段单位 ns，保留主机单调时钟的查询/接收时间，不代表同步硬件采样。
+# 来源时间必须为正；触觉时间为最后一份完整有效通道帧的查询起点。
 TIMING_ROW_DTYPE = np.dtype(
     [
         (name, "<i8")

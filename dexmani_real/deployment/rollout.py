@@ -84,6 +84,7 @@ class Rollout:
         self.max_duration_ns = int(max_running_s * 1e9) if max_running_s is not None else None
         self.cancel_epoch = cancel_epoch
         self.history: deque[dict[str, np.ndarray]] = deque(maxlen=policy_info.n_obs_steps)
+        self.model_input_issues: tuple[str, ...] = ()
         self.plan: ActionChunk | None = None
         self.query: Prediction | None = None
         self.cursor = 0
@@ -418,14 +419,18 @@ class Rollout:
         return row
 
     def update_history(self, row):
-        model_input_valid = not check_observation(row, self.runtime, self.model_needs)
-        if model_input_valid:
-            projected = self.observations.project(row)
-            if not self.history:
-                self.history.extend([projected] * self.policy_info.n_obs_steps)
-            else:
-                self.history.append(projected)
-        return model_input_valid
+        issues = tuple(check_observation(row, self.runtime, self.model_needs))
+        if issues and issues != self.model_input_issues:
+            logger.warning("策略暂缓新推理：%s", "; ".join(issues))
+        self.model_input_issues = issues
+        if issues:
+            return False
+        projected = self.observations.project(row)
+        if not self.history:
+            self.history.extend([projected] * self.policy_info.n_obs_steps)
+        else:
+            self.history.append(projected)
+        return True
 
     def duration_expired(self):
         if self.run_deadline_ns is not None and time.monotonic_ns() >= self.run_deadline_ns:
