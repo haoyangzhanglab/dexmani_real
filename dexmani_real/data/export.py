@@ -28,7 +28,10 @@ from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
 from dexmani_real.geometry.pose import encode_eef_pose, validate_rigid_transform
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
-from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
+from dexmani_real.robot.model import (
+    XHAND_FINGERTIP_LINK_NAMES,
+    XHAND_TACTILE_SCALE_DIVISOR,
+)
 from dexmani_real.utils.io import publish
 
 CANONICAL_FORMAT = "dexmani.real.canonical"
@@ -269,6 +272,7 @@ def iter_canonical_blocks(
                 ))
         for name, source in (("finger_tactile_force", "hand_contact"), ("taxel_tactile_force", "hand_tactile_force")):
             if name in fields:
+                # Raw 已为 SDK / 255；导出只复制，不再次缩放。
                 block[name] = raw[source].astype(np.float32, copy=False)
         for name, values in camera["parameters"].items():
             block[name] = np.broadcast_to(values, (count, values.size))
@@ -410,6 +414,8 @@ def create_store(store, processing, camera, *, fields, control_hz):
     specs = canonical_array_specs(fields, processing, camera)
     root = zarr.group(store=store, overwrite=True)
     root.attrs.update(format=CANONICAL_FORMAT, dt=1.0 / control_hz)
+    if {"finger_tactile_force", "taxel_tactile_force"}.intersection(fields):
+        root.attrs["tactile_scale_divisor"] = XHAND_TACTILE_SCALE_DIVISOR
     if {"action", "action_ee"}.intersection(fields):
         root.attrs["action_semantics"] = "absolute_joint_goal_not_next_step_arrival"
     if "point_cloud" in fields:

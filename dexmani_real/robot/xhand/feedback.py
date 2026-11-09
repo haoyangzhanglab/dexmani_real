@@ -1,4 +1,4 @@
-"""XHand 标准化状态、触觉缓存与反馈时效。"""
+"""XHand SDK Native 状态、SDK / 255 触觉缓存与反馈时效。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from dexmani_real.robot.model import (
     HAND_JOINT_SHAPE,
     HAND_TACTILE_FORCE_SHAPE,
     HAND_TACTILE_SUM_SHAPE,
+    XHAND_TACTILE_SCALE_DIVISOR,
 )
 
 HAND_STATE_DTYPE = np.dtype(
@@ -28,7 +29,7 @@ HAND_STATE_DTYPE = np.dtype(
 
 @dataclass
 class XHandState:
-    """关节可信；触觉为完整有效帧或 None；时间为主机 SDK 查询起点，非硬件采样时刻。"""
+    """关节可信；触觉为 SDK Native 完整有效帧或 None；时间为主机 SDK 查询起点，非硬件采样时刻。"""
 
     qpos: np.ndarray
     tactile_aggregate: np.ndarray | None
@@ -37,6 +38,8 @@ class XHandState:
 
 
 class XHandFeedback:
+    """只读反馈缓存；两种触觉仅在新有效帧入缓存时转换为 SDK / 255。"""
+
     def __init__(self):
         self.latest: np.ndarray | None = None
 
@@ -65,7 +68,10 @@ class XHandFeedback:
         for name in ("aggregate", "dense"):
             values = getattr(state, f"tactile_{name}")
             if values is not None:
-                frame[f"tactile_{name}"] = values
+                frame[f"tactile_{name}"] = (
+                    np.asarray(values, dtype=np.float32)
+                    / np.float32(XHAND_TACTILE_SCALE_DIVISOR)
+                )
                 frame[f"tactile_{name}_timestamp_ns"] = state.timestamp_ns
         frame["timestamp_ns"] = state.timestamp_ns
         frame.flags.writeable = False

@@ -68,7 +68,7 @@ class ObservationBuilder:
         # 大数组已由 ring 独立复制；交给录制和模型历史后，快照数组只读。
         for name in fields:
             if name == "finger_tactile_force":
-                # 独立复制，避免聚合触觉视图持有仅供录制的稠密载荷。
+                # 两种触觉已为 SDK / 255；独立复制避免聚合视图持有稠密载荷。
                 values[name] = row.hand["tactile_aggregate"][0].copy()
             elif name == "taxel_tactile_force":
                 values[name] = row.hand["tactile_dense"][0].copy()

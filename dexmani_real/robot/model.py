@@ -11,6 +11,7 @@ XARM7_JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 8))
 ARM_DOF = 7
 HAND_DOF = 12
 HAND_FINGER_COUNT = 5
+XHAND_TACTILE_SCALE_DIVISOR = 255.0
 XHAND_TACTILE_SENSOR_FINGER_IDS: tuple[int, ...] = (2, 5, 7, 9, 11)
 XHAND_FINGERTIP_LINK_NAMES: tuple[str, ...] = (
     "right_hand_thumb_rota_tip",

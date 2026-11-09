@@ -20,7 +20,7 @@ import numpy as np
 
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.config.real import load_config
-from dexmani_real.data.raw import RawReader
+from dexmani_real.data.raw import TACTILE_FINGER_ORDER, RawReader
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
@@ -149,15 +149,16 @@ class EpisodeVisualizer:
             )
             # 同一份定义供布局、标签和批量发送使用，数组仅保留引用。
             self.series = []
+            force_labels = tuple(f"{axis} (SDK / 255)" for axis in ("Fx", "Fy", "Fz"))
             for group, path, key, labels in (
                 ("State", "state/arm_qpos", "arm_qpos", None),
                 ("State", "state/hand_qpos", "hand_qpos", None),
                 ("Action", "action/action_arm_joint_target", "action_arm_joint_target", None),
                 ("Action", "action/action_hand_joint_target", "action_hand_joint_target", None),
                 ("Contact Force", "state/hand_contact_mag", "hand_contact_mag",
-                 [f"{finger} (SDK native)" for finger in ("thumb", "index", "middle", "ring", "pinky")]),
-                ("Contact Force", "state/hand_force_thumb", "hand_force_thumb", ("Fx", "Fy", "Fz")),
-                ("Contact Force", "state/hand_force_index", "hand_force_index", ("Fx", "Fy", "Fz")),
+                 [f"{finger} (SDK / 255)" for finger in TACTILE_FINGER_ORDER.split(",")]),
+                ("Contact Force", "state/hand_force_thumb", "hand_force_thumb", force_labels),
+                ("Contact Force", "state/hand_force_index", "hand_force_index", force_labels),
             ):
                 values = self.state[key]
                 if labels is None:

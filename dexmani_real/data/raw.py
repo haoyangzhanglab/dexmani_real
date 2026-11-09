@@ -17,7 +17,11 @@ from dexmani_real.geometry.camera import (
     parse_camera_matrix,
 )
 from dexmani_real.geometry.pose import validate_rigid_transform
-from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
+from dexmani_real.robot.model import (
+    XARM7_JOINT_NAMES,
+    XHAND_SDK_JOINT_NAMES,
+    XHAND_TACTILE_SCALE_DIVISOR,
+)
 from dexmani_real.utils.timing import sampling_clock_ns
 
 if TYPE_CHECKING:
@@ -35,7 +39,7 @@ TACTILE_AGE_WARNING_NS = 500_000_000
 ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
     "arm_qpos": ((7,), np.dtype(np.float64)),
     "hand_qpos": ((12,), np.dtype(np.float64)),
-    # 触觉保留 SDK 原始数值、最近有效值及其原来源时间。
+    # 两种触觉直接保留 Feedback 的 SDK / 255 最近有效值及其原来源时间。
     "hand_contact": ((5, 3), np.dtype(np.float32)),
     "hand_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
     # 记录最终提交的绝对目标，包括失败的提交尝试。
@@ -159,13 +163,14 @@ def decode_camera_metadata(meta) -> CameraSnapshot:
 
 
 def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata):
-    """记录实际相机参数、触觉指序及复位结果。"""
+    """记录实际相机参数、触觉指序、固定尺度及复位结果。"""
     metadata = camera_metadata(camera_snapshot)
     metadata.update(tactile_reset_metadata)
     if tactile_reset_metadata:
         # HDF5 属性不支持 dict，设备结果只在录制边界编码。
         metadata["hand_tactile_reset_result"] = json.dumps(metadata["hand_tactile_reset_result"])
     metadata["hand_tactile_finger_order"] = TACTILE_FINGER_ORDER
+    metadata["hand_tactile_scale_divisor"] = XHAND_TACTILE_SCALE_DIVISOR
     return metadata
 
 
@@ -233,6 +238,12 @@ class RawWriter:
     def open(self, metadata):
         import h5py
 
+        divisor = metadata.get("hand_tactile_scale_divisor")
+        if divisor != XHAND_TACTILE_SCALE_DIVISOR:
+            raise ValueError(
+                f"Raw hand_tactile_scale_divisor: expected {XHAND_TACTILE_SCALE_DIVISOR}, "
+                f"got {divisor!r}"
+            )
         self.data_file = data = h5py.File(self.path / "data.h5", "w")
         self.meta = data.create_group("meta")
         self.meta.attrs.update(metadata)
@@ -483,8 +494,14 @@ class RawReader:
             raise ValueError(f"Raw {name}: incompatible joint order")
 
     def validate_tactile_metadata(self) -> None:
-        if self.meta["hand_tactile_finger_order"] != TACTILE_FINGER_ORDER:
+        if self.meta.get("hand_tactile_finger_order") != TACTILE_FINGER_ORDER:
             raise ValueError("Raw hand_tactile_finger_order: incompatible tactile semantics")
+        divisor = self.meta.get("hand_tactile_scale_divisor")
+        if divisor != XHAND_TACTILE_SCALE_DIVISOR:
+            raise ValueError(
+                f"Raw hand_tactile_scale_divisor: expected {XHAND_TACTILE_SCALE_DIVISOR}, "
+                f"got {divisor!r}"
+            )
 
     @property
     def timestamps_s(self):
