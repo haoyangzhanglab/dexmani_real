@@ -15,7 +15,7 @@
 3. 在 `data.h5` 使用 **HDF5 内部 `/hoi` 分组**存储派生字段（这是文件内部 Group，**不是文件系统新文件夹**）。对外统一提供可选字段别名 `object_pointcloud`；不能破坏旧 Raw 的字段枚举与读取逻辑。
 4. 策略输入固定为 **`object_pointcloud: float32[1024,3]`，单位米、xArm base frame**。各物体在同一任务内按固定顺序拼接；点索引、模板版本在训练与推理间必须完全一致。
 5. 不改变遥操作时的传感器采集内容、机器人命令或安全约束；HOI 推理必须在独立 Worker 中运行，不能阻塞控制线程。
-6. 旧 Episode 没有 `/hoi` 时，`visualize_episode.py` 完全保持现有行为；仅显式导出 `object_pointcloud` 才要求 HOI 数据。存在不完整/不合法 `/hoi` 时不得当成“旧 Raw”静默跳过。
+6. 旧 Episode 没有 `/hoi` 时，`visualize_episode.py` 完全保持现有行为；仅显式导出 `object_pointcloud` 才要求 HOI 数据。存在不完整/不合法 `/hoi` 时不得静默跳过；RawReader 统一要求其 `task_name` 与 Raw `/meta` 的 `task_label` 属性一致，缺少标签时报错。
 7. 保留现有 `Grounding DINO + SAM2.1 + Hunyuan3D-2.1 + FoundationPose` 实现为默认基线。**不把 FoundationPose++、TensorRT、新的网络结构、SDF、非刚体跟踪引入首版必需依赖。**
 8. 优先遵循根目录 `AGENTS.md`：少抽象、无额外框架、少新文件、错误透明、仅针对真实风险增加校验；修改前检查已有未提交改动。
 
@@ -90,7 +90,7 @@ P_task^B(t) = concatenate(P_1^B(t), ..., P_M^B(t))  # (1024,3)
 
 ### 1.4 同一模板保证
 
-一个 `template_sha256` 覆盖任务对象顺序、冻结模板文件和实际跟踪 Mesh；尺度已应用到米制几何中。Raw `/hoi`、Zarr 与 Checkpoint 共用 `task_name`、`object_names`、`template_sha256`，不再建立逐文件哈希或额外版本清单。启动时校验任务和模板，再把已加载模板传给 Worker；失配、缺 Mesh、非法尺度均在运动开始前报错。不可在线自动重新重建替换资产。
+一个 `template_sha256` 覆盖任务对象顺序、冻结模板文件和实际跟踪 Mesh；尺度已应用到米制几何中。Raw `/hoi`、Zarr 与 Checkpoint 共用 `task_name`、`object_names`、`template_sha256`，不再建立逐文件哈希或额外版本清单。模板加载时要求 Manifest 的 `task_name` 等于任务目录名。启动时校验任务和模板，再把已加载模板传给 Worker；失配、缺 Mesh、非法尺度均在运动开始前报错。不可在线自动重新重建替换资产。
 
 ## 2. 五阶段具体实施
 
@@ -186,7 +186,7 @@ python scripts/export_zarr.py episodes/pnp_apple_banana \
 **入口：** 原地扩展 `scripts/run_policy.py`、`dexmani_real/deployment/{run,session,observation,preflight}.py`、`runtime/observation.py` 与 `ipc/sensors.py`；新增一个 `perception/hoi_worker.py` 是合理的独立职责。
 
 - [ ] **只有当 Checkpoint 要求 `object_pointcloud` 且显式传入 `--enable_hoi_pcd` 时启动**。Checkpoint 要求但没开开关，或开关已开但模型不使用，均在设备运动前明确报错。
-- [ ] 配套 `dexmani_policy` 的 `training/common/data.py`、`deployment/metadata.py` 直接传递三个 `hoi_pcd` 字段，复用现有 Checkpoint 机制。部署前校验任务与模板，模板数据只加载一次；缺失直接拒绝。
+- [ ] 配套 `dexmani_policy` 的训练入口要求 `hoi_pcd` 的任务名非空且匹配训练任务、对象名称列表非空且无重复、Hash 为 64 位十六进制字符串、点云为 `float32[T,1024,3]`；出口只传递三个 Manifest 字段并将 Hash 统一为小写，复用现有 Checkpoint 机制。部署前校验任务与模板，模板数据只加载一次；缺失直接拒绝。
 - [ ] 复用**同一现有 RealSense Camera Ring**。HOI 需求必须将 RGB+对齐深度、内参、米制深度尺度、外参加入相机启动依赖，即使模型不使用普通 `point_cloud`。
 - [ ] 一个 HOI Worker 处理所有物体，加载 Mesh、任务模板和跟踪模型一次。只处理新的相机序列，优先最新帧，不把旧相机帧排队形成假新鲜点云。
 - [ ] 每个 Episode 按 B 后重置 SAM2 跟踪状态和 FoundationPose 位姿（复用模型权重），从该轮新的 RGB-D 帧初始化全部必需对象，验证后**再允许动作执行**。HOI Warmup 在 `Rollout.prepare()` 获得本轮有效观测后执行；非 HOI 路径沿用启动时 Warmup。结束时发送 `episode_id=0`，Worker 暂停相机读取和跟踪但保留模型；下一轮正整数 ID 重新初始化。
@@ -236,7 +236,7 @@ python scripts/run_policy.py <checkpoint> --enable_hoi_pcd
 ### P2 — 真机启用与安全
 
 - [ ] 不连接机器人时通过 Mock/Fake Camera Ring 验证全部 HOI 观测路径。
-- [ ] 使用旧/新 Checkpoint 分别测试 `--enable_hoi_pcd` 的启用/拒绝条件。
+- [ ] 使用合法、缺少 Manifest 及模板失配的 Checkpoint 测试 `--enable_hoi_pcd` 的启用/拒绝条件。
 - [ ] 验证每轮 Episode 重置、从按 B 后新帧初始化、失效时动作停止、Worker 意外退出和时间戳过期。
 - [ ] 只有在得到真实硬件测试授权后运行真机；记录 GPU 显存峰值、模型加载时间、跟踪 P50/P95 延迟、端到端 Pose Age，**不得把上游 Benchmark 当作本机性能**。
 

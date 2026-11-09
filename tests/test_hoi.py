@@ -121,6 +121,15 @@ def test_template_identity_covers_used_geometry(task, changed):
         load_task_template(task)
 
 
+def test_template_rejects_task_name_mismatch(task):
+    path = task / "hoi/manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["task_name"] = "other_task"
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="task_name.*目录名"):
+        load_task_template(task)
+
+
 def make_raw(path):
     path.mkdir()
     with h5py.File(path / "data.h5", "w") as f:
@@ -129,6 +138,36 @@ def make_raw(path):
         rows["observation_ns"] = rows["control_ns"] + 1000
         f.create_dataset("timing/rows", data=rows)
         f.create_group("meta").attrs["control_hz"] = 10
+        f["meta"].attrs["task_label"] = "task"
+
+
+@pytest.mark.parametrize("with_hoi", [False, True])
+@pytest.mark.parametrize("task_label", ["task", "other_task", None])
+def test_raw_task_identity(task, tmp_path, with_hoi, task_label):
+    episode = tmp_path / "episode_1"
+    make_raw(episode)
+    if with_hoi:
+        template, manifest = load_task_template(task)
+        write_hoi(
+            episode / "data.h5", template, manifest,
+            np.tile(np.eye(4, dtype=np.float32), (2, 2, 1, 1)),
+            np.ones((2, 2), bool), np.ones((2, 2), np.float32), np.eye(4),
+        )
+    with h5py.File(episode / "data.h5", "r+") as data:
+        del data["meta"].attrs["task_label"]
+        if task_label is not None:
+            data["meta"].attrs["task_label"] = task_label
+    if with_hoi and task_label != "task":
+        with pytest.raises(ValueError, match="task_label"):
+            RawReader(episode)
+        with pytest.raises(ValueError, match="task_label"):
+            annotation.annotate_episodes([episode], task)
+        with pytest.raises(ValueError, match="task_label"):
+            export_zarr(episode, tmp_path / "bad.zarr", processing=ExportConfig(), fields=["object_pointcloud"])
+        assert not (tmp_path / "bad.zarr").exists()
+    else:
+        with RawReader(episode) as reader:
+            assert (reader.hoi_metadata is not None) == with_hoi
 
 
 def test_raw_export(task, tmp_path):
@@ -936,78 +975,134 @@ def test_sam_history_keeps_conditioning_and_recent_frames():
     assert state["consolidated_frame_inds"]["non_cond_frame_outputs"] == set(range(985, 1000))
 
 
-def test_policy_metadata(task):
-    from types import SimpleNamespace
-    from dexmani_policy.deployment.metadata import policy_info
-
-    _, manifest = load_task_template(task)
-    cfg = {
-        "task_name": "task",
-        "action_key": "action",
-        "deployment_metadata": {"hoi_pcd": manifest},
-    }
-    agent = SimpleNamespace(
-        normalization_dims={"object_pointcloud": 3, "action": 19},
-        n_obs_steps=3,
-        n_action_steps=8,
-        future_steps=14,
-        control_action_dim=19,
-        supports_rtc=False,
-    )
-    info = policy_info(Path("/tmp/test.pt"), cfg, agent, weights="raw", inference_steps=10)
-    assert info.hoi_pcd == manifest
-    assert info.to_dict()["hoi_pcd"] == manifest
-
-
-@pytest.mark.parametrize("defect", [
-    "none", "missing", "task", "points", "channels", "rank", "dtype", "non_hoi", "non_hoi_metadata",
-])
-def test_training_carries_template_metadata(task, tmp_path, defect):
+@pytest.fixture
+def training_data(task, tmp_path):
     import zarr
-    from hydra.errors import InstantiationException
     from omegaconf import OmegaConf
-    from dexmani_policy.training.common.data import build_dataset
 
     _, manifest = load_task_template(task)
-    needs_hoi = defect not in ("non_hoi", "non_hoi_metadata")
     path = tmp_path / "training.zarr"
     root = zarr.open_group(str(path), mode="w")
     data = root.create_group("data")
-    shape = {"points": (8, 512, 3), "channels": (8, 1024, 6), "rank": (8, 3)}.get(defect, (8, 1024, 3))
-    dtype = np.float64 if defect == "dtype" else np.float32
-    data.create_dataset("object_pointcloud", data=np.zeros(shape, dtype))
-    data.create_dataset("joint_state", data=np.zeros((8, 19), np.float32))
-    data.create_dataset("action", data=np.zeros((8, 19), np.float32))
+    for name, shape in (("object_pointcloud", (8, 1024, 3)), ("joint_state", (8, 19)), ("action", (8, 19))):
+        data.create_dataset(name, data=np.zeros(shape, np.float32))
     root.create_group("meta").create_dataset("episode_ends", data=np.array([8], np.int64))
-    if defect not in ("missing", "non_hoi"):
-        root.attrs["hoi_pcd"] = manifest
-    cfg = OmegaConf.create(
-        {
-            "task_name": "wrong" if defect in ("task", "non_hoi_metadata") else "task",
-            "agent": {"action_dim": 19},
-            "dataset": {
-                "_target_": "dexmani_policy.datasets.demonstration.DemonstrationDataset",
-                "zarr_path": str(path),
-                "sensor_modalities": ["object_pointcloud" if needs_hoi else "joint_state"],
-                "obs_horizon": 3,
-                "horizon": 4,
-                "pc_dim": 3,
-            },
-        }
-    )
-    if needs_hoi and defect != "none":
-        error = InstantiationException if defect == "rank" else ValueError
-        message = {"missing": "hoi_pcd", "task": "task", "rank": "shape"}.get(defect, "float32")
-        with pytest.raises(error, match=message):
-            build_dataset(cfg)
-        return
+    root.attrs["hoi_pcd"] = manifest
+    cfg = OmegaConf.create({
+        "task_name": "task", "action_key": "action", "agent": {"action_dim": 19},
+        "dataset": {
+            "_target_": "dexmani_policy.datasets.demonstration.DemonstrationDataset",
+            "zarr_path": str(path), "sensor_modalities": ["object_pointcloud"],
+            "obs_horizon": 3, "horizon": 4, "pc_dim": 3,
+        },
+    })
+    return cfg, root, manifest
+
+
+@pytest.mark.parametrize("variant", ["canonical", "uppercase_hash", "extra_metadata"])
+def test_training_metadata_reaches_deployment(task, training_data, tmp_path, monkeypatch, variant):
+    import shutil
+    from types import SimpleNamespace
+    from dexmani_policy.deployment.metadata import policy_info
+    from dexmani_policy.training.common.config import assemble_effective_config
+    from dexmani_policy.training.common.data import build_dataset
+    import dexmani_real.deployment.preflight as preflight
+
+    cfg, root, manifest = training_data
+    metadata = dict(manifest)
+    if variant == "uppercase_hash":
+        metadata["template_sha256"] = metadata["template_sha256"].upper()
+    elif variant == "extra_metadata":
+        metadata["note"] = "dataset annotation"
+    root.attrs["hoi_pcd"] = metadata
     dataset, description = build_dataset(cfg)
-    if not needs_hoi:
-        assert "hoi_pcd" not in description["deployment_metadata"]
-        assert dataset[0]["obs"]["joint_state"].shape == (3, 19)
-        return
     assert description["deployment_metadata"]["hoi_pcd"] == manifest
+    assert root.attrs["hoi_pcd"] == metadata
     assert dataset[0]["obs"]["object_pointcloud"].shape == (3, 1024, 3)
+    agent = SimpleNamespace(
+        normalization_dims=description["field_dims"], n_obs_steps=3, n_action_steps=8,
+        future_steps=14, control_action_dim=19, supports_rtc=False, effective_config={},
+    )
+    cfg = assemble_effective_config(cfg, description, agent)
+    info = policy_info(tmp_path / "policy.pt", cfg, agent, weights="raw", inference_steps=10)
+    assert info.to_dict()["hoi_pcd"] == manifest
+    checkout = tmp_path / "checkout"
+    target = checkout / "assets/pointcloud_template/object/task"
+    shutil.copytree(task, target)
+    monkeypatch.setattr(preflight, "__file__", str(checkout / "dexmani_real/deployment/preflight.py"))
+    loaded_path, template = preflight.validate_hoi_deployment(info, True)
+    assert loaded_path == target
+    assert template["points_local"].shape == (1024, 3)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("hoi_pcd", ...), ("hoi_pcd", None),
+    ("task_name", ...), ("task_name", "wrong"), ("task_name", "  "), ("task_name", 123),
+    ("object_names", ...), ("object_names", []), ("object_names", ["apple", "apple"]),
+    ("object_names", "apple"), ("object_names", [" "]), ("object_names", [["apple"]]),
+    ("template_sha256", ...), ("template_sha256", "a" * 63),
+    ("template_sha256", "g" * 64), ("template_sha256", 123),
+])
+def test_training_rejects_invalid_manifest(training_data, field, value):
+    from dexmani_policy.training.common.data import build_dataset
+
+    cfg, root, manifest = training_data
+    attrs = root.attrs if field == "hoi_pcd" else manifest
+    if value is ...:
+        del attrs[field]
+    else:
+        attrs[field] = value
+    if field != "hoi_pcd":
+        root.attrs["hoi_pcd"] = attrs
+    with pytest.raises(ValueError, match=field):
+        build_dataset(cfg)
+
+
+@pytest.mark.parametrize("shape,dtype,error", [
+    ((8, 512, 3), np.float32, "float32"), ((8, 1024, 6), np.float32, "float32"),
+    ((8, 3), np.float32, "shape"), ((8, 1024, 3), np.float64, "float32"),
+])
+def test_training_rejects_invalid_object_points(training_data, shape, dtype, error):
+    from hydra.errors import InstantiationException
+    from dexmani_policy.training.common.data import build_dataset
+
+    cfg, root, _ = training_data
+    del root["data/object_pointcloud"]
+    root["data"].create_dataset("object_pointcloud", data=np.zeros(shape, dtype))
+    with pytest.raises(InstantiationException if len(shape) == 2 else ValueError, match=error):
+        build_dataset(cfg)
+
+
+@pytest.mark.parametrize("metadata", [..., None, {"task_name": "wrong"}])
+def test_non_hoi_training_ignores_manifest(training_data, metadata):
+    from dexmani_policy.training.common.data import build_dataset
+
+    cfg, root, _ = training_data
+    cfg.dataset.sensor_modalities = ["joint_state"]
+    if metadata is ...:
+        del root.attrs["hoi_pcd"]
+    else:
+        root.attrs["hoi_pcd"] = metadata
+    dataset, description = build_dataset(cfg)
+    assert "hoi_pcd" not in description["deployment_metadata"]
+    assert dataset[0]["obs"]["joint_state"].shape == (3, 19)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("task_name", "other"), ("object_names", ["bowl", "apple"]), ("template_sha256", "0" * 64),
+])
+def test_resume_rejects_changed_manifest(training_data, field, value):
+    from types import SimpleNamespace
+    from dexmani_policy.training.common.data import build_dataset
+    from dexmani_policy.training.trainer import PolicyTrainer
+
+    cfg, _, manifest = training_data
+    dataset, description = build_dataset(cfg)
+    checkpoint = SimpleNamespace(effective_config={
+        "deployment_metadata": {"hoi_pcd": dict(manifest, **{field: value})},
+    })
+    with pytest.raises(ValueError, match="Resume data/model mismatch: HOI"):
+        PolicyTrainer(cfg, dataset, description, checkpoint=checkpoint)
 
 
 @pytest.mark.parametrize('failure', ['missing', 'ambiguous', 'invalid', 'program', 'cuda', 'ipc'])

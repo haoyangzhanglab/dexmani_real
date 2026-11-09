@@ -56,6 +56,8 @@ def load_task_template(task):
 
     task = Path(task)
     manifest = json.loads((task / "hoi/manifest.json").read_text())
+    if manifest["task_name"] != task.name:
+        raise ValueError(f"{task}: Manifest task_name 与任务目录名不匹配")
     names = manifest["object_names"]
     if [obj["name"] for obj in task_objects(task)] != names:
         raise ValueError("任务对象顺序已改变")

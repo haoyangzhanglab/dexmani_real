@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
-TACTILE_UNITS = "sdk_native_unknown_physical_scale"
 TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
 # 录制/导出的 Hold 诊断阈值，不是运行时必需触觉的 TTL。
 TACTILE_AGE_WARNING_NS = 500_000_000
@@ -36,7 +35,7 @@ TACTILE_AGE_WARNING_NS = 500_000_000
 ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
     "arm_qpos": ((7,), np.dtype(np.float64)),
     "hand_qpos": ((12,), np.dtype(np.float64)),
-    # 触觉保留 SDK 单位、最近有效值及其原来源时间。
+    # 触觉保留 SDK 原始数值、最近有效值及其原来源时间。
     "hand_contact": ((5, 3), np.dtype(np.float32)),
     "hand_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
     # 记录最终提交的绝对目标，包括失败的提交尝试。
@@ -160,16 +159,13 @@ def decode_camera_metadata(meta) -> CameraSnapshot:
 
 
 def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata):
-    """记录实际相机参数、触觉单位、指序及复位结果。"""
+    """记录实际相机参数、触觉指序及复位结果。"""
     metadata = camera_metadata(camera_snapshot)
     metadata.update(tactile_reset_metadata)
     if tactile_reset_metadata:
         # HDF5 属性不支持 dict，设备结果只在录制边界编码。
         metadata["hand_tactile_reset_result"] = json.dumps(metadata["hand_tactile_reset_result"])
-    metadata.update(
-        hand_tactile_units=TACTILE_UNITS,
-        hand_tactile_finger_order=TACTILE_FINGER_ORDER,
-    )
+    metadata["hand_tactile_finger_order"] = TACTILE_FINGER_ORDER
     return metadata
 
 
@@ -366,6 +362,10 @@ class RawReader:
             self.hoi_metadata = None
             if "hoi" in self.data_file:
                 self.hoi_metadata = validate_hoi(self.data_file["hoi"], self.num_frames)
+                if "meta" not in self.data_file or "task_label" not in self.meta:
+                    raise ValueError(f"Raw {self.path}: /hoi requires /meta task_label")
+                if self.hoi_metadata["task_name"] != self.meta["task_label"]:
+                    raise ValueError(f"Raw {self.path}: /hoi task_name differs from /meta task_label")
         except BaseException:
             try:
                 self.close()
@@ -438,12 +438,8 @@ class RawReader:
             raise ValueError(f"Raw {name}: incompatible joint order")
 
     def validate_tactile_metadata(self) -> None:
-        for name, expected in (
-            ("hand_tactile_units", TACTILE_UNITS),
-            ("hand_tactile_finger_order", TACTILE_FINGER_ORDER),
-        ):
-            if self.meta[name] != expected:
-                raise ValueError(f"Raw {name}: incompatible tactile semantics")
+        if self.meta["hand_tactile_finger_order"] != TACTILE_FINGER_ORDER:
+            raise ValueError("Raw hand_tactile_finger_order: incompatible tactile semantics")
 
     @property
     def timestamps_s(self):

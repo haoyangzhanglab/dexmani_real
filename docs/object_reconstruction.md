@@ -57,7 +57,7 @@ python scripts/run_policy.py CHECKPOINT --enable_hoi_pcd
 
 `task_objects()` 是构建、模板读取、离线标注和在线 Worker 共用的任务入口。缺少 `prompt` 时在内存中补为对象名，不改写 `task.json`；显式 Prompt 必须是非空字符串，不能仅含空白或标点。按检测器的 `strip().lower().rstrip(".")` 匹配规则拒绝重复 Prompt，并报告冲突对象；合法文本和对象顺序保持原样。每个 Prompt 必须匹配唯一候选，当前 HOI 不支持以相同 Prompt 区分多个实例；构建时的 `instance` 只选择参考图候选，不参与在线实例匹配。
 
-`template.npz` 只保存 `points_local` 和 `offsets`；点顺序由数组行固定。`manifest.json` 只保存 `task_name`、`object_names`、`template_sha256`，一个指纹覆盖模板文件、物体顺序和实际跟踪 Mesh，防止形状相同但点索引或几何不同的资产被训练与部署混用。尺度已应用到米制 Mesh 和点；固定的 1024 点、米制和 xArm base 是代码接口。
+`template.npz` 只保存 `points_local` 和 `offsets`；点顺序由数组行固定。`manifest.json` 只保存 `task_name`、`object_names`、`template_sha256`，一个指纹覆盖模板文件、物体顺序和实际跟踪 Mesh，防止形状相同但点索引或几何不同的资产被训练与部署混用。加载模板时要求 `task_name` 与任务目录名称一致。尺度已应用到米制 Mesh 和点；固定的 1024 点、米制和 xArm base 是代码接口。
 
 Raw `/hoi` 用原生 HDF5 属性保存上述三个字段和 `offsets`；Zarr 与 Checkpoint 直接沿用这三个字段作为 `hoi_pcd`，没有额外 recipe、来源证明或逐文件校验清单。启动时校验一次并把已加载模板交给 Worker。已有正式模板和标注拒绝覆盖。阶段 3 跨 Episode 复用模型，每段重置跟踪状态；中断结果只留在 HDF5 `_hoi_staging` 中，下次重算后发布。HDF5 group move 不提供断电级事务保证。
 
@@ -65,9 +65,9 @@ Raw `/hoi` 用原生 HDF5 属性保存上述三个字段和 `offsets`；Zarr 与
 
 同一汇总输出 `timing/rows` 中 `|camera_ns-arm_ns|`、`|camera_ns-hand_ns|` 的 P50／P95／Max（ms）和有效样本数；只有时间对中的两个来源时间戳均为正值才参与统计，无有效样本时显示不可用。Raw 手部几何的时间差同样要求 Camera、Arm、Hand 三个来源时间戳均为正值。这些只是主机记录时间戳的差异，不是硬件真实同步误差。
 
-无效帧为显式 false 掩码和零点占位，Viewer 清除物体点，导出拒绝整个 Episode 并提示 `--exclude`。Raw 打开时只检查完成状态和数组结构；点云数值在写入、逐帧显示和分块导出时检查，不再全量扫描未使用的数据。原 Hand Point Cloud 标签按固定点分段着色；`--no-point-cloud` 只关闭普通场景点云。Raw 无 `/hoi` 保持原有读取路径；不完整 `/hoi` 报错。
+无效帧为显式 false 掩码和零点占位，Viewer 清除物体点，导出拒绝整个 Episode 并提示 `--exclude`。RawReader 在存在 `/hoi` 时检查完成状态、数组结构，并要求 `/meta` 的 `task_label` 属性存在且等于 HOI `task_name`；该身份检查由所有读取方共用。点云数值在写入、逐帧显示和分块导出时检查，不再全量扫描未使用的数据。原 Hand Point Cloud 标签按固定点分段着色；`--no-point-cloud` 只关闭普通场景点云。Raw 无 `/hoi` 保持原有读取路径；不完整 `/hoi` 报错。
 
-Policy 训练需把 `zarr_path` 显式指向上述导出路径（其默认路径是 `robot_data/`）。训练使用 `object_pointcloud` 时，Zarr 必须包含 `hoi_pcd`，其中 `task_name` 与训练任务一致，原始点云存储必须为 `float32[T,1024,3]`；校验后将元数据传入 Checkpoint，恢复训练拒绝不同模板。普通非 HOI Dataset 不要求或传递该属性。HOI Checkpoint 缺少模板信息时拒绝真机部署。在线每轮 B 后重新初始化，真实观测 warmup 完成且新鲜有效才允许动作。HOI 缺失、过期或 Worker 故障终止当前动作计划。只有模型需要 RGB/深度时，HOI Ring 才携带相应的同源图像；安全检查不复制图像。Raw 独立读取最新 Camera Ring，其图像帧可以不同于模型 HOI 来源帧。首版不支持同时使用普通 `point_cloud`。普通 Camera / Point Cloud TTL 沿用现有配置；HOI 使用 `execution.hoi_max_age_s`，默认 250 ms，仅在模型需要 `object_pointcloud` 时校验该配置；时间戳仍继承来源相机帧，不能把发布时刻当作采集时刻。
+Policy 训练需把 `zarr_path` 显式指向上述导出路径（其默认路径是 `robot_data/`）。训练使用 `object_pointcloud` 时，Zarr 必须包含 `hoi_pcd`，其中 `task_name` 必须是非空字符串且与训练任务一致，`object_names` 必须是非空、无重复的非空字符串列表，`template_sha256` 必须是 64 位十六进制字符串；原始点云存储必须为 `float32[T,1024,3]`。训练出口只传递这三个字段，将 Hash 统一为资产生成器使用的小写形式，不修改源 Zarr。Checkpoint 沿用该 Manifest，恢复训练和部署均拒绝任务、对象顺序或模板失配。普通非 HOI Dataset 不要求或传递该属性。HOI Checkpoint 缺少模板信息时拒绝真机部署。在线每轮 B 后重新初始化，真实观测 warmup 完成且新鲜有效才允许动作。HOI 缺失、过期或 Worker 故障终止当前动作计划。只有模型需要 RGB/深度时，HOI Ring 才携带相应的同源图像；安全检查不复制图像。Raw 独立读取最新 Camera Ring，其图像帧可以不同于模型 HOI 来源帧。首版不支持同时使用普通 `point_cloud`。普通 Camera / Point Cloud TTL 沿用现有配置；HOI 使用 `execution.hoi_max_age_s`，默认 250 ms，仅在模型需要 `object_pointcloud` 时校验该配置；时间戳仍继承来源相机帧，不能把发布时刻当作采集时刻。
 
 HOI Episode 结束时，`Rollout.stop()` 通过原请求通道发布一次 `episode_id=0`（inactive）。Worker 看到该请求后只短暂等待，不读取相机或继续跟踪，模型保持加载；已开始的在途计算可以完成，但结果仍受 Episode ID 检查约束。下一轮 B 的新正整数 ID 触发场景 reset 和初始化，旧 Ring 快照不能进入新 Episode 观测。
 
@@ -78,8 +78,11 @@ HOI Episode 结束时，`Rollout.stop()` 通过原请求通道发布一次 `epis
 ### 当前验证范围
 
 - CPU/Mock 测试覆盖冻结模板确定性、偏移几何变换、Raw staging 与无效帧、显式导出、Viewer Clear、启用条件、来源 TTL、三种调度模式清空计划和 Worker 几何一致性；另覆盖无模型依赖的资产复用、批量标注共享模型、初始化期间切换 Episode、Worker 故障停止及按需传输同源图像。当前回归另覆盖预期初始化失败后的跨轮重试、独立 HOI 年龄预算、Raw 最新帧写入及动作映射期间的失效检查。
-- CPU/Mock 回归还覆盖 inactive 期间 Worker 不读相机或跟踪、跨轮只打开一次 Tracker、在途结果隔离、历史中断后的预测输入、HOI 训练元数据与存储契约、非 HOI 策略不受 HOI TTL 或数据属性约束、离线逐物体诊断、非正来源时间和重复帧处理、Prompt 前置校验及默认值、非法 FoundationPose 输出与模型执行错误的分类。以下 GPU 记录均为此前实验，本轮正确性修复仅使用 CPU/Mock 验证。
+- CPU/Mock 回归还覆盖 inactive 期间 Worker 不读相机或跟踪、跨轮只打开一次 Tracker、在途结果隔离、历史中断后的预测输入、HOI 训练元数据与存储契约、非 HOI 策略不受 HOI TTL 或数据属性约束、离线逐物体诊断、非正来源时间和重复帧处理、Prompt 前置校验及默认值、非法 FoundationPose 输出与模型执行错误的分类。Manifest 回归覆盖 Raw 身份拒绝在标注和导出入口生效、训练元数据传递到部署，以及续训拒绝不同任务、对象顺序或模板。
 - RTX 4090：8 帧真实 Raw 副本完成三物体跟踪、内部 `/hoi` 写入、四字段 Zarr 导出、实际 CordViP Dataset 读取及重复标注跳过；另验证两轮 GPU 场景重置保留模型实例。完整 `episode_20261101_165909` 副本的 403 帧增强也已通过，三个物体均为 403/403 有效，离线总耗时约 79 秒（含模型加载）。
+- 2026-11-09，第二段 `episode_20261101_173701` 在临时副本中用正式后端重跑两次，均为 Apple 146/403、Banana 402/403、Bowl 403/403，有效率不代表真值位姿精度。Apple 第 143 行模型支持点为 26（门槛 30），144 行重注册恢复；147 行再次失效，148–150 行三次重注册仅支持 23、14、0 个点，151–402 行因预算耗尽跳过位姿估计。RGB 显示手部遮挡，重新可见后也不会再尝试恢复；Banana 第 369 行门控失败、370 行恢复。未降低质量阈值或增加重试次数。
+- 上述重跑时原始 Episode 没有 `/hoi`，正式任务目录缺少冻结 `hoi/`，因此仅在临时资产副本通过现有分配入口生成模板，无法核对历史模板 Hash。原始 HDF5 与视频 SHA256 前后相同，临时数据已清理。
+- L515 真实 RGB-D 独立采集 30 秒：RGB 30.024 Hz、深度 29.991 Hz，帧号无跳跃或回退。这不是 HOI Worker 与策略并发测试；缺少匹配的训练完成 Checkpoint，且物体场景未准备，五分钟并发、两轮初始化及硬件故障注入尚未执行。未执行或授权机器人运动。
 - 已验证既有资产复用及一个物体的真实 Hunyuan 新建资产 GPU 流程（1024 点和法向、重复运行缓存命中）。未执行完整任务数据质量评估、Rerun GUI 人工检查、策略与感知并发性能或真机运动测试。8 帧通过不代表遮挡场景精度或真机安全性能已证明。
 - GPU 运行期间上游 Warp 输出驱动 API 告警，但上述实验正常完成；不以此宣称其他 CUDA 扩展路径均可用。
 
@@ -101,7 +104,7 @@ HOI Episode 结束时，`Rollout.stop()` 通过原请求通道发布一次 `epis
 | 完整 VOS + TensorRT FP | 47.20/49.12 ms | 403 / 146 | 仅 Benchmark |
 | EdgeTAM + TensorRT FP | 32.96/34.62 ms | 403 / 143 | 仅 Benchmark |
 
-有效帧数只表示通过当前门控，不是 6D 真值精度；失效后跳过物体的低耗时不能作为加速收益。EfficientTAM-S 512 在第二段苹果出现 252 帧空 Mask，未采用。后续优先验证保留当前 SAM2 的 TensorRT FP 路线。
+有效帧数只表示通过当前门控，不是 6D 真值精度；失效后跳过物体的低耗时不能作为加速收益。EfficientTAM-S 512 在第二段苹果出现 252 帧空 Mask，未采用。后续先完成真实相机与已训练策略的并发验收；只有正式后端无法满足时效要求时，再对照评估 TensorRT FP。
 
 原速 Camera Ring 回放使用第一段原始时间间隔，包含自动初始化、正式 HOI Worker 和固定点云变换；403 帧约 25.2 秒，Raw 本身约 16 Hz。每约 5 ms 采样最新结果：
 
