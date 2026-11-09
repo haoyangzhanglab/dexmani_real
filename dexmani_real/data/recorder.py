@@ -9,6 +9,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty, Full, Queue
 
+from av.error import FFmpegError
+
 from dexmani_real.data.raw import TACTILE_AGE_WARNING_NS, RawWriter, validate_task_label
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.runtime.observation import Observation
@@ -21,7 +23,7 @@ RECORDER_STOP_TIMEOUT_S = 60.0
 
 
 class RecordingError(RuntimeError):
-    """录制 I/O 失败，由控制线程停止本段并退出会话。"""
+    """明确的录制 I/O 失败；不代表控制或设备故障。"""
 
 
 @dataclass(frozen=True)
@@ -29,12 +31,11 @@ class _FinishRequest:
     save: bool
     reason: str
     details: tuple[dict, ...]
-    recording_truncated_reason: str | None
     deadline: float
 
 
 class EpisodeRecorder:
-    """每个 episode 独占一个 writer，调用方须先停止运动再登记收尾。"""
+    """每个 episode 独占一个 writer；录制失败可在控制继续时收尾。"""
 
     def __init__(self, data_dir, *, control_hz):
         sampling_clock_ns(control_hz)
@@ -48,6 +49,7 @@ class EpisodeRecorder:
         self.recording_truncated_reason = None
         self.finish_request: _FinishRequest | None = None
         self.warned_tactile_channels = set()
+        self.warned_gaps = set()
         self.staging_path: Path | None = None
         self.published_path: Path | None = None
         self.writer = None
@@ -61,17 +63,43 @@ class EpisodeRecorder:
         return self.thread is not None and self.thread.is_alive()
 
     def store_error(self, error, *, stage="recording_cleanup"):
+        self.is_recording = False
+        if isinstance(error, (OSError, FFmpegError)):
+            failure = RecordingError(f"Recording failed: {type(error).__name__}: {error}")
+            failure.__cause__ = error
+            error = failure
         if self.error is None:
             self.error = error
+            logger.error("录制失败；staging 保留：%s", self.staging_path,
+                         exc_info=(type(error), error, error.__traceback__))
         else:
             logger.error("%s also failed", stage, exc_info=(type(error), error, error.__traceback__))
+            # 程序错误或中断不能被更早的 I/O 错误降级。
+            if (isinstance(self.error, RecordingError) and not isinstance(error, RecordingError)
+                    or isinstance(self.error, Exception) and not isinstance(error, Exception)):
+                self.error = error
 
     def check_error(self):
         if self.error is not None:
-            if not isinstance(self.error, RecordingError):
-                failure = RecordingError(f"Recording failed: {type(self.error).__name__}: {self.error}")
-                raise failure from self.error
             raise self.error
+
+    def service(self):
+        """监督录制失败的清理；程序错误和无法回收的资源仍向外传播。"""
+        error = self.error
+        if error is None:
+            return
+        if not isinstance(error, RecordingError):
+            raise error
+        self.request_finish(save=False, reason="recording_failed")
+        self.poll_finish()
+
+    def mark_gap(self, reason):
+        if self.recording_truncated_reason is None:
+            self.recording_truncated_reason = reason
+        if reason not in self.warned_gaps:
+            logger.warning("录制存在缺失：%s；控制继续，后续有效行仍可接收。", reason)
+            self.warned_gaps.add(reason)
+        return reason
 
     def result(self):
         """仅报告最后可观察的结果，pending 不推断线程之后的结局。"""
@@ -90,6 +118,7 @@ class EpisodeRecorder:
             "path": str(published) if published is not None else None,
             "staging_path": str(staging) if staging is not None and published is None else None,
             "row_count": self.written_frames,
+            "error": str(self.error) if self.error is not None else None,
             "recording_truncated_reason": self.recording_truncated_reason,
         }
 
@@ -146,13 +175,12 @@ class EpisodeRecorder:
         self.is_recording = True
 
     def append(self, row, command=None, *, quality_issue=None) -> str | None:
-        """质量拒绝返回原因，调用方立即结束本段；I/O 错误继续抛出。"""
-        self.check_error()
+        """质量拒绝只丢弃当前整行；已知 I/O 失败停止录制，程序错误仍传播。"""
+        self.service()
         if not self.is_recording:
             return None
         if quality_issue is not None:
-            self.recording_truncated_reason = quality_issue
-            return quality_issue
+            return self.mark_gap(quality_issue)
         if row.hand is not None:
             for channel in ("aggregate", "dense"):
                 stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0])
@@ -166,8 +194,7 @@ class EpisodeRecorder:
         try:
             self.queue.put_nowait((snapshot, command))
         except Full:
-            self.recording_truncated_reason = "recording_queue_full"
-            return self.recording_truncated_reason
+            return self.mark_gap("recording_queue_full")
         return None
 
     def request_finish(self, *, save, reason, details=None) -> _FinishRequest:
@@ -176,21 +203,22 @@ class EpisodeRecorder:
         if self.finish_request is None:
             self.finish_request = _FinishRequest(
                 save, reason, tuple(dict(item) for item in (details or ())),
-                self.recording_truncated_reason, time.monotonic() + RECORDER_STOP_TIMEOUT_S,
+                time.monotonic() + RECORDER_STOP_TIMEOUT_S,
             )
         return self.finish_request
 
     def poll_finish(self) -> bool:
-        """False 仅表示仍在等待；关闭且处置完成才返回 True，失败照常抛出。"""
+        """返回资源收尾是否完成；已知 I/O 失败由 result 报告，绝不发布。"""
         request = self.finish_request
         if request is None:
             raise RuntimeError("recording finish has not been requested")
         if self.writer_pending:
-            self.check_error()
             if time.monotonic() < request.deadline:
                 return False
-            self.store_error(TimeoutError("recording writer did not exit before the deadline"))
-        # 线程退出后读取最终错误，包括 close 的失败。
+            raise TimeoutError("recording writer did not exit before the deadline")
+        # 线程退出后才判定最终结果；close 的程序错误不能被 I/O 失败掩盖。
+        if isinstance(self.error, RecordingError):
+            return True
         self.check_error()
         if self.staging_path is None:
             return True
@@ -200,7 +228,7 @@ class EpisodeRecorder:
                 publish(self.staging_path, destination)
                 self.published_path, self.staging_path = destination, None
                 if self.recording_truncated_reason is not None:
-                    logger.warning("录制已截断：%s（%d 行），%s。",
+                    logger.warning("部分录制已保存：%s（%d 行），%s。",
                                    destination, self.written_frames, self.recording_truncated_reason)
                 else:
                     logger.info("Raw 已保存：%s（%d 帧）。", destination, self.written_frames)
@@ -213,7 +241,8 @@ class EpisodeRecorder:
             self.store_error(exc)
             if not isinstance(exc, Exception):
                 raise
-            self.check_error()
+            if not isinstance(self.error, RecordingError):
+                self.check_error()
         return True
 
     def finish(self, *, save, reason, details=None):
@@ -255,10 +284,11 @@ class EpisodeRecorder:
                     writer.finish(
                         finish.reason,
                         finish.details,
-                        recording_truncated_reason=finish.recording_truncated_reason,
+                        recording_truncated_reason=self.recording_truncated_reason,
                     )
             except BaseException as exc:  # noqa: BLE001 — writer 线程的失败由控制线程读取并抛出。
                 self.store_error(exc)
+                self.ready.set()  # 启动失败无需等待可能仍在阻塞的 close。
             finally:
                 writer.close()
         except BaseException as exc:  # noqa: BLE001 — 关闭失败也必须回传，不能发布不完整录制。
@@ -266,8 +296,6 @@ class EpisodeRecorder:
         finally:
             self.ready.set()
             self.drain_frames()
-            if self.error is not None:
-                logger.error("Recording failed; staging retained: %s", staging)
 
     def drain_frames(self):
         while True:

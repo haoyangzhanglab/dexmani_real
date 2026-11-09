@@ -19,35 +19,6 @@ from dexmani_real.runtime.observation import (
 )
 
 
-@pytest.fixture
-def clock(monkeypatch):
-    value = SimpleNamespace(now_ns=1_000_000_000)
-    monkeypatch.setattr("time.monotonic_ns", lambda: value.now_ns)
-    return value
-
-
-@pytest.fixture
-def runtime():
-    config = RealConfig()
-    return replace(config, execution=replace(
-        config.execution, control_dt_s=0.05, action_steps=2, prefetch_steps=1,
-    ))
-
-
-@pytest.fixture
-def camera_snapshot():
-    from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
-
-    return CameraSnapshot(
-        "test-camera",
-        CameraIntrinsics(
-            width=4, height=4, fx=10, fy=10, ppx=2, ppy=2,
-            distortion_model="none", distortion_coeffs=(0, 0, 0, 0, 0),
-        ),
-        0.001, np.eye(4),
-    )
-
-
 def hand_sample(stamp):
     return XHandState(
         qpos=np.deg2rad(RealConfig().hand.home_qpos_deg),
@@ -330,6 +301,7 @@ def test_arm_expiry_blocks_servo(clock, runtime, expiry, stage):
         driver.servo.assert_not_called()
         assert trajectory.step.call_count == int(stage == "during")
         assert state.stop_signal.is_set()
+        assert io.stop_reason.value.decode() == ("arm_feedback_expired" if expiry == "feedback" else "command_expired")
         assert controller.active is controller.reference is None
         controller.tick()
         driver.servo.assert_not_called()
@@ -351,7 +323,7 @@ def test_arm_feedback_uses_query_start(clock, runtime):
 
 @pytest.mark.parametrize("after_arm_publish", [False, True])
 def test_hand_expiry_blocks_new_positions(clock, runtime, after_arm_publish):
-    from dexmani_real.robot.commands import RobotCommand, RobotError
+    from dexmani_real.robot.commands import FeedbackUnavailable, RobotCommand
     from dexmani_real.robot.system import Robot
     from dexmani_real.runtime.state import SessionState
 
@@ -368,7 +340,7 @@ def test_hand_expiry_blocks_new_positions(clock, runtime, after_arm_publish):
         robot.arm.submit.side_effect = expire
     else:
         expire()
-    with pytest.raises(RobotError, match="hand feedback"):
+    with pytest.raises(FeedbackUnavailable, match="hand feedback"):
         robot.send_action(
             RobotCommand(np.asarray(runtime.arm.home_qpos), hand_sample(clock.now_ns).qpos),
             expires_ns=clock.now_ns + 1_000_000_000,
@@ -589,6 +561,7 @@ def make_teleop(runtime, clock):
         controller=controller, recording_dir=None, max_duration_s=None,
         keyboard=keyboard, audio=Mock(),
     )
+    robot.stop.side_effect = state.stop_signal.set
     loop.cancel_epoch = state.cancel_epoch
     loop.try_begin()
     return loop
@@ -610,10 +583,10 @@ def test_vr_repeated_sample_renews_targets_until_source_expires(clock, runtime):
     loop.run_control_tick()
     assert loop.robot.send_action.call_count == loop.controller.compute_target.call_count == 8
     assert loop.runtime_state.stop_signal.is_set()
-    assert loop.termination_details[-1]["reason"] == "control_sources: vr_stale"
-    loop.end_episode()
+    assert loop.pending_termination_reason is None
+    assert loop.phase is TeleopPhase.PAUSED
     loop.robot.stop.assert_called_once()
-    assert loop.phase is TeleopPhase.IDLE
+    assert loop.last_command is None
 
 
 @pytest.mark.parametrize("expiry", ["source", "target"])
@@ -639,8 +612,10 @@ def test_vr_expiry_during_mapping_prevents_submission(clock, runtime, expiry):
     before = loop.robot.send_action.call_count
     loop.run_control_tick()
     assert loop.robot.send_action.call_count == before
-    reason = "control_sources: vr_stale" if expiry == "source" else "target_expired"
-    assert loop.termination_details[-1]["reason"] == reason
+    from dexmani_real.teleop.loop import TeleopPhase
+    assert loop.pending_termination_reason is None
+    assert loop.phase is TeleopPhase.PAUSED
+    assert loop.last_command is None
 
 
 def test_vr_rejected_targets_do_not_extend_lease(clock, runtime):
@@ -658,7 +633,10 @@ def test_vr_rejected_targets_do_not_extend_lease(clock, runtime):
     assert loop.robot.send_action.call_count == 4
     clock.now_ns = deadline
     loop.run_control_tick()
-    assert loop.termination_details[-1]["reason"] == "target_expired"
+    from dexmani_real.teleop.loop import TeleopPhase
+    assert loop.pending_termination_reason is None
+    assert loop.phase is TeleopPhase.PAUSED
+    assert loop.target_deadline_ns is None
     assert loop.robot.send_action.call_count == 4
 
 
@@ -880,9 +858,9 @@ def test_invalid_hoi_age_config(runtime, age, hoi):
     (True, True, False), (False, True, True), (False, True, False),
 ])
 def test_model_and_raw_camera_sources(clock, runtime, monkeypatch, tmp_path, camera_snapshot, hoi, images, record):
-    from dexmani_real.ipc.sensors import SensorChannels
-    from dexmani_real.data.raw import RawWriter, RawReader, snapshot_recording_metadata
+    from dexmani_real.data.raw import RawReader, RawWriter, snapshot_recording_metadata
     from dexmani_real.data.recorder import EpisodeRecorder
+    from dexmani_real.ipc.sensors import SensorChannels
     fields = ('rgb', 'depth') if images else ()
     needs = ObservationNeeds(hoi=hoi, camera_fields=fields)
     rollout = make_rollout(runtime, needs, clock, record_raw=record)
@@ -996,11 +974,9 @@ def test_rollout_records_independent_raw_snapshot(clock, runtime, monkeypatch, m
     rollout.step()
     rollout.recorder.append.assert_called_once()
     assert rollout.recorder.append.call_args.args[0] is raw
-    if raw_stale:
-        assert rollout.finished
-        assert rollout.result.termination_details == 'camera_source_stale'
-        rollout.robot.send_action.assert_not_called()
-    else:
-        assert not rollout.finished
-        rollout.robot.send_action.assert_called_once()
-        assert rollout.recorder.append.call_args.args[1] is rollout.robot.send_action.call_args.args[0]
+    assert not rollout.finished
+    rollout.robot.send_action.assert_called_once()
+    assert rollout.recorder.append.call_args.args[1] is rollout.robot.send_action.call_args.args[0]
+    assert rollout.recorder.append.call_args.kwargs["quality_issue"] == (
+        "camera_source_stale" if raw_stale else None
+    )

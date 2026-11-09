@@ -60,6 +60,15 @@ class ArmProcess:
     def fault(self):
         return self.io.fault.value.decode(errors="replace") or None
 
+    @property
+    def soft_stop_reason(self):
+        self.check_error()
+        if self.io.stop.is_set():
+            reason = self.io.stop_reason.value.decode()
+            if reason in {"command_expired", "arm_feedback_expired"}:
+                return reason
+        return None
+
     def connect(self, *, check_services=None):
         from dexmani_real.robot.xarm7.worker import run_arm
 

@@ -134,6 +134,7 @@ class ArmController:
             self.io.stopped.set()  # 处理结束；停止失败仍保存在 fault。
 
     def operation(self, message: PrepareRequest | HomeRequest):
+        self.io.stop_reason.value = b""
         self.io.stopped.clear()
         kind = "home" if isinstance(message, HomeRequest) else "prepare"
         error = None
@@ -198,6 +199,8 @@ class ArmController:
         if issue:
             logger.warning("arm stopped: %s", issue)
             self.active = self.reference = None
+            if issue in {"command_expired", "arm_feedback_expired"}:
+                self.io.stop_reason.value = issue.encode()
             self.io.stop.set()
             return None
         if self.reference is None:
@@ -218,6 +221,8 @@ class ArmController:
         if issue:
             logger.warning("arm stopped: %s", issue)
             self.active = self.reference = None
+            if issue in {"command_expired", "arm_feedback_expired"}:
+                self.io.stop_reason.value = issue.encode()
             self.io.stop.set()
             return None
         started = time.monotonic_ns()

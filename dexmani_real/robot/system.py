@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 
 from dexmani_real.robot.commands import (
+    CommandExpired,
+    FeedbackUnavailable,
     OperationCancelled,
     RobotError,
     validate_arm_target,
@@ -165,7 +167,7 @@ class Robot:
         frame = self.hand_feedback.snapshot()
         stamp = int(frame["timestamp_ns"][0]) if frame is not None else 0
         if not sample_is_fresh(stamp, self.hand_config.feedback_max_age_s, time.monotonic_ns()):
-            raise RobotError("current hand feedback unavailable/stale")
+            raise FeedbackUnavailable("current hand feedback unavailable/stale")
 
     def _read_initial_state(self, *, cancel_requested):
         """回调负责完整故障检查及当前操作的取消语义，异常原样传播。"""
@@ -197,8 +199,13 @@ class Robot:
             check_wait()
             self.service_feedback()
 
-    def prepare_streaming(self, cancel_epoch):
-        cast("ArmProcess", self.arm).prepare(cancel_epoch, service=self.service_feedback)
+    def prepare_streaming(self, cancel_epoch, *, poll_operator=None):
+        def service():
+            if poll_operator is not None:
+                poll_operator()
+            self.service_feedback()
+        service()
+        cast("ArmProcess", self.arm).prepare(cancel_epoch, service=service)
         self.check_run()
 
     def send_action(self, command, *, expires_ns):
@@ -215,7 +222,7 @@ class Robot:
                 # arm 发布可能等待邮箱锁；真正发送 hand 前仍须复核当前反馈。
                 self._check_hand_feedback()
                 if time.monotonic_ns() >= expires_ns:
-                    raise OperationCancelled("command expired before hand submission")
+                    raise CommandExpired("command expired before hand submission")
                 self.hand_stop_required = True
                 cast("XHand", self.hand)._send_action(command.hand_qpos)
             self.check_run()

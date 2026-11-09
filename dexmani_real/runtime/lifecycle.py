@@ -48,14 +48,10 @@ class SensorWorkers:
             raise RuntimeError(f"{process.name} failed to become ready")
 
     def check(self, *, names=None) -> bool:
-        healthy = True
-        for process in self.processes:
-            if (names is None or process.name in names) and not process.is_alive():
-                logger.error("required worker %s exited: %s", process.name, process.exitcode)
-                healthy = False
-        return healthy
+        return all(process.is_alive() for process in self.processes
+                   if names is None or process.name in names)
 
-    def shutdown(self, runtime_state: SessionState) -> None:
+    def shutdown(self, runtime_state: SessionState, *, optional_names=()) -> None:
         """短时退出，必要时终止 sensor；仅保留实际未回收的句柄。"""
         if self.channels is not None:
             self.channels.is_running.value = False
@@ -81,6 +77,9 @@ class SensorWorkers:
                     raise RuntimeError(f"process {process.name} could not be confirmed stopped")
                 if exitcode == 0:
                     continue
+                if process.name in optional_names:
+                    logger.warning("recording worker %s exited: %s; resources reclaimed", process.name, exitcode)
+                    continue
                 # 升级 kill 后，退出仍可能由先前尝试的 SIGTERM 引起。
                 if not (
                     terminated and exitcode == -signal.SIGTERM
@@ -101,14 +100,14 @@ class SensorWorkers:
             raise errors[0][1]
 
 
-def close_runtime(runtime_state: SessionState, robot=None, *, sensors=None, keyboard=None) -> None:
+def close_runtime(runtime_state: SessionState, robot=None, *, sensors=None, keyboard=None, optional_sensor_names=()) -> None:
     """停止后尝试全部关闭；即时锁存中断，首错传播，其余错误记录 traceback。"""
     runtime_state.stop_signal.set()
     errors = []
     for stage, close in (
         ("robot_close", robot.close if robot is not None else None),
         ("keyboard_stop", keyboard.stop if keyboard is not None else None),
-        ("sensor_shutdown", (lambda: sensors.shutdown(runtime_state)) if sensors is not None else None),
+        ("sensor_shutdown", (lambda: sensors.shutdown(runtime_state, optional_names=optional_sensor_names)) if sensors is not None else None),
     ):
         if close is None:
             continue

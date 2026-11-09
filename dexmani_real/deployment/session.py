@@ -1,5 +1,7 @@
 """管理模型、设备与多轮策略实验。"""
 
+from __future__ import annotations
+
 import logging
 import multiprocessing as mp
 import time
@@ -7,7 +9,7 @@ from collections.abc import Sequence
 from concurrent.futures import wait
 from dataclasses import asdict
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.calibration_data import CAMERAS_PATH
 from dexmani_real.config.deployment import RUNTIME_SECTIONS
@@ -46,6 +48,9 @@ from dexmani_real.utils.table_plane import load_table_plane, resolve_table_plane
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from dexmani_policy.deployment import PolicyInfo
+
 
 def session_directory(root: Path) -> Path:
     base = root.expanduser().resolve()
@@ -69,18 +74,30 @@ class PolicySession:
         self.enable_hoi_pcd = enable_hoi_pcd
         self.runtime, self.policy = runtime, policy
         self.weights, self.inference_steps = weights, inference_steps
-        self.info = self.observations = None
+        self.info: PolicyInfo
+        self.observations: ObservationBuilder
+        self.model_needs = ObservationNeeds()
         self.table_plane_abcd = None
         self.device, self.seed = device, seed
         self.max_running_s, self.num_episodes = max_running_s, num_episodes
         self.record_raw = record_raw
-        self.output_root = output_root
+        self.output_root = (Path(output_root) if output_root is not None else
+                            Path(__file__).resolve().parents[2] / "rollouts" if record_raw else None)
         self.output_dir = None
         self.camera_calibration_path = camera_calibration_path
         self.camera_snapshot = None
         self.runtime_state = SessionState()
         self.startup_cancel_epoch = self.runtime_state.cancel_epoch
-        self.sensors = self.robot = self.keyboard = self.model = None
+        self.sensors = SensorWorkers()
+        self.keyboard = Keyboard(
+            estop_callback=self.runtime_state.request_emergency_stop,
+            bindings={
+                "s": self.runtime_state.request_stop, "c": self.runtime_state.request_stop,
+                "d": self.runtime_state.request_stop, "q": self.runtime_state.request_quit,
+            },
+        )
+        self.robot: Robot | None = None
+        self.model: PolicyWorker | None = None
         self.episode = None
         self.episodes, self.errors = [], []
         self.summary = {"started_utc": utc_now(), "ended_utc": None, "termination_reason": None}
@@ -105,7 +122,7 @@ class PolicySession:
                 "record_raw": self.record_raw,
             }
             write_yaml(payload, path)
-        except Exception:
+        except OSError:
             logger.exception("辅助输出保存失败：%s", path)
 
     def save_results(self):
@@ -119,7 +136,7 @@ class PolicySession:
                            episodes=[asdict(result) for result in self.episodes],
                            emergency_stop_requested=self.runtime_state.estop_request)
             write_json(payload, path)
-        except Exception:
+        except OSError:
             logger.exception("辅助输出保存失败：%s", path)
 
     def run(self):
@@ -143,7 +160,7 @@ class PolicySession:
             else:
                 print("就绪：B 新段 | S/C 保存结束 | D 丢弃 | Q 保存退出 | Esc 急停退出 | 空闲 H 先手后臂回位、T 复位触觉。", flush=True)
                 self.run_control_loop()
-                self.robot.check()
+                cast(Robot, self.robot).check()
         except KeyboardInterrupt as exc:
             failure = exc
             self.runtime_state.request_emergency_stop()
@@ -158,13 +175,6 @@ class PolicySession:
     def prepare_resources(self):
         from dexmani_policy.deployment import load_policy
 
-        self.keyboard = Keyboard(
-            estop_callback=self.runtime_state.request_emergency_stop,
-            bindings={
-                "s": self.runtime_state.request_stop, "c": self.runtime_state.request_stop,
-                "d": self.runtime_state.request_stop, "q": self.runtime_state.request_quit,
-            },
-        )
         self.keyboard.start()
         if not self.startup_allowed():
             raise OperationCancelled("startup cancelled before model load")
@@ -193,14 +203,11 @@ class PolicySession:
             self.info.action_mode, arm=self.runtime.arm, hand=self.runtime.hand,
             motion=self.runtime.motion, environment=self.runtime.environment,
         )
-        if self.output_root is not None or self.record_raw:
-            root = self.output_root if self.output_root is not None else Path(__file__).resolve().parents[2] / "rollouts"
+        if self.output_root is not None:
             try:
-                self.output_dir = session_directory(Path(root))
-            except Exception:
-                if self.record_raw:
-                    raise
-                logger.exception("辅助输出目录创建失败：%s", root)
+                self.output_dir = session_directory(self.output_root)
+            except OSError:
+                logger.exception("输出目录创建失败：%s；要求录制的实验将在 B 时重试。", self.output_root)
         print(
             f"执行：{self.info.checkpoint_path.name} ({self.info.weights}) | NFE={self.info.inference_steps} | "
             f"A_exec={self.runtime.execution.action_steps} | {self.runtime.execution.mode} | "
@@ -222,10 +229,10 @@ class PolicySession:
                 depth_enabled=needs.hoi or needs.point_cloud or "depth" in needs.camera_fields,
                 hoi=needs.hoi,
                 pointcloud_num_points=self.runtime.pointcloud.num_points if needs.point_cloud else None,
-                camera_fields=self.model_needs.camera_fields if needs.hoi else needs.camera_fields,
+                camera_fields=self.model_needs.camera_fields if needs.hoi or needs.point_cloud else needs.camera_fields,
             ) if camera_required else None
         )
-        self.sensors = SensorWorkers(channels)
+        self.sensors.channels = channels
         self.robot = Robot(
             self.runtime.arm, self.runtime.hand, runtime_state=self.runtime_state,
             check_services=self.check_services,
@@ -235,7 +242,11 @@ class PolicySession:
         if not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
             return False
-        if not self.sensors.check():
+        needs = self.model_needs
+        names = tuple(name for name, required in (
+            ("camera", needs.camera_worker), ("pointcloud", needs.point_cloud), ("hoi", needs.hoi),
+        ) if required)
+        if not self.sensors.check(names=names):
             raise RobotError("required sensor process exited")
         return True
 
@@ -267,9 +278,8 @@ class PolicySession:
         self.observations.configure_camera(self.camera_snapshot)
         if needs.hoi:
             from dexmani_real.perception.hoi_worker import run_hoi_worker
-            sensors = cast(SensorWorkers, self.sensors)
-            channels = sensors.channels
-            sensors.start(self.process_context.Process(
+            channels = self.sensors.channels
+            self.sensors.start(self.process_context.Process(
                 name="hoi", target=run_hoi_worker,
                 args=(channels, self.camera_snapshot, *self.hoi_inputs),
             ), ring=channels.hoi_ring, may_start=self.startup_allowed)
@@ -314,6 +324,7 @@ class PolicySession:
         try:
             close_runtime(
                 self.runtime_state, self.robot, sensors=self.sensors, keyboard=self.keyboard,
+                optional_sensor_names=() if self.model_needs.camera_worker else ("camera",),
             )
         except BaseException as exc:
             if isinstance(exc, SystemExit):
@@ -374,9 +385,10 @@ class PolicySession:
             raise OperationCancelled("startup cancelled")
 
     def wait_model(self):
+        model = cast(PolicyWorker, self.model)
         while True:
             self.check_startup()
-            future = self.model.poll()
+            future = model.poll()
             if future is not None:
                 result = future.result()
                 self.check_startup()
@@ -405,7 +417,7 @@ class PolicySession:
                 "rtc_delay": self.runtime.execution.prefetch_steps,
             }
         self.check_startup()
-        self.model.warmup(rows, **kwargs)
+        cast(PolicyWorker, self.model).warmup(rows, **kwargs)
         self.wait_model()
 
     def poll_operator(self) -> int | None:
@@ -414,6 +426,7 @@ class PolicySession:
         )
 
     def handle_command_batch(self, signals: Sequence[str]) -> int | None:
+        robot = cast(Robot, self.robot)
         keys = set(signals)
         if "d" in keys and self.episode is not None and not self.episode.finished:
             self.episode.discard_requested = True
@@ -449,12 +462,12 @@ class PolicySession:
                     continue
                 try:
                     logger.info("正在复位触觉，请保持手部无接触；S/Q/Esc 可中断。")
-                    self.robot.reset_tactile_sensors(
+                    robot.reset_tactile_sensors(
                         cancel_epoch=cancel_epoch,
                         cancel_requested=self.home_abort_requested,
                     )
                 except OperationCancelled as exc:
-                    self.robot.check()
+                    robot.check()
                     logger.info("%s", exc)
                 return None
         return None
@@ -497,14 +510,15 @@ class PolicySession:
         return True
 
     def home_abort_requested(self) -> bool:
-        self.robot.check()
+        cast(Robot, self.robot).check()
         return not self.runtime_state.requests_allow_motion()
 
     def run_control_loop(self):
+        robot = cast(Robot, self.robot)
         while not self.runtime_state.quit_requested:
             self.keyboard.allow_start()
             cancel_epoch = self.poll_operator()
-            self.robot.service_idle()
+            robot.service_idle()
             if self.runtime_state.estop_request:
                 break
             if cancel_epoch is not None and (
@@ -515,6 +529,13 @@ class PolicySession:
             if cancel_epoch is None:
                 time.sleep(0.005)
                 continue
+            if self.record_raw and self.output_dir is None:
+                try:
+                    self.output_dir = session_directory(cast(Path, self.output_root))
+                except OSError:
+                    logger.exception("录制目录尚不可用；本轮未开始，可再次按 B。")
+                    continue
+                self.save_run_config()
             episode = self.episode = Rollout(
                 self.runtime_state, self.runtime, self.info, cancel_epoch=cancel_epoch,
                 robot=self.robot, sensors=self.sensors, observations=self.observations,

@@ -431,7 +431,7 @@ def test_invalid_hoi_discards_plan(mode, failure):
         from dexmani_real.deployment.session import PolicySession
         from dexmani_real.robot.commands import RobotError
 
-        session = SimpleNamespace(keyboard=Mock(), sensors=Mock())
+        session = SimpleNamespace(keyboard=Mock(), sensors=Mock(), model_needs=rollout.model_needs)
         session.keyboard.check_health.return_value = True
         session.sensors.check.return_value = False
         rollout.robot.check.side_effect = lambda: PolicySession.check_services(session)

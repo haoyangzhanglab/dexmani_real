@@ -17,6 +17,7 @@ from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.data.raw import (
     TACTILE_AGE_WARNING_NS,
     RawReader,
+    require_continuous_recording,
     require_published_raw,
 )
 from dexmani_real.geometry.camera import (
@@ -159,25 +160,18 @@ def validate_export_episode(reader: RawReader, fields):
         reader[name]
     camera = export_camera(reader, fields)
     rows = reader["timing/rows"][:]
+    require_continuous_recording(reader.meta, rows)
     period = round(1e9 / reader.control_hz)
 
-    def first_bad(bad, offset=0):
+    def first_bad(bad):
         indices = np.flatnonzero(bad)
-        return int(indices[0]) + offset if len(indices) else None
+        return int(indices[0]) if len(indices) else None
 
     control, observation = rows["control_ns"], rows["observation_ns"]
-    for bad, detail, offset in (
-        ((control < 0) | (observation < 0) | (observation < control), "invalid_control_or_observation_clock", 0),
-        (np.diff(control) <= 0, "control_clock_not_increasing", 1),
-        (np.diff(observation) <= 0, "observation_clock_not_increasing", 1),
-    ):
-        row = first_bad(bad, offset)
-        if row is not None:
-            raise ValueError(f"{detail} at row {row}")
     if frames == 1:
         logger.warning("%s: single row, no sampling interval to verify", reader.path)
     if np.any(np.abs(np.diff(control) - period) > period // 4):
-        logger.warning("%s: control interval jitter/gaps; 不重采样，实际时间保留于 Raw", reader.path)
+        logger.warning("%s: short control intervals; 不重采样，实际时间保留于 Raw", reader.path)
     if np.any(observation[:-1] >= control[1:]):
         logger.warning("%s: observation readout overlaps the next control sample", reader.path)
 

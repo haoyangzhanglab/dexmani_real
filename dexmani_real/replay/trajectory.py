@@ -1,16 +1,18 @@
-"""一次读取当前设备顺序的绝对关节目标；不依赖存档模态。"""
+"""校验当前 Raw 时间与动作契约，读取尝试提交的绝对关节目标。"""
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import h5py
 import numpy as np
 
-from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
+from dexmani_real.data.raw import (
+    RawReader,
+    require_continuous_recording,
+    require_published_raw,
+)
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 
 if TYPE_CHECKING:
@@ -35,46 +37,28 @@ def load_trajectory(episode_path: str | Path, runtime: RealConfig) -> Trajectory
     validate_robot_config(runtime)
     if not runtime.hand.enabled:
         raise ValueError("replay requires XHand")
-    with h5py.File(Path(episode_path).expanduser() / "data.h5", "r") as data:
-        meta = data["meta"].attrs
-        if meta["joint_units"] != "rad":
-            raise ValueError("replay joint_units must be rad")
-        for field, names in (
-            ("arm_joint_names", XARM7_JOINT_NAMES),
-            ("hand_joint_names", XHAND_SDK_JOINT_NAMES),
-        ):
-            if json.loads(meta[field]) != list(names):
-                raise ValueError(f"replay {field} order mismatch")
-        hz = float(meta["control_hz"])
+    require_published_raw(episode_path)
+    with RawReader(episode_path) as reader:
+        require_continuous_recording(reader.meta, reader["timing/rows"][:])
+        hz = reader.control_hz
         validate_control_rate(runtime, hz)
         arrays = []
-        for field, size, lower, upper in (
+        for field, lower, upper in (
             (
                 "action_arm_joint_target",
-                7,
                 runtime.arm.joint_limit_lower,
                 runtime.arm.joint_limit_upper,
             ),
             (
                 "action_hand_joint_target",
-                12,
                 runtime.hand.qpos_min_rad,
                 runtime.hand.qpos_max_rad,
             ),
         ):
-            values = data[field][:]
-            if values.dtype.kind not in "iuf":
-                raise ValueError(f"{field} must contain real numeric targets")
-            values = values.astype(np.float64)
-            if (
-                values.ndim != 2
-                or values.shape[1] != size
-                or not len(values)
-                or not np.isfinite(values).all()
-            ):
-                raise ValueError(
-                    f"{field} requires nonempty finite targets of shape (N, {size})"
-                )
+            # RawReader 统一检查当前动作语义、关节顺序及与时间行数一致的形状。
+            values = reader[field][:].astype(np.float64)
+            if not len(values) or not np.isfinite(values).all():
+                raise ValueError(f"{field} requires nonempty finite targets")
             lower_bound, upper_bound = np.asarray(lower), np.asarray(upper)
             if np.any(values < lower_bound - TARGET_LIMIT_TOLERANCE_RAD) or np.any(
                 values > upper_bound + TARGET_LIMIT_TOLERANCE_RAD
@@ -83,6 +67,4 @@ def load_trajectory(episode_path: str | Path, runtime: RealConfig) -> Trajectory
             # 仅归一文件精度造成的边界误差；真正越界已在上面拒绝。
             np.clip(values, lower_bound, upper_bound, out=values)
             arrays.append(values)
-        if len(arrays[0]) != len(arrays[1]):
-            raise ValueError("replay target lengths differ")
     return Trajectory(hz, *arrays)

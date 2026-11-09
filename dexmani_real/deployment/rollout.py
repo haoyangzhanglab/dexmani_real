@@ -14,7 +14,7 @@ import numpy as np
 
 from dexmani_real.control.ik import IKReferenceError
 from dexmani_real.data.raw import snapshot_recording_metadata
-from dexmani_real.data.recorder import EpisodeRecorder
+from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
 from dexmani_real.deployment.schedule import (
     ActionChunk,
     Prediction,
@@ -27,6 +27,7 @@ from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.robot.commands import (
     COMMAND_LEASE_NS,
+    FeedbackUnavailable,
     OperationCancelled,
     RobotCommand,
     arm_reference_from_feedback,
@@ -77,7 +78,7 @@ class Rollout:
         self.observations = observations
         self.model_needs = observations.needs
         self.capture_needs = self.model_needs.union(record_needs)
-        if self.model_needs.hoi:
+        if self.model_needs.hoi or self.model_needs.point_cloud:
             self.capture_needs = replace(self.capture_needs, camera_fields=self.model_needs.camera_fields)
         self.record_needs = record_needs
         self.action_mapper, self.model = action_mapper, model
@@ -108,7 +109,7 @@ class Rollout:
 
     def recording_issue(self, row):
         if not self.sensors.check(names=("camera",)):
-            raise RuntimeError("recording camera worker exited")
+            return "recording_camera_worker_exited"
         issues = check_observation(row, self.runtime, self.record_needs,
                                    now_ns=row.observation_timestamp_ns, allow_tactile_hold=True)
         return "; ".join(issues) if issues else None
@@ -151,9 +152,9 @@ class Rollout:
                 if not recorder.poll_finish():
                     return False
             result.raw = recorder.result()
-            # 只在真正完成后释放 owner；失败/仍存活时保留 recorder。
+            # 线程实际退出才释放 owner；失败结果及 staging 路径保留在 result。
             self.recorder = None
-            if not recorder.finish_request.save:
+            if not recorder.finish_request.save and recorder.error is None:
                 logger.info("Raw 已丢弃。")
         return True
 
@@ -168,6 +169,10 @@ class Rollout:
                     self.step()
                     if not self.finished:
                         time.sleep(0.001)
+            except FeedbackUnavailable as exc:
+                self.robot.check()
+                poll_operator()
+                self.stop(str(exc))
             except OperationCancelled as exc:
                 # 取消不能掩盖同时发生的设备或 worker 故障。
                 self.robot.check()
@@ -209,10 +214,10 @@ class Rollout:
         return valid
 
     def read_observations(self) -> tuple[Observation, Observation]:
-        """共享关节采样；HOI 模型图像同源，Raw 独立取最新相机帧。"""
+        """共享关节采样；派生模型图像同源，Raw 独立取最新相机帧。"""
         row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
         raw = row
-        if self.record_raw and self.model_needs.hoi:
+        if self.record_raw and (self.model_needs.hoi or self.model_needs.point_cloud):
             camera = read_camera_frame(self.sensors.channels, fields=self.record_needs.camera_fields)
             raw = replace(row, camera=camera, hoi=None, observation_timestamp_ns=time.monotonic_ns())
         return row, raw
@@ -308,10 +313,17 @@ class Rollout:
                 self.camera_snapshot,
                 tactile_reset_metadata=self.robot.hand.tactile_reset_metadata,
             )
-            self.recorder.start(
-                task_label=self.policy_info.task_name,
-                episode_name=f"episode_{self.result.index:03d}", collection_source="policy_rollout", metadata=metadata,
-            )
+            try:
+                self.recorder.start(
+                    task_label=self.policy_info.task_name,
+                    episode_name=f"episode_{self.result.index:03d}", collection_source="policy_rollout", metadata=metadata,
+                )
+            except RecordingError as exc:
+                self.recorder.service()
+                poll_operator()
+                self.preparation_issue = "recording_start_failed"
+                self.stop(str(exc))
+                return
             # writer 可能阻塞超过反馈 TTL；仍停止采样，允许一次 CRC 后恢复。
             if self.start_observation(poll_operator, after_ns=time.monotonic_ns()) is None:
                 self.stop(self.preparation_issue)
@@ -319,7 +331,7 @@ class Rollout:
         poll_operator()
         if not self.preparation_valid():
             raise OperationCancelled("cancelled before streaming preparation")
-        self.robot.prepare_streaming(self.cancel_epoch)
+        self.robot.prepare_streaming(self.cancel_epoch, poll_operator=poll_operator)
         if self.start_observation(poll_operator) is None:
             self.stop(self.preparation_issue)
             return
@@ -429,15 +441,11 @@ class Rollout:
             self.robot.check()
             raise OperationCancelled("operation cancelled")
 
-    def sample_observation(self) -> tuple[Observation, Observation] | None:
+    def sample_observation(self) -> tuple[Observation, Observation]:
         row, raw = self.read_observations()
         devices = check_device_feedback(row, self.runtime)
         if devices:
-            raise RuntimeError("device feedback: " + "; ".join(devices))
-        if self.recorder is not None and (quality := self.recording_issue(raw)) is not None:
-            self.recorder.append(raw, quality_issue=quality)
-            self.stop(quality)
-            return None
+            raise FeedbackUnavailable("device feedback: " + "; ".join(devices))
         return row, raw
 
     def update_history(self, row):
@@ -475,7 +483,7 @@ class Rollout:
             return None
         issues = check_device_feedback(row, self.runtime)
         if issues:
-            raise RuntimeError("device feedback: " + "; ".join(issues))
+            raise FeedbackUnavailable("device feedback: " + "; ".join(issues))
         if self.model_needs.hoi:
             needs = ObservationNeeds(hoi=True)
             latest = read_observation(self.sensors.channels, self.robot, needs=needs)
@@ -491,9 +499,7 @@ class Rollout:
             self.runtime_state.stop_signal.set()
         if row is not None and self.recorder is not None:
             try:
-                issue = self.recorder.append(row, attempted_command)
-                if issue is not None:
-                    self.stop(issue)
+                self.recorder.append(row, attempted_command, quality_issue=self.recording_issue(row))
             except BaseException as exc:
                 if primary_error is None:
                     raise
@@ -510,7 +516,7 @@ class Rollout:
                 or not self.runtime_state.requests_allow_motion()):
             raise OperationCancelled("operation cancelled")
         if self.recorder is not None:
-            self.recorder.check_error()
+            self.recorder.service()
         if self.duration_expired():
             return
         if self.runtime_state.stop_signal.is_set():
@@ -544,10 +550,7 @@ class Rollout:
         self.next_step_ns = next_tick_ns(self.next_step_ns, self.dt_ns, now)
         row = raw = attempted = None
         try:
-            sample = self.sample_observation()
-            if sample is None:
-                return
-            row, raw = sample
+            row, raw = self.sample_observation()
             valid = self.update_history(row)
             self.check_motion()
             if self.duration_expired():
@@ -584,10 +587,7 @@ class Rollout:
         row = raw = attempted = None
         pending = self.model.future
         try:
-            sample = self.sample_observation()
-            if sample is None:
-                return
-            row, raw = sample
+            row, raw = self.sample_observation()
             valid = self.update_history(row)
             self.check_motion()
             if self.duration_expired():

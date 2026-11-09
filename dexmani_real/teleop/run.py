@@ -128,7 +128,7 @@ def run_teleop(
             keyboard.start()
 
             def check_services():
-                if not keyboard.check_health() or not sensors.check():
+                if not keyboard.check_health() or not sensors.check(names=("vr",)):
                     raise RobotError("teleop control service unavailable")
                 return True
 
@@ -184,7 +184,7 @@ def run_teleop(
         if audio is not None and runtime_state.estop_request:
             audio.play("emergency")
         try:
-            close_runtime(runtime_state, robot, sensors=sensors, keyboard=keyboard)
+            close_runtime(runtime_state, robot, sensors=sensors, keyboard=keyboard, optional_sensor_names=("camera",))
         except BaseException as exc:
             primary_failure = primary_failure or exc
             if loop is not None:

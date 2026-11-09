@@ -33,6 +33,14 @@ class OperationCancelled(RuntimeError):
     """本次操作已撤销；普通取消不要求关闭设备会话。"""
 
 
+class FeedbackUnavailable(OperationCancelled):
+    """可信反馈暂不可用；恢复前仍须确认停止并重新准备。"""
+
+
+class CommandExpired(OperationCancelled):
+    """命令未能在租约内提交；不代表设备 SDK 故障。"""
+
+
 class RobotError(RuntimeError):
     """设备或执行器失败，调用方须终止本次运行。"""
 

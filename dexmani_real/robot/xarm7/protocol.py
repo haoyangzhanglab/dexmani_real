@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.robot.commands import OperationCancelled
+from dexmani_real.robot.commands import CommandExpired, OperationCancelled
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
 
 # startup/prepare 的基础等待预算；HOME 使用独立的 homing.timeout_s。
@@ -46,13 +46,15 @@ class ArmChannels:
         self.stop, self.emergency = stop_signal, emergency_signal
         self.closing, self.stopped, self.ready = (ctx.Event() for _ in range(3))
         self.fault = ctx.Array("c", 1024, lock=False)
+        # 仅 Owner 写；先写原因再置 stop，接纳新操作时清除。
+        self.stop_reason = ctx.Array("c", 64, lock=False)
         self.goal_lock, self.status_lock = ctx.Lock(), ctx.Lock()
         self.goal = ctx.RawArray("b", GOAL_DTYPE.itemsize)
         self.status = ctx.RawArray("b", ARM_STATE_DTYPE.itemsize)
 
     def publish_goal(self, command, *, expires_ns):
         if not self.goal_lock.acquire(timeout=max(0, expires_ns - time.monotonic_ns()) / 1e9):
-            raise OperationCancelled("arm target publication expired waiting for mailbox")
+            raise CommandExpired("arm target publication expired waiting for mailbox")
         try:
             if (
                 self.closing.is_set()
@@ -61,7 +63,7 @@ class ArmChannels:
             ):
                 raise OperationCancelled("arm target run cancelled")
             if time.monotonic_ns() >= expires_ns:
-                raise OperationCancelled("arm target deadline expired")
+                raise CommandExpired("arm target deadline expired")
             np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)[0] = (
                 True,
                 command.arm_hold,

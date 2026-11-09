@@ -177,7 +177,7 @@ class _VideoWriter:
         self.rate = Fraction(str(fps)).limit_denominator(1_000_000)
         self.container = None
         self.stream = None
-        self.frame_count = 0
+        self.first_control_ns = None
 
     def open(self):
         import av
@@ -190,20 +190,23 @@ class _VideoWriter:
         self.stream.options = {"crf": "18", "preset": "ultrafast"}
         # 为控制和推理保留 CPU。
         self.stream.codec_context.thread_count = 1
+        self.stream.time_base = Fraction(1, 1_000_000_000)
+        self.stream.codec_context.time_base = self.stream.time_base
         self.stream.codec_context.open()
         self.container.start_encoding()
 
-    def write_frame(self, frame):
+    def write_frame(self, frame, control_ns):
         import av
 
         av_frame = av.VideoFrame.from_ndarray(frame, format="rgb24").reformat(format="yuv444p")
-        av_frame.pts = self.frame_count
-        av_frame.time_base = 1 / self.rate
+        if self.first_control_ns is None:
+            self.first_control_ns = control_ns
+        av_frame.pts = control_ns - self.first_control_ns
+        av_frame.time_base = Fraction(1, 1_000_000_000)
         stream = cast("av.video.stream.VideoStream", self.stream)
         container = cast("av.container.OutputContainer", self.container)
         for packet in stream.encode(av_frame):
             container.mux(packet)
-        self.frame_count += 1
 
     def close(self):
         if self.container is None:
@@ -296,7 +299,7 @@ class RawWriter:
             array[self.buffered] = values[name]
         timing_rows = cast(np.ndarray, self.timing_rows)
         timing_rows[self.buffered] = timing
-        cast(_VideoWriter, self.video).write_frame(rgb)
+        cast(_VideoWriter, self.video).write_frame(rgb, row.control_timestamp_ns)
         self.buffered += 1
         if self.buffered == len(timing_rows):
             self.flush()
@@ -340,11 +343,30 @@ class RawWriter:
             self.timing_rows = None
 
 
+def require_continuous_recording(meta, rows):
+    """固定频率消费者不能压缩已知缺失或明显的控制时间间隙。"""
+    control, observation = rows["control_ns"], rows["observation_ns"]
+    for bad, detail, offset in (
+        ((control < 0) | (observation < control), "invalid_control_or_observation_clock", 0),
+        (np.diff(control) <= 0, "control_clock_not_increasing", 1),
+        (np.diff(observation) <= 0, "observation_clock_not_increasing", 1),
+    ):
+        indices = np.flatnonzero(bad)
+        if len(indices):
+            raise ValueError(f"{detail} at row {int(indices[0]) + offset}")
+    reason = meta.get("recording_truncated_reason")
+    period = sampling_clock_ns(float(meta["control_hz"]))
+    gaps = np.flatnonzero(np.diff(rows["control_ns"]) > period + period // 4)
+    if reason or len(gaps):
+        detail = reason or f"control gap before row {int(gaps[0]) + 1}"
+        raise ValueError(f"recording has gaps ({detail}); fixed-rate consumption is not allowed")
+
+
 def require_published_raw(path):
     requested = Path(path).expanduser()
     resolved = requested.resolve()
     if any(candidate.name.startswith(".tmp_") for candidate in (requested, resolved)):
-        raise ValueError(f"unpublished Raw cannot be exported: {requested}")
+        raise ValueError(f"unpublished Raw: {requested}")
 
 
 class RawReader:

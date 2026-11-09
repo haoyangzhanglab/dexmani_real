@@ -23,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Export published Raw episodes with valid data to a canonical multimodal Zarr. "
             "Validate structure and timing first, numeric values during chunk conversion. "
             "Warn on source-clock diagnostics; reject missing/nonfinite selected data. "
+            "Reject recordings with missing rows, pauses, or control intervals over 1.25 periods. "
             "Publish only after all episodes succeed; "
             "use --exclude and retry."
         )
@@ -57,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fields", nargs="+", choices=tuple(FIELD_INPUTS),
-        help="Canonical fields to export; omitted means all 13 fields.",
+        help="Canonical fields to export; omitted means every listed field.",
     )
     parser.add_argument(
         "--exclude",
