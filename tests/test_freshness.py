@@ -378,7 +378,7 @@ def test_hand_expiry_blocks_new_positions(clock, runtime, after_arm_publish):
     assert robot.runtime_state.stop_signal.is_set()
 
 
-def make_rollout(runtime, needs, clock):
+def make_rollout(runtime, needs, clock, *, record_raw=False):
     from dexmani_real.deployment.rollout import Rollout
     from dexmani_real.runtime.state import SessionState
 
@@ -387,8 +387,9 @@ def make_rollout(runtime, needs, clock):
         state, runtime, SimpleNamespace(n_obs_steps=2, action_mode="joint"),
         cancel_epoch=state.cancel_epoch, robot=Mock(),
         observations=SimpleNamespace(needs=needs, project=Mock(return_value={"test": np.ones(1)})),
-        record_needs=ObservationNeeds(), sensors=Mock(), action_mapper=Mock(),
-        model=Mock(future=None), max_running_s=None, index=1, output_dir=None, record_raw=False,
+        record_needs=ObservationNeeds(camera_fields=("rgb", "depth")) if record_raw else ObservationNeeds(),
+        sensors=Mock(), action_mapper=Mock(),
+        model=Mock(future=None), max_running_s=None, index=1, output_dir=None, record_raw=record_raw,
     )
     rollout.model.poll.return_value = None
     rollout.action_mapper.map_joint.return_value = SimpleNamespace(
@@ -462,11 +463,13 @@ def test_stale_inputs_preserve_finite_chunks_without_new_inference(clock, runtim
     def sample():
         row = observation(clock.now_ns)
         if modality == "camera":
-            return replace(row, camera=source.camera)
+            sample = replace(row, camera=source.camera)
+            return sample, sample
         # 关节仍新鲜，只有模型必需的触觉来源过期。
         hand = row.hand.copy()
         hand["tactile_aggregate_timestamp_ns"] = source.hand["tactile_aggregate_timestamp_ns"]
-        return replace(row, hand=hand)
+        sample = replace(row, hand=hand)
+        return sample, sample
 
     monkeypatch.setattr(rollout, "sample_observation", sample)
     for _ in range(2):
@@ -499,7 +502,7 @@ def test_inflight_prediction_keeps_existing_handoff_rules(clock, runtime, monkey
     rollout.model.future = future
     rollout.model.poll.return_value = future
     row = replace(observation(clock.now_ns), camera=observation(clock.now_ns - 500_000_000).camera)
-    monkeypatch.setattr(rollout, "sample_observation", lambda: row)
+    monkeypatch.setattr(rollout, "sample_observation", lambda: (row, row))
     rollout.step()
     rollout.robot.send_action.assert_called_once()
     rollout.model.predict.assert_not_called()
@@ -759,3 +762,182 @@ def test_xhand_tool_uses_one_read_deadline(clock, runtime, monkeypatch, case):
         with pytest.raises(TimeoutError, match="deadline expired"):
             hand.read_fresh_state(action_deadline_ns=deadline)
     assert hand.get_state.call_count == (2 if case == "crc" else 1)
+
+
+@pytest.mark.parametrize('valid', [True, False])
+def test_hoi_initial_observation_finishes_immediately(clock, runtime, monkeypatch, valid):
+    rollout = make_rollout(runtime, ObservationNeeds(hoi=True), clock)
+    row = replace(observation(clock.now_ns), hoi={'valid': valid, 'timestamp_ns': clock.now_ns})
+    monkeypatch.setattr('dexmani_real.deployment.rollout.read_observation', lambda *a, **k: row)
+    monkeypatch.setattr('time.sleep', Mock(side_effect=AssertionError('明确结果不应继续等待')))
+    assert (rollout.start_observation() is not None) == valid
+    if not valid:
+        assert 'hoi_pose_invalid' in rollout.preparation_issue
+
+
+@pytest.mark.parametrize('initial_hoi,budget', [(False, 1), (True, 120)])
+def test_hoi_observation_wait_budget(clock, runtime, monkeypatch, initial_hoi, budget):
+    rollout = make_rollout(runtime, ObservationNeeds(hoi=True), clock)
+    monkeypatch.setattr('dexmani_real.deployment.rollout.read_observation',
+                        lambda *a, **k: observation(clock.now_ns))
+    start = clock.now_ns
+    def sleep(seconds):
+        clock.now_ns += round(seconds * 1e9)
+    monkeypatch.setattr('time.sleep', sleep)
+    assert rollout.start_observation(initial_hoi=initial_hoi) is None
+    assert clock.now_ns - start == budget * 1_000_000_000
+
+
+@pytest.mark.parametrize('age,valid,expected', [
+    (180_000_000, True, []), (250_000_000, True, ['hoi_stale']),
+    (260_000_000, True, ['hoi_stale']), (20_000_000, False, ['hoi_pose_invalid']),
+    (250_000_000, False, ['hoi_pose_invalid', 'hoi_stale']),
+])
+def test_separate_hoi_age_budget(clock, runtime, age, valid, expected):
+    stamp = clock.now_ns - age
+    row = replace(observation(stamp), hoi={'valid': valid, 'timestamp_ns': stamp})
+    assert check_observation(row, runtime, ObservationNeeds(hoi=True)) == expected
+    if age >= 180_000_000:
+        assert check_observation(row, runtime, ObservationNeeds(camera_fields=('rgb',))) == ['camera_source_stale']
+        assert check_observation(row, runtime, ObservationNeeds(point_cloud=True)) == ['pointcloud_stale']
+    overridden = replace(runtime, execution=replace(runtime.execution, hoi_max_age_s=.1))
+    if valid:
+        assert check_observation(row, overridden, ObservationNeeds(hoi=True)) == ['hoi_stale']
+
+
+@pytest.mark.parametrize('age', [0, -1, float('nan'), float('inf'), True, None, '0.25'])
+def test_invalid_hoi_age_config(runtime, age):
+    from dexmani_real.deployment.preflight import validate_execution_config
+    with pytest.raises(ValueError, match='hoi_max_age_s'):
+        validate_execution_config(SimpleNamespace(future_steps=4), replace(runtime.execution, hoi_max_age_s=age))
+
+
+@pytest.mark.parametrize('hoi,images,record', [
+    (True, False, True), (True, True, True), (True, False, False),
+    (True, True, False), (False, True, True), (False, True, False),
+])
+def test_model_and_raw_camera_sources(clock, runtime, monkeypatch, tmp_path, camera_snapshot, hoi, images, record):
+    from dexmani_real.ipc.sensors import SensorChannels
+    from dexmani_real.data.raw import RawWriter, RawReader, snapshot_recording_metadata
+    from dexmani_real.data.recorder import EpisodeRecorder
+    fields = ('rgb', 'depth') if images else ()
+    needs = ObservationNeeds(hoi=hoi, camera_fields=fields)
+    rollout = make_rollout(runtime, needs, clock, record_raw=record)
+    channels = SensorChannels(mp.get_context('spawn'), camera=CameraConfig(width=4, height=4),
+                              hoi=hoi, camera_fields=fields)
+    rollout.sensors.channels = channels
+    rollout.robot.read_state.side_effect = lambda: observation(clock.now_ns)
+    source = clock.now_ns - 180_000_000
+    def pixels(value):
+        return dict(rgb=np.full((4, 4, 3), value, np.uint8), depth=np.full((4, 4), value, np.uint16))
+    if hoi:
+        channels.hoi_request.write(episode_id=1, after_ns=1, after_sequence=0)
+        channels.hoi_ring.write(episode_id=1, timestamp_ns=source, source_camera_sequence=10,
+            valid=True, object_pointcloud=np.ones((1024, 3), np.float32),
+            **{k: v for k, v in pixels(10).items() if k in fields})
+    for _ in range(12):
+        channels.camera_ring.write(timestamp_ns=clock.now_ns - 20_000_000, **pixels(12))
+    read = channels.camera_ring.read
+    completed = []
+    def camera_read(**kwargs):
+        result = read(**kwargs)
+        clock.now_ns += 1_000_000
+        completed.append(clock.now_ns)
+        clock.now_ns += 1
+        return result
+    spy = Mock(side_effect=camera_read)
+    monkeypatch.setattr(channels.camera_ring, 'read', spy)
+    row, raw = rollout.read_observations()
+    assert spy.call_count == int(record or not hoi)
+    assert check_observation(row, runtime, needs) == []
+    if hoi:
+        assert row.hoi['timestamp_ns'] == source
+        assert row.hoi['source_camera_sequence'] == 10
+        assert set(channels.hoi_ring.dtype.names) & {'rgb', 'depth'} == set(fields)
+    if images:
+        assert row.camera['ring_sequence'] == (10 if hoi else 12)
+        assert np.all(row.camera['rgb'] == (10 if hoi else 12))
+    else:
+        assert row.camera is None
+    if not record:
+        assert raw is row
+        return
+    assert raw.camera['ring_sequence'] == 12
+    assert raw.observation_timestamp_ns > completed[-1]
+    assert raw.observation_timestamp_ns >= raw.camera['timestamp_ns']
+    assert rollout.recording_issue(raw) is None
+    assert raw.hoi is None
+    monkeypatch.setattr('dexmani_real.data.raw._VideoWriter', Mock())
+    recorder = EpisodeRecorder(tmp_path, control_hz=20)
+    recorder.is_recording = True
+    assert recorder.append(raw) is None
+    writer = RawWriter(tmp_path, control_hz=20)
+    try:
+        writer.open(dict(snapshot_recording_metadata(camera_snapshot, tactile_reset_metadata={}),
+                         collection_source='policy', task_label='hoi'))
+        writer.append_frame(*recorder.queue.get_nowait())
+        writer.finish('test', [])
+    finally:
+        writer.close()
+    with RawReader(tmp_path) as reader:
+        timing = reader['timing/rows'][0]
+        assert timing['camera_sequence'] == 12
+        assert timing['camera_ns'] == raw.camera['timestamp_ns']
+        assert np.all(reader['depth'][0] == 12)
+
+
+@pytest.mark.parametrize('mode', ['sync', 'async', 'rtc'])
+@pytest.mark.parametrize('stage', ['between_ticks', 'mapping'])
+def test_hoi_loss_stops_before_submission(clock, runtime, monkeypatch, mode, stage):
+    from dexmani_real.deployment.schedule import ActionChunk
+    runtime = replace(runtime, execution=replace(runtime.execution, mode=mode))
+    rollout = make_rollout(runtime, ObservationNeeds(hoi=True), clock)
+    row = replace(observation(clock.now_ns), hoi={'valid': True, 'timestamp_ns': clock.now_ns})
+    latest = replace(row, hoi=dict(row.hoi))
+    rollout.plan = ActionChunk(np.ones((2, 19)), 0)
+    rollout.first_prediction = False
+    monkeypatch.setattr('dexmani_real.deployment.rollout.read_observation', lambda *a, **k: latest)
+    monkeypatch.setattr(rollout, 'sample_observation', lambda: (row, row))
+    if stage == 'between_ticks':
+        rollout.next_step_ns += rollout.dt_ns
+        latest.hoi['valid'] = False
+    else:
+        map_command = rollout.map_command
+        def mapping(action, sample):
+            result = map_command(action, sample)
+            latest.hoi['valid'] = False
+            return result
+        monkeypatch.setattr(rollout, 'map_command', mapping)
+    rollout.step()
+    assert rollout.finished
+    assert rollout.plan is rollout.query is None
+    rollout.robot.send_action.assert_not_called()
+
+
+@pytest.mark.parametrize('mode', ['sync', 'async', 'rtc'])
+@pytest.mark.parametrize('raw_stale', [False, True])
+def test_rollout_records_independent_raw_snapshot(clock, runtime, monkeypatch, mode, raw_stale):
+    from dexmani_real.deployment.schedule import ActionChunk
+    runtime = replace(runtime, execution=replace(runtime.execution, mode=mode))
+    rollout = make_rollout(runtime, ObservationNeeds(hoi=True), clock, record_raw=True)
+    model = replace(observation(clock.now_ns), camera=None,
+                    hoi={'valid': True, 'timestamp_ns': clock.now_ns - 180_000_000})
+    raw = observation(clock.now_ns - (180_000_000 if raw_stale else 20_000_000))
+    raw = replace(raw, observation_timestamp_ns=clock.now_ns)
+    monkeypatch.setattr(rollout, 'read_observations', lambda: (model, raw))
+    monkeypatch.setattr('dexmani_real.deployment.rollout.read_observation', lambda *a, **k: model)
+    rollout.recorder = Mock()
+    rollout.recorder.append.return_value = None
+    rollout.first_prediction = False
+    rollout.plan = ActionChunk(np.ones((2, 19)), 0)
+    rollout.step()
+    rollout.recorder.append.assert_called_once()
+    assert rollout.recorder.append.call_args.args[0] is raw
+    if raw_stale:
+        assert rollout.finished
+        assert rollout.result.termination_details == 'camera_source_stale'
+        rollout.robot.send_action.assert_not_called()
+    else:
+        assert not rollout.finished
+        rollout.robot.send_action.assert_called_once()
+        assert rollout.recorder.append.call_args.args[1] is rollout.robot.send_action.call_args.args[0]

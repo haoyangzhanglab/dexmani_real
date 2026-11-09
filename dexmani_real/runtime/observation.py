@@ -152,10 +152,11 @@ def check_observation(row, runtime, needs, *, now_ns=None, allow_tactile_hold=Fa
     if needs.hoi:
         if row.hoi is None:
             issues.append("hoi_unavailable")
-        elif not row.hoi['valid']:
-            issues.append("hoi_pose_invalid")
-        elif not sample_is_fresh(int(row.hoi['timestamp_ns']), runtime.camera.max_frame_age_s, now):
-            issues.append("hoi_stale")
+        else:
+            if not row.hoi["valid"]:
+                issues.append("hoi_pose_invalid")
+            if not sample_is_fresh(int(row.hoi["timestamp_ns"]), runtime.execution.hoi_max_age_s, now):
+                issues.append("hoi_stale")
     if needs.vr:
         if row.vr is None:
             issues.append("vr_unavailable")

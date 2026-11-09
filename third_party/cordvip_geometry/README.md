@@ -36,7 +36,7 @@ with (
 
 mask 支持 `1/L/P` PNG 及 bool/uint8 单通道 NPY，尺寸须与 RGB 一致；`P` 模式按实际调色板转灰度，再以非零像素为前景，其他多通道和高位深输入不支持。已有初始 mask 时忽略 prompt，mask 加载失败直接报错。普通选择保存允许全前景，空选择仍拒绝；Hunyuan 生成入口另要求透明背景。CLI 与 Python API 的对象名均按唯一、非空的合法单级目录名原样使用，允许 `Object-1`、`1st_object`、中文和 `A__B`；禁止 `.`、`..`、路径分隔符及绝对路径。
 
-`SceneTracker.open` 一次加载资产与模型，并负责资源收尾。API 返回内存结果；SAM 日志默认输出到宿主 stderr，指定 `log_dir` 可保存日志。CLI 使用同一工厂，并写入可独立查看的结果目录。接口和返回语义见 [Python API](docs/usage.md#python-api)。
+`SceneTracker.open` 一次加载资产与模型，并负责资源收尾。`reset()` 清空场景并保留模型。首帧重叠像素由 `SceneTracker` 排除；候选不唯一、排除后空 mask 或有效深度不足抛出 `cordvip_geometry.tracking.SceneInitializationError`，宿主可结束当前轮并在下一轮重置。模型及 IPC 故障继续传播。API 返回内存结果；SAM 日志默认输出到宿主 stderr，指定 `log_dir` 可保存日志。CLI 使用同一工厂，并写入可独立查看的结果目录。接口和返回语义见 [Python API](docs/usage.md#python-api)。
 
 ## 几何约定
 

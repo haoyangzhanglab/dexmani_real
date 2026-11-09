@@ -210,12 +210,6 @@ class GroundedSAM2:
     def initialize(self, rgb, ids, masks):
         import torch
 
-        # 初始重叠像素没有归属依据，排除后再传播。
-        masks = masks & (masks.sum(axis=0) == 1)[None]
-        if any(not mask.any() for mask in masks):
-            raise ValueError(
-                "Initial mask empty after overlap exclusion; select distinct instances"
-            )
         self._detection_rgb = None
         self.image_predictor.reset_predictor()
         gc.collect()

@@ -17,6 +17,8 @@ class ExecutionConfig:
     mode: str = "sync"
     prefetch_steps: int = 1
     rtc_guidance_cap: float = 10.0
+    # 回放测量后的暂定来源年龄预算，非真机安全保证。
+    hoi_max_age_s: float = 0.25
 
 RUNTIME_SECTIONS = (
     "execution", "arm", "hand", "motion", "camera", "pointcloud", "hand_pointcloud", "environment",

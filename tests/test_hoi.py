@@ -214,11 +214,11 @@ def test_hoi_admission_and_clock():
         validate_hoi_deployment(names, False)
     with pytest.raises(ValueError, match="缺少"):
         validate_hoi_deployment(names, True)
-    runtime = SimpleNamespace(camera=SimpleNamespace(max_frame_age_s=0.1))
+    runtime = SimpleNamespace(camera=SimpleNamespace(max_frame_age_s=0.1), execution=SimpleNamespace(hoi_max_age_s=0.25))
     needs = ObservationNeeds(hoi=True)
     row = SimpleNamespace(hoi={"valid": True, "timestamp_ns": 1000000000})
     assert check_observation(row, runtime, needs, now_ns=1050000000) == []
-    assert check_observation(row, runtime, needs, now_ns=1200000000) == ["hoi_stale"]
+    assert check_observation(row, runtime, needs, now_ns=1250000000) == ["hoi_stale"]
     row.hoi["valid"] = False
     assert check_observation(row, runtime, needs, now_ns=1050000000) == ["hoi_pose_invalid"]
 
@@ -254,7 +254,7 @@ def test_hoi_reads_only_requested_same_source_images(camera_fields, monkeypatch)
     assert set(channels.hoi_ring.dtype.names) & {"rgb", "depth"} == set(camera_fields)
     channels.camera_ring.write(timestamp_ns=30, rgb=rgb + 1, depth=depth + 1)
     robot = SimpleNamespace(read_state=lambda: SimpleNamespace(arm=None, hand=None))
-    runtime = SimpleNamespace(camera=CameraConfig())
+    runtime = SimpleNamespace(camera=CameraConfig(), execution=SimpleNamespace(hoi_max_age_s=0.25))
     with monkeypatch.context() as patch:
         patch.setattr(
             channels.camera_ring, "read", Mock(side_effect=AssertionError("异步相机帧不应被读取"))
@@ -294,7 +294,7 @@ def test_stale_hoi_does_not_enter_history(monkeypatch):
     )
     rollout = Rollout.__new__(Rollout)
     rollout.model_needs = ObservationNeeds(hoi=True)
-    rollout.runtime = SimpleNamespace(camera=SimpleNamespace(max_frame_age_s=0.133))
+    rollout.runtime = SimpleNamespace(camera=SimpleNamespace(max_frame_age_s=0.133), execution=SimpleNamespace(hoi_max_age_s=0.25))
     rollout.policy_info = SimpleNamespace(n_obs_steps=2)
     rollout.observations = SimpleNamespace(
         project=Mock(return_value={"points": np.ones((1024, 3))})
@@ -305,7 +305,7 @@ def test_stale_hoi_does_not_enter_history(monkeypatch):
     assert rollout.update_history(row)
     monkeypatch.setattr("time.monotonic_ns", lambda: 1_120_000_000)
     assert rollout.update_history(row)
-    monkeypatch.setattr("time.monotonic_ns", lambda: 1_140_000_000)
+    monkeypatch.setattr("time.monotonic_ns", lambda: 1_250_000_000)
     assert not rollout.update_history(row)
     assert rollout.observations.project.call_count == 2
 
@@ -336,7 +336,7 @@ def test_invalid_hoi_discards_plan(mode, failure):
         1,
     )
     rollout.sensors.channels.hoi_request.read.return_value = ({"episode_id": 1}, 1)
-    rollout.runtime = SimpleNamespace(camera=SimpleNamespace(max_frame_age_s=0.1))
+    rollout.runtime = SimpleNamespace(camera=SimpleNamespace(max_frame_age_s=0.1), execution=SimpleNamespace(hoi_max_age_s=0.25))
     rollout.model_needs = ObservationNeeds(hoi=True)
     rollout.execution = SimpleNamespace(mode=mode)
     rollout.recorder = None
@@ -768,3 +768,103 @@ def test_training_carries_template_metadata(task, tmp_path):
     cfg.task_name = "wrong"
     with pytest.raises(ValueError, match="task"):
         build_dataset(cfg)
+
+
+@pytest.mark.parametrize('failure', ['missing', 'ambiguous', 'invalid', 'program', 'cuda', 'ipc'])
+def test_worker_episode_failure_and_retry(task, monkeypatch, caplog, failure):
+    import multiprocessing as mp
+    from contextlib import contextmanager
+    from unittest.mock import Mock
+    from types import SimpleNamespace
+    from cordvip_geometry.tracking import SceneTracker
+    from dexmani_real.config.sensor import CameraConfig
+    from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
+    from dexmani_real.ipc.sensors import SensorChannels
+    from dexmani_real.perception.hoi_worker import run_hoi_worker
+
+    template, manifest = load_task_template(task)
+    channels = SensorChannels(mp.get_context('spawn'), camera=CameraConfig(width=4, height=4), hoi=True)
+    camera = CameraSnapshot(None, CameraIntrinsics(width=4, height=4, fx=10, fy=10, ppx=2, ppy=2,
+        distortion_model='none', distortion_coeffs=(0, 0, 0, 0, 0)), .001, np.eye(4))
+    def request(epoch):
+        channels.hoi_request.write(episode_id=epoch, after_ns=10, after_sequence=channels.camera_ring.latest_sequence)
+        channels.camera_ring.write(timestamp_ns=20 * epoch, rgb=np.zeros((4, 4, 3), np.uint8), depth=np.ones((4, 4), np.uint16))
+    request(1)
+    tracker = SimpleNamespace(reset=Mock())
+    def detect(frame, prompts):
+        if tracker.reset.call_count == 1:
+            if failure in ('program', 'cuda', 'ipc'):
+                raise {'program': ValueError, 'cuda': RuntimeError, 'ipc': BrokenPipeError}[failure](failure)
+            if failure in ('missing', 'ambiguous'):
+                tracker.segmenter = SimpleNamespace(predict=lambda *a: [dict(label=next(iter(prompts.values())), mask=np.ones((4, 4), bool))] * (0 if failure == 'missing' else 2))
+                return SceneTracker.detect_masks(tracker, frame, prompts)
+        return {}
+    tracker.detect_masks = Mock(side_effect=detect)
+    tracker.step = Mock(side_effect=lambda *a, **k: {'objects': {
+        name: dict(pose_valid=tracker.reset.call_count > 1, pose=np.eye(4), error='gate failed')
+        for name in manifest['object_names']}})
+    @contextmanager
+    def opened(*a, **k):
+        yield tracker
+    monkeypatch.setattr(SceneTracker, 'open', opened)
+    monkeypatch.setattr('signal.signal', lambda *a: None)
+    writes = []
+    write = channels.hoi_ring.write
+    def publish(**payload):
+        writes.append(payload)
+        write(**payload)
+        if payload['valid']:
+            channels.is_running.value = False
+    monkeypatch.setattr(channels.hoi_ring, 'write', publish)
+    sleeps = []
+    def idle(seconds):
+        sleeps.append(seconds)
+        assert len(writes) == 1 and not writes[0]['valid']
+        assert tracker.detect_masks.call_count == 1
+        if len(sleeps) == 1:
+            channels.camera_ring.write(timestamp_ns=30, rgb=np.zeros((4, 4, 3), np.uint8), depth=np.ones((4, 4), np.uint16))
+        else:
+            request(2)
+    monkeypatch.setattr('time.sleep', idle)
+    if failure in ('program', 'cuda', 'ipc'):
+        with pytest.raises({'program': ValueError, 'cuda': RuntimeError, 'ipc': BrokenPipeError}[failure], match=failure):
+            run_hoi_worker(channels, camera, task, template)
+        assert not writes
+    else:
+        run_hoi_worker(channels, camera, task, template)
+        assert tracker.reset.call_count == 2
+        assert [p['episode_id'] for p in writes] == [1, 2]
+        assert [int(p['timestamp_ns']) for p in writes] == [20, 40]
+        assert not writes[0]['object_pointcloud'].any()
+        assert len([r for r in caplog.records if r.name.endswith('hoi_worker')]) == 1
+
+
+@pytest.mark.parametrize('failure', ['empty', 'overlap', 'depth', 'shape'])
+def test_scene_initialization_error_scope(monkeypatch, failure):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from cordvip_geometry.rgbd import RGBDFrame
+    from cordvip_geometry.tracking import SceneTracker, SceneInitializationError
+    frame = RGBDFrame(np.zeros((8, 8, 3), np.uint8), np.zeros((8, 8), np.float32),
+                      np.eye(3), 'none', (0, 0, 0, 0, 0))
+    tracker = SceneTracker.__new__(SceneTracker)
+    tracker.maps = None
+    tracker.initial_selections = None
+    tracker.assets = {'apple': None}
+    tracker.segmenter = SimpleNamespace(initialize=Mock(side_effect=lambda rgb, masks: masks))
+    tracker.pixel_stride = 1
+    tracker.min_matched_pixels = 1
+    tracker.trackers = {'apple': Mock()}
+    tracker.lost_objects = {}
+    mask = np.ones((8, 8), bool)
+    masks = {'apple': mask}
+    if failure == 'empty':
+        masks['apple'] = np.zeros_like(mask)
+    elif failure == 'overlap':
+        masks['bowl'] = mask.copy()
+    elif failure == 'shape':
+        masks['apple'] = np.ones((4, 4), bool)
+    with pytest.raises(ValueError) as raised:
+        tracker.step(frame, initial_masks=masks)
+    assert isinstance(raised.value, SceneInitializationError) == (failure != 'shape')
+    tracker.trackers['apple'].register.assert_not_called()

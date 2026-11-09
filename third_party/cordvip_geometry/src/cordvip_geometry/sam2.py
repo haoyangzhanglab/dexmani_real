@@ -154,7 +154,7 @@ class SAM2Client:
     def initialize(self, rgb, masks):
         rgb = self._rgb(rgb)
         if self._ids is not None:
-            raise RuntimeError("Create a new SAM2 session to reinitialize")
+            raise RuntimeError("Call reset() before initializing another scene")
         if not masks:
             raise ValueError("Provide fixed named masks for the scene")
         for name, mask in masks.items():

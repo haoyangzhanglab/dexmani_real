@@ -6,7 +6,7 @@ import logging
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import cast
 
@@ -24,6 +24,7 @@ from dexmani_real.deployment.schedule import (
     prefetch_handoff,
 )
 from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
+from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.robot.commands import (
     COMMAND_LEASE_NS,
     OperationCancelled,
@@ -32,6 +33,7 @@ from dexmani_real.robot.commands import (
 )
 from dexmani_real.runtime.ik_reference import IKReference, prepare_reference
 from dexmani_real.runtime.observation import (
+    Observation,
     ObservationNeeds,
     check_device_feedback,
     check_observation,
@@ -75,6 +77,8 @@ class Rollout:
         self.observations = observations
         self.model_needs = observations.needs
         self.capture_needs = self.model_needs.union(record_needs)
+        if self.model_needs.hoi:
+            self.capture_needs = replace(self.capture_needs, camera_fields=self.model_needs.camera_fields)
         self.record_needs = record_needs
         self.action_mapper, self.model = action_mapper, model
         self.recorder = None
@@ -200,21 +204,35 @@ class Rollout:
             self.robot.check()
         return valid
 
-    def start_observation(self, poll_operator=lambda: None, *, after_ns=None):
-        until = time.monotonic_ns() + int((120.0 if self.model_needs.hoi else INITIAL_STATE_TIMEOUT_S) * 1e9)
+    def read_observations(self) -> tuple[Observation, Observation]:
+        """共享关节采样；HOI 模型图像同源，Raw 独立取最新相机帧。"""
+        row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
+        raw = row
+        if self.record_raw and self.model_needs.hoi:
+            camera = read_camera_frame(self.sensors.channels, fields=self.record_needs.camera_fields)
+            raw = replace(row, camera=camera, hoi=None, observation_timestamp_ns=time.monotonic_ns())
+        return row, raw
+
+    def start_observation(self, poll_operator=lambda: None, *, after_ns=None, initial_hoi=False):
+        timeout_s = 120.0 if initial_hoi else INITIAL_STATE_TIMEOUT_S
+        until = time.monotonic_ns() + int(timeout_s * 1e9)
         while True:
             poll_operator()
             if not self.preparation_valid():
                 raise OperationCancelled("initial observation cancelled")
             self.robot.service_feedback()
-            row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
+            row, raw = self.read_observations()
             devices = check_device_feedback(row, self.runtime)
             model_issues = check_observation(row, self.runtime, self.model_needs)
+            if "hoi_pose_invalid" in model_issues:
+                self.preparation_issue = "model_input_hoi_pose_invalid"
+                logger.warning("本轮 HOI 初始化/位姿失效；详见 Worker 日志，可再次按 B。")
+                return None
             issue = ("device feedback: " + "; ".join(devices)) if devices else (
                 "model_input_" + model_issues[0] if model_issues else None
             )
             if self.record_raw:
-                recording_issue = self.recording_issue(row)
+                recording_issue = self.recording_issue(raw)
                 issue = issue or recording_issue
             joints_ready = after_ns is None or (
                 int(row.arm["timestamp_ns"][0]) >= after_ns
@@ -257,7 +275,7 @@ class Rollout:
             channels.hoi_request.write(episode_id=self.result.index, after_ns=time.monotonic_ns(),
                                        after_sequence=channels.camera_ring.latest_sequence)
         # 全模态初值先于 writer；等待与资源初始化期间设备保持停止。
-        row = self.start_observation(poll_operator)
+        row = self.start_observation(poll_operator, initial_hoi=self.model_needs.hoi)
         if row is None:
             self.stop(self.preparation_issue)
             return
@@ -407,16 +425,16 @@ class Rollout:
             self.robot.check()
             raise OperationCancelled("operation cancelled")
 
-    def sample_observation(self):
-        row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
+    def sample_observation(self) -> tuple[Observation, Observation] | None:
+        row, raw = self.read_observations()
         devices = check_device_feedback(row, self.runtime)
         if devices:
             raise RuntimeError("device feedback: " + "; ".join(devices))
-        if self.recorder is not None and (quality := self.recording_issue(row)) is not None:
-            self.recorder.append(row, quality_issue=quality)
+        if self.recorder is not None and (quality := self.recording_issue(raw)) is not None:
+            self.recorder.append(raw, quality_issue=quality)
             self.stop(quality)
             return None
-        return row
+        return row, raw
 
     def update_history(self, row):
         issues = tuple(check_observation(row, self.runtime, self.model_needs))
@@ -519,11 +537,12 @@ class Rollout:
             self.poll_model()
             return
         self.next_step_ns = next_tick_ns(self.next_step_ns, self.dt_ns, now)
-        row = attempted = None
+        row = raw = attempted = None
         try:
-            row = self.sample_observation()
-            if row is None:
+            sample = self.sample_observation()
+            if sample is None:
                 return
+            row, raw = sample
             valid = self.update_history(row)
             self.check_motion()
             if self.duration_expired():
@@ -545,7 +564,7 @@ class Rollout:
             if self.cursor == min(len(self.plan.actions), self.execution.action_steps):
                 self.plan = None
         finally:
-            self.record_row(row, attempted)
+            self.record_row(raw, attempted)
 
     def step_async(self):
         slot, self.next_step_ns, skipped = control_slot(
@@ -557,12 +576,13 @@ class Rollout:
             return
         self.result.skipped_slots += skipped
         self.last_slot = slot
-        row = attempted = None
+        row = raw = attempted = None
         pending = self.model.future
         try:
-            row = self.sample_observation()
-            if row is None:
+            sample = self.sample_observation()
+            if sample is None:
                 return
+            row, raw = sample
             valid = self.update_history(row)
             self.check_motion()
             if self.duration_expired():
@@ -596,4 +616,4 @@ class Rollout:
             if self.execution.mode == "rtc":
                 self.cursor += 1
         finally:
-            self.record_row(row, attempted)
+            self.record_row(raw, attempted)

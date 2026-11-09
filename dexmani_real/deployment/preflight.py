@@ -25,6 +25,10 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
     if execution.mode == "rtc" and not info.supports_rtc:
         raise NotImplementedError("Policy does not support RTC")
 
+    age = execution.hoi_max_age_s
+    if type(age) not in (int, float) or not math.isfinite(age) or age <= 0:
+        raise ValueError("hoi_max_age_s requires a finite positive value")
+
     dt = execution.control_dt_s
     if dt is None:
         raise ValueError("Checkpoint has no control period; set execution.control_dt_s")

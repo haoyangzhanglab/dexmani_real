@@ -61,18 +61,18 @@ Raw `/hoi` 用原生 HDF5 属性保存上述三个字段和 `offsets`；Zarr 与
 
 无效帧为显式 false 掩码和零点占位，Viewer 清除物体点，导出拒绝整个 Episode 并提示 `--exclude`。Raw 打开时只检查完成状态和数组结构；点云数值在写入、逐帧显示和分块导出时检查，不再全量扫描未使用的数据。原 Hand Point Cloud 标签按固定点分段着色；`--no-point-cloud` 只关闭普通场景点云。Raw 无 `/hoi` 保持原有读取路径；不完整 `/hoi` 报错。更早期缺少 `timing/rows` 的 Raw 不在本次迁移范围。
 
-Policy 训练需把 `zarr_path` 显式指向上述导出路径（其默认路径是 `robot_data/`）。训练读取 Zarr 的 `hoi_pcd` 到 Checkpoint，恢复训练拒绝不同模板。HOI Checkpoint 缺少模板信息时拒绝真机部署。在线每轮 B 后重新初始化，真实观测 warmup 完成且新鲜有效才允许动作。HOI 缺失、过期或 Worker 故障终止当前动作计划。只有策略或录制需要 RGB/深度时，HOI Ring 才携带相应的同源图像；安全检查不复制图像。首版不支持同时使用普通 `point_cloud`。相机 TTL 沿用现有配置，不能把发布时刻当作采集时刻。
+Policy 训练需把 `zarr_path` 显式指向上述导出路径（其默认路径是 `robot_data/`）。训练读取 Zarr 的 `hoi_pcd` 到 Checkpoint，恢复训练拒绝不同模板。HOI Checkpoint 缺少模板信息时拒绝真机部署。在线每轮 B 后重新初始化，真实观测 warmup 完成且新鲜有效才允许动作。HOI 缺失、过期或 Worker 故障终止当前动作计划。只有模型需要 RGB/深度时，HOI Ring 才携带相应的同源图像；安全检查不复制图像。Raw 独立读取最新 Camera Ring，其图像帧可以不同于模型 HOI 来源帧。首版不支持同时使用普通 `point_cloud`。普通 Camera / Point Cloud TTL 沿用现有配置；HOI 使用 `execution.hoi_max_age_s`，默认 250 ms，时间戳仍继承来源相机帧，不能把发布时刻当作采集时刻。
+
+候选缺失或歧义、首帧空 mask／深度不足以及位姿门控失败会结束当前轮；Worker 记录原因并停止该轮视觉处理，保留模型，用户可重新按 B 初始化。已发布无效结果时不继续等待；每轮首次 HOI 初始化保留 120 秒预算，后续新鲜快照等待使用现有 1 秒预算。模型、CUDA、IPC 等故障仍通过原故障路径退出。
 
 ### 当前验证范围
 
-- CPU/Mock 测试覆盖冻结模板确定性、偏移几何变换、Raw staging 与无效帧、显式导出、Viewer Clear、启用条件、来源 TTL、三种调度模式清空计划和 Worker 几何一致性；另覆盖无模型依赖的资产复用、批量标注共享模型、初始化期间切换 Episode、Worker 故障停止及按需传输同源图像。
+- CPU/Mock 测试覆盖冻结模板确定性、偏移几何变换、Raw staging 与无效帧、显式导出、Viewer Clear、启用条件、来源 TTL、三种调度模式清空计划和 Worker 几何一致性；另覆盖无模型依赖的资产复用、批量标注共享模型、初始化期间切换 Episode、Worker 故障停止及按需传输同源图像。当前回归另覆盖预期初始化失败后的跨轮重试、独立 HOI 年龄预算、Raw 最新帧写入及动作映射期间的失效检查。
 - RTX 4090：8 帧真实 Raw 副本完成三物体跟踪、内部 `/hoi` 写入、四字段 Zarr 导出、实际 CordViP Dataset 读取及重复标注跳过；另验证两轮 GPU 场景重置保留模型实例。完整 `episode_20261101_165909` 副本的 403 帧增强也已通过，三个物体均为 403/403 有效，离线总耗时约 79 秒（含模型加载）。
 - 已验证既有资产复用及一个物体的真实 Hunyuan 新建资产 GPU 流程（1024 点和法向、重复运行缓存命中）。未执行完整任务数据质量评估、Rerun GUI 人工检查、策略与感知并发性能或真机运动测试。8 帧通过不代表遮挡场景精度或真机安全性能已证明。
 - GPU 运行期间上游 Warp 输出驱动 API 告警，但上述实验正常完成；不以此宣称其他 CUDA 扩展路径均可用。
-- 本轮简化后，41 项回归测试通过；真实 GPU 在临时副本上批量处理两段 Raw 各 8 帧，三个物体全部有效，重复标注跳过。四字段 Zarr 经实际 CordViP Dataset 读取，生成 10 个训练窗口，三个模板字段完整传入训练元数据。
-- 13 个相关文件通过定向 Mypy，27 个改动 Python 文件（含 Policy 读取端）通过 AST/Ruff 检查，六个脚本的 `--help` 与 `run_policy.py --print-config` 通过。前一轮两个 Python 包的 wheel 构建通过。扩大 Mypy 检查仍有 `PolicySession` 基线已存在的 31 处 Optional 生命周期标注错误，不能称全仓类型检查通过。未重跑完整性能 Benchmark。
 
-测试：`PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_hoi.py -q`。测试写入使用临时目录，不修改历史 Raw、冻结资产或机器人配置。
+测试：`PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider tests/test_hoi.py tests/test_freshness.py -q`。测试写入使用临时目录，不修改历史 Raw、冻结资产或机器人配置。
 
 ### 当前实现与性能结论
 
@@ -98,6 +98,8 @@ Policy 训练需把 `zarr_path` 显式指向上述导出路径（其默认路径
 | --- | --- | --- | --- | --- |
 | 当前 FP | 322/322 | 12.8 Hz | 150/200 ms | 69.5% |
 | TensorRT FP 实验适配器 | 403/403 | 15.98 Hz | 91/120 ms | 0.46% |
+
+HOI 默认 250 ms 依据上述回放 P95 约 200 ms 留出余量，是暂定研究参数，不代表真机安全保证。
 
 回放没有策略 GPU 并发或真实设备，也缺少原相机 30 Hz 中未被记录的中间帧。正式策略仍在过期或失效时清空动作计划并停止，不能据此宣称满足连续真机执行要求。来源相机时钟用于 TTL；关节反馈目前仍为最新值，未做历史对齐或动力学补偿。
 

@@ -222,7 +222,7 @@ class PolicySession:
                 depth_enabled=needs.hoi or needs.point_cloud or "depth" in needs.camera_fields,
                 hoi=needs.hoi,
                 pointcloud_num_points=self.runtime.pointcloud.num_points if needs.point_cloud else None,
-                camera_fields=needs.camera_fields,
+                camera_fields=self.model_needs.camera_fields if needs.hoi else needs.camera_fields,
             ) if camera_required else None
         )
         self.sensors = SensorWorkers(channels)

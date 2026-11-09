@@ -19,6 +19,10 @@ from .geometry import (
 from .model_depth import ModelDepthRenderer, camera_rays
 
 
+class SceneInitializationError(ValueError):
+    """当前场景无法初始化；新一轮可重新尝试，模型和协议错误不属于此类。"""
+
+
 def validate_object_name(name):
     if (
         not isinstance(name, str)
@@ -254,7 +258,7 @@ class SceneTracker:
         for name, prompt in prompts.items():
             matches = [item for item in candidates if item["label"].strip().lower().rstrip(".") == prompt.strip().lower().rstrip(".")]
             if len(matches) != 1:
-                raise ValueError(f"{name}: 首帧候选数 {len(matches)}，无法无歧义初始化")
+                raise SceneInitializationError(f"{name}: 首帧候选数 {len(matches)}，无法无歧义初始化")
             masks[name] = matches[0]["mask"]
         return masks
 
@@ -307,13 +311,15 @@ class SceneTracker:
                         f"Initial mask {name} must use the original bool color grid"
                     )
                 mask = maps.apply_mask(mask)
-                if not mask.any():
-                    raise ValueError(
-                        f"{name}: initial mask must be nonempty after rectification"
-                    )
                 masks[name] = mask
             if not self.assets.keys() <= masks.keys():
                 raise ValueError("Every asset requires a named initial mask")
+            # 排除无明确归属的重叠像素，在 IPC 前识别场景初始化失败。
+            unique = np.stack(list(masks.values())).sum(axis=0) == 1
+            masks = {name: mask & unique for name, mask in masks.items()}
+            for name, mask in masks.items():
+                if not mask.any():
+                    raise SceneInitializationError(f"{name}: initial mask empty after rectification/overlap exclusion")
             masks = self.segmenter.initialize(rgb, masks)
             self.maps = maps
             self._camera = (
@@ -340,11 +346,11 @@ class SceneTracker:
             fp_count = np.count_nonzero(mask & (depth_m >= 0.001))
             if count < self.min_matched_pixels or fp_count < MIN_DEPTH_PIXELS:
                 if first:
-                    raise ValueError(
+                    raise SceneInitializationError(
                         f"{name}: pose initialization has {count} independent depth points "
                         f"after segmentation/stride and {fp_count} FoundationPose depth pixels; "
                         f"requires {self.min_matched_pixels} and {MIN_DEPTH_PIXELS}, respectively. "
-                        "Select a supported instance and start a new session."
+                        "Select a supported instance and reset the scene."
                     )
                 self.lost_objects[name] = (
                     "Insufficient independently segmented depth; pose lost"
