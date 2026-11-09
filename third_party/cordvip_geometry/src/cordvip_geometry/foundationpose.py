@@ -11,7 +11,7 @@ from .geometry import simplify_mesh, validate_pose
 
 
 class PoseRegistrationError(RuntimeError):
-    """注册未建立位姿，不能使用推测或历史位姿。"""
+    """模型未建立有效位姿，不能使用推测或历史位姿。"""
 
 
 MIN_DEPTH_PIXELS = 4
@@ -109,7 +109,10 @@ class PoseTracker:
             raise PoseRegistrationError(
                 "FoundationPose registration did not initialize tracking"
             )
-        return validate_pose(pose)
+        try:
+            return validate_pose(pose)
+        except ValueError as exc:
+            raise PoseRegistrationError(f"invalid FoundationPose output: {exc}") from exc
 
     def track(self, intrinsics, mask, *, prepared_frame):
         import torch
@@ -135,10 +138,14 @@ class PoseTracker:
             get_vis=False,
         )
         estimator.pose_last = pose
-        return validate_pose(
+        pose = (
             (pose @ estimator.get_tf_to_centered_mesh())
             .detach()
             .cpu()
             .numpy()
             .reshape(4, 4)
         )
+        try:
+            return validate_pose(pose)
+        except ValueError as exc:
+            raise PoseRegistrationError(f"invalid FoundationPose output: {exc}") from exc

@@ -98,7 +98,7 @@ P_task^B(t) = concatenate(P_1^B(t), ..., P_M^B(t))  # (1024,3)
 
 **入口建议：** 新增 `scripts/cordvip/build_task.py --task <task>`，只负责这一阶段；复用 `reconstruct_object.py`、`cordvip_geometry.cli.object`、`assets.prepare_asset`，不复制 Hunyuan3D 或 SAM2 算法。
 
-**输入：** 物体子目录下 `reference.jpg`，可选任务 `task.json`（提示词、明确的尺度标定参数；已有合法 `asset.json` 可复用）。Prompt 可从目录名生成，但不能凭图片自动假定公制尺度。
+**输入：** 物体子目录下 `reference.jpg`，可选任务 `task.json`（提示词、明确的尺度标定参数；已有合法 `asset.json` 可复用）。共享任务读取入口将缺省 Prompt 补为对象名，并拒绝非字符串、空白/标点内容和按检测器匹配规则等价的 Prompt；保留合法原文及顺序。不能凭图片自动假定公制尺度。
 
 **完成条件：**
 - [ ] 自动发现任务物体，直接复用已发布的合法资产；重复运行幂等且不依赖模型权重。图片和构建参数仅用于新资产，已发布资产不另建构建指纹或自动替换。
@@ -133,17 +133,17 @@ sum(N_i) == 1024
 
 **入口：** `scripts/cordvip/annotate_episodes.py --task <task>`；支持 `--episode <path>` 仅处理单段。任务自动扫描 `episodes/<task>/episode_*`，直接在各 Episode 的 `data.h5` 写入 `/hoi`。无额外文件夹、不修改 `rgb.mp4`。
 
-**算法：** 复用 `cordvip_geometry.SceneTracker`、`track_raw`/`RGBDFrame`、SAM2、FoundationPose、模型深度验证；不要重写一套跟踪器。优先同帧一次 Grounding DINO 多类检测及共享 SAM2 图片特征，但需正确识别多实例、跨帧维持固定 object ID。
+**算法：** 复用 `cordvip_geometry.SceneTracker`、`iter_raw_rows`/`RGBDFrame`、SAM2、FoundationPose、模型深度验证。同帧一次 Grounding DINO 多类检测及共享 SAM2 图片特征；每个不同 Prompt 必须对应唯一候选，跨帧维持固定 object ID，不支持通过相同 Prompt 区分多个实例。
 
 **处理与写入步骤：**
 1. 只接收已经发布的 Raw Episode；读取原始 `rgb.mp4`、深度、相机内外参和 `timing/rows`。
 2. 自动初始化每个任务物体；对候选歧义、遮挡或缺深度明确报告。不能把文本类别置信度当作模型位姿正确性的证据。
 3. 优先沿用当前 SAM2 每帧 Mask 引导与 FoundationPose 深度一致性检查。**不能在改为 Mask-free tracking 时又继续假设每帧有真实语义 Mask 来计算支持比例。**
-4. 对重复 `camera_sequence` 的 Raw 行只做一次视觉跟踪，保留逐 Raw 行的结果与原始相机采集时间；手部 FK 仍可按每行实测关节独立计算。
-5. 在跟踪丢失时标记无效，不再无限复用旧位姿；恢复方案优先使用现有 Mask + `register` 做有界重新注册。不要在首次实现中引入复杂滤波网络。
+4. 要求 `camera_sequence`、`camera_ns` 为正值且不回退，相同序列的来源时间必须一致。对合法重复相机帧只做一次视觉跟踪，保留逐 Raw 行的结果与原始相机采集时间；手部 FK 仍可按每行实测关节独立计算。
+5. 在跟踪丢失时标记无效，不复用旧位姿。非法 FoundationPose 输出的 SE(3) 校验失败归类为位姿丢失，模型执行和 IPC 故障原样传播；离线使用现有 Mask + `register` 做最多 3 次连续重注册，在线默认不重注册。
 6. 在 RawReader 关闭后，以 `h5py.File(..., "r+")` 在 HDF5 **临时 staging Group** 中分块写点云和姿态；检查数组结构和输出有限性后发布为 `/hoi`。已有同模板完整标注由批处理入口跳过，写入函数直接拒绝覆盖。Raw 打开时仅检查完成状态和数组结构，数值在显示或导出时按需检查。不实现覆盖或迁移分支，不能将 HDF5 Group move 夸大为断电级原子事务。
 7. 大规模 Episode 不应把全部 `T×1024×3` 点云常驻内存：先收集轻量位姿/状态，再按块生成和写入点云。
-8. 终端按 Raw 行输出逐物体有效数、首次丢失行、状态数、最近失败原因和重注册耗尽情况；重复相机帧不重复跟踪。主机记录时间戳差另输出 P50/P95/Max，不能当作硬件同步误差。异常继续传播，不保存额外诊断文件。
+8. 终端按 Raw 行输出逐物体有效数、首次丢失行、状态数、最近失败原因和重注册耗尽情况；重复相机帧不重复跟踪。主机记录时间戳差仅统计双方均为正的时间对，输出 P50/P95/Max，无有效样本时显示不可用；不能当作硬件同步误差。不保存额外诊断文件。
 
 **可视化仅修改现有入口：**
 - `dexmani_real/utils/visualization/rerun.py`：在现有 **Hand Point Cloud** 标签页的 `Spatial3DView.contents` 加入 `"/object_pointcloud/**"`；保留标签页名称与其他布局。

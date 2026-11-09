@@ -21,7 +21,7 @@ def annotate_episodes(episodes, task):
     template, manifest = load_task_template(task)
     objects = task_objects(task)
     assets = {obj["name"]: task / obj["name"] for obj in objects}
-    prompts = {obj["name"]: obj.get("prompt", obj["name"]) for obj in objects}
+    prompts = {obj["name"]: obj["prompt"] for obj in objects}
     with ExitStack() as stack:
         tracker = None
         for episode in episodes:
@@ -55,8 +55,8 @@ def annotate_episodes(episodes, task):
                 for index, (frame, timing) in enumerate(iter_raw_rows(reader, camera)):
                     sequence, stamp = int(timing["camera_sequence"]), int(timing["camera_ns"])
                     if (
-                        sequence < 0
-                        or stamp < 0
+                        sequence <= 0
+                        or stamp <= 0
                         or sequence < previous_sequence
                         or stamp < previous_stamp
                     ):
@@ -103,7 +103,7 @@ def annotate_episodes(episodes, task):
                     f"当前连续重注册={attempts}/{tracker.max_reregistrations}, 耗尽={exhausted}"
                 )
             for field in ("arm_ns", "hand_ns"):
-                available = (timing_rows["camera_ns"] >= 0) & (timing_rows[field] >= 0)
+                available = (timing_rows["camera_ns"] > 0) & (timing_rows[field] > 0)
                 delta_ms = np.abs(timing_rows["camera_ns"][available] - timing_rows[field][available]) / 1e6
                 summary = (
                     "/".join(f"{value:.3f}" for value in np.percentile(delta_ms, [50, 95, 100]))

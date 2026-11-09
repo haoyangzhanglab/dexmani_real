@@ -55,13 +55,15 @@ python scripts/run_policy.py CHECKPOINT --enable_hoi_pcd
 
 对象列表决定顺序；未提供时按目录名排序。尺度也可使用明确的 `scale_to_meters`，不能与轴尺寸混用。单图多个候选时检查保留的 `.build-*` 诊断并在对象配置中明确 `instance`；不自动选择最高检测分数。`asset.json` 及其合法 Mesh/点云是阶段 1 的复用依据，无需原图片或模型权重，也不另建构建指纹。图片和构建参数只用于尚未发布的资产；修改输入不会替换已发布资产，重新构建应使用新的资产目录。
 
-`template.npz` 只保存 `points_local` 和 `offsets`；点顺序由数组行固定。`manifest.json` 只保存 `task_name`、`object_names`、`template_sha256`，一个指纹覆盖模板文件、物体顺序和实际跟踪 Mesh。尺度已应用到米制 Mesh 和点；固定的 1024 点、米制和 xArm base 是代码接口，不再作为配置或 schema 版本反复传递。
+`task_objects()` 是构建、模板读取、离线标注和在线 Worker 共用的任务入口。缺少 `prompt` 时在内存中补为对象名，不改写 `task.json`；显式 Prompt 必须是非空字符串，不能仅含空白或标点。按检测器的 `strip().lower().rstrip(".")` 匹配规则拒绝重复 Prompt，并报告冲突对象；合法文本和对象顺序保持原样。每个 Prompt 必须匹配唯一候选，当前 HOI 不支持以相同 Prompt 区分多个实例；构建时的 `instance` 只选择参考图候选，不参与在线实例匹配。
+
+`template.npz` 只保存 `points_local` 和 `offsets`；点顺序由数组行固定。`manifest.json` 只保存 `task_name`、`object_names`、`template_sha256`，一个指纹覆盖模板文件、物体顺序和实际跟踪 Mesh，防止形状相同但点索引或几何不同的资产被训练与部署混用。尺度已应用到米制 Mesh 和点；固定的 1024 点、米制和 xArm base 是代码接口。
 
 Raw `/hoi` 用原生 HDF5 属性保存上述三个字段和 `offsets`；Zarr 与 Checkpoint 直接沿用这三个字段作为 `hoi_pcd`，没有额外 recipe、来源证明或逐文件校验清单。启动时校验一次并把已加载模板交给 Worker。已有正式模板和标注拒绝覆盖。阶段 3 跨 Episode 复用模型，每段重置跟踪状态；中断结果只留在 HDF5 `_hoi_staging` 中，下次重算后发布。HDF5 group move 不提供断电级事务保证。
 
-阶段 3 的终端汇总按 Raw 行统计每个物体的有效数、首次失效行（从 0 开始）、TRACKING／POSE_LOST 数量、末态和最近一次失败原因；重复相机序列沿用上次结果，不重复跟踪。当前连续重注册计数及上限来自 Tracker，成功恢复会清零计数；仅当仍处于 POSE_LOST 且计数达到上限时报告耗尽。暂保留 `max_reregistrations=3`，不能仅凭总有效率认定次数耗尽是主因。诊断不写入 HDF5 或其他文件，已有完整标注仍直接跳过。
+阶段 3 要求 `camera_sequence`、`camera_ns` 均为正值且不回退，同一序列必须保留相同来源时间；合法重复帧沿用上次结果，不重复跟踪或改写时间。终端汇总按 Raw 行统计每个物体的有效数、首次失效行（从 0 开始）、TRACKING／POSE_LOST 数量、末态和最近一次失败原因。当前连续重注册计数及上限来自 Tracker，成功恢复会清零计数；仅当仍处于 POSE_LOST 且计数达到上限时报告耗尽。离线标注的 `max_reregistrations=3`，在线默认 0；不能仅凭总有效率认定次数耗尽是主因。诊断不写入 HDF5 或其他文件，已有完整标注仍直接跳过。
 
-同一汇总输出 `timing/rows` 中 `|camera_ns-arm_ns|`、`|camera_ns-hand_ns|` 的 P50／P95／Max（ms）和有效样本数；负值缺失时间戳不参与统计，无有效样本时显示不可用。这些只是主机记录时间戳的差异，不是硬件真实同步误差。
+同一汇总输出 `timing/rows` 中 `|camera_ns-arm_ns|`、`|camera_ns-hand_ns|` 的 P50／P95／Max（ms）和有效样本数；只有时间对中的两个来源时间戳均为正值才参与统计，无有效样本时显示不可用。Raw 手部几何的时间差同样要求 Camera、Arm、Hand 三个来源时间戳均为正值。这些只是主机记录时间戳的差异，不是硬件真实同步误差。
 
 无效帧为显式 false 掩码和零点占位，Viewer 清除物体点，导出拒绝整个 Episode 并提示 `--exclude`。Raw 打开时只检查完成状态和数组结构；点云数值在写入、逐帧显示和分块导出时检查，不再全量扫描未使用的数据。原 Hand Point Cloud 标签按固定点分段着色；`--no-point-cloud` 只关闭普通场景点云。Raw 无 `/hoi` 保持原有读取路径；不完整 `/hoi` 报错。
 
@@ -71,12 +73,12 @@ HOI Episode 结束时，`Rollout.stop()` 通过原请求通道发布一次 `epis
 
 任一模型必需模态失效时，观测 history 清空并暂停新预测；恢复后的首帧重新填满 `n_obs_steps`。非 HOI 模态失效时，已有有限 Action Chunk 和在途预测继续遵循 Sync／Async／RTC 原调度规则；HOI 失效仍直接停止当前动作计划。
 
-候选缺失或歧义、首帧空 mask／深度不足以及位姿门控失败会结束当前轮；Worker 记录原因并停止该轮视觉处理，保留模型，用户可重新按 B 初始化。已发布无效结果时不继续等待；每轮首次 HOI 初始化保留 120 秒预算，后续新鲜快照等待使用现有 1 秒预算。模型、CUDA、IPC 等故障仍通过原故障路径退出。
+候选缺失或歧义、首帧空 mask／深度不足以及位姿门控失败会结束当前轮；Worker 记录原因并停止该轮视觉处理，保留模型，用户可重新按 B 初始化。FoundationPose 正常返回但输出不是合法 SE(3) 时，仅输出校验的 `ValueError` 转为 `PoseRegistrationError`，由 Tracker 标记 POSE_LOST，沿用相同的 Episode 失败路径。已发布无效结果时不继续等待；每轮首次 HOI 初始化保留 120 秒预算，后续新鲜快照等待使用现有 1 秒预算。模型执行、CUDA、IPC 及配置错误继续传播，不伪装成位姿丢失。
 
 ### 当前验证范围
 
 - CPU/Mock 测试覆盖冻结模板确定性、偏移几何变换、Raw staging 与无效帧、显式导出、Viewer Clear、启用条件、来源 TTL、三种调度模式清空计划和 Worker 几何一致性；另覆盖无模型依赖的资产复用、批量标注共享模型、初始化期间切换 Episode、Worker 故障停止及按需传输同源图像。当前回归另覆盖预期初始化失败后的跨轮重试、独立 HOI 年龄预算、Raw 最新帧写入及动作映射期间的失效检查。
-- 本次补充 CPU/Mock 回归：inactive 期间相机继续更新但 Worker 不读相机或跟踪、跨轮只打开一次 Tracker、在途结果隔离、历史中断后的预测输入、HOI 训练元数据与存储契约、非 HOI 策略不受 HOI TTL 或数据属性约束，以及离线逐物体诊断和时间差统计。未新增 GPU 并发、真实 30 FPS 相机或真机运动验证；以下 GPU 记录均为此前实验。
+- CPU/Mock 回归还覆盖 inactive 期间 Worker 不读相机或跟踪、跨轮只打开一次 Tracker、在途结果隔离、历史中断后的预测输入、HOI 训练元数据与存储契约、非 HOI 策略不受 HOI TTL 或数据属性约束、离线逐物体诊断、非正来源时间和重复帧处理、Prompt 前置校验及默认值、非法 FoundationPose 输出与模型执行错误的分类。以下 GPU 记录均为此前实验，本轮正确性修复仅使用 CPU/Mock 验证。
 - RTX 4090：8 帧真实 Raw 副本完成三物体跟踪、内部 `/hoi` 写入、四字段 Zarr 导出、实际 CordViP Dataset 读取及重复标注跳过；另验证两轮 GPU 场景重置保留模型实例。完整 `episode_20261101_165909` 副本的 403 帧增强也已通过，三个物体均为 403/403 有效，离线总耗时约 79 秒（含模型加载）。
 - 已验证既有资产复用及一个物体的真实 Hunyuan 新建资产 GPU 流程（1024 点和法向、重复运行缓存命中）。未执行完整任务数据质量评估、Rerun GUI 人工检查、策略与感知并发性能或真机运动测试。8 帧通过不代表遮挡场景精度或真机安全性能已证明。
 - GPU 运行期间上游 Warp 输出驱动 API 告警，但上述实验正常完成；不以此宣称其他 CUDA 扩展路径均可用。

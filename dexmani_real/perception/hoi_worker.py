@@ -23,7 +23,7 @@ def run_hoi_worker(shared, camera, task, template):
 
     signal.signal(signal.SIGTERM, terminate)
     objects = task_objects(task)
-    prompts = {obj["name"]: obj.get("prompt", obj["name"]) for obj in objects}
+    prompts = {obj["name"]: obj["prompt"] for obj in objects}
     camera_fields = tuple(name for name in ("rgb", "depth") if name in shared.hoi_ring.dtype.names)
     epoch = last_sequence = 0
     first = True

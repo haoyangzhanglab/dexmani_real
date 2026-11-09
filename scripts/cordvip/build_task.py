@@ -40,7 +40,7 @@ def build_task(task):
             "--image",
             str(image),
             "--prompt",
-            obj.get("prompt", obj["name"]),
+            obj["prompt"],
             "--output",
             str(work / "result"),
             "--headless",

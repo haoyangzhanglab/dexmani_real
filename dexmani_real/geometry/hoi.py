@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,7 @@ def template_digest(template_path, names, mesh_paths):
 
 
 def task_objects(task):
+    """读取并校验有序任务对象，在内存中补齐默认 Prompt。"""
     task = Path(task)
     config = json.loads((task / "task.json").read_text()) if (task / "task.json").exists() else {}
     objects = config.get("objects")
@@ -27,12 +29,25 @@ def task_objects(task):
             for p in sorted(task.iterdir())
             if p.is_dir() and ((p / "asset.json").is_file() or (p / "reference.jpg").is_file())
         ]
-    names = [obj["name"] for obj in objects]
-    if not names or len(names) != len(set(names)):
+    if not objects:
         raise ValueError("任务必须包含非空且不重复的对象")
-    for name in names:
-        if not isinstance(name, str) or name in ("", ".", "..") or Path(name).name != name:
+    names_by_prompt: dict[str, str] = {}
+    for obj in objects:
+        name = obj["name"]
+        if not isinstance(name, str) or name in ("", ".", "..") or "\0" in name or Path(name).name != name:
             raise ValueError(f"非法对象名：{name!r}")
+        if name in names_by_prompt.values():
+            raise ValueError(f"重复对象名：{name!r}")
+        prompt = obj.setdefault("prompt", name)
+        if not isinstance(prompt, str) or all(
+            char.isspace() or unicodedata.category(char).startswith("P") for char in prompt
+        ):
+            raise ValueError(f"{name}: Prompt 必须是非空字符串，且不能仅含空白或标点")
+        # 与 SceneTracker.detect_masks 的标签匹配一致；保留原始 Prompt 文本。
+        normalized = prompt.strip().lower().rstrip(".")
+        if normalized in names_by_prompt:
+            raise ValueError(f"对象 {names_by_prompt[normalized]!r} 与 {name!r} 的 Prompt 冲突：{prompt!r}")
+        names_by_prompt[normalized] = name
     return objects
 
 

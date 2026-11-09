@@ -111,7 +111,7 @@ class RawHandCloud:
             (self.reader["arm_qpos"][row], self.reader["hand_qpos"][row])
         )
         cloud = self.hand_model.transform(joint_state)
-        timing_available = min(arm_ns, hand_ns, camera_ns) >= 0
+        timing_available = min(arm_ns, hand_ns, camera_ns) > 0
         skew_ms = (
             (max(arm_ns, hand_ns, camera_ns) - min(arm_ns, hand_ns, camera_ns)) / 1e6
             if timing_available

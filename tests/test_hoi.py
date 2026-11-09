@@ -11,10 +11,11 @@ import trimesh
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "third_party/cordvip_geometry/src")]
 from cordvip_geometry.assets import prepare_asset
-from dexmani_real.geometry.hoi import load_task_template, transform_task_points
+from dexmani_real.geometry.hoi import load_task_template, task_objects, transform_task_points
 from dexmani_real.data.hoi import write_hoi
 from dexmani_real.data.raw import RawReader, TIMING_ROW_DTYPE
 from dexmani_real.data.export import resolve_fields, export_zarr, ExportConfig
+from scripts.cordvip import annotate_episodes as annotation
 
 spec = importlib.util.spec_from_file_location(
     "allocate", ROOT / "scripts/cordvip/allocate_points.py"
@@ -35,6 +36,43 @@ def task(tmp_path):
         prepare_asset(source, directory / name, scale_to_meters=0.1)
     allocate.allocate_task(directory)
     return directory
+
+
+@pytest.mark.parametrize("objects,error", [
+    ([{"name": "apple"}, {"name": "bowl"}], None),
+    ([{"name": "bowl", "prompt": "  Blue bowl. "}, {"name": "apple", "prompt": "red apple"}], None),
+    *[([{"name": "apple", "prompt": prompt}], "apple.*Prompt")
+      for prompt in ("", " \t\n", ". .", "，。！", None, 123, ["apple"])],
+    *[([{"name": "apple", "prompt": "Red apple"}, {"name": "bowl", "prompt": prompt}], "apple.*bowl")
+      for prompt in ("red APPLE", " Red apple... ")],
+    ([{"name": "apple"}, {"name": "bowl", "prompt": "APPLE."}], "apple.*bowl"),
+])
+def test_task_prompts(tmp_path, objects, error):
+    source = json.dumps({"objects": objects})
+    (tmp_path / "task.json").write_text(source)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            task_objects(tmp_path)
+    else:
+        expected = [dict(obj, prompt=obj.get("prompt", obj["name"])) for obj in objects]
+        assert task_objects(tmp_path) == expected
+    assert (tmp_path / "task.json").read_text() == source
+
+
+@pytest.mark.parametrize("name", [None, 123, ["apple"], {"id": "apple"}, "a\0b", "../apple", ""])
+def test_task_rejects_invalid_object_names(tmp_path, name):
+    (tmp_path / "task.json").write_text(json.dumps({"objects": [{"name": name}]}))
+    with pytest.raises(ValueError, match="非法对象名"):
+        task_objects(tmp_path)
+
+
+def test_task_rejects_duplicate_names_with_distinct_prompts(tmp_path):
+    (tmp_path / "task.json").write_text(json.dumps({"objects": [
+        {"name": "apple", "prompt": "red apple"},
+        {"name": "apple", "prompt": "green apple"},
+    ]}))
+    with pytest.raises(ValueError, match="重复对象名"):
+        task_objects(tmp_path)
 
 
 def test_template(task):
@@ -627,33 +665,44 @@ def test_build_reuses_published_assets_without_models(tmp_path, monkeypatch):
         (task / obj["name"] / "reference.jpg").unlink()
     builder.build_task(task)
     assert len(calls) == 2
+    assert [args.prompt for args in calls] == ["apple", "bowl"]
     assert all((task / obj["name"] / "mesh/mesh_m.obj").is_file() for obj in objects)
     (task / "apple/mesh/mesh_m.obj").unlink()
     with pytest.raises(ValueError, match="mesh_m.obj"):
         builder.build_task(task)
 
 
-def test_batch_annotation_reuses_models_and_deduplicates_frames(task, tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("timings,error", [
+    ([(7, 10), (7, 10)], None),
+    ([(7, 10), (8, 11)], None),
+    ([(0, 10), (7, 10)], "非法相机时钟"),
+    ([(7, 0), (8, 10)], "非法相机时钟"),
+    ([(-1, 10), (7, 10)], "非法相机时钟"),
+    ([(7, -1), (8, 10)], "非法相机时钟"),
+    ([(7, 10), (6, 11)], "非法相机时钟"),
+    ([(7, 10), (8, 9)], "非法相机时钟"),
+    ([(7, 10), (7, 11)], "来源时间冲突"),
+])
+def test_batch_annotation_reuses_models_and_deduplicates_frames(task, tmp_path, monkeypatch, capsys, timings, error):
     from contextlib import contextmanager
     from types import SimpleNamespace
 
-    spec = importlib.util.spec_from_file_location(
-        "annotate", ROOT / "scripts/cordvip/annotate_episodes.py"
-    )
-    annotation = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(annotation)
     episodes = [tmp_path / f"episode_{i}" for i in range(2)]
     for episode in episodes:
         make_raw(episode)
         with h5py.File(episode / "data.h5", "r+") as f:
             f["meta"].attrs["task_label"] = task.name
+            rows = f["timing/rows"][:]
+            rows["camera_sequence"], rows["camera_ns"] = np.asarray(timings).T
+            rows["arm_ns"] = [0, -1]
+            f["timing/rows"][:] = rows
     monkeypatch.setattr(
         RawReader, "read_camera", lambda self: SimpleNamespace(T_xarm_base_from_color=np.eye(4))
     )
     monkeypatch.setattr(
         annotation,
         "iter_raw_rows",
-        lambda *args: iter([(None, {"camera_sequence": 7, "camera_ns": 10})] * 2),
+        lambda reader, camera: iter((None, row) for row in reader["timing/rows"][:]),
     )
     calls = []
 
@@ -664,7 +713,8 @@ def test_batch_annotation_reuses_models_and_deduplicates_frames(task, tmp_path, 
         def reset(self):
             calls.append("reset")
 
-        def detect_masks(self, *args):
+        def detect_masks(self, frame, prompts):
+            assert prompts == {"apple": "apple", "bowl": "bowl"}
             calls.append("detect")
             return {}
 
@@ -690,11 +740,19 @@ def test_batch_annotation_reuses_models_and_deduplicates_frames(task, tmp_path, 
         calls.append("close")
 
     monkeypatch.setattr(annotation.SceneTracker, "open", opened)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            annotation.annotate_episodes(episodes, task)
+        with RawReader(episodes[0]) as reader:
+            assert reader.hoi_metadata is None
+        return
     annotation.annotate_episodes(episodes, task)
-    assert calls == ["open", "detect", "step", "reset", "detect", "step", "close"]
+    steps = ["step"] * len({seq for seq, stamp in timings})
+    assert calls == ["open", "detect", *steps, "reset", "detect", *steps, "close"]
     output = capsys.readouterr().out
     assert output.count("TRACKING=2, POSE_LOST=0") == 4
     assert output.count("耗尽=False") == 4
+    assert output.count("P50/P95/Max(ms)=不可用, 有效样本=0/2") == 4
     for episode in episodes:
         with RawReader(episode) as reader:
             np.testing.assert_array_equal(
@@ -710,17 +768,15 @@ def test_annotation_diagnostics(task, tmp_path, monkeypatch, capsys, attempts, r
     from contextlib import contextmanager
     from types import SimpleNamespace
 
-    spec = importlib.util.spec_from_file_location("annotate", ROOT / "scripts/cordvip/annotate_episodes.py")
-    annotation = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(annotation)
     episode = tmp_path / "episode"
     make_raw(episode)
     timing = np.zeros(6, dtype=TIMING_ROW_DTYPE)
     timing["camera_sequence"] = [1, 2, 2, 3, 4, 4]
     timing["camera_ns"] = np.array([10, 20, 20, 30, 40, 40]) * 1_000_000
     timing["arm_ns"] = timing["camera_ns"] - np.arange(1, 7) * 1_000_000
-    timing["arm_ns"][-1] = -1
+    timing["arm_ns"][-2:] = [0, -1]
     timing["hand_ns"] = -1
+    timing["hand_ns"][0] = 0
     with h5py.File(episode / "data.h5", "r+") as data:
         del data["timing/rows"]
         data.create_dataset("timing/rows", data=timing)
@@ -768,7 +824,7 @@ def test_annotation_diagnostics(task, tmp_path, monkeypatch, capsys, attempts, r
     assert "最近失败原因=depth gate" in apple_line
     assert f"当前连续重注册={attempts}/3, 耗尽={attempts == 3}" in apple_line
     assert "bowl: 有效 6/6; 首次丢失 Raw 行(0-based)=None" in output
-    assert "P50/P95/Max(ms)=3.000/4.800/5.000, 有效样本=5/6" in output
+    assert "P50/P95/Max(ms)=2.500/3.850/4.000, 有效样本=4/6" in output
     assert "P50/P95/Max(ms)=不可用, 有效样本=0/6（非硬件同步误差）" in output
     with RawReader(episode) as reader:
         np.testing.assert_array_equal(reader["object_pose_valid"][:, 0], [True, False, False, False, recovered, recovered])
@@ -779,6 +835,26 @@ def test_manifest_order_change_rejected(task):
     (task / "task.json").write_text(json.dumps({"objects": [{"name": "bowl"}, {"name": "apple"}]}))
     with pytest.raises(ValueError, match="顺序"):
         load_task_template(task)
+
+
+@pytest.mark.parametrize("field", ["camera_ns", "arm_ns", "hand_ns"])
+@pytest.mark.parametrize("stamp", [-1, 0, 1_000_000])
+def test_raw_hand_timing_requires_positive_sources(field, stamp):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from cordvip_geometry.raw import RawHandCloud
+
+    source = RawHandCloud.__new__(RawHandCloud)
+    source.reader = MagicMock(num_frames=1)
+    source.reader.__getitem__.return_value = np.zeros((1, 3))
+    source.hand_model = SimpleNamespace(transform=lambda joints: {})
+    source.T_base_camera = np.eye(4)
+    timing = dict(camera_ns=1_000_000, arm_ns=2_000_000, hand_ns=3_000_000)
+    timing[field] = stamp
+    result = source.for_row(SimpleNamespace(row_index=0), timing)
+    assert result["timing_available"] == (stamp > 0)
+    expected = (max(timing.values()) - min(timing.values())) / 1e6 if stamp > 0 else None
+    assert result["skew_ms"] == expected
 
 
 def test_checkpoint_asset_validation(task, tmp_path, monkeypatch):
@@ -801,6 +877,38 @@ def test_checkpoint_asset_validation(task, tmp_path, monkeypatch):
     info.hoi_pcd = dict(info.hoi_pcd, template_sha256="0" * 64)
     with pytest.raises(ValueError, match="哈希"):
         preflight.validate_hoi_deployment(info, True)
+
+
+@pytest.mark.parametrize("entry", ["preflight", "worker", "offline"])
+def test_prompt_validation_before_models(task, monkeypatch, entry):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from cordvip_geometry.tracking import SceneTracker
+    from dexmani_real.deployment import preflight
+    from dexmani_real.perception.hoi_worker import run_hoi_worker
+
+    template, manifest = load_task_template(task)
+    (task / "task.json").write_text(json.dumps({"objects": [
+        {"name": "apple"}, {"name": "bowl", "prompt": "APPLE."},
+    ]}))
+    opened = Mock()
+    monkeypatch.setattr(SceneTracker, "open", opened)
+    monkeypatch.setattr("signal.signal", lambda *args: None)
+    if entry == "preflight":
+        root = task.parent
+        destination = root / "assets/pointcloud_template/object/task"
+        destination.parent.mkdir(parents=True)
+        task.rename(destination)
+        monkeypatch.setattr(preflight, "__file__", str(root / "dexmani_real/deployment/preflight.py"))
+        info = SimpleNamespace(observation_fields=("object_pointcloud",), task_name="task", hoi_pcd=manifest)
+        call = lambda: preflight.validate_hoi_deployment(info, True)
+    elif entry == "worker":
+        call = lambda: run_hoi_worker(None, None, task, template)
+    else:
+        call = lambda: annotation.annotate_episodes([], task)
+    with pytest.raises(ValueError, match="apple.*bowl"):
+        call()
+    opened.assert_not_called()
 
 
 def test_sam_history_keeps_conditioning_and_recent_frames():
@@ -1000,3 +1108,103 @@ def test_scene_initialization_error_scope(monkeypatch, failure):
         tracker.step(frame, initial_masks=masks)
     assert isinstance(raised.value, SceneInitializationError) == (failure != 'shape')
     tracker.trackers['apple'].register.assert_not_called()
+
+
+@pytest.fixture
+def pose_tracker():
+    import torch
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from cordvip_geometry.foundationpose import PoseTracker
+
+    tracker = PoseTracker.__new__(PoseTracker)
+    pose = torch.eye(4)
+    pose[2, 3] = 1
+    tracker.estimator = SimpleNamespace(
+        pose_last=pose.clone(), mesh=None, mesh_tensors=None, diameter=1, glctx=None,
+        refiner=SimpleNamespace(predict=Mock(return_value=(pose.clone(), None))),
+        get_tf_to_centered_mesh=lambda: torch.eye(4),
+    )
+
+    def register(**kwargs):
+        tracker.estimator.pose_last = pose.clone()
+        return tracker.estimator.register.return_value
+
+    tracker.estimator.register = Mock(side_effect=register, return_value=pose.numpy().copy())
+    return tracker
+
+
+@pytest.mark.parametrize("operation", ["register", "track"])
+@pytest.mark.parametrize("output", ["valid", "nan", "homogeneous", "rotation"])
+def test_foundationpose_output_validation(pose_tracker, operation, output):
+    from cordvip_geometry.foundationpose import PoseRegistrationError
+
+    estimator = pose_tracker.estimator
+    pose = estimator.register.return_value if operation == "register" else estimator.refiner.predict.return_value[0]
+    if output == "nan":
+        pose[0, 3] = float("nan")
+    elif output == "homogeneous":
+        pose[3, 0] = 1
+    elif output == "rotation":
+        pose[0, 0] = 2
+    mask = np.ones((4, 4), bool)
+    if operation == "register":
+        call = lambda: pose_tracker.register(None, None, np.eye(3), mask)
+    else:
+        call = lambda: pose_tracker.track(np.eye(3), mask, prepared_frame={})
+    if output == "valid":
+        np.testing.assert_array_equal(call(), pose)
+    else:
+        with pytest.raises(PoseRegistrationError, match="invalid FoundationPose output") as raised:
+            call()
+        assert isinstance(raised.value.__cause__, ValueError)
+
+
+@pytest.mark.parametrize("operation", ["register", "track"])
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError, BrokenPipeError])
+def test_foundationpose_estimator_errors_propagate(pose_tracker, operation, error_type):
+    error = error_type("estimator failed")
+    estimator = pose_tracker.estimator
+    method = estimator.register if operation == "register" else estimator.refiner.predict
+    method.side_effect = error
+    with pytest.raises(error_type) as raised:
+        if operation == "register":
+            pose_tracker.register(None, None, np.eye(3), np.ones((4, 4), bool))
+        else:
+            pose_tracker.track(np.eye(3), np.ones((4, 4), bool), prepared_frame={})
+    assert raised.value is error
+
+
+@pytest.mark.parametrize("operation", ["register", "track"])
+def test_scene_marks_invalid_foundationpose_output_lost(pose_tracker, monkeypatch, operation):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from cordvip_geometry import tracking
+    from cordvip_geometry.rgbd import RGBDFrame
+
+    mask = np.ones((4, 4), bool)
+    frame = RGBDFrame(np.zeros((4, 4, 3), np.uint8), np.ones((4, 4), np.float32),
+                     np.eye(3), "none", (0, 0, 0, 0, 0))
+    segmenter = SimpleNamespace(initialize=lambda rgb, masks: masks, track=lambda rgb: {"apple": mask})
+    pose_tracker.mesh = None
+    renderer = SimpleNamespace(render=Mock(return_value=np.ones(16)))
+    monkeypatch.setattr(tracking, "PoseTracker", lambda *args, **kwargs: pose_tracker)
+    monkeypatch.setattr(tracking, "ModelDepthRenderer", lambda *args, **kwargs: renderer)
+    monkeypatch.setattr(tracking, "prepare_tracking_frame", lambda *args: {})
+    scene = tracking.SceneTracker(segmenter, {"apple": (None, None, None)},
+                                  foundationpose_root=".", debug_dir=".",
+                                  pixel_stride=1, min_matched_pixels=1)
+    if operation == "register":
+        pose_tracker.estimator.register.return_value[0, 3] = np.nan
+        result = scene.step(frame, initial_masks={"apple": mask})
+    else:
+        assert scene.step(frame, initial_masks={"apple": mask})["objects"]["apple"]["pose_valid"]
+        renderer.render.reset_mock()
+        pose_tracker.estimator.refiner.predict.return_value[0][0, 0] = 2
+        result = scene.step(frame)
+    item = result["objects"]["apple"]
+    assert not item["pose_valid"] and item["pose"] is None
+    assert item["state"] == "POSE_LOST"
+    assert item["error"] == scene.lost_objects["apple"]
+    assert "invalid FoundationPose output" in item["error"]
+    renderer.render.assert_not_called()
