@@ -17,7 +17,6 @@ from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.data.raw import (
     TACTILE_AGE_WARNING_NS,
     RawReader,
-    require_continuous_recording,
     require_published_raw,
 )
 from dexmani_real.geometry.camera import (
@@ -159,9 +158,7 @@ def validate_export_episode(reader: RawReader, fields):
     for name in inputs - {"rgb"}:
         reader[name]
     camera = export_camera(reader, fields)
-    rows = reader["timing/rows"][:]
-    require_continuous_recording(reader.meta, rows)
-    period = round(1e9 / reader.control_hz)
+    rows = reader.read_timing()
 
     def first_bad(bad):
         indices = np.flatnonzero(bad)
@@ -170,8 +167,6 @@ def validate_export_episode(reader: RawReader, fields):
     control, observation = rows["control_ns"], rows["observation_ns"]
     if frames == 1:
         logger.warning("%s: single row, no sampling interval to verify", reader.path)
-    if np.any(np.abs(np.diff(control) - period) > period // 4):
-        logger.warning("%s: short control intervals; 不重采样，实际时间保留于 Raw", reader.path)
     if np.any(observation[:-1] >= control[1:]):
         logger.warning("%s: observation readout overlaps the next control sample", reader.path)
 
@@ -336,8 +331,9 @@ def export_zarr(
                 require_published_raw(episode)
                 with RawReader(episode) as reader:
                     camera = validate_export_episode(reader, fields)
+                    starts = reader.segment_starts
                     frames = reader.num_frames
-                    logger.info("%s: exporting full episode (%d frames)", episode.name, frames)
+                    logger.info("%s: exporting %d rows in %d segments", episode.name, frames, len(starts))
                     if index == 0:
                         arm_fk = ArmFK() if ARM_FK_FIELDS.intersection(fields) else None
                         hand_fk = HandFK() if HAND_FK_FIELDS.intersection(fields) else None
@@ -379,7 +375,8 @@ def export_zarr(
                         hand_cloud=hand_cloud,
                         camera=camera,
                     )
-                    append_episode(arrays, offset, blocks, frames)
+                    append_rows(arrays, offset, blocks, frames)
+                    ends.extend(offset + int(start) for start in starts[1:])
                     ends.append(offset + frames)
             except (KeyError, ValueError) as exc:
                 raise ValueError(f"Raw {episode}: {exc}") from exc
@@ -393,7 +390,8 @@ def export_zarr(
         if progress_callback:
             progress_callback(len(selected), len(selected))
         return {
-            "episode_count": len(ends), "total_frames": ends[-1], "excluded_episodes": sorted(excluded),
+            "raw_episode_count": len(selected), "episode_count": len(ends),
+            "total_frames": ends[-1], "excluded_episodes": sorted(excluded),
         }
     finally:
         if staging is not None:
@@ -439,7 +437,7 @@ def create_store(store, processing, camera, *, fields, control_hz):
     return root, arrays
 
 
-def append_episode(arrays, offset, blocks, frames):
+def append_rows(arrays, offset, blocks, frames):
     for array in arrays.values():
         array.resize((offset + frames, *array.shape[1:]))
     count = 0

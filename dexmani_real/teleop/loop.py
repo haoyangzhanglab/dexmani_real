@@ -378,6 +378,14 @@ class TeleopLoop:
                         cancel_epoch=expected_cancel_epoch,
                         cancel_requested=self.poll_blocking_commands,
                     )
+                except FeedbackUnavailable as exc:
+                    # hand HOME 的 finally、arm 生命周期协议已完成停止收尾。
+                    interrupted = self.poll_blocking_commands()
+                    if (interrupted or self.runtime_state.cancel_epoch != expected_cancel_epoch
+                            or not self.runtime_state.requests_allow_motion()):
+                        logger.info("HOME cancelled: %s", exc)
+                    else:
+                        logger.warning("本次 HOME 未完成：%s", exc)
                 except OperationCancelled as exc:
                     self.robot.stop()
                     self.robot.check()
@@ -498,12 +506,12 @@ class TeleopLoop:
         except IKReferenceError as exc:
             self.request_episode_end(str(exc))
         except (FeedbackUnavailable, CommandExpired) as exc:
-            self.pause(str(exc))
+            self.pause(str(exc), mark_recording_gap=command is None)
         except OperationCancelled as exc:
             # 先检查 SDK/worker 故障，再即时登记已入队的终止意图。
             interrupted = self.poll_blocking_commands()
             if self.pending_termination_reason is None and not interrupted:
-                self.handle_executor_stop(f"control_interrupted: {exc}")
+                self.handle_executor_stop(f"control_interrupted: {exc}", mark_recording_gap=command is None)
         finally:
             primary_error = sys.exc_info()[1]
             if primary_error is not None:
@@ -517,6 +525,10 @@ class TeleopLoop:
                         raise
                     self.record_error("recording_append", exc)
                     logger.exception("teleop recording append also failed")
+                finally:
+                    # 本次提交尝试发生在暂停前，断点属于恢复后的下一条记录。
+                    if self.phase is TeleopPhase.PAUSED:
+                        self.recorder.mark_gap("teleop_paused")
 
     def recording_issue(self, row):
         if not self.sensors.check(names=("camera",)):
@@ -529,7 +541,7 @@ class TeleopLoop:
         return (check_device_feedback(row, self.runtime)
                 + check_observation(row, self.runtime, self.control_needs))
 
-    def pause(self, reason):
+    def pause(self, reason, *, mark_recording_gap=True):
         if self.preparation_interrupted():
             return
         self.robot.stop()  # 返回才代表两设备停止请求已确认；失败不得进入恢复。
@@ -541,14 +553,14 @@ class TeleopLoop:
         if self.phase is not TeleopPhase.PAUSED:
             logger.warning("Teleop 暂停：%s；等待新输入后重新锚定。", reason)
         self.phase = TeleopPhase.PAUSED
-        if self.recorder is not None:
+        if self.recorder is not None and mark_recording_gap:
             self.recorder.mark_gap("teleop_paused: " + reason)
 
-    def handle_executor_stop(self, unknown_reason="executor_stopped_unknown"):
+    def handle_executor_stop(self, unknown_reason="executor_stopped_unknown", *, mark_recording_gap=True):
         self.robot.check()
         reason = self.robot.arm.soft_stop_reason
         if reason is not None:
-            self.pause(reason)
+            self.pause(reason, mark_recording_gap=mark_recording_gap)
         else:
             self.request_episode_end(unknown_reason)
 
@@ -598,6 +610,8 @@ class TeleopLoop:
             return
         planned_ns = now_ns if self.next_tick_ns is None else self.next_tick_ns
         self.next_tick_ns = next_tick_ns(planned_ns, self.control_dt_ns, now_ns)
+        if now_ns - planned_ns >= self.control_dt_ns and self.recorder is not None:
+            self.recorder.mark_gap("control_slots_skipped")
         row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
         if self.phase is TeleopPhase.PAUSED:
             self.resume_tick(row)

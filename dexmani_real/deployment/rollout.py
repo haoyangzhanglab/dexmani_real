@@ -547,7 +547,10 @@ class Rollout:
         if now < self.next_step_ns:
             self.poll_model()
             return
-        self.next_step_ns = next_tick_ns(self.next_step_ns, self.dt_ns, now)
+        planned_ns = self.next_step_ns
+        self.next_step_ns = next_tick_ns(planned_ns, self.dt_ns, now)
+        if now - planned_ns >= self.dt_ns and self.recorder is not None:
+            self.recorder.mark_gap("control_slots_skipped")
         row = raw = attempted = None
         try:
             row, raw = self.sample_observation()
@@ -583,6 +586,8 @@ class Rollout:
             self.poll_model()
             return
         self.result.skipped_slots += skipped
+        if skipped and self.recorder is not None:
+            self.recorder.mark_gap("control_slots_skipped")
         self.last_slot = slot
         row = raw = attempted = None
         pending = self.model.future

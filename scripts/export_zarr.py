@@ -13,7 +13,12 @@ from pathlib import Path
 from tqdm import tqdm
 
 from dexmani_real.config.real import load_config
-from dexmani_real.data.export import FIELD_INPUTS, ExportConfig, export_zarr, resolve_fields
+from dexmani_real.data.export import (
+    FIELD_INPUTS,
+    ExportConfig,
+    export_zarr,
+    resolve_fields,
+)
 from dexmani_real.utils.table_plane import load_table_plane
 
 
@@ -23,7 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Export published Raw episodes with valid data to a canonical multimodal Zarr. "
             "Validate structure and timing first, numeric values during chunk conversion. "
             "Warn on source-clock diagnostics; reject missing/nonfinite selected data. "
-            "Reject recordings with missing rows, pauses, or control intervals over 1.25 periods. "
+            "Export recorded continuous segments as separate episodes without resampling. "
+            "Legacy omissions without segment boundaries require explicit exclusion. "
             "Publish only after all episodes succeed; "
             "use --exclude and retry."
         )
@@ -58,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fields", nargs="+", choices=tuple(FIELD_INPUTS),
-        help="Canonical fields to export; omitted means every listed field.",
+        help="Canonical fields to export; omitted means all fields except object_pointcloud.",
     )
     parser.add_argument(
         "--exclude",
@@ -122,7 +128,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             progress_callback=update_progress,
         )
     print(
-        f"Exported {result['episode_count']} episode(s), {result['total_frames']} frames.",
+        f"Exported {result['raw_episode_count']} Raw file(s) as "
+        f"{result['episode_count']} continuous episode(s), {result['total_frames']} frames.",
         file=sys.stderr,
     )
     print(

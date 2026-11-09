@@ -171,6 +171,8 @@ def test_raw_task_identity(task, tmp_path, with_hoi, task_label):
 
 
 def test_raw_export(task, tmp_path):
+    import zarr
+
     template, manifest = load_task_template(task)
     episode = tmp_path / "episode_1"
     make_raw(episode)
@@ -192,9 +194,17 @@ def test_raw_export(task, tmp_path):
         assert reader.hoi_metadata["template_sha256"] == manifest["template_sha256"]
     assert len(resolve_fields(None)) == 13
     assert "object_pointcloud" not in resolve_fields(None)
-    export_zarr(
+    with h5py.File(episode / "data.h5", "r+") as data:
+        data["timing"].create_dataset("segment_starts", data=np.array([0, 1], np.int64))
+    result = export_zarr(
         episode, tmp_path / "out.zarr", processing=ExportConfig(), fields=["object_pointcloud"]
     )
+    assert result["raw_episode_count"] == 1
+    assert result["episode_count"] == 2
+    exported = zarr.open_group(str(tmp_path / "out.zarr"), mode="r")
+    assert exported["meta/episode_ends"][:].tolist() == [1, 2]
+    with RawReader(episode) as reader:
+        np.testing.assert_array_equal(exported["data/object_pointcloud"][:], reader["object_pointcloud"][:])
     with h5py.File(episode / "data.h5", "r+") as f:
         f["hoi/object_pointcloud"][1, 0, 0] = np.nan
     with RawReader(episode) as reader:

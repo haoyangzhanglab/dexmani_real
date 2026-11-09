@@ -29,9 +29,9 @@ if TYPE_CHECKING:
     from dexmani_real.config.real import RealConfig
 
 
-def run_replay(episode_path: str | Path, runtime: RealConfig) -> None:
+def run_replay(episode_path: str | Path, runtime: RealConfig, *, segment: int | None = None) -> None:
     """起点读取一次姿态；播放和留驻通过公共设备服务处理 I/O 与停止。"""
-    trajectory = load_trajectory(episode_path, runtime)
+    trajectory = load_trajectory(episode_path, runtime, segment=segment)
     state = SessionState()
     epoch = state.cancel_epoch
     robot = keyboard = None

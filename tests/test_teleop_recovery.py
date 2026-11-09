@@ -36,6 +36,149 @@ def live_keyboard(loop):
     return keyboard
 
 
+@pytest.fixture(params=["teleop", "policy"])
+def home_session(request, clock, runtime):
+    from test_freshness import hand_sample
+
+    from dexmani_real.deployment.session import PolicySession
+    from dexmani_real.robot.system import Robot
+
+    mode = request.param
+    if mode == "teleop":
+        owner = make_teleop(runtime, clock)
+        owner.phase = TeleopPhase.IDLE
+    else:
+        owner = PolicySession(runtime, None, weights=None, inference_steps=None,
+                              output_root=None, device="cpu", seed=0, max_running_s=None,
+                              num_episodes=None, record_raw=False, camera_calibration_path=None)
+    keyboard = live_keyboard(owner)
+    keyboard.allow_start()
+    robot = owner.robot = Robot(runtime.arm, runtime.hand, runtime_state=owner.runtime_state)
+    robot.connected = True
+    robot.arm = Mock(is_connected=True)
+    robot.hand = Mock(is_connected=True)
+    robot.hand_feedback.consume(hand_sample(clock.now_ns))
+    robot.feedback_next_ns = clock.now_ns + 1_000_000_000
+    return mode, owner
+
+
+@pytest.mark.parametrize("key", [None, "s", "q", "esc"])
+def test_home_feedback_failure_preserves_session_and_operator_priority(home_session, clock, key, caplog):
+    mode, owner = home_session
+    robot, keyboard = owner.robot, owner.keyboard
+    original_send = robot.send_hand_home
+
+    def expire_before_send(*args, **kwargs):
+        clock.now_ns += 210_000_000
+        try:
+            return original_send(*args, **kwargs)
+        except FeedbackUnavailable:
+            if key:
+                keyboard.handle_key(key, True)
+            raise
+
+    robot.send_hand_home = expire_before_send
+    initial_epoch = owner.runtime_state.cancel_epoch
+    if mode == "teleop":
+        owner.handle_operator_command("h")
+        assert owner.phase is TeleopPhase.IDLE
+        assert "home_done" not in [c.args[0] for c in owner.audio.play.call_args_list]
+    else:
+        epoch = keyboard.accept_operation(owner.runtime_state)
+        assert owner.run_home(epoch)
+        assert owner.episode is None
+    assert robot.arm.wait_stopped.call_count == 2  # 开始停止 + 真实 HOME finally；上层不重复停止。
+    robot.arm.home.assert_not_called()
+    robot.hand._send_position.assert_not_called()
+    assert owner.runtime_state.stop_signal.is_set()
+    assert owner.runtime_state.quit_requested == (key == "q")
+    assert owner.runtime_state.estop_request == (key == "esc")
+    assert owner.runtime_state.cancel_epoch == initial_epoch + int(key in ("s", "q"))
+    assert ("本次 HOME 未完成" in caplog.text) == (key is None)
+    keyboard.allow_start()
+    assert (keyboard.accept_operation(owner.runtime_state) is not None) == (key not in ("q", "esc"))
+
+
+@pytest.mark.parametrize("failure", ["stop", "fault", "timeout", "program", "cancel"])
+def test_home_real_cleanup_does_not_hide_failures(home_session, failure):
+    mode, owner = home_session
+    robot, keyboard = owner.robot, owner.keyboard
+    if failure == "stop":
+        robot.arm.wait_stopped.side_effect = [None, RobotError("stop unconfirmed")]
+    error_type = {"stop": RobotError, "fault": RobotError, "timeout": TimeoutError,
+                  "program": ValueError, "cancel": OperationCancelled}[failure]
+
+    def fail_submission(*args, **kwargs):
+        if failure == "fault":
+            robot.arm.check_error.side_effect = RobotError("device fault")
+        raise FeedbackUnavailable("feedback stale") if failure in ("stop", "fault") else error_type("injected")
+
+    robot.send_hand_home = fail_submission
+    with pytest.raises(error_type):
+        if mode == "teleop":
+            owner.handle_operator_command("h")
+        else:
+            owner.run_home(keyboard.accept_operation(owner.runtime_state))
+    robot.arm.home.assert_not_called()
+    robot.hand._send_position.assert_not_called()
+
+
+def test_arm_home_feedback_failure_drains_reply_before_next_operation(home_session, clock, monkeypatch, caplog):
+    from test_freshness import hand_sample
+
+    from dexmani_real.robot.xarm7.process import ArmProcess
+    from dexmani_real.robot.xarm7.protocol import HomeRequest
+
+    mode, owner = home_session
+    robot, keyboard = owner.robot, owner.keyboard
+    arm = robot.arm = ArmProcess(robot.arm_config, runtime_state=owner.runtime_state)
+    arm.process = Mock()
+    arm.io.ready.set()
+    arm.io.stopped.set()
+    monkeypatch.setattr("time.sleep", lambda seconds: setattr(clock, "now_ns", clock.now_ns + round(seconds * 1e9)))
+    robot.read_hand = lambda: robot.hand_feedback.consume(hand_sample(clock.now_ns))
+    robot.feedback_next_ns = clock.now_ns
+    service_feedback = robot.service_feedback
+    submitted = False
+    replied = False
+
+    def service_owner_and_feedback():
+        nonlocal submitted, replied
+        if arm.child_pipe.poll():
+            assert isinstance(arm.child_pipe.recv(), HomeRequest)
+            assert not submitted
+            submitted = True
+            arm.io.stopped.clear()
+            # 手部 HOME 已完成；机械臂运动期间没有收到新手部反馈。
+            clock.now_ns += 210_000_000
+            robot.feedback_next_ns = clock.now_ns + 1_000_000_000
+        elif submitted and owner.runtime_state.stop_signal.is_set() and not replied:
+            arm.io.stopped.set()
+            arm.child_pipe.send(OperationCancelled("owner stopped HOME"))
+            replied = True
+        return service_feedback()
+
+    robot.service_feedback = service_owner_and_feedback
+    try:
+        if mode == "teleop":
+            owner.handle_operator_command("h")
+            assert owner.phase is TeleopPhase.IDLE
+            assert "home_done" not in [c.args[0] for c in owner.audio.play.call_args_list]
+        else:
+            assert owner.run_home(keyboard.accept_operation(owner.runtime_state))
+            assert owner.episode is None
+        assert submitted and replied
+        assert arm.io.stopped.is_set() and owner.runtime_state.stop_signal.is_set()
+        assert not arm.io.closing.is_set()
+        assert not arm.pipe.poll() and not arm.child_pipe.poll()
+        assert "本次 HOME 未完成" in caplog.text
+        keyboard.allow_start()
+        assert keyboard.accept_operation(owner.runtime_state) is not None
+    finally:
+        arm.pipe.close()
+        arm.child_pipe.close()
+
+
 def fresh_vr(loop, clock, position=None):
     ring = loop.sensors.channels.vr_ring
     payload = ring.read()[0]

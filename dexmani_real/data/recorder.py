@@ -42,11 +42,12 @@ class EpisodeRecorder:
         self.data_dir = Path(data_dir)
         self.control_hz = float(control_hz)
         self.thread = None
-        self.queue: Queue[tuple[Observation, RobotCommand | None]] = Queue(maxsize=16)
+        self.queue: Queue[tuple[Observation, RobotCommand | None, bool]] = Queue(maxsize=16)
         self.ready = threading.Event()
         self.error = None
         self.is_recording = False
         self.recording_truncated_reason = None
+        self.pending_segment_start = False
         self.finish_request: _FinishRequest | None = None
         self.warned_tactile_channels = set()
         self.warned_gaps = set()
@@ -94,6 +95,7 @@ class EpisodeRecorder:
         self.poll_finish()
 
     def mark_gap(self, reason):
+        self.pending_segment_start = True
         if self.recording_truncated_reason is None:
             self.recording_truncated_reason = reason
         if reason not in self.warned_gaps:
@@ -192,9 +194,10 @@ class EpisodeRecorder:
         # 数组已脱离共享缓冲，入队后生产者不再修改。
         snapshot = replace(row, point_cloud=None)
         try:
-            self.queue.put_nowait((snapshot, command))
+            self.queue.put_nowait((snapshot, command, self.pending_segment_start))
         except Full:
             return self.mark_gap("recording_queue_full")
+        self.pending_segment_start = False
         return None
 
     def request_finish(self, *, save, reason, details=None) -> _FinishRequest:

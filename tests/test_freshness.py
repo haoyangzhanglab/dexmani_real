@@ -745,7 +745,7 @@ def test_replay_start_uses_current_feedback_budgets(clock, runtime, monkeypatch,
     robot, keyboard = Mock(), Mock()
     robot.read_state.return_value = row
     keyboard.poll.return_value = ([], False)
-    monkeypatch.setattr(replay, "load_trajectory", lambda *args: trajectory)
+    monkeypatch.setattr(replay, "load_trajectory", lambda *args, **kwargs: trajectory)
     monkeypatch.setattr(replay, "Robot", Mock(return_value=robot))
     monkeypatch.setattr(replay, "Keyboard", Mock(return_value=keyboard))
 

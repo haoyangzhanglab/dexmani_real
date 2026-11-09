@@ -20,7 +20,11 @@ from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.deployment.rollout import Rollout, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
-from dexmani_real.robot.commands import OperationCancelled, RobotError
+from dexmani_real.robot.commands import (
+    FeedbackUnavailable,
+    OperationCancelled,
+    RobotError,
+)
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.home import HomeConfigurationError, home_arm, home_hand
 from dexmani_real.runtime.keyboard import Keyboard
@@ -495,6 +499,15 @@ class PolicySession:
                 cancel_epoch=cancel_epoch,
                 cancel_requested=self.home_abort_requested,
             )
+        except FeedbackUnavailable as exc:
+            # 底层 HOME 已确认停止；这里检查硬故障并保留操作指令优先级。
+            robot.check()
+            self.poll_operator()
+            if (self.runtime_state.cancel_epoch != cancel_epoch
+                    or not self.runtime_state.requests_allow_motion()):
+                logger.info("回初始位已中断：%s", exc)
+            else:
+                logger.warning("本次 HOME 未完成：%s", exc)
         except OperationCancelled as exc:
             robot.stop()
             robot.check()

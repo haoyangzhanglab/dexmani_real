@@ -44,7 +44,7 @@ ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
 }
 
 
-# 仅供遥操作调试，不参与训练导出的字段与有效前缀判定。
+# 仅供遥操作调试，不作为训练导出字段。
 VR_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
     "vr_wrist_pos": ((3,), np.dtype(np.float64)),
     "vr_wrist_quat_wxyz": ((4,), np.dtype(np.float64)),
@@ -261,6 +261,9 @@ class RawWriter:
         self.row_times = timing.create_dataset(
             "rows", shape=(0,), maxshape=(None,), dtype=TIMING_ROW_DTYPE
         )
+        self.segment_starts = timing.create_dataset(
+            "segment_starts", shape=(0,), maxshape=(None,), dtype=np.int64,
+        )
         rgb_shape = (metadata["camera_color_height"], metadata["camera_color_width"], 3)
         self.datasets["depth"] = data.create_dataset(
             "depth",
@@ -288,7 +291,7 @@ class RawWriter:
         )
         self.video.open()
 
-    def append_frame(self, row, command):
+    def append_frame(self, row, command, segment_start=False):
         values = encode_raw_row(row, command)
         if "vr_landmarks" in self.datasets:
             values.update({name: row.vr[name.removeprefix("vr_")] for name in VR_DATASET_SPECS})
@@ -300,6 +303,12 @@ class RawWriter:
         timing_rows = cast(np.ndarray, self.timing_rows)
         timing_rows[self.buffered] = timing
         cast(_VideoWriter, self.video).write_frame(rgb, row.control_timestamp_ns)
+        # 只有 Writer 知道实际接收顺序；缓冲中尚未 flush 的行也计入索引。
+        index = self.frame_count + self.buffered
+        if index == 0 or segment_start:
+            count = len(self.segment_starts)
+            self.segment_starts.resize(count + 1, axis=0)
+            self.segment_starts[count] = index
         self.buffered += 1
         if self.buffered == len(timing_rows):
             self.flush()
@@ -341,25 +350,6 @@ class RawWriter:
         finally:
             self.arrays = {}
             self.timing_rows = None
-
-
-def require_continuous_recording(meta, rows):
-    """固定频率消费者不能压缩已知缺失或明显的控制时间间隙。"""
-    control, observation = rows["control_ns"], rows["observation_ns"]
-    for bad, detail, offset in (
-        ((control < 0) | (observation < control), "invalid_control_or_observation_clock", 0),
-        (np.diff(control) <= 0, "control_clock_not_increasing", 1),
-        (np.diff(observation) <= 0, "observation_clock_not_increasing", 1),
-    ):
-        indices = np.flatnonzero(bad)
-        if len(indices):
-            raise ValueError(f"{detail} at row {int(indices[0]) + offset}")
-    reason = meta.get("recording_truncated_reason")
-    period = sampling_clock_ns(float(meta["control_hz"]))
-    gaps = np.flatnonzero(np.diff(rows["control_ns"]) > period + period // 4)
-    if reason or len(gaps):
-        detail = reason or f"control gap before row {int(gaps[0]) + 1}"
-        raise ValueError(f"recording has gaps ({detail}); fixed-rate consumption is not allowed")
 
 
 def require_published_raw(path):
@@ -404,6 +394,44 @@ class RawReader:
         hz = float(self.meta["control_hz"])
         sampling_clock_ns(hz)
         return hz
+
+    def read_timing(self) -> np.ndarray:
+        """读取并校验时间行；周期偏差只诊断，断点以 segment_starts 为准。"""
+        rows = self["timing/rows"][:]
+        control, observation = rows["control_ns"], rows["observation_ns"]
+        for bad, detail, offset in (
+            ((control < 0) | (observation < control), "invalid_control_or_observation_clock", 0),
+            (np.diff(control) <= 0, "control_clock_not_increasing", 1),
+            (np.diff(observation) <= 0, "observation_clock_not_increasing", 1),
+        ):
+            indices = np.flatnonzero(bad)
+            if len(indices):
+                raise ValueError(f"Raw {self.path}: {detail} at row {int(indices[0]) + offset}")
+        period = round(1e9 / self.control_hz)
+        if np.any(np.abs(np.diff(control) - period) > period // 4):
+            logger.warning("%s: 控制周期存在抖动或间隙；按标称频率使用，不重采样，真实时间保留于 Raw。", self.path)
+        return rows
+
+    @property
+    def segment_starts(self) -> np.ndarray:
+        reason = self.meta.get("recording_truncated_reason")
+        if "timing/segment_starts" not in self.data_file:
+            if reason:
+                raise ValueError(
+                    f"Raw {self.path}: recording_truncated_reason={reason}, but segment_starts is missing; "
+                    "insufficient information to locate interruptions"
+                )
+            return np.array([0] if self.num_frames else [], dtype=np.int64)
+        starts = np.asarray(self.data_file["timing/segment_starts"][()])
+        if (starts.ndim != 1 or starts.dtype.kind not in "iu"
+                or (self.num_frames == 0 and starts.size != 0)
+                or (self.num_frames > 0 and (starts.size == 0 or starts[0] != 0))
+                or np.any(starts[1:] <= starts[:-1])
+                or np.any(starts >= self.num_frames)):
+            raise ValueError(f"Raw {self.path}: invalid timing/segment_starts")
+        if reason:
+            logger.warning("%s: %s；按已记录的连续区间使用。", self.path, reason)
+        return starts
 
     @property
     def fields(self):
