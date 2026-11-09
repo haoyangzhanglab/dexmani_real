@@ -36,17 +36,21 @@ def validate_object_name(name):
 
 def _validate_tracking_parameters(
     *, has_models, pixel_stride, depth_tolerance_m, min_matched_pixels, min_matched_fraction,
+    max_reregistrations,
 ):
-    integer_parameters = [("pixel_stride", pixel_stride)]
+    integer_parameters = [("pixel_stride", pixel_stride, 1)]
     if has_models:
-        integer_parameters.append(("min_matched_pixels", min_matched_pixels))
-    for name, value in integer_parameters:
+        integer_parameters.extend((
+            ("min_matched_pixels", min_matched_pixels, 1),
+            ("max_reregistrations", max_reregistrations, 0),
+        ))
+    for name, value, minimum in integer_parameters:
         if (
             isinstance(value, bool)
             or not isinstance(value, (int, np.integer))
-            or value < 1
+            or value < minimum
         ):
-            raise ValueError(f"{name} must be a positive integer")
+            raise ValueError(f"{name} must be an integer >= {minimum}")
     if has_models:
         for name, value in (
             ("depth_tolerance_m", depth_tolerance_m),
@@ -183,6 +187,7 @@ class SceneTracker:
             has_models=any(path is not None for path in assets.values()),
             pixel_stride=pixel_stride, depth_tolerance_m=depth_tolerance_m,
             min_matched_pixels=min_matched_pixels, min_matched_fraction=min_matched_fraction,
+            max_reregistrations=max_reregistrations,
         )
         from .assets import load_asset
         from .models import DEFAULT_MODELS_DIR, resolve_sam_model

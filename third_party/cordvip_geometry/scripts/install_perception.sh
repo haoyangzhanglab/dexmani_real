@@ -134,4 +134,4 @@ cmake --build third_party/FoundationPose/mycpp/build -j"$MAX_JOBS"
 python -m pip list --format=json > "$cordvip_log_dir/packages_after.json"
 printf 'Dependency installation and builds completed. No models or devices were opened.\n'
 printf 'Next, from the workspace root: python -m cordvip_geometry download\n'
-printf 'FoundationPose weights require the separate official download described in docs/usage.md.\n'
+printf 'Prepare FoundationPose weights separately under third_party/FoundationPose/weights/; see third_party/cordvip_geometry/README.md.\n'

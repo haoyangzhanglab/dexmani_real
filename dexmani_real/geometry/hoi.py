@@ -9,7 +9,7 @@ import numpy as np
 
 
 def template_digest(template_path, names, mesh_paths):
-    """一个指纹绑定实际使用的点、顺序和 Mesh，不记录逐文件校验清单。"""
+    """绑定固定点、物体顺序和跟踪 Mesh 的模板身份。"""
     digest = hashlib.sha256(json.dumps(names, ensure_ascii=False).encode())
     for path in (template_path, *mesh_paths):
         with Path(path).open("rb") as stream:

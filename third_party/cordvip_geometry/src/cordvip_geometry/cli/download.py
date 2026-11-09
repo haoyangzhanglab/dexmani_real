@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from typing import Any
 
@@ -66,27 +65,10 @@ def main(argv=None, *, workspace=None):
             revision=spec["revision"],
             allow_patterns=spec["patterns"],
             local_dir=destination,
-            cache_dir=output / ".hub_cache",
             max_workers=3,
         )
         for path in required:
             existing_file(path)
-        files = [
-            str(p.relative_to(destination))
-            for pattern in spec["patterns"]
-            for p in destination.glob(pattern)
-            if p.is_file()
-        ]
-        record = {
-            **spec,
-            "files": sorted(set(files)),
-            "download_source": "huggingface",
-        }
-        record_name = f"sam2_{args.sam_variant}" if name == "sam" else name
-        target = output / f"{record_name}_download.json"
-        temporary = target.with_suffix(".tmp")
-        temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n")
-        temporary.replace(target)
         print(f"Ready: {destination}", flush=True)
     return 0
 

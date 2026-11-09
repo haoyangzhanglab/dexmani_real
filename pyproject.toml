@@ -39,8 +39,3 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "dexmani_real.config.calibration_data" = ["*.json"]
-
-[tool.pytest.ini_options]
-markers = [
-    "policy_integration: 跨仓库训练数据与部署契约验证，需要 dexmani_policy 及其依赖",
-]

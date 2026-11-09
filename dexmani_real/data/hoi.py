@@ -1,4 +1,4 @@
-"""Raw 内 HOI 分组的校验和分块发布；不改变采集格式。"""
+"""Raw 内 HOI 分组的校验与分块发布。"""
 
 import numpy as np
 

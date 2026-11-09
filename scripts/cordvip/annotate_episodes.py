@@ -1,4 +1,4 @@
-"""将已发布 Raw 的离线 HOI 结果写入原 data.h5；不创建 Sidecar。"""
+"""将已发布 Raw 的离线 HOI 结果写入原 data.h5。"""
 
 # Usage: python scripts/cordvip/annotate_episodes.py --task pnp_apple_banana
 # 单段处理：追加 --episode episodes/pnp_apple_banana/episode_20261101_165909。
@@ -6,6 +6,7 @@ import argparse
 import sys
 from contextlib import ExitStack
 from pathlib import Path
+from typing import cast
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -106,7 +107,10 @@ def annotate_episodes(episodes, task):
                 available = (timing_rows["camera_ns"] > 0) & (timing_rows[field] > 0)
                 delta_ms = np.abs(timing_rows["camera_ns"][available] - timing_rows[field][available]) / 1e6
                 summary = (
-                    "/".join(f"{value:.3f}" for value in np.percentile(delta_ms, [50, 95, 100]))
+                    "/".join(
+                        f"{value:.3f}"
+                        for value in cast(np.ndarray, np.percentile(delta_ms, [50, 95, 100]))
+                    )
                     if len(delta_ms) else "不可用"
                 )
                 print(

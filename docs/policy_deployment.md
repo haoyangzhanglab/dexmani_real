@@ -1,89 +1,71 @@
 # 策略部署
 
-部署模块将 `dexmani_policy` 提供的模型推理接入真实机器人。模型描述所需的观测与动作表示，本仓库负责采集观测、调度预测动作、执行控制和记录评估数据。
+`dexmani_policy` 提供模型及观测／动作描述，本仓库负责读取观测、调度预测、执行控制和录制评估数据。
 
 ## 数据流
 
 **传感器与机器人反馈 → 观测历史 → 模型推理 → 动作序列调度 → 动作映射 → 机器人**。
 
-观测构造按模型需求组合图像、关节、触觉、点云及手部几何。模型输出的关节动作经范围投影生成目标；末端动作经共享 IK 转为机械臂关节目标，并与手部目标一起提交。局部 IK 给出当前可执行的下一步目标，允许保留末端跟踪残差。
-
-评估会话可复用示教采集的 Raw 录制组件，保存观测与指令提交尝试，供后续可视化、导出和分析。
+观测按模型需求组合图像、关节、触觉和点云。关节动作经范围投影生成目标，末端动作经共享局部 IK 转为关节目标；IK 允许保留跟踪残差。Raw 保存观测与指令提交尝试，不代表两设备原子执行或物理到位。
 
 ## 核心模块
 
-以下模块位于 [deployment](../dexmani_real/deployment/) 下。
-
 | 模块 | 职责 |
 | --- | --- |
-| [session.py](../dexmani_real/deployment/session.py) | 装配模型、传感器和机器人，组织多段评估及结果汇总。 |
-| [observation.py](../dexmani_real/deployment/observation.py) | 将观测历史编码为模型所需输入。 |
-| [inference.py](../dexmani_real/deployment/inference.py) | 对接模型加载、预热、预测和关闭。 |
-| [schedule.py](../dexmani_real/deployment/schedule.py) / [rollout.py](../dexmani_real/deployment/rollout.py) | 管理动作序列接续，推进单段评估中的观测、推理、控制和录制。 |
+| [session.py](../dexmani_real/deployment/session.py) | 装配模型、传感器和机器人，组织多段评估与结果汇总。 |
+| [observation.py](../dexmani_real/deployment/observation.py) | 将观测历史编码为模型输入。 |
+| [inference.py](../dexmani_real/deployment/inference.py) | 加载、预热、预测与关闭模型。 |
+| [schedule.py](../dexmani_real/deployment/schedule.py) / [rollout.py](../dexmani_real/deployment/rollout.py) | 接续动作序列，推进单段观测、推理、控制与录制。 |
 
-机器人交互、运动约束和 Raw 存储分别复用主包的 `robot`、`control` 和 `data` 模块。
+设备交互、运动约束和 Raw 存储复用 `robot`、`control`、`data` 模块。
 
 ## 执行模式
 
-| 模式 | 方式 |
+| 模式 | 预测与动作接续 |
 | --- | --- |
-| sync | 等待一次预测，再顺序执行一段动作，随后请求下一次预测。 |
-| async | 执行当前动作序列时提前请求预测，依据观测时间衔接仍有效的新动作。 |
-| rtc | 在支持 RTC 的模型中，将当前计划的动作前缀交给下一次预测，按已提交进度接续动作。 |
-
-三种模式共用观测与控制链，区别在于推理时机和动作序列的接续方式。
+| sync | 等待预测，执行一段动作后再请求下一次预测。 |
+| async | 执行当前序列时提前预测，按观测时间接续仍有效的新动作。 |
+| rtc | 支持 RTC 的模型接收当前动作前缀，按已提交进度接续预测。 |
 
 ## 来源时间与时效
 
-观测采用 latest-value 语义：同一份有效样本可以重复使用，读取缓存不刷新来源时间。所有运行时年龄都按主机 `time.monotonic_ns()` 计算：Arm 和 Hand 使用 SDK 反馈查询开始时间，Camera 使用新帧首次接收时间，VR 使用完整腕部/关键点观测中较早的接收时间。这些时间不是同步硬件采样时间；尤其 Hand SDK 没有可靠的硬件采样序号或时间戳。
+观测采用 latest-value 语义：有效样本可重复读取，读取不刷新来源时间。年龄按主机 `time.monotonic_ns()` 计算；Arm／Hand 使用 SDK 查询开始时间，Camera 使用新帧首次接收时间，VR 使用完整腕部／关键点观测中较早的接收时间。这些均非同步硬件采样时间，Hand SDK 也没有可靠的硬件采样序号或时间戳。
 
-| 用途 | 默认值 | 含义 |
+| 用途 | 默认预算 | 约定 |
 | --- | --- | --- |
-| Arm 反馈 TTL | 160 ms（`4 / 25` s） | 默认 25 Hz 查询的四个周期；反馈周期必须小于 TTL。 |
-| Hand／策略必需触觉 TTL | 200 ms | 共用主机查询时效预算，30 Hz 反馈服务保持不变。 |
-| Camera／Point Cloud TTL | 约 133 ms（`4 / 30` s） | 点云保留相机来源时间和序列，计算消耗原相机预算。 |
-| VR 来源 TTL | 500 ms | 暂定掉线容忍度；实际生产频率未知，不由 16 Hz 控制频率推导。 |
-| VR／Keyboard 目标租约 | 250 ms | 与观测 TTL 独立，分别由正常 16 Hz／30 Hz 控制循环续租。 |
-| XHand 停止反馈阈值 | 约 133 ms | 停止时选择实测位置保持或 passive，独立于普通反馈 TTL。 |
-| Camera 来源停帧超时 | 2 s | 来源设备超时，独立于消费者 TTL。 |
-| 策略命令租约 | 2 s | 保留原有执行边界的命令到期行为。 |
-| 触觉录制告警 | 500 ms | 仅提示 Hold 过久，继续保留最近有效值及原时间戳。 |
+| Arm 反馈 | 160 ms（`4 / 25` s） | 默认 25 Hz 查询，查询周期须小于 TTL。 |
+| Hand／模型必需触觉 | 200 ms | 共用主机查询时效预算。 |
+| Camera／普通 Point Cloud | 约 133 ms（`4 / 30` s） | 点云继承相机来源时间与序列，处理消耗同一预算。 |
+| HOI | 250 ms | 独立的 `execution.hoi_max_age_s`，仍按来源相机时间计龄。 |
+| VR 来源 | 500 ms | 暂定掉线容忍度，不能由控制频率推导。 |
+| VR／Keyboard 目标租约 | 250 ms | 与来源 TTL 独立，由控制循环续租。 |
+| 策略命令租约 | 2 s | 命令到期后停止执行。 |
 
-HOI 使用独立的 `execution.hoi_max_age_s`（默认 250 ms），仍按原始相机来源时间计算年龄。该暂定研究参数依据已记录回放 P95 约 200 ms 留出余量，不代表真机安全保证；真实运动、策略推理与 HOI GPU 并发性能尚未验证。
+配置见 [config](../dexmani_real/config/)。HOI 预算来自已记录回放，依据与验证范围见[性能结论](object_reconstruction.md#当前实现与性能结论)；普通点云延迟和 VR 真实生产频率仍待测量。
 
-`ObservationNeeds` 只检查消费者实际需要的模态。普通策略遇到无效模型输入时不更新历史、不提交新推理，已有有限 Action Chunk 和在途预测继续遵循原调度规则；关键机器人反馈仍须有效。拒绝诊断仅在原因变化时输出。HOI `object_pointcloud` 保留其已有特例：缺失、过期或位姿无效立即终止当前计划，详见[HOI 流程](object_reconstruction.md#hoi-五阶段流程)。
+`ObservationNeeds` 只检查消费者实际需要的模态。模型输入失效时清空历史并暂停新预测，恢复首帧重新填满 `n_obs_steps`。普通策略的已有有限动作序列和在途预测按原模式继续；HOI 缺失、过期或位姿失效立即停止当前计划。关键机器人反馈始终须有效。
 
-HOI 或 PointCloud 模型同时需要 RGB/Depth 时保持与点云同源；Raw 则独立读取控制采样时最新 Camera RGB-D，并用普通 Camera TTL 检查，保留实际录制帧的 `camera_ns` 和 `camera_sequence`。两者不要求相机帧相同；Raw 观测完成时间在其图像读取完成后记录。
+## Raw 录制与连续区间
 
-Raw 录制是独立消费者，仍要求两个触觉通道各出现过一次有效值；之后无效触觉可以持续 Hold，不用 200 ms 运行时 TTL 截断录制。未启用录制且不需要相机或触觉的策略不依赖这些模态。显式触觉 reset 仍使旧触觉失效；Raw 保留来源时间，不补造新鲜样本。导出对非正来源时间、未来时间和回退时间只作诊断，不修补或删除原始行；没有有效来源时间的触觉不算作 Hold。
+- 模型所需 RGB／Depth 与 HOI 或普通点云同源；Raw 独立读取控制采样时最新的 Camera RGB-D，按普通 Camera TTL 检查并保留实际 `camera_ns`、`camera_sequence`。
+- 录制要求两个触觉通道各出现过一次有效值，之后可 Hold 最近有效值及原时间戳；显式 reset 使旧值失效。模型不需要的相机／触觉只在启用录制时成为依赖。导出仅诊断来源时间非正、未来或回退，不修补样本。
+- 相机暂不可用或队列满时丢弃整行，后续有效行继续接收；仅供录制的 Camera Worker 退出不终止控制，模型所需服务和设备 Owner 故障仍须处理。
+- 已知文件／编码 I/O 失败停止录制、保留 staging 并报告，控制继续；初始化失败则不启动要求录制的实验。Writer 实际退出后才完成收尾，发布与失败以 `Recorder.result()` 为准，`poll_finish()` 仅表示收尾完成。程序与设备错误继续传播。
+- RGB／Depth／状态逐行对应，MP4 PTS 相对首行控制时间。质量拒绝、队列满、暂停或调度跳槽后，在下一条已保存行记录 `/timing/segment_starts`；非空录制从 0 开始、严格递增，`recording_truncated_reason` 仅作诊断。
+- 导出与回放必须有合法 `segment_starts`，不从时间间隔猜测断点。导出保留有效行，每个连续区间形成一个 Zarr `meta/episode_ends` 边界，训练窗口不跨断点；`raw_episode_count` 统计文件，`episode_count` 统计区间。区间按标称频率使用，周期抖动只告警、不重采样；控制时间倒退、非法数组和所选字段非有限值仍拒绝。
 
-普通点云处理延迟和真实 VR 生产频率尚需测量。已有 HOI 回放超过 Camera TTL 的记录只说明该回放下的性能问题，不能外推为普通点云或真机并发结果，也不能通过改写时间戳消除。
+多区间回放须显式选择，如 `python scripts/replay_episode.py EPISODE --segment 0`。编号从 0 开始，非法选择在连接设备前报错；回放以所选区间首行检查起始姿态，不跨段或补过渡动作。批量导出可用 `--exclude` 排除不符合契约的 Episode；失败 staging 不发布。
 
-录制与控制的停止边界：
+## 暂停、结束与 HOME
 
-- 运行中 Raw 相机暂不可用或 Recorder 队列满只丢弃当前整行；后续有效行继续接收。仅供录制的 Camera Worker 退出不终止控制；模型所需的 Camera、PointCloud、HOI Worker 和设备 Owner 仍是必需服务。
-- 已知文件／编码 I/O 失败停止录制并报告 staging 路径，控制继续。失败数据不发布，清理必须等 Writer 线程实际退出；超出既有关闭预算是资源故障。程序错误、设备故障和用户中断不会按普通录制失败处理。
-- Recorder 的 `poll_finish()` 返回值只表示收尾是否完成；发布、失败及路径以 `result()` 为准。失败录制不播放保存或丢弃成功提示。Session 辅助输出仅隔离文件 I/O 错误，序列化等程序错误继续上报。
-- 要求录制时，Recorder 或输出目录初始化失败不会启动无录制实验；资源回收后可再次按 B。动作字段始终表示提交尝试，不保证 Arm／Hand 原子执行或物理到位。
-- Raw 时间不重写，MP4 PTS 使用相对首行的控制时间，RGB／Depth／状态仍逐行对应。质量拒绝、队列满、Teleop 暂停和调度器明确跳槽，会在下一条成功接收的数据前记录断点。`/timing/segment_starts` 是已保存行的起始索引，非空录制从 0 开始，严格递增且小于行数；没有内部中断时为 `[0]`。首行前及末行后的缺失不产生空区间，`recording_truncated_reason` 仅保留诊断摘要。
-- 导出逐 Raw 文件解码一次，保留所有有效行，各连续区间分别形成 Zarr `meta/episode_ends` 边界，训练窗口不能跨断点。返回统计中的 `raw_episode_count` 是输入 Raw 数，`episode_count` 是输出连续区间数。区间内使用标称频率语义；普通周期抖动仅告警，不推断断点，也不重采样或宣称严格等间隔。时间倒退、非法数组和所选字段的非有限值仍拒绝。
-- 导出与回放要求 Raw 含有有效的 `timing/segment_starts`，缺失时直接拒绝，不根据缺失摘要或时间间隔推断区间；批量导出可用 `--exclude` 排除不符合要求的文件。成功关闭的部分 Raw 可按已记录区间使用，失败 staging 仍不发布。
+| 场景 | 行为 |
+| --- | --- |
+| Teleop 输入／反馈暂不可用或目标过期 | 确认两设备停止后软暂停；恢复先完成 Arm 准备，清空旧邮箱与伺服参考，再用准备后的新反馈和有效 VR 重新锚定。暂停期间不提交、不续租，Episode 时长继续计时。 |
+| Policy 反馈暂不可用 | 结束当前 Episode，不在同段自动恢复；设备、录制和在途预测收尾后才可开始下一轮。 |
+| HOME 的 `FeedbackUnavailable` 或手部 `HomeTimeout` | 本次 HOME 未完成；停止收尾成功且无硬故障后保留空闲会话，可重新按 H 或按原流程 B。手部失败时不继续 Arm HOME，不自动重试。 |
 
-Teleop 增加软暂停：VR 缺失／过期、明确的反馈暂不可用或命令过期先停止两设备并确认，再等待有效输入。恢复通过既有 Arm 准备协议清空邮箱和旧伺服参考，使用准备完成后的新 Arm／Hand 反馈及有效 VR 重新锚定。暂停期间不提交动作、不续租，不重置 Episode 时长。S/C/D 结束当前 Episode，Q 保存退出，Esc 急停锁存；这些指令在暂停和恢复准备期间仍优先。来源不明的停止不自动恢复，停止未确认或真实 SDK 故障仍终止会话。
+Teleop 暂停／恢复期间，S/C/D 结束本段，Q 保存退出，Esc 急停；HOME 期间 S/Q/Esc 也优先。来源不明的停止不自动恢复；停止未确认、真实 SDK 故障、程序错误及底层普通 `TimeoutError` 继续退出或报错。Keyboard Jog 保持其退出边界。
 
-回放与导出共用 RawReader 的动作语义、关节顺序、行数、区间及控制时间校验；时间诊断包含 Raw 路径，便于定位批量导出中的来源。单段 Raw 保持原用法；多段必须通过 `python scripts/replay_episode.py <episode> --segment 0` 明确选择一个区间，编号从 0 开始。未选择或编号无效时，会在连接设备前列出可选区间及行范围。所选区间仍按标称频率回放，起始姿态以该区间首行检查，不自动跨段或添加过渡动作；实际提交仍检查配置限位和当前反馈。文件里的目标是提交尝试，不能由此推断原实验已执行成功。
-
-Teleop 与 Policy 的 HOME 遇到明确的 `FeedbackUnavailable`，或手部 HOME 自身预算耗尽（`HomeTimeout`）时，本次操作未完成；仅在底层停止收尾成功且检查无硬故障后保留空闲 Session。手部未完成时不继续机械臂 HOME，不报告成功或启动 Episode。操作者可重新按 H，或按原流程用 B 启动下一段；新请求仍须经过原有准备及反馈检查，不自动重试或恢复运动。S/Q/Esc 仍优先，不清除取消上下文、退出请求或急停。停止未确认、设备故障、程序错误及底层普通 `TimeoutError` 继续退出或报错；键盘 Jog 保持原有退出边界。
-
-Policy 不做同段自动恢复。明确的关节反馈暂不可用只结束本 Episode；设备停止、录制资源和在途预测均正确收尾后才允许下一轮。普通模型 History 恢复、有限 Action Chunk、prediction exhausted 和 HOI 保护保持原规则。
-
-Teleop 自动恢复尚未完成实机验收。SDK 接受停止请求不等于物理停稳；Arm 准备检查实测停稳，Hand 不提供等价证明。最小实机验收包括：输入中断停止旧目标、恢复使用新反馈重新锚定、反馈异常与真实故障区分、暂停及准备期间 S/Q/Esc 优先。Mock 测试不代表运动安全保证。
-
-本地录制、导出、回放和 HOME 回归不需要训练仓库；Policy 采样集成测试单独选择，缺少 `dexmani_policy` 或其依赖时会明确失败，不自动跳过：
-
-```bash
-python -m pytest -p no:cacheprovider -q tests/test_recording.py tests/test_teleop_recovery.py tests/test_freshness.py -m "not policy_integration"
-python -m pytest -p no:cacheprovider -q tests/test_recording.py -m policy_integration
-```
+Teleop 自动恢复尚未完成实机验收。SDK 接受停止请求不等于物理停稳；Arm 准备检查实测停稳，Hand 无等价证明。仍需验收输入中断、重新锚定、反馈异常与硬故障区分，以及暂停／准备期间的操作指令优先级。
 
 返回[项目架构](../README.md)。
