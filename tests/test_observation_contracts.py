@@ -114,13 +114,16 @@ class ObservationContracts(unittest.TestCase):
                 stack.enter_context(patch('dexmani_real.deployment.session.Robot'))
                 stack.enter_context(patch('dexmani_real.deployment.session.session_directory', return_value=Path('/tmp/not-created')))
                 stack.enter_context(patch.object(PolicySession, 'wait_model', return_value=info))
-                stack.enter_context(patch('dexmani_real.geometry.hoi.load_task_template', return_value=({}, manifest)))
-                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                loader = stack.enter_context(patch('dexmani_real.geometry.hoi.load_task_template', return_value=({}, manifest)))
+                output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
                 session = PolicySession(self.runtime, 'offline.pt', weights=None, inference_steps=None,
                                         output_root=None, device='cpu', seed=0, max_running_s=1,
-                                        num_episodes=1, record_raw=recording, camera_calibration_path=None,
-                                        enable_hoi_pcd='object_pointcloud' in fields)
+                                        num_episodes=1, record_raw=recording, camera_calibration_path=None)
                 session.prepare_resources()
+                self.assertEqual(loader.call_count, int('object_pointcloud' in fields))
+                self.assertIn('action_mode=joint', output.getvalue())
+                self.assertIn('action_steps=4 (Checkpoint)', output.getvalue())
+                self.assertIn('control_dt_s=0.1 (RealConfig)', output.getvalue())
                 channels = session.sensors.channels
                 needs = session.observations.needs
                 self.assertEqual(channels is not None, recording or needs.camera_worker or session.observations.camera_static)
@@ -168,6 +171,20 @@ class ObservationContracts(unittest.TestCase):
                     self.assertIs(raw.hand, model_row.hand)
                 if not recording or not (needs.hoi or needs.point_cloud):
                     self.assertIs(raw, model_row)
+
+                # 执行实际启动分支，但 Process 和所有设备边界均使用替身。
+                session.process_context = Mock()
+                session.process_context.Process.side_effect = lambda **kw: NS(**kw)
+                if session.sensors.channels and 'object_pointcloud' in fields:
+                    session.sensors.channels.hoi_ready.value = True
+                with patch.object(session, 'check_startup'), patch.object(session, 'save_run_config'), \
+                        patch.object(session, 'warmup_policy'), patch.object(session.observations, 'configure_camera'), \
+                        patch('dexmani_real.deployment.session.snapshot_camera_parameters'), \
+                        patch('dexmani_real.deployment.session.load_table_plane'), \
+                        patch.object(session.sensors, 'shutdown'), patch.object(session.sensors, 'start') as start:
+                    session.start_devices()
+                started = [call.args[0].name for call in start.call_args_list]
+                self.assertEqual('hoi' in started, 'object_pointcloud' in fields)
 
     def test_hoi_and_raw_quality_have_independent_budgets(self):
         now = 10**10

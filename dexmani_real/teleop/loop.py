@@ -131,6 +131,9 @@ class TeleopLoop:
             self.cancel_epoch = None
         if failure is not None and primary_failure is None:
             raise failure
+        if (failure is None and self.recorder is None
+                and not self.runtime_state.quit_requested and not self.runtime_state.estop_request):
+            logger.info("停止流程已完成；遥操作控制锚点已清空。检查上方结束原因并确认输入正常后按 B 开始新段。")
 
     def finish_recording(self, *, wait=True) -> bool:
         """pending 返回 False；轮询完成时仍可能执行发布或目录删除。"""
@@ -228,7 +231,7 @@ class TeleopLoop:
                     reason = "initial_observation_unavailable: " + "; ".join(issues)
                 else:
                     reason = "initial_joint_feedback_unavailable"
-                logger.warning("本段未开始：%s；可稍后再次按 B。", reason)
+                logger.warning("本段未开始：%s；等待停止与收尾。", reason)
                 self.request_episode_end(reason)
                 return None
             time.sleep(0.005)

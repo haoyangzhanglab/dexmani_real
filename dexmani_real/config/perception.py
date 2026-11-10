@@ -38,4 +38,4 @@ class HandCloudConfig:
 
     def validate(self):
         if type(self.num_points) is not int or self.num_points < 1:
-            raise ValueError("hand point count must be a positive integer")
+            raise ValueError("hand_pointcloud.num_points must be a positive integer")

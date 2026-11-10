@@ -40,7 +40,12 @@ flowchart LR
 ```bash
 python scripts/collect_teleop.py --print-config
 python scripts/run_policy.py --help
+python scripts/run_policy.py --print-config
 ```
+
+`run_policy.py --print-config` 打印本地声明的 RealConfig（declared config），不加载 Checkpoint 或标定，不代表部署后的全部有效参数。模型输入输出契约由 Checkpoint 决定；硬件、安全限制、传感器和环境由 RealConfig 决定。`execution.control_dt_s` 和 `action_steps` 的非 `None` 本地值优先，否则使用 Checkpoint；其余执行参数使用 RealConfig。完整规则见[配置来源](docs/policy_deployment.md#配置来源与启动信息)。
+
+部署自动从 `observation_fields` 识别 HOI：包含 `object_pointcloud` 才校验并加载任务模板、启动 HOI Worker；普通策略不加载 HOI。任务、模板内容和哈希必须匹配，验证失败在连接设备前报错。
 
 ## 一次实验
 

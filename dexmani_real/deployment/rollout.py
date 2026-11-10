@@ -237,7 +237,7 @@ class Rollout:
             model_issues = check_observation(row, self.runtime, self.observations.needs)
             if "hoi_pose_invalid" in model_issues:
                 self.preparation_issue = "model_input_hoi_pose_invalid"
-                logger.warning("本轮 HOI 初始化/位姿失效；详见 Worker 日志，可再次按 B。")
+                logger.warning("本轮 HOI 初始化/位姿失效；详见 Worker 日志，等待停止与收尾。")
                 return None
             issue = ("device feedback: " + "; ".join(devices)) if devices else (
                 "model_input_" + model_issues[0] if model_issues else None
@@ -255,7 +255,7 @@ class Rollout:
                 break
             if time.monotonic_ns() >= until:
                 self.preparation_issue = issue or "initial_joint_feedback_unavailable"
-                logger.warning("本轮未开始：%s；可稍后再次按 B。", self.preparation_issue)
+                logger.warning("本轮未开始：%s；等待停止与收尾。", self.preparation_issue)
                 return None
             time.sleep(0.005)
         if self.policy_info.action_mode == "eef":
@@ -263,7 +263,7 @@ class Rollout:
                 self.action_mapper.solver.measured_reference(row.arm["qpos"][0])
             except IKReferenceError as exc:
                 self.preparation_issue = str(exc)
-                logger.warning("本轮未开始：%s；请就位后再次按 B。", exc)
+                logger.warning("本轮未开始：%s；等待停止与收尾后检查起始姿态。", exc)
                 return None
         else:
             arm_reference_from_feedback(

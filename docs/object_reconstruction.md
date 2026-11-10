@@ -1,6 +1,6 @@
 # 物体重建与点云资产
 
-CordVIP 将物体图像与实测尺寸转换为米制网格和固定点云，用于几何分析与位姿跟踪。HOI 通过显式开关接入策略；普通示教采集和常规 Zarr 导出无需运行该流程。
+CordVIP 将物体图像与实测尺寸转换为米制网格和固定点云，用于几何分析与位姿跟踪。HOI 根据 Checkpoint 的 `observation_fields` 自动接入策略；普通示教采集和常规 Zarr 导出无需运行该流程。
 
 ## 数据流
 
@@ -18,7 +18,7 @@ CordVIP 将物体图像与实测尺寸转换为米制网格和固定点云，用
 | 2. 模板冻结 | `allocate_points.py` 按表面积从已有点云选固定索引，总计 1024 点、每物体至少 64 点。 |
 | 3. Raw 标注 | `annotate_episodes.py` 写入原 `data.h5:/hoi`，用 `visualize_episode.py` 查看。 |
 | 4. Zarr 导出 | `export_zarr.py` 显式选择 `object_pointcloud`；默认导出不包含该字段。 |
-| 5. 训练与部署 | 训练显式设置 `zarr_path`，部署使用匹配的 Checkpoint 与 `--enable_hoi_pcd`。 |
+| 5. 训练与部署 | 训练显式设置 `zarr_path`，部署使用匹配的 Checkpoint，自动识别 HOI 需求。 |
 
 阶段 4 的常用字段与阶段 5 的真机部署命令：
 
@@ -26,7 +26,7 @@ CordVIP 将物体图像与实测尺寸转换为米制网格和固定点云，用
 python scripts/export_zarr.py episodes/pnp_apple_banana \
   --output datasets/pnp_apple_banana.cordvip.zarr \
   --fields joint_state action hand_pointcloud object_pointcloud
-python scripts/run_policy.py CHECKPOINT --enable_hoi_pcd
+python scripts/run_policy.py CHECKPOINT
 ```
 
 ### 任务配置

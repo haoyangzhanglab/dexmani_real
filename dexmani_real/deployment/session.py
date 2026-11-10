@@ -78,9 +78,8 @@ def session_directory(root: Path) -> Path:
 class PolicySession:
     def __init__(
         self, runtime, policy, *, weights, inference_steps, output_root, device, seed,
-        max_running_s, num_episodes, record_raw, camera_calibration_path, enable_hoi_pcd=False,
+        max_running_s, num_episodes, record_raw, camera_calibration_path,
     ):
-        self.enable_hoi_pcd = enable_hoi_pcd
         self.runtime, self.policy = runtime, policy
         self.weights, self.inference_steps = weights, inference_steps
         self.info: PolicyInfo
@@ -185,7 +184,8 @@ class PolicySession:
         )
         self.model.load()
         self.info = self.wait_model()
-        self.hoi_inputs = resolve_hoi_inputs(self.info, self.enable_hoi_pcd)
+        self.hoi_inputs = resolve_hoi_inputs(self.info)
+        declared_execution = self.runtime.execution
         self.runtime = resolve_deployment_config(self.info, self.runtime)
         self.observations = ObservationBuilder(self.info, self.runtime)
         self.record_needs = RAW_RECORDING_NEEDS if self.record_raw else ObservationNeeds()
@@ -207,17 +207,25 @@ class PolicySession:
         if self.output_root is not None:
             self.output_dir = session_directory(self.output_root)
         print(
-            f"执行：{self.info.checkpoint_path.name} ({self.info.weights}) | inference_steps={self.info.inference_steps} | "
-            f"A_exec={self.runtime.execution.action_steps} | {self.runtime.execution.mode} | "
-            f"{1.0 / self.runtime.execution.control_dt_s:g} Hz"
+            f"模型：{self.info.checkpoint_path} ({self.info.weights}) | inference_steps={self.info.inference_steps} | "
+            f"action_mode={self.info.action_mode}"
+        )
+        print(
+            "执行："
+            f"action_steps={self.runtime.execution.action_steps} "
+            f"({'Checkpoint' if declared_execution.action_steps is None else 'RealConfig'}) | "
+            f"mode={self.runtime.execution.mode} (RealConfig) | "
+            f"{1.0 / self.runtime.execution.control_dt_s:g} Hz / "
+            f"control_dt_s={self.runtime.execution.control_dt_s:g} "
+            f"({'Checkpoint' if declared_execution.control_dt_s is None else 'RealConfig'})"
         )
         duration = f"{self.max_running_s:g} s" if self.max_running_s is not None else "无限制"
         print(f"评估：{self.num_episodes if self.num_episodes is not None else '不限'} 轮 | 每轮预算 {duration} | 输入：{', '.join(self.info.observation_fields)}")
         for name, field in (("pointcloud", "point_cloud"), ("hand_pointcloud", "hand_pointcloud")):
             if field in self.info.observation_fields:
-                print(f"{field}: {asdict(getattr(self.runtime, name))}")
+                print(f"{field} (Checkpoint): {asdict(getattr(self.runtime, name))}")
         if "depth" in self.info.observation_fields:
-            print(f"depth: {self.info.depth_config}")
+            print(f"depth (Checkpoint): {self.info.depth_config}")
         print(f"输出：{self.output_dir}" if self.output_dir is not None else "输出：仅终端")
 
         self.process_context = mp.get_context("spawn")
@@ -556,15 +564,15 @@ class PolicySession:
                 self.episodes.append(episode.result)
             self.finish_episode()
             result = episode.result
+            logger.info("第 %d 段结束：%s（%s，%.1f s）。", result.index,
+                        result.termination_reason, result.termination_details, result.duration_s)
             if result.started_utc is not None:
                 completed = sum(item.started_utc is not None for item in self.episodes)
-                logger.info("第 %d 轮控制结束：%s（%s，%.1f s）。", completed,
-                            result.termination_reason, result.termination_details, result.duration_s)
                 if self.num_episodes is not None and completed >= self.num_episodes:
                     self.runtime_state.request_quit()
             if self.runtime_state.quit_requested or self.runtime_state.estop_request:
                 break
-            print("等待下一轮：B 开始，按需 H 回初始位；Q 退出。", flush=True)
+            print("停止流程已完成；本轮观测历史与动作计划已清空。检查上方结束原因并确认输入正常后按 B 开始新轮，按需 H 回初始位；Q 退出。", flush=True)
 
     def finish_episode(self):
         """停止后回收本段资源；退出意图交由最终关闭先释放设备。"""

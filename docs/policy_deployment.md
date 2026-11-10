@@ -19,7 +19,29 @@
 
 设备交互、运动约束和 Raw 存储复用 `robot`、`control`、`data` 模块。
 
-几何观测使用 Checkpoint 中保存的处理配置：`point_cloud`、`hand_pointcloud` 和 `fingertip_xyz` 分别要求对应点云参数和指尖 Link 顺序，缺失时在连接设备前报错。未被模型使用的点云配置保留本机声明值；控制周期仍可通过 `execution.control_dt_s` 显式指定。
+## 配置来源与启动信息
+
+| 配置领域 | 权威来源 |
+| --- | --- |
+| `observation_fields`、`action_mode`、`control_action_dim`、`n_obs_steps`、`n_action_steps`、`future_steps`、`supports_rtc`、`requires_prev_action` | Checkpoint 的模型契约，本地配置不覆盖。 |
+| 模型使用的 PointCloud／HandCloud recipe、Fingertip Link 顺序、Depth shape／scale、HOI 任务与模板 manifest | Checkpoint。 |
+| Arm／Hand、关节与运动限制、反馈 TTL、传感器和相机、环境与碰撞、HOME、遥操作 | RealConfig；相机等本地标定仍由现有标定入口加载。 |
+
+| ExecutionConfig 参数 | 优先级 |
+| --- | --- |
+| `control_dt_s` | 非 `None` 的 RealConfig 值 > Checkpoint；两处缺失时报错。 |
+| `action_steps` | 非 `None` 的 RealConfig 值 > Checkpoint `n_action_steps`。 |
+| `mode`、`prefetch_steps`、`rtc_guidance_cap`、`hoi_max_age_s` | RealConfig。 |
+
+显式非法值直接报错，不回退到 Checkpoint。控制周期缺失时，在 `--config` 指定的 Python 实验文件中设置 `CONFIG.execution.control_dt_s`。覆盖值仍须通过现有控制频率、预测长度和 ODE 限制检查。
+
+模型使用 `point_cloud`／`hand_pointcloud` 时必须保存对应 recipe；recipe 内有默认值的字段可以省略，未知字段和非法值拒绝。未使用的几何配置保留本地值。`fingertip_xyz` 使用 Checkpoint 的 `fingertip_link_names` 顺序。`pointcloud.workspace` 是模型点云裁剪范围，与 RealConfig 的机器人安全 `environment.workspace` 职责不同。
+
+Depth 必须保存 `depth_config.shape`（height, width）和 `depth_scale_m`。shape 必须等于本地 `camera.height`、`camera.width`，不自动 resize。设备实际 depth scale 在相机启动后、机器人保持停止时核对；不自动修改比例、内参或坐标系。
+
+HOI 由 `observation_fields` 中的 `object_pointcloud` 自动识别，无需额外 CLI 开关。任务名、项目资产目录、manifest、对象顺序及模板／Mesh SHA256 在连接设备前校验；仍拒绝同时使用普通 `point_cloud`。非 HOI 模型即使附带 HOI 元数据，也不加载模板或启动 HOI Worker。
+
+`--print-config` 只打印声明的 RealConfig，不加载模型或标定，因此不是最终有效部署配置。启动摘要另显示 Checkpoint、Action Mode、有效周期／频率与来源、Action Steps 与来源、Execution Mode、实际使用的几何／Depth recipe 和输出路径；`run_config.yaml` 继续使用原有归档结构。
 
 指定 `--output` 或启用 `--record-raw` 后，输出目录、`run_config.yaml` 和 `session_result.json` 都是实验产物。创建或写入失败会结束会话并报告错误；目录不可用时不会推迟到下一次 B 重试。策略评估与遥操作中任何一段的程序、录制或收尾错误都会使最终退出码非零，后续成功的新段不清除此前失败。来源过期和操作取消仍通过各段的结束原因报告。
 
@@ -64,6 +86,25 @@
 模型需求由 `ObservationBuilder.needs` 定义；PolicySession 将它与共用的 `RAW_RECORDING_NEEDS` 一次性解析为传感器需求 `sensor_needs` 和读取需求 `read_needs`。前者决定相机、Depth 和 Worker 的初始化，后者决定派生 Ring 携带的模型图像及 Rollout 的读取字段。Rollout 直接接收解析结果，保留独立的 Raw 质量检查；HOI／普通点云模式下，Raw 仍另外读取原始 Camera RGB-D。
 
 三种执行模式共用采样、动作提交和录制流程；只有动作选择与接续方式不同。控制循环等待下一控制步或反馈采样机会，键盘事件可唤醒等待，其他服务的协作检查间隔上限为 5 ms。这个等待上限不代表 SDK 调用或物理停止的延迟保证。
+
+## 输入失效后的操作
+
+观测失效会结束当前段并清空动作计划和历史，执行停止流程；Recorder 完成收尾、迟到预测消费完毕后才允许再次按 B。来源恢复本身不会恢复运动。检查终端的具体原因：
+
+| 原因码 | 检查对象与处理 |
+| --- | --- |
+| `camera_source_stale`／`camera_source_unavailable_or_unmatched` | Camera RGB-D 来源及采集进程。 |
+| `hand_tactile_aggregate_timestamp_ns_unavailable_or_stale` | 聚合触觉 aggregate 来源。 |
+| `hand_tactile_dense_timestamp_ns_unavailable_or_stale` | 稠密触觉 dense 来源。 |
+| `vr_stale`／`vr_unavailable` | VR 来源输入；不等同于机器人控制器故障。 |
+| `pointcloud_stale`／`pointcloud_unavailable`、`hoi_stale`／`hoi_unavailable`／`hoi_pose_invalid` | 对应派生观测、相机来源和 Worker 日志。 |
+| 必需 Worker 退出、SDK 通信故障、停止失败 | Session 故障退出；检查原因后重新启动程序，不能按 B 原地继续。 |
+
+终端按段编号报告结束原因，包括未进入运行的准备失败；只有实际开始运行的段计入 `--num-episodes`。停止和收尾完成的提示出现后，检查来源，再显式按 B 建立新段。每个新段重新进行有界观测等待和 TTL 检查，首次有效观测填满 `n_obs_steps`，首个预测重置模型；不要求等待 `n_obs_steps` 个不同来源帧，也不复用旧历史和动作。
+
+Sensor Worker 与模型线程跨段保留；段间只回收本段 Recorder 和在途模型任务。HOI 段结束发布零 Episode ID，下一次 B 用新 ID 重置场景，旧 ID 结果不能进入新段。初次 HOI 观测等待保持 120 s，其他启动观测等待保持 1 s。取消、退出、急停仍优先，不增加自动重试或恢复状态。
+
+“停止流程已完成”表示现有停止调用成功及资源收尾完成，不等于机器人整体物理停稳证明；Arm 新段准备仍检查实测停稳，Hand 没有等价证明。Recorder 错误继续按下述现有发布与退出码契约处理。
 
 ## Raw 录制与连续区间
 

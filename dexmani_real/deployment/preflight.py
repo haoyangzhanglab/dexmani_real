@@ -27,17 +27,23 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
 
     dt = execution.control_dt_s
     if dt is None:
-        raise ValueError("Checkpoint has no control period; set execution.control_dt_s")
+        raise ValueError(
+            "Checkpoint has no control period; set CONFIG.execution.control_dt_s "
+            "in the experiment file passed via --config"
+        )
     if (
         type(dt) not in (int, float)
         or not math.isfinite(dt * 1e9)
         or int(dt * 1e9) <= 0
     ):
-        raise ValueError("Real deployment requires finite positive control_dt_s of at least 1 ns")
+        raise ValueError(f"execution.control_dt_s must be finite, positive and at least 1 ns; got {dt!r}")
     prediction_steps = info.future_steps
     action_steps = execution.action_steps
     if type(action_steps) is not int or not 1 <= action_steps <= prediction_steps:
-        raise ValueError("execution requires integer 1 <= A_exec <= policy future_steps")
+        raise ValueError(
+            f"execution.action_steps={action_steps!r} requires an integer in "
+            f"[1, Checkpoint future_steps={prediction_steps}]"
+        )
     if info.requires_prev_action and (
         execution.mode != "sync" or action_steps != info.n_action_steps
     ):
@@ -78,34 +84,45 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     names = set(info.observation_fields)
     if not runtime.hand.enabled:
         raise ValueError("Dexterous policy deployment requires hand.enabled=true")
-    pointcloud, hand_pointcloud = runtime.pointcloud, runtime.hand_pointcloud
-    if "point_cloud" in names:
-        if info.pointcloud_config is None:
-            raise ValueError("point_cloud requires saved pointcloud_config")
-        pointcloud = PointCloudConfig(**info.pointcloud_config)
-        pointcloud.validate()
-    if "hand_pointcloud" in names:
-        if info.hand_pointcloud_config is None:
-            raise ValueError("hand_pointcloud requires saved hand_pointcloud_config")
-        hand_pointcloud = HandCloudConfig(**info.hand_pointcloud_config)
-        hand_pointcloud.validate()
+    geometry = {}
+    for field, name, config_type in (
+        ("point_cloud", "pointcloud", PointCloudConfig),
+        ("hand_pointcloud", "hand_pointcloud", HandCloudConfig),
+    ):
+        if field not in names:
+            continue
+        recipe_name = f"{name}_config"
+        recipe = getattr(info, recipe_name)
+        if recipe is None:
+            raise ValueError(f"{field} requires Checkpoint {recipe_name}; use a Checkpoint containing the training recipe")
+        try:
+            config = config_type(**recipe)
+            config.validate()
+        except (TypeError, ValueError) as exc:
+            raise type(exc)(f"Checkpoint {recipe_name}: {exc}") from exc
+        geometry[name] = config
     if "fingertip_xyz" in names and info.fingertip_link_names is None:
-        raise ValueError("fingertip_xyz requires saved fingertip_link_names")
+        raise ValueError("fingertip_xyz requires Checkpoint fingertip_link_names in model input order")
     if "depth" in names:
         recipe = info.depth_config
         if not isinstance(recipe, dict) or "shape" not in recipe or "depth_scale_m" not in recipe:
-            raise ValueError("Real depth input requires saved shape and depth_scale_m")
+            raise ValueError("Checkpoint depth_config requires saved shape and depth_scale_m")
         scale = recipe["depth_scale_m"]
         if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
-            raise ValueError("Saved depth_scale_m must be finite and positive")
+            raise ValueError(f"Checkpoint depth_config.depth_scale_m={scale!r} must be finite and positive")
         if tuple(recipe["shape"]) != runtime.camera.image_shape:
-            raise ValueError("Live camera shape differs from the saved depth input")
+            raise ValueError(
+                f"Checkpoint depth_config.shape={tuple(recipe['shape'])} (height, width), "
+                f"but RealConfig camera.image_shape={runtime.camera.image_shape}; "
+                "set camera.height and camera.width in the experiment file passed via --config; "
+                "depth is not resized"
+            )
 
     runtime = replace(
         runtime,
         execution=execution,
-        pointcloud=pointcloud,
-        hand_pointcloud=hand_pointcloud,
+        pointcloud=cast(PointCloudConfig, geometry.get("pointcloud", runtime.pointcloud)),
+        hand_pointcloud=cast(HandCloudConfig, geometry.get("hand_pointcloud", runtime.hand_pointcloud)),
     )
     validate_robot_config(runtime)
     if info.action_mode == "eef":
@@ -114,14 +131,11 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     return runtime
 
 
-def resolve_hoi_inputs(info, enabled):
-    """解析并加载 HOI 任务模板；显式启用或模板身份失配在设备连接前失败。"""
+def resolve_hoi_inputs(info):
+    """解析并加载 HOI 任务模板；模板身份失配在设备连接前失败。"""
     from pathlib import Path
 
-    required = "object_pointcloud" in info.observation_fields
-    if required != enabled:
-        raise ValueError("object_pointcloud Checkpoint 与 --enable_hoi_pcd 必须同时启用")
-    if not required:
+    if "object_pointcloud" not in info.observation_fields:
         return None
     if "point_cloud" in info.observation_fields:
         raise ValueError("HOI 与 point_cloud 不支持混合输入")

@@ -86,7 +86,11 @@ class ObservationBuilder:
             if camera.depth_scale_m is None:
                 raise ValueError("depth observations require a camera depth scale")
             if not depth_scales_match(camera.depth_scale_m, self.info.depth_config["depth_scale_m"]):
-                raise ValueError("Live depth scale differs from the saved raw-count input recipe")
+                raise ValueError(
+                    f"Live camera depth_scale_m={camera.depth_scale_m!r} differs from "
+                    f"Checkpoint depth_config.depth_scale_m={self.info.depth_config['depth_scale_m']!r}; "
+                    "check the camera device/calibration and training recipe; raw depth counts are not rescaled"
+                )
         requested.discard("depth")
         if not requested:
             return

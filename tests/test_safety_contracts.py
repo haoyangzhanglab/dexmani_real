@@ -2,6 +2,8 @@
 
 import threading
 import unittest
+from concurrent.futures import Future
+from dataclasses import replace
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
@@ -9,7 +11,16 @@ import numpy as np
 
 from dexmani_real.config.real import RealConfig
 from dexmani_real.control.actions import ActionMapper
-from dexmani_real.robot.commands import HomeTimeout, RobotCommand, RobotError
+from dexmani_real.deployment.inference import PolicyWorker
+from dexmani_real.deployment.observation import ObservationBuilder
+from dexmani_real.deployment.rollout import Rollout
+from dexmani_real.deployment.session import PolicySession
+from dexmani_real.robot.commands import (
+    HomeTimeout,
+    OperationCancelled,
+    RobotCommand,
+    RobotError,
+)
 from dexmani_real.robot.system import Robot
 from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
 from dexmani_real.robot.xarm7.worker import ArmController
@@ -22,6 +33,7 @@ from dexmani_real.runtime.observation import (
     check_observation,
 )
 from dexmani_real.runtime.state import SessionState
+from dexmani_real.teleop.loop import TeleopLoop, TeleopPhase
 
 
 class SafetyContracts(unittest.TestCase):
@@ -101,3 +113,155 @@ class SafetyContracts(unittest.TestCase):
                               cancel_requested=lambda: False)
                 self.assertEqual(robot.stop.call_count, 2)
                 self.assertEqual(robot.method_calls[-1][0], 'stop')
+
+    def make_rollout(self):
+        runtime = replace(self.runtime, execution=replace(self.runtime.execution, control_dt_s=0.1, action_steps=2))
+        info = NS(n_obs_steps=2, observation_fields=('rgb',), action_mode='joint', requires_prev_action=False)
+        builder = ObservationBuilder(info, runtime)
+        robot = Mock()
+        rollout = Rollout(self.state, runtime, info, cancel_epoch=self.state.cancel_epoch,
+                          robot=robot, sensors=None, observations=builder, read_needs=builder.needs,
+                          record_needs=ObservationNeeds(), action_mapper=None, model=Mock(future=None),
+                          max_running_s=None, index=1, output_dir=None, record_raw=False)
+        arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+        hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
+        arm['timestamp_ns'] = hand['timestamp_ns'] = self.now
+        arm['qpos'] = self.runtime.arm.home_qpos
+        row = Observation(arm, hand, {'timestamp_ns': self.now, 'rgb': np.ones((2, 2, 3), np.uint8)},
+                          None, None, self.now)
+        return rollout, row
+
+    def test_stale_input_discards_plan_and_new_episode_refills_history(self):
+        rollout, row = self.make_rollout()
+        with patch('dexmani_real.deployment.rollout.time.monotonic_ns', return_value=self.now):
+            self.assertTrue(rollout.update_history(row))
+            rollout.plan = rollout.query = object()
+            rollout.prev_action = np.ones(19)
+            stale = replace(row, camera=dict(row.camera, timestamp_ns=self.now-10**9))
+            self.assertFalse(rollout.update_history(stale))
+            self.assertTrue(self.state.stop_signal.is_set())
+            self.assertEqual(len(rollout.history), 0)
+            self.assertIsNone(rollout.plan)
+            self.assertIsNone(rollout.query)
+            self.assertIsNone(rollout.prev_action)
+            rollout.step()
+            rollout.robot.send_action.assert_not_called()
+            new, fresh = self.make_rollout()
+            self.assertEqual(len(new.history), 0)
+            self.assertTrue(new.update_history(fresh))
+            self.assertEqual(len(new.history), 2)
+            for sample in new.history:
+                np.testing.assert_array_equal(sample['rgb'], fresh.camera['rgb'])
+            self.state.stop_signal.clear()  # 模拟设备完成新段准备；测试不调用硬件。
+            new.submit(None)
+            self.assertTrue(new.model.predict.call_args.kwargs['reset_episode'])
+
+    def test_initial_observation_resamples_and_cancellation_wins(self):
+        rollout, row = self.make_rollout()
+        stale = replace(row, camera=dict(row.camera, timestamp_ns=self.now-10**9))
+        self.state.stop_signal.set()
+        with patch('dexmani_real.deployment.rollout.time.monotonic_ns', return_value=self.now), \
+                patch('dexmani_real.deployment.rollout.time.sleep'), \
+                patch.object(rollout, 'read_observations', side_effect=[(stale, stale), (row, row)]) as read:
+            self.assertIs(rollout.start_observation(lambda: None), row)
+            self.assertEqual(read.call_count, 2)
+            self.assertTrue(self.state.stop_signal.is_set())
+            rollout.robot.send_action.assert_not_called()
+        for cancel in (self.state.request_stop, self.state.request_emergency_stop):
+            rollout.cancel_epoch = self.state.cancel_epoch
+            with self.subTest(cancel=cancel), patch.object(rollout, 'read_observations') as read:
+                with self.assertRaises(OperationCancelled):
+                    rollout.start_observation(cancel)
+                read.assert_not_called()
+
+    def test_rollout_stops_and_propagates_fatal_errors(self):
+        for error in (RobotError('required sensor process exited'), RobotError('SDK failed')):
+            rollout, _ = self.make_rollout()
+            with patch.object(rollout, 'prepare', side_effect=error), self.assertRaisesRegex(RobotError, str(error)):
+                rollout.run(poll_operator=Mock())
+            rollout.robot.stop.assert_called_once()
+            self.assertTrue(rollout.result.errors)
+        rollout, _ = self.make_rollout()
+        rollout.robot.stop.side_effect = RobotError('stop failed')
+        with patch.object(rollout, 'prepare', side_effect=lambda poll: rollout.stop('camera_source_stale')), \
+                self.assertRaisesRegex(RobotError, 'stop failed'):
+            rollout.run(poll_operator=Mock())
+        self.assertEqual(rollout.result.errors[-1]['stage'], 'stop')
+
+    def test_episode_finalization_consumes_late_prediction_before_idle(self):
+        with patch('dexmani_real.deployment.session.SessionState', return_value=self.state):
+            session = PolicySession(self.runtime, 'offline.pt', weights=None, inference_steps=None,
+                output_root=None, device='cpu', seed=0, max_running_s=1, num_episodes=1,
+                record_raw=False, camera_calibration_path=None)
+        episode, _ = self.make_rollout()
+        episode.stop('camera_source_stale')
+        session.episode = episode
+        session.robot = episode.robot
+        future = Future()
+        future.set_result(np.ones((2, 19)))
+        session.model = PolicyWorker(lambda: None, build_observation=lambda rows: rows)
+        session.model.future = future
+        self.addCleanup(lambda: session.model.close().result(timeout=1))
+        with patch.object(session, 'poll_operator'), patch.object(session, 'save_results'), \
+                patch.object(episode, 'finish_recording', side_effect=[False, True]) as finish:
+            session.finish_episode()
+        self.assertEqual(finish.call_count, 2)
+        self.assertIsNone(session.model.future)
+        self.assertIsNone(session.episode)
+        self.assertIsNone(episode.plan)
+        self.assertTrue(self.state.stop_signal.is_set())
+        self.assertIsNone(session.handle_command_batch([]))
+
+    def test_preparation_end_is_reported_before_restart_hint(self):
+        import contextlib
+        import io
+
+        with patch('dexmani_real.deployment.session.SessionState', return_value=self.state):
+            session = PolicySession(self.runtime, 'offline.pt', weights=None, inference_steps=None,
+                output_root=None, device='cpu', seed=0, max_running_s=1, num_episodes=1,
+                record_raw=False, camera_calibration_path=None)
+        episode, _ = self.make_rollout()
+        episode.stop('device feedback: arm_feedback_stale')
+        session.robot = episode.robot
+        session.info = episode.policy_info
+        session.observations = episode.observations
+        session.read_needs = episode.read_needs
+        session.record_needs = episode.record_needs
+        session.action_mapper = None
+        session.keyboard = Mock()
+        calls = []
+
+        def poll():
+            if calls:
+                self.state.request_quit()
+                return None
+            calls.append('B')
+            return self.state.cancel_epoch
+
+        with patch('dexmani_real.deployment.session.Rollout', return_value=episode), \
+                patch.object(episode, 'run'), patch.object(session, 'finish_episode'), \
+                patch.object(session, 'poll_operator', side_effect=poll), \
+                self.assertLogs('dexmani_real.deployment.session', level='INFO') as logs, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            session.run_control_loop()
+        self.assertIn('arm_feedback_stale', logs.output[0])
+        self.assertIn('停止流程已完成', output.getvalue())
+        self.assertIsNone(episode.result.started_utc)
+
+    def test_teleop_restart_hint_only_after_successful_stop(self):
+        for error in (None, RobotError('stop failed')):
+            robot, controller = Mock(), Mock()
+            robot.stop.side_effect = error
+            loop = TeleopLoop(self.state, self.runtime, robot, task_label='test', sensors=None,
+                              controller=controller, recording_dir=None, max_duration_s=1,
+                              keyboard=Mock(), audio=Mock())
+            loop.phase = TeleopPhase.ACTIVE
+            with patch('dexmani_real.teleop.loop.logger.info') as log:
+                if error:
+                    with self.assertRaises(RobotError):
+                        loop.end_episode()
+                else:
+                    loop.end_episode()
+                hints = [c for c in log.call_args_list if '停止流程已完成' in c.args[0]]
+                self.assertEqual(len(hints), int(error is None))
+            controller.clear.assert_called_once()
