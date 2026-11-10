@@ -2,10 +2,11 @@
 
 import contextlib
 import io
+import json
 import logging
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -198,7 +199,8 @@ class DataContracts(unittest.TestCase):
         annotation = read_episode_outcome(path)
         self.assertEqual(annotation['note'], '抓取后滑落')
         self.assertTrue(annotation['annotated_at_utc'].endswith('Z'))
-        self.assertIsNotNone(datetime.fromisoformat(annotation['annotated_at_utc'].replace('Z', '+00:00')).tzinfo)
+        self.assertEqual(datetime.fromisoformat(annotation['annotated_at_utc'].replace('Z', '+00:00')).tzinfo,
+                         timezone.utc)
         with self.assertRaises(FileExistsError):
             write_episode_outcome(path, 'success')
         self.assertEqual(read_episode_outcome(path), annotation)
@@ -213,14 +215,59 @@ class DataContracts(unittest.TestCase):
             self.assertEqual((path / name).read_bytes(), data)
 
     def test_invalid_outcome_is_not_unknown(self):
-        path = self.record('policy_rollout')
-        for content in ('{', '[]', '{}', '{"outcome":"typo"}', '{"outcome":"success","note":2}'):
+        path = self.root
+        for content, message in (
+            ('{', 'Expecting property name'),
+            ('[]', 'outcome must be'),
+            ('{}', 'outcome must be'),
+            ('{"outcome":"typo","annotated_at_utc":"2026-11-10T08:00:00Z"}', 'outcome must be'),
+            ('{"outcome":"success","annotated_at_utc":"2026-11-10T08:00:00Z","note":2}', 'note must be'),
+        ):
             with self.subTest(content=content):
                 (path / 'outcome.json').write_text(content)
-                with self.assertRaises(ValueError):
+                with self.assertRaisesRegex(ValueError, message):
                     read_episode_outcome(path)
         with self.assertRaises(ValueError):
             write_episode_outcome(path, 'typo', overwrite=True)
+
+    def test_read_outcome_requires_episode_directory(self):
+        path = self.root / 'missing'
+        with self.assertRaises(NotADirectoryError):
+            read_episode_outcome(path)
+        path.write_text('not a directory')
+        with self.assertRaises(NotADirectoryError):
+            read_episode_outcome(path)
+        self.assertEqual(read_episode_outcome(self.root), {'outcome': 'unknown'})
+
+    def test_outcome_requires_valid_utc_timestamp(self):
+        path = self.root / 'outcome.json'
+        path.write_text(json.dumps({'outcome': 'success'}))
+        with self.assertRaisesRegex(ValueError, 'annotated_at_utc'):
+            read_episode_outcome(self.root)
+        for timestamp in (None, 123, '', 'invalid', '2026-02-30T08:00:00Z',
+                          '2026-11-10', '2026-11-10T08:00:00', '2026-11-10T08:00:00+08:00'):
+            with self.subTest(timestamp=timestamp):
+                path.write_text(json.dumps({'outcome': 'success', 'annotated_at_utc': timestamp}))
+                with self.assertRaisesRegex(ValueError, 'annotated_at_utc'):
+                    read_episode_outcome(self.root)
+        for timestamp in ('2026-11-10T08:00:00Z', '2026-11-10T08:00:00+00:00',
+                          '2026-11-10T08:00:00.123456Z'):
+            with self.subTest(timestamp=timestamp):
+                annotation = {'outcome': 'success', 'annotated_at_utc': timestamp, 'note': '完成'}
+                path.write_text(json.dumps(annotation))
+                self.assertEqual(read_episode_outcome(self.root), annotation)
+
+    def test_info_rejects_invalid_outcome_before_visualization(self):
+        from scripts.visualize_episode import main as info
+
+        # 显式 unknown 也必须有合法时间戳，不能等同于缺少 Sidecar。
+        (self.root / 'outcome.json').write_text(json.dumps({'outcome': 'unknown'}))
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+                patch('scripts.visualize_episode.EpisodeVisualizer') as viewer, \
+                self.assertRaisesRegex(ValueError, 'annotated_at_utc'):
+            info([str(self.root), '--info'])
+        viewer.assert_not_called()
+        self.assertNotIn('Task outcome: unknown', output.getvalue())
 
     def test_outcome_requires_published_raw_structure(self):
         missing = self.root / 'missing'

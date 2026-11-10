@@ -40,8 +40,11 @@ EPISODE_OUTCOMES = ("success", "failure", "unknown")
 
 
 def read_episode_outcome(episode_path: str | Path) -> dict[str, str]:
-    """缺少人工标注表示 unknown；损坏的标注与 I/O 错误直接报告。"""
-    path = Path(episode_path).expanduser() / "outcome.json"
+    """已存在的 Episode 缺少标注才表示 unknown；非法标注与 I/O 错误直接报告。"""
+    episode = Path(episode_path).expanduser()
+    if not episode.is_dir():
+        raise NotADirectoryError(episode)
+    path = episode / "outcome.json"
     try:
         with path.open(encoding="utf-8") as stream:
             annotation = json.load(stream)
@@ -51,6 +54,19 @@ def read_episode_outcome(episode_path: str | Path) -> dict[str, str]:
         return {"outcome": "unknown"}
     if not isinstance(annotation, dict) or annotation.get("outcome") not in EPISODE_OUTCOMES:
         raise ValueError(f"{path}: outcome must be one of {EPISODE_OUTCOMES}")
+    timestamp = annotation.get("annotated_at_utc")
+    if not isinstance(timestamp, str):
+        # JSON 字段违反标注契约，与 outcome/note 一样报告 ValueError。
+        raise ValueError(f"{path}: annotated_at_utc must be an ISO 8601 UTC datetime string")  # noqa: TRY004
+    try:
+        # Python 3.10 的 fromisoformat 不接受 Z，等价解析为 UTC 偏移。
+        annotated_at = datetime.fromisoformat(
+            timestamp[:-1] + "+00:00" if timestamp.endswith("Z") else timestamp
+        )
+    except ValueError as exc:
+        raise ValueError(f"{path}: invalid annotated_at_utc: {timestamp!r}") from exc
+    if annotated_at.tzinfo != timezone.utc:
+        raise ValueError(f"{path}: annotated_at_utc must have a UTC timezone")
     if "note" in annotation and not isinstance(annotation["note"], str):
         raise ValueError(f"{path}: note must be a string")
     return annotation
