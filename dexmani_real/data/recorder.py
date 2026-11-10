@@ -11,7 +11,7 @@ from queue import Empty, Full, Queue
 
 from av.error import FFmpegError
 
-from dexmani_real.data.raw import TACTILE_AGE_WARNING_NS, RawWriter, validate_task_label
+from dexmani_real.data.raw import RawWriter, validate_task_label
 from dexmani_real.robot.commands import RobotCommand
 from dexmani_real.runtime.observation import Observation
 from dexmani_real.utils.io import publish
@@ -35,7 +35,7 @@ class _FinishRequest:
 
 
 class EpisodeRecorder:
-    """每个 episode 独占一个 writer；录制失败可在控制继续时收尾。"""
+    """每段独占一个 writer；失败由控制流程终段，线程退出后才处置文件。"""
 
     def __init__(self, data_dir, *, control_hz):
         sampling_clock_ns(control_hz)
@@ -49,8 +49,6 @@ class EpisodeRecorder:
         self.recording_truncated_reason = None
         self.pending_segment_start = False
         self.finish_request: _FinishRequest | None = None
-        self.warned_tactile_channels = set()
-        self.warned_gaps = set()
         self.staging_path: Path | None = None
         self.published_path: Path | None = None
         self.writer = None
@@ -84,24 +82,11 @@ class EpisodeRecorder:
         if self.error is not None:
             raise self.error
 
-    def service(self):
-        """监督录制失败的清理；程序错误和无法回收的资源仍向外传播。"""
-        error = self.error
-        if error is None:
-            return
-        if not isinstance(error, RecordingError):
-            raise error
-        self.request_finish(save=False, reason="recording_failed")
-        self.poll_finish()
-
-    def mark_gap(self, reason):
+    def mark_gap(self):
         self.pending_segment_start = True
         if self.recording_truncated_reason is None:
-            self.recording_truncated_reason = reason
-        if reason not in self.warned_gaps:
-            logger.warning("录制存在缺失：%s；控制继续，后续有效行仍可接收。", reason)
-            self.warned_gaps.add(reason)
-        return reason
+            self.recording_truncated_reason = "control_slots_skipped"
+            logger.warning("控制调度跳槽；下一行开始新的连续区间。")
 
     def result(self):
         """仅报告最后可观察的结果，pending 不推断线程之后的结局。"""
@@ -177,28 +162,23 @@ class EpisodeRecorder:
         self.is_recording = True
 
     def append(self, row, command=None, *, quality_issue=None) -> str | None:
-        """质量拒绝只丢弃当前整行；已知 I/O 失败停止录制，程序错误仍传播。"""
-        self.service()
+        """质量拒绝或队列满停止接纳，返回终段原因；写入错误原样传播。"""
+        self.check_error()
         if not self.is_recording:
             return None
-        if quality_issue is not None:
-            return self.mark_gap(quality_issue)
-        if row.hand is not None:
-            for channel in ("aggregate", "dense"):
-                stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0])
-                age_ns = row.observation_timestamp_ns - stamp
-                if stamp > 0 and age_ns > TACTILE_AGE_WARNING_NS and channel not in self.warned_tactile_channels:
-                    logger.warning("录制触觉 %s 已保持 %.3f s；继续记录最近有效值及原来源时间。",
-                                   channel, age_ns / 1e9)
-                    self.warned_tactile_channels.add(channel)
-        # 数组已脱离共享缓冲，入队后生产者不再修改。
-        snapshot = replace(row, point_cloud=None)
-        try:
-            self.queue.put_nowait((snapshot, command, self.pending_segment_start))
-        except Full:
-            return self.mark_gap("recording_queue_full")
-        self.pending_segment_start = False
-        return None
+        if quality_issue is None:
+            # 数组已脱离共享缓冲，入队后生产者不再修改。
+            snapshot = replace(row, point_cloud=None)
+            try:
+                self.queue.put_nowait((snapshot, command, self.pending_segment_start))
+            except Full:
+                quality_issue = "recording_queue_full"
+            else:
+                self.pending_segment_start = False
+                return None
+        self.is_recording = False
+        self.recording_truncated_reason = quality_issue
+        return quality_issue
 
     def request_finish(self, *, save, reason, details=None) -> _FinishRequest:
         """停止接纳新行；首次请求固定处置意图和整个收尾的等待预算。"""

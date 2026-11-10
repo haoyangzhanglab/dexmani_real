@@ -14,18 +14,18 @@ HOI_FIELDS = (
 
 
 def validate_hoi(group, frames):
-    """打开文件时检查完成状态和数组结构；数值在写入、显示或导出时检查。"""
-    if not group.attrs["complete"]:
-        raise ValueError("Raw /hoi 未完成，不能作为正式标注读取")
+    """读取已发布分组时检查数组结构；数值在写入、显示或导出时检查。"""
     names = group.attrs["object_names"].tolist()
     if not names or len(set(names)) != len(names):
         raise ValueError("Raw /hoi 对象顺序非法")
     offsets = np.asarray(group.attrs["offsets"])
+    # 直接比较顺序，避免整数差分溢出后掩盖倒序。
     if (
         offsets.dtype.kind not in "iu"
         or offsets.shape != (len(names) + 1,)
         or offsets[0] != 0
         or offsets[-1] != 1024
+        or np.any(offsets[1:] <= offsets[:-1])
         or np.any(np.diff(offsets) < 64)
     ):
         raise ValueError("Raw /hoi 点分段非法")
@@ -59,7 +59,7 @@ def write_hoi(path, template, manifest, poses, valid, quality, base_from_camera)
         if "_hoi_staging" in data:
             del data["_hoi_staging"]
         group = data.create_group("_hoi_staging")
-        group.attrs.update(manifest, offsets=template["offsets"], complete=False)
+        group.attrs.update(manifest, offsets=template["offsets"])
         cloud = group.create_dataset(
             "object_pointcloud", (frames, 1024, 3), dtype="f4", chunks=(1, 1024, 3)
         )
@@ -77,8 +77,6 @@ def write_hoi(path, template, manifest, poses, valid, quality, base_from_camera)
                 if frame_valid[index]:
                     block[offset] = transform_task_points(template, poses[index], base_from_camera)
             cloud[start : start + len(block)] = block
-        group.attrs["complete"] = True
-        validate_hoi(group, frames)
         data.flush()
         data.move("_hoi_staging", "hoi")
         data.flush()

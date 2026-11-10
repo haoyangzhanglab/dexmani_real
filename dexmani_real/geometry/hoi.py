@@ -52,8 +52,6 @@ def task_objects(task):
 
 
 def load_task_template(task):
-    from cordvip_geometry.assets import load_asset
-
     task = Path(task)
     manifest = json.loads((task / "hoi/manifest.json").read_text())
     if manifest["task_name"] != task.name:
@@ -63,7 +61,7 @@ def load_task_template(task):
         raise ValueError("任务对象顺序已改变")
     meshes = []
     for name in names:
-        _, _, _, metadata = load_asset(task / name)
+        metadata = json.loads((task / name / "asset.json").read_text())
         meshes.append(task / name / metadata["mesh_file"])
     if template_digest(task / "hoi/template.npz", names, meshes) != manifest["template_sha256"]:
         raise ValueError(f"{task}: HOI 模板或 Mesh 已改变")
@@ -72,11 +70,13 @@ def load_task_template(task):
     points, offsets = template["points_local"], template["offsets"]
     if points.shape != (1024, 3) or points.dtype != np.float32 or not np.isfinite(points).all():
         raise ValueError("非法 HOI 模板点")
+    # 直接比较顺序，避免整数差分溢出后掩盖倒序。
     if (
         offsets.dtype.kind not in "iu"
         or offsets.shape != (len(names) + 1,)
         or offsets[0] != 0
         or offsets[-1] != 1024
+        or np.any(offsets[1:] <= offsets[:-1])
         or np.any(np.diff(offsets) < 64)
     ):
         raise ValueError("非法 HOI 点分段")

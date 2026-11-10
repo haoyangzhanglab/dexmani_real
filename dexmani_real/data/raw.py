@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
 TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
-# 录制/导出的 Hold 诊断阈值，不是运行时必需触觉的 TTL。
+# 离线导出的来源年龄诊断阈值；在线采集使用实际 Hand TTL。
 TACTILE_AGE_WARNING_NS = 500_000_000
 
 
@@ -163,14 +163,12 @@ def decode_camera_metadata(meta) -> CameraSnapshot:
 
 
 def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata):
-    """记录实际相机参数、触觉指序、固定尺度及复位结果。"""
+    """记录本轮实际相机参数与触觉复位结果。"""
     metadata = camera_metadata(camera_snapshot)
     metadata.update(tactile_reset_metadata)
     if tactile_reset_metadata:
         # HDF5 属性不支持 dict，设备结果只在录制边界编码。
         metadata["hand_tactile_reset_result"] = json.dumps(metadata["hand_tactile_reset_result"])
-    metadata["hand_tactile_finger_order"] = TACTILE_FINGER_ORDER
-    metadata["hand_tactile_scale_divisor"] = XHAND_TACTILE_SCALE_DIVISOR
     return metadata
 
 
@@ -238,12 +236,6 @@ class RawWriter:
     def open(self, metadata):
         import h5py
 
-        divisor = metadata.get("hand_tactile_scale_divisor")
-        if divisor != XHAND_TACTILE_SCALE_DIVISOR:
-            raise ValueError(
-                f"Raw hand_tactile_scale_divisor: expected {XHAND_TACTILE_SCALE_DIVISOR}, "
-                f"got {divisor!r}"
-            )
         self.data_file = data = h5py.File(self.path / "data.h5", "w")
         self.meta = data.create_group("meta")
         self.meta.attrs.update(metadata)
@@ -254,6 +246,8 @@ class RawWriter:
             joint_units="rad",
             arm_joint_names=json.dumps(XARM7_JOINT_NAMES),
             hand_joint_names=json.dumps(XHAND_SDK_JOINT_NAMES),
+            hand_tactile_finger_order=TACTILE_FINGER_ORDER,
+            hand_tactile_scale_divisor=XHAND_TACTILE_SCALE_DIVISOR,
         )
         specs = ROBOT_DATASET_SPECS
         if metadata["collection_source"] == "teleop":

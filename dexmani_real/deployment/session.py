@@ -110,39 +110,31 @@ class PolicySession:
     def save_run_config(self):
         if self.output_dir is None:
             return
-        path = self.output_dir / "run_config.yaml"
-        try:
-            payload = {
-                "policy": self.info.to_dict(),
-                "runtime": {name: asdict(getattr(self.runtime, name)) for name in RUNTIME_SECTIONS},
-                "camera_calibration_path": str(self.camera_calibration_path or CAMERAS_PATH),
-                "effective_camera": ({"camera_T_xarm_base_from_color": None,
-                                      **camera_metadata(self.camera_snapshot)}
-                                     if self.camera_snapshot is not None else None),
-                "table_plane_abcd": self.table_plane_abcd,
-                "table_plane_path": (str(resolve_table_plane_path(self.runtime.environment.table_plane_path))
-                                     if self.table_plane_abcd is not None else None),
-                "seed": self.seed, "device": self.device,
-                "num_episodes": self.num_episodes, "max_duration_s": self.max_running_s,
-                "record_raw": self.record_raw,
-            }
-            write_yaml(payload, path)
-        except OSError:
-            logger.exception("辅助输出保存失败：%s", path)
+        payload = {
+            "policy": self.info.to_dict(),
+            "runtime": {name: asdict(getattr(self.runtime, name)) for name in RUNTIME_SECTIONS},
+            "camera_calibration_path": str(self.camera_calibration_path or CAMERAS_PATH),
+            "effective_camera": ({"camera_T_xarm_base_from_color": None,
+                                  **camera_metadata(self.camera_snapshot)}
+                                 if self.camera_snapshot is not None else None),
+            "table_plane_abcd": self.table_plane_abcd,
+            "table_plane_path": (str(resolve_table_plane_path(self.runtime.environment.table_plane_path))
+                                 if self.table_plane_abcd is not None else None),
+            "seed": self.seed, "device": self.device,
+            "num_episodes": self.num_episodes, "max_duration_s": self.max_running_s,
+            "record_raw": self.record_raw,
+        }
+        write_yaml(payload, self.output_dir / "run_config.yaml")
 
     def save_results(self):
         if self.episode is not None and self.episode.recorder is not None:
             self.episode.result.raw = self.episode.recorder.result()
         if self.output_dir is None:
             return
-        path = self.output_dir / "session_result.json"
-        try:
-            payload = dict(self.summary, errors=self.errors,
-                           episodes=[asdict(result) for result in self.episodes],
-                           emergency_stop_requested=self.runtime_state.estop_request)
-            write_json(payload, path)
-        except OSError:
-            logger.exception("辅助输出保存失败：%s", path)
+        payload = dict(self.summary, errors=self.errors,
+                       episodes=[asdict(result) for result in self.episodes],
+                       emergency_stop_requested=self.runtime_state.estop_request)
+        write_json(payload, self.output_dir / "session_result.json")
 
     def run(self):
         configure_logging()
@@ -209,10 +201,7 @@ class PolicySession:
             motion=self.runtime.motion, environment=self.runtime.environment,
         )
         if self.output_root is not None:
-            try:
-                self.output_dir = session_directory(self.output_root)
-            except OSError:
-                logger.exception("输出目录创建失败：%s；要求录制的实验将在 B 时重试。", self.output_root)
+            self.output_dir = session_directory(self.output_root)
         print(
             f"执行：{self.info.checkpoint_path.name} ({self.info.weights}) | inference_steps={self.info.inference_steps} | "
             f"A_exec={self.runtime.execution.action_steps} | {self.runtime.execution.mode} | "
@@ -247,11 +236,7 @@ class PolicySession:
         if not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
             return False
-        needs = self.model_needs
-        names = tuple(name for name, required in (
-            ("camera", needs.camera_worker), ("pointcloud", needs.point_cloud), ("hoi", needs.hoi),
-        ) if required)
-        if not self.sensors.check(names=names):
+        if not self.sensors.check():
             raise RobotError("required sensor process exited")
         return True
 
@@ -329,7 +314,6 @@ class PolicySession:
         try:
             close_runtime(
                 self.runtime_state, self.robot, sensors=self.sensors, keyboard=self.keyboard,
-                optional_sensor_names=() if self.model_needs.camera_worker else ("camera",),
             )
         except BaseException as exc:
             if isinstance(exc, SystemExit):
@@ -347,7 +331,7 @@ class PolicySession:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
                 logger.exception("episode recording finalization failed")
-                self.errors.append(error_detail("recorder_finalize", exc))
+                self.episode.fail("recording_finalize", exc)
         if self.model is not None:
             try:
                 closed = self.model.close()
@@ -360,8 +344,12 @@ class PolicySession:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
                 logger.exception("policy model close failed")
-                self.errors.append(error_detail("model_close", exc))
-        failed = bool(self.errors or self.runtime_state.estop_request)
+                if self.episode is not None:
+                    self.episode.fail("model_close", exc)
+                else:
+                    self.errors.append(error_detail("model_close", exc))
+        failed = bool(self.errors or any(result.errors for result in self.episodes)
+                      or self.runtime_state.estop_request)
         if self.runtime_state.estop_request:
             self.summary["termination_reason"] = "estop"
         elif failed:
@@ -371,10 +359,15 @@ class PolicySession:
         self.summary["ended_utc"] = utc_now()
         try:
             self.save_results()
-        except KeyboardInterrupt:
-            self.runtime_state.request_emergency_stop()
-            self.summary["termination_reason"] = "estop"
-            raise
+        except BaseException as exc:
+            if isinstance(exc, SystemExit):
+                exit_signal = exit_signal or exc
+            if isinstance(exc, KeyboardInterrupt):
+                self.runtime_state.request_emergency_stop()
+            self.errors.append(error_detail("results_write", exc))
+            self.summary["termination_reason"] = "estop" if self.runtime_state.estop_request else "failed"
+            failed = True
+            logger.exception("session result write failed")
         if exit_signal is not None:
             raise exit_signal
         return int(failed)
@@ -425,9 +418,9 @@ class PolicySession:
         cast(PolicyWorker, self.model).warmup(rows, **kwargs)
         self.wait_model()
 
-    def poll_operator(self) -> int | None:
+    def poll_operator(self, *, timeout=0) -> int | None:
         return self.handle_command_batch(
-            self.keyboard.poll(self.runtime_state, timeout=0)[0],
+            self.keyboard.poll(self.runtime_state, timeout=timeout)[0],
         )
 
     def handle_command_batch(self, signals: Sequence[str]) -> int | None:
@@ -544,13 +537,6 @@ class PolicySession:
             if cancel_epoch is None:
                 time.sleep(0.005)
                 continue
-            if self.record_raw and self.output_dir is None:
-                try:
-                    self.output_dir = session_directory(cast(Path, self.output_root))
-                except OSError:
-                    logger.exception("录制目录尚不可用；本轮未开始，可再次按 B。")
-                    continue
-                self.save_run_config()
             episode = self.episode = Rollout(
                 self.runtime_state, self.runtime, self.info, cancel_epoch=cancel_epoch,
                 robot=self.robot, sensors=self.sensors, observations=self.observations,
@@ -563,14 +549,14 @@ class PolicySession:
                 episode.run(poll_operator=self.poll_operator)
             finally:
                 self.episodes.append(episode.result)
+            self.finish_episode()
             result = episode.result
             if result.started_utc is not None:
                 completed = sum(item.started_utc is not None for item in self.episodes)
-                logger.info("第 %d 轮结束：%s（%s，%.1f s）。", completed,
+                logger.info("第 %d 轮控制结束：%s（%s，%.1f s）。", completed,
                             result.termination_reason, result.termination_details, result.duration_s)
                 if self.num_episodes is not None and completed >= self.num_episodes:
                     self.runtime_state.request_quit()
-            self.finish_episode()
             if self.runtime_state.quit_requested or self.runtime_state.estop_request:
                 break
             print("等待下一轮：B 开始，按需 H 回初始位；Q 退出。", flush=True)
@@ -606,7 +592,7 @@ class PolicySession:
                     raise TimeoutError("episode model task remains pending")
                 time.sleep(0.005)
         except BaseException as exc:
-            episode.result.errors.append(error_detail("episode_finalize", exc))
+            episode.fail("episode_finalize", exc)
             raise
         self.poll_operator()
         if self.runtime_state.quit_requested or self.runtime_state.estop_request:

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from typing import cast
 
@@ -38,12 +39,10 @@ from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_device_feedback,
     check_observation,
-    missing_tactile_channels,
     read_observation,
 )
 from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S, RunEndReason
 from dexmani_real.utils.log import error_detail
-from dexmani_real.utils.timing import next_tick_ns
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +88,6 @@ class Rollout:
         self.max_duration_ns = int(max_running_s * 1e9) if max_running_s is not None else None
         self.cancel_epoch = cancel_epoch
         self.history: deque[dict[str, np.ndarray]] = deque(maxlen=policy_info.n_obs_steps)
-        self.model_input_issues: tuple[str, ...] = ()
         self.plan: ActionChunk | None = None
         self.query: Prediction | None = None
         self.cursor = 0
@@ -109,13 +107,11 @@ class Rollout:
         return self.result.termination_reason is not None
 
     def recording_issue(self, row):
-        if not self.sensors.check(names=("camera",)):
-            return "recording_camera_worker_exited"
         issues = check_observation(row, self.runtime, self.record_needs,
-                                   now_ns=row.observation_timestamp_ns, allow_tactile_hold=True)
+                                   now_ns=row.observation_timestamp_ns)
         return "; ".join(issues) if issues else None
 
-    def stop(self, detail, *, run_end_reason=RunEndReason.CANCELLED, errors=()):
+    def stop(self, detail, *, run_end_reason=RunEndReason.CANCELLED):
         if self.finished:
             return
         ended_ns = time.monotonic_ns()
@@ -123,10 +119,10 @@ class Rollout:
         self.result.duration_s = (ended_ns - self.started_ns) / 1e9 if self.started_ns else 0.0
         self.result.termination_reason = (
             run_end_reason.name.lower() if self.started_ns
-            else "preparation_failed" if self.preparation_issue or errors else "start_cancelled"
+            else "preparation_failed" if self.preparation_issue or run_end_reason is RunEndReason.FAILED
+            else "start_cancelled"
         )
-        self.result.termination_details = detail if not errors else None
-        self.result.errors.extend(errors)
+        self.result.termination_details = detail
         self.plan = self.query = None
         self.history.clear()
         self.has_submitted = False
@@ -156,9 +152,20 @@ class Rollout:
             result.raw = recorder.result()
             # 线程实际退出才释放 owner；失败结果及 staging 路径保留在 result。
             self.recorder = None
+            if recorder.error is not None:
+                self.fail("recording", recorder.error)
             if not recorder.finish_request.save and recorder.error is None:
                 logger.info("Raw 已丢弃。")
         return True
+
+    def fail(self, stage, error):
+        if isinstance(error, KeyboardInterrupt):
+            self.runtime_state.request_emergency_stop()
+        self.stop(None, run_end_reason=RunEndReason.FAILED)
+        # 停止与收尾仍属于本段；不能保留它们失败前的正常结束状态。
+        self.result.termination_reason = "failed" if self.started_ns else "preparation_failed"
+        self.result.termination_details = None
+        self.result.errors.append(error_detail(stage, error))
 
     def run(self, *, poll_operator):
         """运行结束先停设备；段间及最终资源收尾由 Session 编排。"""
@@ -166,11 +173,15 @@ class Rollout:
             try:
                 self.prepare(poll_operator)
                 while not self.finished:
-                    poll_operator()
+                    due_ns = min(self.next_step_ns, self.robot.feedback_next_ns)
+                    timeout = min(0.005, max(0, due_ns - time.monotonic_ns()) / 1e9)
+                    poll_operator(timeout=timeout)
                     self.robot.service_feedback()
                     self.step()
-                    if not self.finished:
-                        time.sleep(0.001)
+            except RecordingError:
+                self.stop("recording_failed", run_end_reason=RunEndReason.FAILED)
+                self.robot.check()
+                poll_operator()
             except FeedbackUnavailable as exc:
                 self.robot.check()
                 poll_operator()
@@ -184,23 +195,14 @@ class Rollout:
                     raise
                 self.stop(str(exc))
         except BaseException as exc:
-            if isinstance(exc, KeyboardInterrupt):
-                self.runtime_state.request_emergency_stop()
-            if not self.finished:
-                stage = "control" if self.started_ns else "preparation"
-                self.stop(str(exc), run_end_reason=RunEndReason.FAILED,
-                          errors=[error_detail(stage, exc)])
-            else:
-                self.result.errors.append(error_detail("control", exc))
+            self.fail("control" if self.started_ns else "preparation", exc)
             raise
         finally:
             primary_error = sys.exc_info()[1]
             try:
                 self.robot.stop()
             except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                self.result.errors.append(error_detail("stop", exc))
+                self.fail("stop", exc)
                 if primary_error is None:
                     raise
                 logger.exception("device stop also failed")
@@ -224,7 +226,7 @@ class Rollout:
             raw = replace(row, camera=camera, hoi=None, observation_timestamp_ns=time.monotonic_ns())
         return row, raw
 
-    def start_observation(self, poll_operator=lambda: None, *, after_ns=None, initial_hoi=False):
+    def start_observation(self, poll_operator, *, after_ns=None, initial_hoi=False):
         timeout_s = 120.0 if initial_hoi else INITIAL_STATE_TIMEOUT_S
         until = time.monotonic_ns() + int(timeout_s * 1e9)
         while True:
@@ -254,11 +256,7 @@ class Rollout:
                 self.preparation_issue = None
                 break
             if time.monotonic_ns() >= until:
-                missing = missing_tactile_channels(row, self.capture_needs.required_tactile)
-                if missing:
-                    self.preparation_issue = "initial_tactile_unavailable: " + ", ".join(missing)
-                else:
-                    self.preparation_issue = issue or "initial_joint_feedback_unavailable"
+                self.preparation_issue = issue or "initial_joint_feedback_unavailable"
                 logger.warning("本轮未开始：%s；可稍后再次按 B。", self.preparation_issue)
                 return None
             time.sleep(0.005)
@@ -315,18 +313,12 @@ class Rollout:
                 self.camera_snapshot,
                 tactile_reset_metadata=self.robot.hand.tactile_reset_metadata,
             )
-            try:
-                self.recorder.start(
-                    task_label=self.policy_info.task_name,
-                    episode_name=f"episode_{self.result.index:03d}", collection_source="policy_rollout", metadata=metadata,
-                )
-            except RecordingError as exc:
-                self.recorder.service()
-                poll_operator()
-                self.preparation_issue = "recording_start_failed"
-                self.stop(str(exc))
-                return
-            # writer 可能阻塞超过反馈 TTL；仍停止采样，允许一次 CRC 后恢复。
+            metadata["runtime_config_json"] = json.dumps(asdict(self.runtime), allow_nan=False)
+            self.recorder.start(
+                task_label=self.policy_info.task_name,
+                episode_name=f"episode_{self.result.index:03d}", collection_source="policy_rollout", metadata=metadata,
+            )
+            # writer 初始化期间设备保持停止，准备运动前重新等候新反馈。
             if self.start_observation(poll_operator, after_ns=time.monotonic_ns()) is None:
                 self.stop(self.preparation_issue)
                 return
@@ -399,7 +391,13 @@ class Rollout:
             return None, f"action_rejected: {decoded.rejection_reason}"
         return RobotCommand(decoded.arm_qpos, decoded.hand_qpos), None
 
-    def select_async_action(self, slot, model_input_valid):
+    def select_action(self, slot):
+        if self.execution.mode == "sync":
+            if self.plan is None:
+                if self.model.future is None:
+                    self.submit(None)
+                return None
+            return self.plan.actions[self.cursor]
         rtc = self.execution.mode == "rtc"
         if rtc:
             query = self.query
@@ -419,14 +417,14 @@ class Rollout:
                 self.plan, self.query = new_plan, None
         if self.plan is None:
             # 仅首预测允许无旧计划等待；运行中耗尽直接结束。
-            if self.first_prediction and model_input_valid:
+            if self.first_prediction:
                 self.submit(slot)
             return None
         exhausted = self.cursor >= len(self.plan.actions) if rtc else plan_exhausted(self.plan, slot)
         if exhausted:
             self.stop("prediction exhausted")
             return None
-        if self.query is None and model_input_valid:
+        if self.query is None:
             if rtc:
                 window = min(self.execution.action_steps, len(self.plan.actions))
                 if self.cursor >= max(0, window - self.execution.prefetch_steps):
@@ -453,12 +451,9 @@ class Rollout:
         return row, raw
 
     def update_history(self, row):
-        issues = tuple(check_observation(row, self.runtime, self.model_needs))
-        if issues and issues != self.model_input_issues:
-            logger.warning("策略暂缓新推理：%s", "; ".join(issues))
-        self.model_input_issues = issues
+        issues = check_observation(row, self.runtime, self.model_needs)
         if issues:
-            self.history.clear()
+            self.stop("model_input: " + "; ".join(issues))
             return False
         projected = self.observations.project(row)
         if not self.history:
@@ -488,6 +483,10 @@ class Rollout:
         issues = check_device_feedback(row, self.runtime)
         if issues:
             raise FeedbackUnavailable("device feedback: " + "; ".join(issues))
+        issues = check_observation(row, self.runtime, self.model_needs)
+        if issues:
+            self.stop("model_input before submission: " + "; ".join(issues))
+            return None
         if self.model_needs.hoi:
             needs = ObservationNeeds(hoi=True)
             latest = read_observation(self.sensors.channels, self.robot, needs=needs)
@@ -497,16 +496,20 @@ class Rollout:
                 return None
         return command
 
-    def record_row(self, row, attempted_command):
+    def record_row(self, row, attempted_command, *, quality_issue):
         primary_error = sys.exc_info()[1]
         if primary_error is not None:
             self.runtime_state.stop_signal.set()
-        if row is not None and self.recorder is not None:
+        if self.recorder is not None:
             try:
-                self.recorder.append(row, attempted_command, quality_issue=self.recording_issue(row))
+                issue = self.recorder.append(row, attempted_command, quality_issue=quality_issue)
+                if issue is not None:
+                    self.stop(issue)
             except BaseException as exc:
                 if primary_error is None:
                     raise
+                if exc is primary_error:
+                    return
                 self.result.errors.append(error_detail("recording_append", exc))
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
@@ -516,15 +519,11 @@ class Rollout:
         if self.finished:
             return
         self.robot.check()
-        if (self.runtime_state.cancel_epoch != self.cancel_epoch
-                or not self.runtime_state.requests_allow_motion()):
-            raise OperationCancelled("operation cancelled")
+        self.check_motion()
         if self.recorder is not None:
-            self.recorder.service()
+            self.recorder.check_error()
         if self.duration_expired():
             return
-        if self.runtime_state.stop_signal.is_set():
-            raise OperationCancelled("device stopped")
         if self.model_needs.hoi:
             needs = ObservationNeeds(hoi=True)
             row = read_observation(self.sensors.channels, self.robot, needs=needs)
@@ -532,10 +531,7 @@ class Rollout:
             if issues:
                 self.stop("HOI admission: " + "; ".join(issues))
                 return
-        if self.execution.mode == "sync":
-            self.step_sync()
-        else:
-            self.step_async()
+        self.step_control()
 
     def commit_arm(self, command, row):
         submitted_ns = time.monotonic_ns()
@@ -546,44 +542,7 @@ class Rollout:
             self.ik_reference = IKReference(command.arm_qpos, anchor, submitted_ns)
         self.has_submitted = True
 
-    def step_sync(self):
-        now = time.monotonic_ns()
-        if now < self.next_step_ns:
-            self.poll_model()
-            return
-        planned_ns = self.next_step_ns
-        self.next_step_ns = next_tick_ns(planned_ns, self.dt_ns, now)
-        if now - planned_ns >= self.dt_ns and self.recorder is not None:
-            self.recorder.mark_gap("control_slots_skipped")
-        row = raw = attempted = None
-        try:
-            row, raw = self.sample_observation()
-            valid = self.update_history(row)
-            self.check_motion()
-            if self.duration_expired():
-                return
-            self.poll_model()
-            if self.plan is None:
-                if valid and self.model.future is None:
-                    self.submit(None)
-                return
-            command = self.prepare_command(self.plan.actions[self.cursor], row)
-            if command is None:
-                return
-            attempted = command
-            self.robot.send_action(command, expires_ns=time.monotonic_ns() + COMMAND_LEASE_NS)
-            if self.policy_info.requires_prev_action:
-                self.prev_action = np.concatenate((command.arm_qpos, command.hand_qpos))
-            if not self.has_submitted:
-                logger.info("Policy first target submitted")
-            self.commit_arm(command, row)
-            self.cursor += 1
-            if self.cursor == min(len(self.plan.actions), self.execution.action_steps):
-                self.plan = None
-        finally:
-            self.record_row(raw, attempted)
-
-    def step_async(self):
+    def step_control(self):
         slot, self.next_step_ns, skipped = control_slot(
             now_ns=time.monotonic_ns(), next_step_ns=self.next_step_ns,
             last_slot=self.last_slot, dt_ns=self.dt_ns,
@@ -593,26 +552,31 @@ class Rollout:
             return
         self.result.skipped_slots += skipped
         if skipped and self.recorder is not None:
-            self.recorder.mark_gap("control_slots_skipped")
+            self.recorder.mark_gap()
         self.last_slot = slot
-        row = raw = attempted = None
         pending = self.model.future
+        row, raw = self.sample_observation()
+        quality_issue = self.recording_issue(raw) if self.recorder is not None else None
+        attempted = None
         try:
-            row, raw = self.sample_observation()
-            valid = self.update_history(row)
+            if quality_issue is not None:
+                self.stop(quality_issue)
+                return
+            if not self.update_history(row):
+                return
             self.check_motion()
             if self.duration_expired():
                 return
             self.poll_model()
-            action = self.select_async_action(slot, valid)
+            action = self.select_action(slot)
             if action is None:
                 return
+            plan = cast(ActionChunk, self.plan)
             command = self.prepare_command(action, row)
             if command is None:
                 return
             now = time.monotonic_ns()
             if self.execution.mode == "async":
-                plan = cast(ActionChunk, self.plan)
                 if now >= self.started_ns + (plan.anchor_slot + len(plan.actions)) * self.dt_ns:
                     # 只收取进入本次操作前已有的任务，不轮询刚提交的新请求。
                     if pending is not None and self.model.future is pending:
@@ -626,10 +590,14 @@ class Rollout:
                     return
             attempted = command
             self.robot.send_action(command, expires_ns=now + COMMAND_LEASE_NS)
+            if self.policy_info.requires_prev_action:
+                self.prev_action = np.concatenate((command.arm_qpos, command.hand_qpos))
             if not self.has_submitted:
                 logger.info("Policy first target submitted")
             self.commit_arm(command, row)
-            if self.execution.mode == "rtc":
+            if self.execution.mode in {"sync", "rtc"}:
                 self.cursor += 1
+                if self.execution.mode == "sync" and self.cursor == min(len(plan.actions), self.execution.action_steps):
+                    self.plan = None
         finally:
-            self.record_row(raw, attempted)
+            self.record_row(raw, attempted, quality_issue=quality_issue)

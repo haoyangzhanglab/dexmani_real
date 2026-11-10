@@ -92,7 +92,6 @@ def generate_hand_template(
                 points=np.concatenate(clouds).astype(np.float32),
                 part_names=np.asarray(names),
                 part_offsets=np.r_[0, np.cumsum(counts)],
-                part_areas=areas,
             )
         if overwrite:
             os.replace(temporary, path)

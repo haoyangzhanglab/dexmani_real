@@ -24,7 +24,7 @@ def run_hoi_worker(shared, camera, task, template):
     signal.signal(signal.SIGTERM, terminate)
     objects = task_objects(task)
     prompts = {obj["name"]: obj["prompt"] for obj in objects}
-    camera_fields = tuple(name for name in ("rgb", "depth") if name in shared.hoi_ring.dtype.names)
+    camera_fields = tuple(name for name in ("rgb", "depth") if name in shared.hoi_ring.field_names)
     epoch = last_sequence = 0
     first = True
     episode_failed = False
@@ -54,7 +54,7 @@ def run_hoi_worker(shared, camera, task, template):
             last_sequence = sequence
             if int(data["timestamp_ns"]) <= int(command["after_ns"]):
                 continue
-            frame = RGBDFrame.from_camera(camera, {name: data[name] for name in data.dtype.names})
+            frame = RGBDFrame.from_camera(camera, data)
             failure = None
             try:
                 masks = tracker.detect_masks(frame, prompts) if first else None

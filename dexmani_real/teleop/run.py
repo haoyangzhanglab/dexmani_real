@@ -11,11 +11,7 @@ from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
 from dexmani_real.config.teleop import DEFAULT_TASK_NAME
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.data.raw import validate_task_label
-from dexmani_real.ipc.sensors import (
-    SensorChannels,
-    read_vr_frame,
-    snapshot_camera_parameters,
-)
+from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
 from dexmani_real.runtime.keyboard import Keyboard
@@ -128,7 +124,7 @@ def run_teleop(
             keyboard.start()
 
             def check_services():
-                if not keyboard.check_health() or not sensors.check(names=("vr",)):
+                if not keyboard.check_health() or not sensors.check():
                     raise RobotError("teleop control service unavailable")
                 return True
 
@@ -184,7 +180,7 @@ def run_teleop(
         if audio is not None and runtime_state.estop_request:
             audio.play("emergency")
         try:
-            close_runtime(runtime_state, robot, sensors=sensors, keyboard=keyboard, optional_sensor_names=("camera",))
+            close_runtime(runtime_state, robot, sensors=sensors, keyboard=keyboard)
         except BaseException as exc:
             primary_failure = primary_failure or exc
             if loop is not None:
@@ -212,6 +208,7 @@ def run_teleop(
                 logger.exception("teleop audio cleanup failed")
     return int(
         not runtime_state.quit_requested or primary_failure is not None or runtime_state.estop_request
+        or loop is not None and loop.failed
     )
 
 
@@ -277,8 +274,9 @@ def calibrate_hand(loop, cancel_epoch) -> None:
             raise RuntimeError(
                 f"hand calibration timed out ({len(measurements)}/{config.calibration_samples}): {last_error}"
             )
-        frame = read_vr_frame(loop.sensors.channels)
-        if frame is not None:
+        result = loop.sensors.channels.vr_ring.read()
+        if result is not None:
+            frame, _ = result
             stamp = int(frame["recv_ts_ns"])
             now_ns = time.monotonic_ns()
             if (

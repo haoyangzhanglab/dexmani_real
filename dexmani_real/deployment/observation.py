@@ -10,7 +10,6 @@ from dexmani_real.geometry.kinematics import (
 )
 from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
-from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
 from dexmani_real.runtime.observation import ObservationNeeds
 
 FIELD_DEPENDENCIES = {
@@ -50,11 +49,7 @@ class ObservationBuilder:
         self.arm_fk = ArmFK() if "arm_fk" in self.dependencies else None
         self.hand_fk = self.hand_cloud = None
         if "hand_fk" in self.dependencies:
-            self.hand_fk = HandFK(
-                info.fingertip_link_names
-                if "fingertips" in self.dependencies and info.fingertip_link_names is not None
-                else XHAND_FINGERTIP_LINK_NAMES,
-            )
+            self.hand_fk = HandFK(info.fingertip_link_names) if "fingertips" in self.dependencies else HandFK()
             if "hand_cloud" in self.dependencies:
                 self.hand_cloud = HandPointCloud(self.hand_fk, runtime.hand_pointcloud.num_points)
 

@@ -51,11 +51,13 @@ python scripts/run_policy.py CHECKPOINT --enable_hoi_pcd
 | --- | --- |
 | `task_name` | 非空任务名，与资产目录、Raw `/meta` 的 `task_label` 和训练任务一致。 |
 | `object_names` | 非空、无重复的对象名列表，顺序固定。 |
-| `template_sha256` | 64 位十六进制指纹，绑定模板文件、物体顺序与实际跟踪 Mesh；训练保存时统一为小写。 |
+| `template_sha256` | 模板发布时生成的小写 SHA-256，绑定模板文件、物体顺序与实际跟踪 Mesh；训练原样保存。 |
 
 Raw `/hoi` 用 HDF5 属性保存上述字段及 `offsets`；Zarr 与 Checkpoint 保存为 `hoi_pcd`。物体点云为 `float32[T,1024,3]`，单位米、坐标系为 xArm base。恢复训练与部署均拒绝任务、对象顺序或模板失配，HOI Checkpoint 缺少元数据也会拒绝部署；普通非 HOI 数据无需该属性。
 
-已有模板校验后复用，完整且模板一致的标注跳过，不覆盖正式结果。写入先使用 `_hoi_staging`，完成校验后发布为 `/hoi`；中断可留 staging，下次重算后发布，HDF5 group move 不保证断电事务。RawReader 检查完成状态、数组结构与任务身份，数值在写入、显示及分块导出时校验。
+已有模板校验后复用，已发布且模板一致的标注跳过，不覆盖正式结果。模板身份检查只读取冻结点、对象清单及 Mesh 文件；跟踪器启动时再加载并检查完整资产。
+
+标注先写入 `_hoi_staging`，所有数组写完并 flush 后发布为 `/hoi`，分组名是唯一的发布标志。中断可留 staging，下次重算后发布，HDF5 group move 不保证断电事务。RawReader 只读取已发布的 `/hoi`，检查数组结构与任务身份；数值在写入、显示及分块导出时校验。
 
 无效物体帧用 false 掩码和零点云占位，Viewer 清除物体点，导出拒绝整个 Episode 并提示 `--exclude`。`--no-point-cloud` 仅关闭普通场景点云显示，HOI 与手部几何仍按各自标签展示。
 
@@ -65,7 +67,7 @@ Raw `/hoi` 用 HDF5 属性保存上述字段及 `offsets`；Zarr 与 Checkpoint 
 
 在线 Worker 每轮 B 后重新初始化，模型保留。每段首次 HOI 初始化预算为 120 s，后续观测等待为 1 s；真实观测预热完成且新鲜有效才允许动作。在线不自动重注册，初始化或位姿失败结束本轮，模型执行、CUDA、IPC 和配置错误继续传播。
 
-HOI 使用来源相机时间及独立的 `execution.hoi_max_age_s`（默认 250 ms）；缺失、过期或失效立即停止动作计划。模型需要的 RGB／Depth 与 HOI 同源，Raw 另取最新 Camera 帧；首版不支持同时输入普通 `point_cloud`。其余历史、时效和录制约定见[策略部署](policy_deployment.md#来源时间与时效)。
+HOI 使用来源相机时间及独立的 `execution.hoi_max_age_s`（默认 250 ms）；缺失、过期或失效立即停止动作计划。模型需要的 RGB／Depth 与 HOI 同源，Raw 另取最新 Camera 帧；不支持同时输入普通 `point_cloud`。其余历史、时效和录制约定见[策略部署](policy_deployment.md#来源时间与时效)。
 
 Episode 结束发布 `episode_id=0`，Worker 暂停读取相机和跟踪；下一轮新 ID 重置场景，旧轮在途结果不能进入新观测。
 

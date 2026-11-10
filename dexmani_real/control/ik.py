@@ -75,15 +75,9 @@ class IKSolver:
         )
 
     def bounds(
-        self, measured: np.ndarray, command: np.ndarray, anchor: np.ndarray, h: float
+        self, measured: np.ndarray, command: np.ndarray, *, h: float
     ):
-        if not np.isfinite(h) or h < 0:
-            raise ValueError("invalid IK time budget")
-        for q in (measured, command, anchor):
-            if np.shape(q) != (7,) or not np.isfinite(q).all():
-                raise ValueError("IK references must be finite (7,) vectors")
-            if np.any(q < self.limits[:, 0]) or np.any(q > self.limits[:, 1]):
-                raise IKReferenceError("IK reference outside operational limits")
+        # 实测入口与已提交解建立格式和限位不变量；这里判断变化中的跟踪范围。
         if np.any(
             np.abs(command - measured) > self.lead + FEEDBACK_POSITION_ROUNDOFF_RAD
         ):
@@ -125,7 +119,7 @@ class IKSolver:
     def solve(
         self, target: Pose, measured, command, anchor, *, h: float, hand_qpos
     ) -> IKResult:
-        lower, upper = self.bounds(measured, command, anchor, h)
+        lower, upper = self.bounds(measured, command, h=h)
         seed = np.clip(command, lower, upper)  # 仅初值；最终输出不裁剪。
         weight = np.hypot(CONTINUITY_WEIGHT, ANCHOR_WEIGHT)
         reference = (

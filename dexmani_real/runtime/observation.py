@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.ipc.sensors import read_camera_frame, read_vr_frame
+from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.utils.timing import sample_is_fresh
 
 
@@ -78,34 +78,14 @@ def read_observation(channels, robot, *, needs=ObservationNeeds()):
                 }
         else:
             camera = read_camera_frame(channels, fields=needs.camera_fields)
-    vr = read_vr_frame(channels) if needs.vr else None
+    vr_result = channels.vr_ring.read() if needs.vr else None
     return Observation(
         arm=state.arm, hand=state.hand, hoi=hoi,
-        camera=camera, vr=vr,
+        camera=camera, vr=vr_result[0] if vr_result is not None else None,
         point_cloud=cloud["point_cloud"] if cloud is not None else None,
         observation_timestamp_ns=time.monotonic_ns(), control_timestamp_ns=control_ns,
         pointcloud_timestamp_ns=int(cloud["timestamp_ns"]) if cloud is not None else 0,
     )
-
-
-def sources_available(row, needs):
-    """只区分尚无完整快照；已有快照的过期仍由 TTL 检查负责。"""
-    return (not needs.hoi or row.hoi is not None) and (not needs.vr or row.vr is not None) and (
-        not needs.camera_fields or row.camera is not None
-    ) and (not needs.point_cloud or row.point_cloud is not None)
-
-
-def missing_tactile_channels(row, channels):
-    """SDK 已校验内部快照的形状和数值；这里只检查真实来源，年龄由消费者检查。"""
-    missing = []
-    for channel in channels:
-        if row.hand is None:
-            missing.append(channel)
-            continue
-        stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0])
-        if stamp <= 0 or stamp > row.observation_timestamp_ns:
-            missing.append(channel)
-    return missing
 
 
 def check_device_feedback(row, runtime, *, now_ns=None):
@@ -122,18 +102,14 @@ def check_device_feedback(row, runtime, *, now_ns=None):
     return issues
 
 
-def check_observation(row, runtime, needs, *, now_ns=None, allow_tactile_hold=False):
+def check_observation(row, runtime, needs, *, now_ns=None):
     """模型或录制所需模态，不重复检查关节反馈。"""
     now = time.monotonic_ns() if now_ns is None else now_ns
     issues: list[str] = []
-    if allow_tactile_hold:
-        issues.extend(f"hand_tactile_{channel}_unavailable"
-                      for channel in missing_tactile_channels(row, needs.required_tactile))
-    else:
-        for channel in needs.required_tactile:
-            stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0]) if row.hand is not None else 0
-            if not sample_is_fresh(stamp, runtime.hand.feedback_max_age_s, now):
-                issues.append(f"hand_tactile_{channel}_timestamp_ns_unavailable_or_stale")
+    for channel in needs.required_tactile:
+        stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0]) if row.hand is not None else 0
+        if not sample_is_fresh(stamp, runtime.hand.feedback_max_age_s, now):
+            issues.append(f"hand_tactile_{channel}_timestamp_ns_unavailable_or_stale")
     # read_observation 已让派生快照携带所需同源图像，只检查对应点云/HOI 来源。
     if needs.camera_fields and not (needs.point_cloud or needs.hoi):
         if row.camera is None:

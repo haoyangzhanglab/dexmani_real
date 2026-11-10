@@ -75,7 +75,8 @@ class VRController:
             )
             if hand is None:
                 # 无 arm 求解时仍检查参考，禁止失配目标进入普通重发。
-                self.action_mapper.solver.bounds(*reference)
+                measured, command, _, h = reference
+                self.action_mapper.solver.bounds(measured, command, h=h)
                 return ActionResult(None, None, self.hand_retargeter.rejection_reason)
         return self.action_mapper.map_eef(
             target, hand, reference

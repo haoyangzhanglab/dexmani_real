@@ -1,5 +1,6 @@
 """模型生命周期与预测在同一个工作线程串行执行。"""
 
+import logging
 import sys
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, cast
@@ -8,6 +9,7 @@ if TYPE_CHECKING:
     from dexmani_policy.deployment import PolicyRuntime
 
 MODEL_SHUTDOWN_TIMEOUT_S = 65.0
+logger = logging.getLogger(__name__)
 
 
 class PolicyWorker:
@@ -70,10 +72,12 @@ class PolicyWorker:
                         self.model.close()
                         self.model = None
                 except BaseException as close_error:
-                    # 会话通过最外层中断锁存急停；关闭失败不能遮蔽它。
-                    if isinstance(task_error, (KeyboardInterrupt, SystemExit)):
-                        raise task_error from close_error
-                    raise
+                    # 中断优先；其他收尾错误不能覆盖在途预测的首个失败。
+                    if task_error is None or (
+                        isinstance(task_error, Exception) and not isinstance(close_error, Exception)
+                    ):
+                        raise
+                    logger.exception("policy model close also failed")
 
         self.close_future = self.executor.submit(close_model)
         self.executor.shutdown(wait=False, cancel_futures=False)

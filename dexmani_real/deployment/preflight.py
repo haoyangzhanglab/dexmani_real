@@ -7,16 +7,11 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.deployment import ExecutionConfig
+from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 
 if TYPE_CHECKING:
     from dexmani_real.config.real import RealConfig
-
-
-def _restore_cloud_config(recipe, fallback):
-    config = type(fallback)(**recipe) if recipe is not None else fallback
-    config.validate()
-    return config
 
 
 def validate_execution_config(info, execution: ExecutionConfig) -> None:
@@ -83,6 +78,19 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     names = set(info.observation_fields)
     if not runtime.hand.enabled:
         raise ValueError("Dexterous policy deployment requires hand.enabled=true")
+    pointcloud, hand_pointcloud = runtime.pointcloud, runtime.hand_pointcloud
+    if "point_cloud" in names:
+        if info.pointcloud_config is None:
+            raise ValueError("point_cloud requires saved pointcloud_config")
+        pointcloud = PointCloudConfig(**info.pointcloud_config)
+        pointcloud.validate()
+    if "hand_pointcloud" in names:
+        if info.hand_pointcloud_config is None:
+            raise ValueError("hand_pointcloud requires saved hand_pointcloud_config")
+        hand_pointcloud = HandCloudConfig(**info.hand_pointcloud_config)
+        hand_pointcloud.validate()
+    if "fingertip_xyz" in names and info.fingertip_link_names is None:
+        raise ValueError("fingertip_xyz requires saved fingertip_link_names")
     if "depth" in names:
         recipe = info.depth_config
         if not isinstance(recipe, dict) or "shape" not in recipe or "depth_scale_m" not in recipe:
@@ -96,14 +104,8 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     runtime = replace(
         runtime,
         execution=execution,
-        pointcloud=(
-            _restore_cloud_config(info.pointcloud_config, runtime.pointcloud)
-            if "point_cloud" in names else runtime.pointcloud
-        ),
-        hand_pointcloud=(
-            _restore_cloud_config(info.hand_pointcloud_config, runtime.hand_pointcloud)
-            if "hand_pointcloud" in names else runtime.hand_pointcloud
-        ),
+        pointcloud=pointcloud,
+        hand_pointcloud=hand_pointcloud,
     )
     validate_robot_config(runtime)
     if info.action_mode == "eef":
@@ -113,9 +115,8 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
 
 
 def validate_hoi_deployment(info, enabled):
-    """显式启用与模型需求一致，资产失配在设备连接前失败。"""
+    """显式启用与模型需求一致，模板身份失配在设备连接前失败。"""
     from pathlib import Path
-    import sys
 
     required = "object_pointcloud" in info.observation_fields
     if required != enabled:
@@ -123,14 +124,13 @@ def validate_hoi_deployment(info, enabled):
     if not required:
         return None
     if "point_cloud" in info.observation_fields:
-        raise ValueError("首版不支持 HOI 与 point_cloud 混合输入")
+        raise ValueError("HOI 与 point_cloud 不支持混合输入")
     if info.hoi_pcd is None:
         raise ValueError("Checkpoint 缺少 HOI 任务与模板信息")
     name = info.hoi_pcd["task_name"]
     if Path(name).name != name or name in (".", "..") or name != info.task_name:
         raise ValueError("Checkpoint HOI 任务名不匹配")
     root = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(root / "third_party/cordvip_geometry/src"))
     from dexmani_real.geometry.hoi import load_task_template
     task = root / "assets/pointcloud_template/object" / name
     template, manifest = load_task_template(task)

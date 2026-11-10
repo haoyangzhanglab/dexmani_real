@@ -42,6 +42,26 @@ python scripts/collect_teleop.py --print-config
 python scripts/run_policy.py --help
 ```
 
+## 一次实验
+
+在 `real_robot` 环境中，按采集、检查、导出、评估的顺序运行。以下使用 `pnp_apple_banana`，Episode 路径和 Checkpoint 路径替换为本次实验产物：
+
+```bash
+python scripts/collect_teleop.py pnp_apple_banana --print-config
+python scripts/collect_teleop.py pnp_apple_banana
+python scripts/visualize_episode.py episodes/pnp_apple_banana/episode_20261101_165909 --info
+python scripts/export_zarr.py episodes/pnp_apple_banana \
+  --output datasets/pnp_apple_banana.zarr \
+  --fields joint_state action finger_tactile_force taxel_tactile_force
+python scripts/run_policy.py /path/to/checkpoints/latest.pt --record-raw
+```
+
+需要修改实验参数时，在本地 Python 文件中导出 `CONFIG: RealConfig`，通过 `--config` 传入。模型需要的几何处理参数从 Checkpoint 恢复，缺失会报错。Raw 保存实际配置和标定结果；导出按训练所需字段选择，目标目录必须不存在。HOI 先按 [CordVIP 流程](scripts/cordvip/README.md) 完成标注，再选择 `object_pointcloud` 导出。
+
+采集和评估均按 B 开始新段，S/C 保存结束，D 丢弃，Q 保存退出，Esc 急停。来源失效或录制失败会结束本段；停止与收尾完成后才能再次按 B。触觉录制与模型输入共用默认 200 ms 时效预算。
+
+物理回放使用 `python scripts/replay_episode.py EPISODE`；多区间数据必须加 `--segment N`。运行前将机器人就位到所选区间的起始姿态，入口会检查目标和起点差异。详细数据与停止约定见[策略部署](docs/policy_deployment.md)。
+
 ## 核心模块
 
 以下目录均位于 `dexmani_real/` 下。

@@ -110,17 +110,9 @@ def snapshot_camera_parameters(
     return CameraSnapshot(serial, color, scale, transform)
 
 
-def read_vr_frame(channels):
-    result = channels.vr_ring.read()
-    if result is None:
-        return None
-    record, _ = result
-    return {name: record[name] for name in record.dtype.names}
-
-
 def read_camera_frame(channels, *, fields=None):
     result = channels.camera_ring.read(
-        fields=channels.camera_ring.dtype.names if fields is None else ("timestamp_ns", *fields),
+        fields=None if fields is None else ("timestamp_ns", *fields),
     )
     if result is None:
         return None
