@@ -1,14 +1,12 @@
 """部署解析与用户输出契约；不加载实际 Checkpoint。"""
 
 import contextlib
-import hashlib
 import io
 import json
 import subprocess
 import sys
 import tempfile
 import threading
-import types
 import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -21,7 +19,6 @@ from dexmani_real.config.deployment import ExecutionConfig
 from dexmani_real.config.real import RealConfig
 from dexmani_real.deployment.preflight import (
     resolve_deployment_config,
-    resolve_hoi_inputs,
     validate_execution_config,
 )
 from dexmani_real.deployment.session import PolicySession
@@ -32,11 +29,102 @@ def policy_info(**overrides):
     return NS(**({'action_mode': 'joint', 'control_action_dim': 19, 'control_dt_s': 0.1,
                      'n_action_steps': 4, 'future_steps': 8, 'supports_rtc': True, 'requires_prev_action': False,
                      'observation_fields': ('joint_state',), 'pointcloud_config': None,
-                     'hand_pointcloud_config': None, 'fingertip_link_names': None, 'depth_config': None,
-                     'hoi_pcd': None, 'task_name': 'test'} | overrides))
+                     'fingertip_link_names': None, 'depth_config': None,
+                     'task_name': 'test'} | overrides))
 
 
 class DeploymentContracts(unittest.TestCase):
+    def test_template_order_and_coordinates(self):
+        from dexmani_real.geometry.hoi import load_task_template, transform_task_points
+        with tempfile.TemporaryDirectory() as directory:
+            task = Path(directory)
+            (task / 'hoi').mkdir()
+            (task / 'task.json').write_text(json.dumps({'objects': [{'name': 'b'}, {'name': 'a'}]}))
+            points = np.tile(np.array([1, 2, 3], np.float32), (1024, 1))
+            np.savez(task / 'hoi/template.npz', points_local=points,
+                     offsets=[0, 512, 1024], object_names=['a', 'b'])
+            template = load_task_template(task)
+            poses = np.tile(np.eye(4), (2, 1, 1))
+            poses[0, :3, 3] = [1, 0, 0]
+            poses[1, :3, 3] = [0, 2, 0]
+            base = np.eye(4)
+            base[:3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
+            cloud = transform_task_points(template, poses, base)
+            np.testing.assert_array_equal(cloud[0], [-2, 2, 3])
+            np.testing.assert_array_equal(cloud[-1], [-4, 1, 3])
+            self.assertEqual(template['object_names'].tolist(), ['a', 'b'])
+
+    def test_tracking_depth_gate_and_no_recovery(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
+        from cordvip_geometry.tracking import SceneTracker
+        from cordvip_geometry.rgbd import RGBDFrame
+        segmenter = Mock()
+        masks = {'object': np.ones((40, 40), bool)}
+        segmenter.initialize.return_value = masks
+        segmenter.track.return_value = masks
+        frame = RGBDFrame(np.zeros((40, 40, 3), np.uint8), np.ones((40, 40), np.float32),
+                          np.array([[100., 0, 20], [0, 100., 20], [0, 0, 1]]), 'none', (0, 0, 0, 0, 0))
+        with patch('cordvip_geometry.tracking.PoseTracker') as pose_type, \
+                patch('cordvip_geometry.tracking.ModelDepthRenderer') as renderer_type, \
+                patch('cordvip_geometry.tracking.prepare_tracking_frame', return_value={}):
+            pose = pose_type.return_value
+            pose.register.return_value = pose.track.return_value = np.eye(4)
+            renderer = renderer_type.return_value
+            def depths(count):
+                values = np.full(400, 1.1, np.float32)
+                values[:count] = 1
+                return values
+            renderer.render.side_effect = [depths(60), depths(59)]
+            tracker = SceneTracker(segmenter, {'object': Mock()}, foundationpose_root='.', debug_dir='.')
+            self.assertTrue(tracker.step(frame, initial_masks=masks)['objects']['object']['pose_valid'])
+            for _ in range(2):
+                result = tracker.step(frame)['objects']['object']
+                self.assertFalse(result['pose_valid'])
+                self.assertIsNone(result['pose'])
+            pose.register.assert_called_once()
+            pose.track.assert_called_once()
+
+    def test_hand_xyz_and_joint_mapping(self):
+        from dexmani_real.geometry.kinematics import ArmFK, HandFK
+        from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
+        from dexmani_real.deployment.observation import ObservationBuilder
+        arm, hand = ArmFK(), HandFK()
+        cloud = HandPointCloud(hand, 1024)
+        np.testing.assert_array_equal(hand.sdk_to_urdf, [3, 4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2])
+        arm_q, hand_q = np.arange(7)*.1, np.arange(12)*.03
+        offline = hand_geometry(arm.forward(arm_q)[None], hand_q[None], arm_fk=arm,
+                                hand_fk=hand, hand_cloud=cloud)['hand_pointcloud']
+        builder = ObservationBuilder(policy_info(observation_fields=('hand_pointcloud',)), RealConfig())
+        online = builder.build([{'arm_qpos': arm_q, 'hand_qpos': hand_q}])['hand_pointcloud']
+        np.testing.assert_array_equal(online, offline)
+        self.assertEqual(online.shape, (1, 1024, 3))
+        np.testing.assert_allclose(online[0, :3], [
+            [.2200222164, .01861092262, .02495918050],
+            [.2782891691, .06748141348, .03761848062],
+            [.2365280837, .04420054704, .06319667399]], atol=1e-7)
+
+    def test_reconstruction_selection_outputs(self):
+        from PIL import Image
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
+        from cordvip_geometry.cli.selection import choose, save_selection
+        rgb = np.full((30, 40, 3), 127, np.uint8)
+        mask = np.zeros((30, 40), bool)
+        mask[5:20, 10:30] = True
+        candidate = dict(mask=mask, box_xyxy=np.array([10, 5, 30, 20]), label='object', score=.9, mask_score=.8)
+        self.assertEqual(choose(rgb, [candidate], None, headless=True), 0)
+        with self.assertRaisesRegex(ValueError, '多个候选'):
+            choose(rgb, [candidate, candidate], None, headless=True)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            save_selection(output, rgb, [candidate], 0)
+            metadata = json.loads((output / 'selection.json').read_text())
+            with Image.open(output / metadata['mask_file']) as image:
+                np.testing.assert_array_equal(np.asarray(image), mask.astype(np.uint8) * 255)
+            with Image.open(output / metadata['foreground_file']) as image:
+                rgba = np.asarray(image)
+                np.testing.assert_array_equal(rgba[:, :, :3], rgb)
+                np.testing.assert_array_equal(rgba[:, :, 3], mask.astype(np.uint8) * 255)
+
     def test_modes_and_ode(self):
         base = ExecutionConfig(control_dt_s=0.1, action_steps=4)
         for mode in ('sync', 'async', 'rtc'):
@@ -57,127 +145,14 @@ class DeploymentContracts(unittest.TestCase):
         self.assertEqual((resolved.execution.control_dt_s, resolved.execution.action_steps), (0.1, 4))
         override = replace(runtime, execution=replace(runtime.execution, control_dt_s=0.05, action_steps=2))
         self.assertEqual(resolve_deployment_config(policy_info(), override).execution, override.execution)
-        for fields, error in ((('point_cloud',), 'pointcloud_config'), (('hand_pointcloud',), 'hand_pointcloud_config'),
+        for fields, error in ((('point_cloud',), 'pointcloud_config'),
                               (('fingertip_xyz',), 'fingertip_link_names'), (('depth',), 'saved shape')):
             with self.assertRaisesRegex(ValueError, error):
                 resolve_deployment_config(policy_info(observation_fields=fields), runtime)
         with self.assertRaisesRegex(ValueError, 'no control period'):
             resolve_deployment_config(policy_info(control_dt_s=None), runtime)
 
-    def test_hoi_auto_detection_and_template_identity(self):
-        manifest = {'task_name': 'test', 'object_names': ['object'], 'template_sha256': 'a' * 64}
-        template = object()
-        with patch('dexmani_real.geometry.hoi.load_task_template', return_value=(template, manifest)) as loader:
-            for metadata in (None, manifest):
-                self.assertIsNone(resolve_hoi_inputs(policy_info(hoi_pcd=metadata)))
-            loader.assert_not_called()
-            for fields, metadata, error in (
-                (('object_pointcloud', 'point_cloud'), manifest, '不支持混合'),
-                (('object_pointcloud',), None, '缺少'),
-                (('object_pointcloud',), dict(manifest, task_name='other'), '任务名不匹配'),
-                (('object_pointcloud',), dict(manifest, task_name='../test'), '任务名不匹配'),
-                (('object_pointcloud',), dict(manifest, task_name='/test'), '任务名不匹配'),
-            ):
-                with self.subTest(metadata=metadata), self.assertRaisesRegex(ValueError, error):
-                    resolve_hoi_inputs(policy_info(observation_fields=fields, hoi_pcd=metadata))
-            loader.assert_not_called()
-            task, loaded = resolve_hoi_inputs(policy_info(observation_fields=('object_pointcloud',), hoi_pcd=manifest))
-            self.assertIs(loaded, template)
-            self.assertEqual(task.name, 'test')
-            with self.assertRaisesRegex(ValueError, '哈希不匹配'):
-                resolve_hoi_inputs(policy_info(observation_fields=('object_pointcloud',),
-                                               hoi_pcd=dict(manifest, template_sha256='b' * 64)))
-
-    def test_real_template_digest_and_contents(self):
-        from dexmani_real.geometry.hoi import (
-            load_task_template,
-            task_objects,
-            template_digest,
-        )
-        from scripts.cordvip.allocate_points import allocate_task
-
-        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
-            task = Path(directory) / 'assets/pointcloud_template/object/test'
-            (task / 'hoi').mkdir(parents=True)
-            (task / 'object').mkdir()
-            with self.assertRaises(FileNotFoundError):
-                load_task_template(task)
-            mesh = task / 'object/mesh.obj'
-            mesh.write_text('v 0 0 0\n')
-            (task / 'object/asset.json').write_text(json.dumps({'mesh_file': 'mesh.obj'}))
-            template = task / 'hoi/template.npz'
-            np.savez(template, points_local=np.zeros((1024, 3), np.float32), offsets=np.array([0, 1024]))
-            objects = task_objects(task)
-            manifest = {'task_name': 'test', 'object_names': ['object'],
-                        'template_sha256': template_digest(template, objects, [mesh])}
-            (task / 'hoi/manifest.json').write_text(json.dumps(manifest))
-            self.assertEqual(load_task_template(task)[1], manifest)
-            self.assertEqual(allocate_task(task), task / 'hoi')
-            config = task / 'task.json'
-            config.write_text(json.dumps({'objects': objects}))
-            self.assertEqual(load_task_template(task)[1], manifest)
-            for prompt in ('red object', 'Object', ' object ', 'object.'):
-                config.write_text(json.dumps({'objects': [{'name': 'object', 'prompt': prompt}]}))
-                with self.subTest(prompt=prompt), self.assertRaisesRegex(ValueError, 'HOI 任务身份不匹配'):
-                    load_task_template(task)
-
-            with patch('dexmani_real.deployment.preflight.__file__',
-                       str(Path(directory) / 'dexmani_real/deployment/preflight.py')), \
-                    self.assertRaisesRegex(ValueError, 'HOI 任务身份不匹配'):
-                resolve_hoi_inputs(policy_info(observation_fields=('object_pointcloud',), hoi_pcd=manifest))
-            config.unlink()
-
-            for path in (mesh, template):
-                original = path.read_bytes()
-                path.write_bytes(original + b'changed')
-                with self.assertRaisesRegex(ValueError, 'HOI 任务身份不匹配'):
-                    load_task_template(task)
-                path.write_bytes(original)
-            original_mesh = mesh.read_bytes()
-            mesh.unlink()
-            with self.assertRaises(FileNotFoundError) as missing:
-                load_task_template(task)
-            self.assertEqual(missing.exception.filename, str(mesh))
-            mesh.write_bytes(original_mesh)
-
-            # 旧算法仅用于构造测试夹具；生产路径不接受也不重写旧身份。
-            legacy = hashlib.sha256(json.dumps(['object'], ensure_ascii=False).encode())
-            legacy.update(template.read_bytes())
-            legacy.update(mesh.read_bytes())
-            manifest_path = task / 'hoi/manifest.json'
-            manifest_path.write_text(json.dumps(dict(manifest, template_sha256=legacy.hexdigest())))
-            original_files = {path: path.read_bytes() for path in (manifest_path, template, mesh)}
-            for operation in (load_task_template, allocate_task):
-                with self.subTest(operation=operation.__name__), self.assertRaisesRegex(ValueError, 'HOI 任务身份不匹配'):
-                    operation(task)
-                self.assertEqual({path: path.read_bytes() for path in original_files}, original_files)
-
-            np.savez(template, points_local=np.zeros((1023, 3), np.float32), offsets=np.array([0, 1024]))
-            manifest['template_sha256'] = template_digest(template, objects, [mesh])
-            (task / 'hoi/manifest.json').write_text(json.dumps(manifest))
-            with self.assertRaisesRegex(ValueError, '非法 HOI 模板点'):
-                load_task_template(task)
-
-    def test_task_digest_binds_names_order_and_raw_prompts(self):
-        from dexmani_real.geometry.hoi import template_digest
-
-        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
-            template, mesh = (Path(directory) / name for name in ('template.npz', 'mesh.obj'))
-            template.write_bytes(b'template bytes')
-            mesh.write_bytes(b'mesh bytes')
-            objects = [{'name': 'apple', 'prompt': '红苹果'}, {'name': 'bowl', 'prompt': 'bowl'}]
-            baseline = template_digest(template, objects, [mesh, mesh])
-            reordered_keys = [{'prompt': obj['prompt'], 'name': obj['name']} for obj in objects]
-            self.assertEqual(baseline, template_digest(template, reordered_keys, [mesh, mesh]))
-            for changed in (
-                [dict(objects[0], name='fruit'), objects[1]],
-                list(reversed(objects)),
-                [dict(objects[0], prompt='青苹果'), objects[1]],
-            ):
-                with self.subTest(objects=changed):
-                    self.assertNotEqual(baseline, template_digest(template, changed, [mesh, mesh]))
-
-    def test_allocate_task_freezes_custom_prompt(self):
+    def test_allocate_task_samples_mesh_and_reuses_template(self):
         from dexmani_real.geometry.hoi import load_task_template
         from scripts.cordvip.allocate_points import allocate_task
 
@@ -187,23 +162,24 @@ class DeploymentContracts(unittest.TestCase):
             asset.mkdir(parents=True)
             (asset / 'mesh.obj').write_text('v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n')
             (asset / 'asset.json').write_text(json.dumps({
-                'mesh_file': 'mesh.obj', 'points_file': 'points.npy', 'normals_file': 'normals.npy',
-                'units': 'm', 'frame': 'object', 'scale_to_meters': 1,
+                'mesh_file': 'mesh.obj',
+                'units': 'm', 'frame': 'object',
             }))
-            np.save(asset / 'points.npy', np.zeros((1024, 3), np.float32))
-            np.save(asset / 'normals.npy', np.tile(np.array([0, 0, 1], np.float32), (1024, 1)))
             config = task / 'task.json'
             config.write_text(json.dumps({'objects': [{'name': 'object', 'prompt': 'red object'}]}))
             output = allocate_task(task)
-            template, manifest = load_task_template(task)
-            self.assertEqual(set(manifest), {'task_name', 'object_names', 'template_sha256'})
-            self.assertEqual(manifest['object_names'], ['object'])
+            template = load_task_template(task)
+            self.assertEqual(template['object_names'].tolist(), ['object'])
             self.assertEqual(template['offsets'].tolist(), [0, 1024])
+            points = template['points_local']
+            self.assertTrue((points[:, :2] >= 0).all())
+            self.assertTrue((points[:, :2].sum(axis=1) <= 1).all())
+            self.assertGreater(float(points[:, 0].std()), 0)
+            np.testing.assert_array_equal(points[:, 2], 0)
             frozen = {path: path.read_bytes() for path in output.iterdir()}
             self.assertEqual(allocate_task(task), output)
             config.unlink()
-            with self.assertRaisesRegex(ValueError, 'HOI 任务身份不匹配'):
-                allocate_task(task)
+            self.assertEqual(allocate_task(task), output)
             self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
 
     def test_geometry_precedence_defaults_and_errors(self):
@@ -212,13 +188,13 @@ class DeploymentContracts(unittest.TestCase):
                         hand_pointcloud=replace(runtime.hand_pointcloud, num_points=64))
         self.assertEqual(resolve_deployment_config(policy_info(), local),
                          replace(local, execution=replace(local.execution, control_dt_s=0.1, action_steps=4)))
-        for field, metadata, attribute in (('point_cloud', 'pointcloud_config', 'pointcloud'),
-                                           ('hand_pointcloud', 'hand_pointcloud_config', 'hand_pointcloud')):
-            resolved = resolve_deployment_config(policy_info(observation_fields=(field,), **{metadata: {}}), local)
-            self.assertEqual(getattr(resolved, attribute), getattr(runtime, attribute))
-            for recipe, error in (({'num_points': 0}, ValueError), ({'unknown': 1}, TypeError)):
-                with self.assertRaisesRegex(error, 'Checkpoint ' + metadata):
-                    resolve_deployment_config(policy_info(observation_fields=(field,), **{metadata: recipe}), local)
+        resolved = resolve_deployment_config(policy_info(observation_fields=('point_cloud',), pointcloud_config={}), local)
+        self.assertEqual(resolved.pointcloud, runtime.pointcloud)
+        resolved = resolve_deployment_config(policy_info(observation_fields=('hand_pointcloud',)), local)
+        self.assertEqual(resolved.hand_pointcloud, local.hand_pointcloud)
+        for recipe, error in (({'num_points': 0}, ValueError), ({'unknown': 1}, TypeError)):
+            with self.assertRaisesRegex(error, 'Checkpoint pointcloud_config'):
+                resolve_deployment_config(policy_info(observation_fields=('point_cloud',), pointcloud_config=recipe), local)
         for dt in (0, float('nan')):
             with self.assertRaises(ValueError):
                 resolve_deployment_config(policy_info(), replace(runtime, execution=replace(runtime.execution, control_dt_s=dt)))
@@ -253,36 +229,6 @@ class DeploymentContracts(unittest.TestCase):
                 patch('dexmani_real.deployment.observation.HandFK') as hand_fk:
             ObservationBuilder(info, runtime)
         hand_fk.assert_called_once_with(links)
-
-    def test_hoi_errors_precede_device_connection(self):
-        module = types.ModuleType('dexmani_policy.deployment')
-        module.load_policy = Mock()
-        manifest = {'task_name': 'test', 'object_names': ['object'], 'template_sha256': 'a' * 64}
-        for metadata, fields in ((None, ('object_pointcloud',)),
-                (dict(manifest, task_name='wrong'), ('object_pointcloud',)),
-                (dict(manifest, template_sha256='b' * 64), ('object_pointcloud',)),
-                (manifest, ('object_pointcloud', 'point_cloud')),
-                (manifest, ('object_pointcloud',))):
-            with self.subTest(metadata=metadata), contextlib.ExitStack() as stack:
-                stack.enter_context(patch.dict(sys.modules, {'dexmani_policy.deployment': module}))
-                stack.enter_context(patch('dexmani_real.deployment.session.PolicyWorker'))
-                robot = stack.enter_context(patch('dexmani_real.deployment.session.Robot'))
-                loader = stack.enter_context(patch('dexmani_real.geometry.hoi.load_task_template',
-                                                   return_value=({}, manifest)))
-                if metadata == manifest and fields == ('object_pointcloud',):
-                    loader.side_effect = ValueError('HOI 任务身份不匹配')
-                state = SessionState(stop_signal=threading.Event(), emergency_signal=threading.Event())
-                stack.enter_context(patch('dexmani_real.deployment.session.SessionState', return_value=state))
-                session = PolicySession(RealConfig(), 'offline.pt', weights=None, inference_steps=None,
-                    output_root=None, device='cpu', seed=0, max_running_s=1, num_episodes=1,
-                    record_raw=False, camera_calibration_path=None)
-                session.keyboard = Mock()
-                stack.enter_context(patch.object(session, 'wait_model', return_value=policy_info(
-                    observation_fields=fields, hoi_pcd=metadata)))
-                with self.assertRaises(ValueError):
-                    session.prepare_resources()
-                robot.assert_not_called()
-                self.assertEqual(session.sensors.processes, [])
 
     def test_cli_print_config_contract(self):
         root = Path(__file__).resolve().parents[1]

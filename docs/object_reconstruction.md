@@ -1,33 +1,12 @@
 # 物体重建与点云资产
 
-CordVIP 将物体图像与实测尺寸转换为米制网格和固定点云，用于几何分析与位姿跟踪。HOI 根据 Checkpoint 的 `observation_fields` 自动接入策略；普通示教采集和常规 Zarr 导出无需运行该流程。
-
-## 数据流
-
-**物体图像 → Grounding DINO／SAM2 分割 → Hunyuan3D 网格 → 实测尺度校准 → 米制资产 → 固定任务模板 → Raw／Zarr／策略观测**。
-
-单图不可见几何由模型推断，真实尺度依赖外部测量。资产保留物体局部坐标系；位姿跟踪需要 Mesh。实验命令见 [scripts/cordvip](../scripts/cordvip/README.md)，几何接口与坐标约定见[核心文档](../third_party/cordvip_geometry/docs/usage.md)，已有资产位于 [object](../assets/pointcloud_template/object/)。
-
 ## HOI 五阶段流程
 
-在仓库根目录、已配置感知依赖的 `real_robot` 环境中运行，完整离线命令见[实验入口](../scripts/cordvip/README.md#任务级-hoi-流程)。
+米制 Mesh → 固定任务模板 → Raw 离线标注 → Zarr → CordViP 训练与部署。命令见[实验入口](../scripts/cordvip/README.md)。重建 GUI、模型选择与 `--rgbd` 输入仍可使用。
 
-| 阶段 | 入口与产物 |
-| --- | --- |
-| 1. 资产构建 | `build_task.py` 构建或复用各物体米制 Mesh、1024 点及法向。 |
-| 2. 模板冻结 | `allocate_points.py` 按表面积从已有点云选固定索引，总计 1024 点、每物体至少 64 点。 |
-| 3. Raw 标注 | `annotate_episodes.py` 写入原 `data.h5:/hoi`，用 `visualize_episode.py` 查看。 |
-| 4. Zarr 导出 | `export_zarr.py` 显式选择 `object_pointcloud`；默认导出不包含该字段。 |
-| 5. 训练与部署 | 训练显式设置 `zarr_path`，部署使用匹配的 Checkpoint，自动识别 HOI 需求。 |
+`build_task.py` 构建或复用米制 Mesh。`asset.json` 只要求 `mesh_file`、`units=m`、`frame=object`，最后写入表示发布完成。加载已发布 Mesh 不重复缩放，不居中；不再生产单物体采样点及法向文件。
 
-阶段 4 的常用字段与阶段 5 的真机部署命令：
-
-```bash
-python scripts/export_zarr.py episodes/pnp_apple_banana \
-  --output datasets/pnp_apple_banana.cordvip.zarr \
-  --fields joint_state action hand_pointcloud object_pointcloud
-python scripts/run_policy.py CHECKPOINT
-```
+`allocate_points.py` 保留面积配额：总计 1024 点，每物体至少 64 点；固定 seed=0，直接在各 Mesh 表面采样最终点集。这与旧的二次 FPS 点集不同，不能用于恢复历史几何。
 
 ### 任务配置
 
@@ -45,79 +24,31 @@ python scripts/run_policy.py CHECKPOINT
 
 ### 资产交付与恢复边界
 
-2026-11-10 在源码基线 `e6284d5d28f9f72b1d352fd33c682519609bd58b` 的本地审计：任务根目录为 `assets/pointcloud_template/object/pnp_apple_banana/`，三个 `asset.json` 均引用各自的 `mesh/mesh_m.obj`。
+研究者负责固定实验资产。代码不再比较任务、Prompt 或模板哈希，也不传递身份协议。已有 Raw、Zarr、checkpoint、Mesh 和冻结模板均不自动覆盖或重新生成。
 
-| 物体 | Mesh 相对任务根目录的路径 | 字节数 | 本地／Git 状态 |
-| --- | --- | ---: | --- |
-| apple | `apple/mesh/mesh_m.obj` | 51,771,812 | 本地存在，被忽略，未跟踪 |
-| banana | `banana/mesh/mesh_m.obj` | 11,711,749 | 本地存在，被忽略，未跟踪 |
-| bowl | `bowl/mesh/mesh_m.obj` | 58,925,041 | 本地存在，被忽略，未跟踪 |
+示例任务三个米制 Mesh 在本机存在但未纳入 Git；任务级冻结模板缺失。新 checkout 需要自行提供 Mesh 与实验对应的冻结模板。不能用新采样宣称恢复历史模板。
 
-三个物体的 `asset.json`、`points.npy`、`normals.npy` 均已跟踪且本地存在，数组文件头均为 `float32[1024,3]`。单物体正式文件集合齐全，但本次未运行加载器验证。任务级 `hoi/template.npz` 和 `hoi/manifest.json` 在 Git 与本地均缺失，没有可交付的历史冻结模板；不存在 `task.json`，当前按 apple、banana、bowl 排序并使用同名默认 Prompt。未发现重建中间产物目录。
-
-Mesh 总计 122,408,602 字节，仓库未配置 Git LFS，采用独立归档交付并保留现有忽略规则。以下为交付清单，仓库不提供归档下载；Git checkout 本身不足以恢复完整 HOI 任务。
-
-独立归档保留 `assets/pointcloud_template/object/<task>/` 的相对目录结构，只复制以下正式文件：
-
-- 各对象的 `asset.json` 以及其中 `mesh_file`、`points_file`、`normals_file` 实际引用的文件；不要假定所有 Mesh 都使用上述文件名。
-- 原始冻结的 `hoi/template.npz`、`hoi/manifest.json`，两者必须成对来自同一次冻结。
-- 任务原有的 `task.json`（若存在），以保留对象顺序、自定义 Prompt；不在 Manifest 或 Checkpoint 另存一套 Prompt。
-
-参考图、预览图及 `reconstruction/` 中间产物不是加载已发布资产所必需的文件，不需递归打包。恢复时将正式文件复制到新 checkout 的同名任务目录，保留原始字节；不要覆盖已有实验目录。校验方法见[实验入口的恢复说明](../scripts/cordvip/README.md#复制资产后的只读检查)。
-
-当前三份 Mesh 可从本机复制，但缺失的历史 Template／Manifest 只能向原始保存方索取。点云和法向不能无损恢复 Mesh；重新生成 Mesh 或运行模板分配不能证明恢复了历史身份。取得原始文件前不能校验历史 Hash。
+模板要求显式的 object_names 分段映射，资产文件不由运行时修改。手模板只消费 XYZ 通道。
 
 ### 模板与数据契约
 
-`hoi/template.npz` 保存物体局部坐标的 `points_local` 与对象分段 `offsets`，点序固定。`hoi/manifest.json` 的三个字段贯穿 Raw、Zarr 和 Checkpoint：
+`hoi/template.npz` 包含 `points_local[1024,3]`、`offsets`、`object_names`。名字关联 Mesh、Prompt 与跟踪结果；拼接顺序始终由模板决定，配置列表可以重新排序。加载边界检查必要形状、有限值、分段及对象对应关系。
 
-| 字段 | 约定 |
-| --- | --- |
-| `task_name` | 非空任务名，与资产目录、Raw `/meta` 的 `task_label` 和训练任务一致。 |
-| `object_names` | 非空、无重复的对象名列表，顺序固定。 |
-| `template_sha256` | 新冻结任务使用 v2 小写 SHA-256，绑定物体几何、固定点序、物体顺序及检测 Prompt；训练原样保存。 |
+Raw `/hoi` 只包含 `object_pointcloud[T,1024,3]` 和 `object_pointcloud_valid[T]`。点云以 xArm base 为坐标系、米为单位。中间结果保留在 `_hoi_staging`，写完并 flush 后发布；分组移动不保证断电事务。损坏 HOI 只阻止 HOI 消费者。
 
-Raw `/hoi` 用 HDF5 属性保存上述字段及 `offsets`；Zarr 与 Checkpoint 保存为 `hoi_pcd`。物体点云为 `float32[T,1024,3]`，单位米、坐标系为 xArm base。恢复训练与部署均拒绝任务、对象顺序或模板失配，HOI Checkpoint 缺少元数据也会拒绝部署；普通非 HOI 数据无需该属性。
+离线跨 Episode 复用模型并重置场景，按 camera_sequence 去重；同序列的来源时间必须一致。首次初始化或 pose 失效即报告 Episode、行号与原因，不发布该 Episode，继续下一段。文件、模型或程序错误直接传播。在线失效后等待新请求，旧 Episode 在途结果不能被新请求接受。
 
-v2 Hash 以 `b"dexmani-hoi-task-v2\0"` 为域分隔前缀，随后输入 `task_objects(task)` 返回顺序下的 `(name, prompt)` 列表，使用 `json.dumps(identity, ensure_ascii=False, separators=(",", ":")).encode("utf-8")` 编码；再依次输入 `template.npz` 和各对象实际跟踪 Mesh 的原始字节。保留原有分块读取方式，不散列路径、模型权重或环境信息。
+手点云使用唯一的冻结手模板与 FK，运行时及导出为 XYZ。部署从 info.task_name 定位任务；手点数由 RealConfig.hand_pointcloud 决定，不从 checkpoint 覆盖。
 
-身份绑定原始 Prompt 文本。`SceneTracker.detect_masks()` 按对象顺序用 `". "` 拼接 Prompt 并追加句点，模型侧另做首尾处理、小写转换及末尾句点补齐；标签匹配的规范化仅用于匹配，不用于 Hash。即使某些文本变化经过模型预处理后相同，也会产生不同任务身份。
+### 显式来源时间差预算
 
-已有模板校验后复用，已发布且模板一致的标注跳过，不覆盖正式结果。模板身份检查读取冻结模板、对象名称／顺序、Prompt 及 Mesh 文件；跟踪器启动时再加载并检查完整资产。修改 Prompt 会在 `resolve_hoi_inputs()` 调用 `load_task_template()` 时失败，位于机器人连接与传感器启动之前；不在实时 Worker 中增加逐帧校验。
+物体点云与手几何或 joint_state 联合消费时，必须在实验 CONFIG.execution.hoi_max_skew_s 填入实测选择的有限正数秒值；没有默认值。导出使用同一个 `--config`，程序调用可直接设置 ExportConfig.hoi_max_skew_s。
 
-标注先写入 `_hoi_staging`，所有数组写完并 flush 后发布为 `/hoi`，分组名是唯一的发布标志。中断可留 staging，下次重算后发布，HDF5 group move 不保证断电事务。RawReader 只识别已发布的 `/hoi`，首次请求 HOI 字段或元数据时检查数组结构与任务身份并缓存结果；打开基础 Raw、枚举字段和请求普通字段不会触发 HOI 校验；数值在写入、显示及分块导出时校验。
-
-无效物体帧用 false 掩码和零点云占位，Viewer 清除物体点，导出拒绝整个 Episode 并提示 `--exclude`。`--no-point-cloud` 仅关闭普通场景点云显示，HOI 与手部几何仍按各自标签展示。
-
-### 历史身份兼容
-
-v2 与旧算法不兼容，即使两者都是 64 位十六进制 SHA-256。旧 Hash 未绑定 Prompt，不能反推出历史检测文本；新代码会拒绝旧 Manifest，`allocate_points.py` 也不会覆盖或升级已有 `hoi/`。历史实验须保留对应旧源码和原始资产，新实验在独立 checkout 的任务目录首次冻结，保留与 Raw task_label 一致的任务名；不得重写旧 Manifest、Raw `/hoi`、Zarr 或 Checkpoint 来消除不匹配。
-
-现有 Zarr → Checkpoint 链原样传递三个字段；恢复训练比较保存的 `hoi_pcd`，部署比较 Checkpoint、Manifest 及实际任务文件。三个字段沿同一条身份链传递，无需另存 Prompt 或配置副本。该身份不是完整算法、模型或 Tracking Provenance：权重、代码版本和环境仍需独立记录；在线零重注册与离线最多三次连续重注册的区别保持不变。
-
-### 离线标注与在线观测
-
-离线标注跨 Episode 复用模型，每段重置场景。`camera_sequence`、`camera_ns` 须为正且不回退；同一序列必须保留相同时间，重复帧复用结果。每次丢失最多允许三次连续重注册，成功后清零；终端汇总逐物体有效行、首次丢失、末态、失败原因与重注册预算，并输出相机与关节来源时间差的 P50／P95／Max。时间差仅统计正时间戳，描述主机记录关系。
-
-在线 Worker 每轮 B 后重新初始化，模型保留。每段首次 HOI 初始化预算为 120 s，后续观测等待为 1 s；真实观测预热完成且新鲜有效才允许动作。在线不自动重注册，初始化或位姿失败结束本轮，模型执行、CUDA、IPC 和配置错误继续传播。
-
-HOI 使用来源相机时间及独立的 `execution.hoi_max_age_s`（默认 250 ms）；缺失、过期或失效立即停止动作计划。模型需要的 RGB／Depth 与 HOI 同源，Raw 另取最新 Camera 帧；不支持同时输入普通 `point_cloud`。其余历史、时效和录制约定见[策略部署](policy_deployment.md#来源时间与时效)。
-
-Episode 结束发布 `episode_id=0`，Worker 暂停读取相机和跟踪；下一轮新 ID 重置场景，旧轮在途结果不能进入新观测。
-
-## 当前验证范围
-
-已有验证覆盖 CPU／Mock、离线 GPU 与独立相机采集：
-
-- 历史 CPU／Mock 验证覆盖模板、Raw／导出、训练元数据、来源时效与调度、Worker 重置和错误传播；另完成单物体 Hunyuan 新建资产及缓存复用验证。
-- RTX 4090 上，8 帧 Raw 副本通过三物体标注、四字段导出及实际 CordViP Dataset 读取；完整 `episode_20261101_165909` 的三物体均为 403/403 有效，离线约 79 s（含模型加载），另验证两轮 GPU 场景重置保留模型。
-- 2026-11-09，`episode_20261101_173701` 在临时副本重跑两次，均为 Apple 146/403、Banana 402/403、Bowl 403/403。Apple 第 143 行支持点 26（门槛 30），144 行恢复；147 行再失效，三次重注册支持点为 23、14、0，151 行起预算耗尽。RGB 显示手部遮挡；Banana 第 369 行失效、370 行恢复。未放宽阈值或增加重试。
-- 上述重跑时原始 Episode 无 `/hoi`、正式目录无冻结模板，仅在临时资产副本生成模板，无法核对历史 Hash；原始 HDF5 与视频 SHA256 前后相同，临时副本已清理。
-- L515 独立 RGB-D 采集 30 s：RGB 30.024 Hz、深度 29.991 Hz，帧号无跳跃或回退；这未覆盖策略与 HOI 并发。
-
-有效率表示通过当前门控，不是真值位姿精度。完整任务质量评估、Rerun GUI 检查、TensorRT FP32 对照、策略／感知 GPU 并发、五分钟运行、两轮实机初始化和硬件故障注入仍待完成；尚未执行机器人运动。
+在线使用 HOI 原始相机来源时间与臂、手反馈时间；离线使用 camera_ns、arm_ns、hand_ns。三者 max−min 不得超过预算，超限拒绝整次导出或停止本轮。各来源年龄检查继续保留，不以年龄预算替代时间差预算。主机记录时间差不证明物理同步，不进行插值、补洞或重采样。
 
 ## 当前实现与性能结论
+
+以下为历史性能测量，不能视为本次精简后 GPU 或真机验证。
 
 正式后端为 Grounded-SAM-2／SAM2.1 Small、Mask 引导 FoundationPose 两次跟踪细化及语义深度门控；DINO 只用于首帧。模型跨轮复用，场景逐轮重置，单姿态跟踪使用缓存补丁。完整 VOS 编译分支已移除，EdgeTAM、EfficientTAM 与 TensorRT FP 均未接入正式后端。
 

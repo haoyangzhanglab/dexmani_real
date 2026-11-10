@@ -144,11 +144,8 @@ def generate(args, image=None, output=None):
         f"未定尺度 mesh：{mesh_path}；追踪前须提供实测尺寸或明确缩放系数。", flush=True
     )
     if args.preview:
-        from ..geometry import load_mesh, sample_mesh_surface
         from ..viewer import preview_mesh
-
-        points, normals = sample_mesh_surface(load_mesh(mesh_path), 1024, args.seed)
-        preview_mesh(mesh_path, points=points, normals=normals)
+        preview_mesh(mesh_path)
 
 
 def prepare(args, mesh=None, output=None):
@@ -160,21 +157,11 @@ def prepare(args, mesh=None, output=None):
         scale_to_meters=args.scale_to_meters,
         size_axis=args.size_axis,
         size_meters=args.size_meters,
-        num_points=args.num_points,
-        seed=args.seed,
     )
     print(f"米制资产已准备：{asset}", flush=True)
     if args.preview:
-        import numpy as np
-
         from ..viewer import preview_mesh
-
-        preview_mesh(
-            asset / "mesh/mesh_m.obj",
-            units="m",
-            points=np.load(asset / "points.npy", allow_pickle=False),
-            normals=np.load(asset / "normals.npy", allow_pickle=False),
-        )
+        preview_mesh(asset / "mesh/mesh_m.obj", units="m")
 
 
 def build(args):
@@ -185,8 +172,6 @@ def build(args):
         args.scale_to_meters,
         args.size_axis,
         args.size_meters,
-        args.num_points,
-        args.seed,
         allow_unscaled=True,
     )
     validate_generation_parameters(
@@ -237,10 +222,6 @@ def build(args):
                     str(mesh),
                     "--output",
                     str(output / "asset"),
-                    "--num-points",
-                    str(args.num_points),
-                    "--seed",
-                    str(args.seed),
                     "--size-axis",
                     "AXIS",
                     "--size-meters",

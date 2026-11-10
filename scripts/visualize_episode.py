@@ -86,15 +86,9 @@ class EpisodeVisualizer:
         try:
             self.reader = RawReader(episode_path)
             self.timestamps_s = self.reader.timestamps_s
-            self.object_colors = None
-            if self.reader.hoi_metadata is not None:
-                import colorsys
-                offsets = self.reader.data_file["hoi"].attrs["offsets"]
-                self.object_colors = np.concatenate([
-                    np.tile(np.asarray(colorsys.hsv_to_rgb(i * 0.61803398875 % 1, 0.75, 1)) * 255,
-                            (int(count), 1))
-                    for i, count in enumerate(np.diff(offsets))
-                ]).astype(np.uint8)
+            self.has_hoi = "object_pointcloud" in self.reader.fields
+            if self.has_hoi:
+                self.reader.require_fields("object_pointcloud", "object_pointcloud_valid")
 
             self.reader.require_fields(
                 "rgb",
@@ -208,11 +202,11 @@ class EpisodeVisualizer:
         depth = self.log_camera(step_idx, rgb)
         self.log_pointcloud(rgb, depth)
         self.log_hand_geometry(step_idx)
-        if self.reader.hoi_metadata is not None:
+        if self.has_hoi:
             points = self.reader["object_pointcloud"][step_idx] if self.reader["object_pointcloud_valid"][step_idx] else None
             if points is not None and not np.isfinite(points).all():
                 raise ValueError(f"object_pointcloud contains nonfinite coordinates at row {step_idx}")
-            log_points("object_pointcloud", points, colors=self.object_colors)
+            log_points("object_pointcloud", points, colors=[255, 170, 0])
 
     def log_hand_geometry(self, step_idx: int) -> None:
         arm = self.state["arm_qpos"][step_idx]
@@ -227,7 +221,7 @@ class EpisodeVisualizer:
             )
             fingertips = geometry["fingertip_xyz"][0]
             cloud = geometry["hand_pointcloud"][0]
-        log_points("hand_pointcloud", cloud)
+        log_points("hand_pointcloud", cloud, colors=[100, 180, 255])
         log_points(
             "fingertips", fingertips,
             colors=FINGERTIP_COLORS, radii=0.012,

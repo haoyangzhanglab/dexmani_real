@@ -1,6 +1,6 @@
 """物体候选预览、显式确认与选择产物；不持有分割模型。"""
 
-from ..io import write_npz, write_selection
+from ..io import write_json, write_npz
 from ..viewer import display_available
 
 
@@ -54,9 +54,9 @@ def save_candidates(output, rgb, candidates):
     sheet.save(output / "candidates.jpg", quality=95)
 
 
-def choose(rgb, candidates, instance, *, headless, name="object"):
+def choose(rgb, candidates, instance, *, headless):
     if not candidates:
-        raise RuntimeError(f"{name}: 没有检测到目标，请调整 prompt 后重试")
+        raise RuntimeError("没有检测到目标，请调整 prompt 后重试")
     if instance is not None and not 0 <= instance < len(candidates):
         raise ValueError(f"--instance 必须位于 0..{len(candidates) - 1}")
     if headless:
@@ -64,13 +64,13 @@ def choose(rgb, candidates, instance, *, headless, name="object"):
             return instance
         if len(candidates) == 1:
             return 0
-        raise ValueError(f"{name}: 多个候选需要明确 --instance（0..{len(candidates) - 1}）")
+        raise ValueError(f"多个候选需要明确 --instance（0..{len(candidates) - 1}）")
     display_available()
     import cv2
     import numpy as np
 
     index = 0 if instance is None else instance
-    title = f"Select {name}: n/p, 1-9 or click; Enter confirm; Esc cancel"
+    title = "Select object: n/p, 1-9 or click; Enter confirm; Esc cancel"
 
     def mouse(event, x, y, flags, param):
         nonlocal index
@@ -117,17 +117,18 @@ def save_selection(output, rgb, candidates, index):
     if not mask.any():
         raise ValueError("没有选中前景；请重新选择或分割")
     overlay(rgb, candidate, index).save(output / "overlay.png")
-    write_selection(
-        output,
-        mask,
-        {
-            "selected_instance": index,
-            "label": candidate["label"],
-            "box_xyxy": candidate["box_xyxy"].tolist(),
-            "detection_score": candidate["score"],
-            "mask_score": candidate["mask_score"],
-        },
-        mask_file="mask.png",
-        foreground_rgb=rgb,
-    )
+    import numpy as np
+    from PIL import Image
+
+    Image.fromarray(mask.astype(np.uint8) * 255).save(output / "mask.png")
+    Image.fromarray(np.dstack((rgb, mask.astype(np.uint8) * 255))).save(output / "foreground_rgba.png")
+    write_json(output / "selection.json", {
+        "selected_instance": index,
+        "label": candidate["label"],
+        "box_xyxy": candidate["box_xyxy"].tolist(),
+        "detection_score": candidate["score"],
+        "mask_score": candidate["mask_score"],
+        "mask_file": "mask.png",
+        "foreground_file": "foreground_rgba.png",
+    })
     print(f"已确认候选 {index}；全分辨率 mask、RGBA 与 overlay：{output}", flush=True)

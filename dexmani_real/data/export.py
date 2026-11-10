@@ -33,6 +33,7 @@ from dexmani_real.robot.model import (
     XHAND_TACTILE_SCALE_DIVISOR,
 )
 from dexmani_real.utils.io import publish
+from dexmani_real.utils.timing import hoi_sources_within_skew, validate_hoi_skew_budget
 
 CANONICAL_FORMAT = "dexmani.real.canonical"
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ class ExportConfig:
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
+    hoi_max_skew_s: float | None = None
 
 
 # 输出字段直接对应 Raw 输入；FK 和相机计算由下方普通条件启用。
@@ -141,7 +143,7 @@ def canonical_array_specs(fields, processing, camera):
         "fingertip_xyz": (5, 3), "eef_pose": (9,),
         "camera_intrinsic": (9,), "camera_extrinsic": (12,),
         "point_cloud": (processing.pointcloud.num_points, 6),
-        "hand_pointcloud": (processing.hand_pointcloud.num_points, 6),
+        "hand_pointcloud": (processing.hand_pointcloud.num_points, 3),
     }
     if "rgb" in fields:
         shapes["rgb"] = (*camera["shape"], 3)
@@ -151,8 +153,8 @@ def canonical_array_specs(fields, processing, camera):
             for name in fields}
 
 
-def validate_export_episode(reader: RawReader, fields):
-    """校验所用输入与基本控制时间，来源时钟只作定位诊断。"""
+def validate_export_episode(reader: RawReader, fields, *, hoi_max_skew_s=None):
+    """校验输入及控制时间；联合 HOI 额外限制来源时间差。"""
     frames = reader.num_frames
     if frames <= 0:
         raise ValueError("episode contains no rows")
@@ -162,6 +164,12 @@ def validate_export_episode(reader: RawReader, fields):
         reader[name]
     camera = export_camera(reader, fields)
     rows = reader.read_timing()
+    if hoi_max_skew_s is not None:
+        for row_index, row in enumerate(rows):
+            stamps = tuple(int(row[key]) for key in ("camera_ns", "arm_ns", "hand_ns"))
+            if (not hoi_sources_within_skew(stamps, hoi_max_skew_s)
+                    or max(stamps) > int(row["observation_ns"])):
+                raise ValueError(f"HOI source time invalid/skew exceeds hoi_max_skew_s at row {row_index}")
 
     def first_bad(bad):
         indices = np.flatnonzero(bad)
@@ -313,6 +321,9 @@ def export_zarr(
     progress_callback=None,
 ) -> dict:
     fields = resolve_fields(fields)
+    joint_hoi = "object_pointcloud" in fields and bool(HAND_FK_FIELDS.union({"joint_state"}).intersection(fields))
+    if joint_hoi:
+        validate_hoi_skew_budget(processing.hoi_max_skew_s)
     if "point_cloud" in fields:
         processing.pointcloud.validate()
     if "hand_pointcloud" in fields:
@@ -334,7 +345,9 @@ def export_zarr(
             try:
                 require_published_raw(episode)
                 with RawReader(episode) as reader:
-                    camera = validate_export_episode(reader, fields)
+                    camera = validate_export_episode(
+                        reader, fields, hoi_max_skew_s=processing.hoi_max_skew_s if joint_hoi else None,
+                    )
                     starts = reader.segment_starts
                     frames = reader.num_frames
                     logger.info("%s: exporting %d rows in %d segments", episode.name, frames, len(starts))
@@ -356,8 +369,6 @@ def export_zarr(
                             control_hz=reader.control_hz,
                         )
                     else:
-                        if "object_pointcloud" in fields and reader.hoi_metadata != root.attrs["hoi_pcd"]:
-                            raise ValueError("HOI task/template mismatch; use --exclude")
                         if not np.isclose(reader.dt, root.attrs["dt"], rtol=1e-6, atol=0):
                             raise ValueError("one canonical store requires uniform dt")
                         if "depth" in fields and not depth_scales_match(camera["depth_scale_m"], root.attrs["depth_scale_m_per_unit"]):
@@ -368,8 +379,6 @@ def export_zarr(
                                 if shape != arrays[name].shape[1:]:
                                     raise ValueError(f"inconsistent {name} shape")
 
-                    if "object_pointcloud" in fields and index == 0:
-                        root.attrs["hoi_pcd"] = reader.hoi_metadata
                     blocks = iter_canonical_blocks(
                         reader,
                         processing,
@@ -422,8 +431,6 @@ def create_store(store, processing, camera, *, fields, control_hz):
         root.attrs["pointcloud_config"] = asdict(processing.pointcloud)
         if processing.pointcloud.remove_table:
             root.attrs["table_plane_abcd"] = processing.table_plane_abcd
-    if "hand_pointcloud" in fields:
-        root.attrs["hand_pointcloud_config"] = asdict(processing.hand_pointcloud)
     if "fingertip_xyz" in fields:
         root.attrs["fingertip_link_names"] = list(XHAND_FINGERTIP_LINK_NAMES)
     if "depth" in fields:

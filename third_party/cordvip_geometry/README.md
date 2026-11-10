@@ -1,8 +1,8 @@
 # cordvip_geometry
 
-DexMani Real 共用的物体资产与 RGB-D 几何核心，提供 CLI 和 Python API。支持图像分割、网格重建、实测尺度校准、位姿跟踪及物体／手部点云分析。
+DexMani Real 共用的物体资产与 RGB-D 几何核心，提供 CLI 和 Python API。支持图像分割、网格重建、实测尺度校准、位姿跟踪，供主项目生成手物联合观测。
 
-有米制 Mesh 的对象使用 FoundationPose 估计位姿；无资产对象输出分割与实测点云。两类对象可在同一场景中处理。
+跟踪要求每个任务对象都有米制 Mesh，使用 FoundationPose 估计位姿并通过语义深度和模型深度一致性门控。手点云由主项目的唯一 FK 路径生成。
 
 ## 安装与命令
 
@@ -22,13 +22,9 @@ python -m cordvip_geometry check
 
 ## 使用入口
 
-| 入口 | 用途 |
-| --- | --- |
-| `python -m cordvip_geometry object` | 分割、候选选择、网格生成和米制资产准备。 |
-| `python -m cordvip_geometry track` | 按 Raw 行顺序跟踪并保存场景结果。 |
-| `python -m cordvip_geometry view` | 查看已保存的结果，无需重新推理。 |
+`python -m cordvip_geometry object` 提供分割、候选选择、网格生成和米制资产准备。
 
-完整参数通过各子命令的 `--help` 查看；Python 调用使用 `RGBDFrame`、`SceneTracker` 和 `track_raw`，示例见下方接口文档。
+完整参数通过各子命令的 `--help` 查看；Python 调用使用 `RGBDFrame` 和 `SceneTracker`，示例见下方接口文档。
 
 - [实验脚本与任务流程](../../scripts/cordvip/README.md)：任务资产构建、模板冻结、Raw 标注与导出。
 - [核心接口与结果格式](docs/usage.md)：Python 示例、初始化、坐标与有效性约定、离线结果查看。

@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.deployment import ExecutionConfig
-from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
+from dexmani_real.config.perception import PointCloudConfig
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 
 if TYPE_CHECKING:
@@ -20,6 +20,11 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
     if execution.mode == "rtc" and not info.supports_rtc:
         raise NotImplementedError("Policy does not support RTC")
 
+    if "object_pointcloud" in info.observation_fields and set(info.observation_fields) & {
+        "hand_pointcloud", "joint_state", "fingertip_xyz"
+    }:
+        from dexmani_real.utils.timing import validate_hoi_skew_budget
+        validate_hoi_skew_budget(execution.hoi_max_skew_s)
     if "object_pointcloud" in info.observation_fields:
         age = execution.hoi_max_age_s
         if type(age) not in (int, float) or not math.isfinite(age) or age <= 0:
@@ -84,23 +89,15 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     names = set(info.observation_fields)
     if not runtime.hand.enabled:
         raise ValueError("Dexterous policy deployment requires hand.enabled=true")
-    geometry = {}
-    for field, name, config_type in (
-        ("point_cloud", "pointcloud", PointCloudConfig),
-        ("hand_pointcloud", "hand_pointcloud", HandCloudConfig),
-    ):
-        if field not in names:
-            continue
-        recipe_name = f"{name}_config"
-        recipe = getattr(info, recipe_name)
-        if recipe is None:
-            raise ValueError(f"{field} requires Checkpoint {recipe_name}; use a Checkpoint containing the training recipe")
+    pointcloud = runtime.pointcloud
+    if "point_cloud" in names:
+        if info.pointcloud_config is None:
+            raise ValueError("point_cloud requires Checkpoint pointcloud_config")
         try:
-            config = config_type(**recipe)
-            config.validate()
+            pointcloud = PointCloudConfig(**info.pointcloud_config)
+            pointcloud.validate()
         except (TypeError, ValueError) as exc:
-            raise type(exc)(f"Checkpoint {recipe_name}: {exc}") from exc
-        geometry[name] = config
+            raise type(exc)(f"Checkpoint pointcloud_config: {exc}") from exc
     if "fingertip_xyz" in names and info.fingertip_link_names is None:
         raise ValueError("fingertip_xyz requires Checkpoint fingertip_link_names in model input order")
     if "depth" in names:
@@ -121,8 +118,7 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     runtime = replace(
         runtime,
         execution=execution,
-        pointcloud=cast(PointCloudConfig, geometry.get("pointcloud", runtime.pointcloud)),
-        hand_pointcloud=cast(HandCloudConfig, geometry.get("hand_pointcloud", runtime.hand_pointcloud)),
+        pointcloud=pointcloud,
     )
     validate_robot_config(runtime)
     if info.action_mode == "eef":
@@ -132,22 +128,17 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
 
 
 def resolve_hoi_inputs(info):
-    """解析并加载 HOI 任务模板；模板身份失配在设备连接前失败。"""
+    """解析并加载 HOI 任务模板；模板错误在设备连接前失败。"""
     from pathlib import Path
 
     if "object_pointcloud" not in info.observation_fields:
         return None
     if "point_cloud" in info.observation_fields:
         raise ValueError("HOI 与 point_cloud 不支持混合输入")
-    if info.hoi_pcd is None:
-        raise ValueError("Checkpoint 缺少 HOI 任务与模板信息")
-    name = info.hoi_pcd["task_name"]
-    if Path(name).name != name or name in (".", "..") or name != info.task_name:
-        raise ValueError("Checkpoint HOI 任务名不匹配")
+    name = info.task_name
+    if not name or Path(name).name != name or name in (".", ".."):
+        raise ValueError("非法任务名")
     root = Path(__file__).resolve().parents[2]
     from dexmani_real.geometry.hoi import load_task_template
     task = root / "assets/pointcloud_template/object" / name
-    template, manifest = load_task_template(task)
-    if info.hoi_pcd != manifest:
-        raise ValueError("Checkpoint HOI 任务或模板哈希不匹配")
-    return task, template
+    return task, load_task_template(task)

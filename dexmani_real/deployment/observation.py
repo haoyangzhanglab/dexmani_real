@@ -40,6 +40,7 @@ class ObservationBuilder:
         )
         self.needs = ObservationNeeds(
             hoi="hoi" in self.dependencies,
+            hoi_joint_input={"hoi", "hand"} <= self.dependencies,
             camera_fields=tuple(name for name in ("rgb", "depth") if name in self.dependencies),
             point_cloud="cloud" in self.dependencies,
             required_tactile=tuple(c for c in ("aggregate", "dense") if c in self.dependencies),

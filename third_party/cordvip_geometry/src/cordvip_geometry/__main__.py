@@ -1,4 +1,4 @@
-"""物体资产准备、Raw 离线追踪和结果查看。"""
+"""物体资产准备、模型下载和依赖检查。"""
 
 import argparse
 import sys
@@ -7,8 +7,6 @@ from pathlib import Path
 
 COMMANDS = {
     "object": "分割、单图生成和资产准备",
-    "track": "确认首帧实例后顺序处理 Raw 全部行",
-    "view": "查看已保存的离线场景结果，不加载模型",
     "check": "静态检查追踪依赖，不连接设备",
     "download": "从明确的官方 revision 下载模型权重",
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""离线生成手部 link 局部 XYZRGB 模板，运行时仅按 FK 变换组装。"""
+"""离线生成手部 link 局部 XYZ 模板，运行时仅按 FK 变换组装。"""
 
 import argparse
 import os
@@ -29,7 +29,7 @@ def generate_hand_template(
     path = output_dir / f"hand_{num_points}.npz"
     if path.exists() and not overwrite:
         raise FileExistsError(f"Hand template already exists: {path}; use --overwrite to regenerate")
-    meshes, colors, names = [], [], []
+    meshes, names = [], []
     for link in ET.parse(urdf_path).getroot().findall("link"):
         if not link.attrib["name"].startswith("right_hand_"):
             continue
@@ -38,9 +38,8 @@ def generate_hand_template(
             continue
         (visual,) = visuals
         mesh_tag = visual.find("geometry/mesh")
-        color = visual.find("material/color")
-        if mesh_tag is None or color is None:
-            raise ValueError(f"Hand visual requires a mesh and inline color: {link.attrib['name']}")
+        if mesh_tag is None:
+            raise ValueError(f"Hand visual requires a mesh: {link.attrib['name']}")
         mesh = trimesh.load_mesh(urdf_path.parent / mesh_tag.attrib["filename"], process=False)
         mesh.apply_scale(np.fromstring(mesh_tag.get("scale", "1 1 1"), sep=" "))
         origin = visual.find("origin")
@@ -56,11 +55,7 @@ def generate_hand_template(
         # 与仿真一致，剔除小于 1 cm² 的辅助标记，保留 bend links。
         if mesh.area < 1e-4:
             continue
-        rgb = np.fromstring(color.attrib["rgba"], sep=" ")[:3]
-        if rgb.shape != (3,) or not np.isfinite(rgb).all() or np.any((rgb < 0) | (rgb > 1)):
-            raise ValueError(f"Invalid hand visual color: {link.attrib['name']}")
         meshes.append(mesh)
-        colors.append(rgb)
         names.append(link.attrib["name"])
     if not meshes:
         raise ValueError(f"No hand visual surfaces in {urdf_path}")
@@ -74,14 +69,14 @@ def generate_hand_template(
         raise ValueError("Hand point budget leaves a retained link without samples; increase num_points")
 
     clouds = []
-    for index, (mesh, rgb, count) in enumerate(zip(meshes, colors, counts)):
+    for index, (mesh, count) in enumerate(zip(meshes, counts)):
         rng = np.random.default_rng(index)
         selected = rng.choice(len(mesh.faces), count, p=mesh.area_faces / mesh.area)
         uv = rng.random((count, 2))
         root_u = np.sqrt(uv[:, 0])
         weights = np.column_stack((1 - root_u, root_u * (1 - uv[:, 1]), root_u * uv[:, 1]))
         xyz = np.sum(mesh.triangles[selected] * weights[:, :, None], axis=1)
-        clouds.append(np.column_stack((xyz, np.broadcast_to(rgb, (count, 3)))))
+        clouds.append(xyz)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)

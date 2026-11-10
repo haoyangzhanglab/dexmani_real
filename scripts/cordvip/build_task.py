@@ -23,15 +23,13 @@ def build_task(task):
         image = directory / obj.get("image", "reference.jpg")
         existing = directory / "asset.json"
         if existing.exists():
-            _, points, _, _ = load_asset(directory)
-            if len(points) != 1024:
-                raise ValueError(f"{directory}: 单物体必须有 1024 个点")
+            load_asset(directory)
             print(f"复用已发布资产：{directory}")
             continue
         validate_asset_parameters(
             obj.get("scale_to_meters"), obj.get("size_axis"), obj.get("size_meters")
         )
-        for name in ("mesh", "points.npy", "normals.npy", "reconstruction"):
+        for name in ("mesh", "reconstruction"):
             if (directory / name).exists():
                 raise FileExistsError(f"拒绝覆盖未发布的资产文件：{directory / name}")
         # 失败时保留候选和生成结果，供明确诊断，不发布 asset.json。
@@ -45,8 +43,6 @@ def build_task(task):
             "--output",
             str(work / "result"),
             "--headless",
-            "--num-points",
-            "1024",
         ]
         for name in (
             "scale_to_meters",
@@ -63,12 +59,8 @@ def build_task(task):
         args = parse_object_args(argv, workspace=ROOT)
         build(args)
         asset = work / "result/asset"
-        _, _, _, metadata = load_asset(asset)
-        metadata.update(
-            source_image=image.name, source_mesh="reconstruction/generation/mesh_unscaled.obj"
-        )
-        for name in ("mesh", "points.npy", "normals.npy"):
-            (asset / name).rename(directory / name)
+        _, metadata = load_asset(asset)
+        (asset / "mesh").rename(directory / "mesh")
         (asset / "asset.json").unlink()
         asset.rmdir()
         (work / "result").rename(directory / "reconstruction")

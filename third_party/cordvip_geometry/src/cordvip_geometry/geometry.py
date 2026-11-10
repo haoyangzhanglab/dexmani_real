@@ -47,15 +47,6 @@ def float32_points(points):
     return points
 
 
-def project_points(points, K):
-    points = np.asarray(points)
-    valid = np.isfinite(points).all(axis=1) & (points[:, 2] > 1e-5)
-    pixels = np.full((len(points), 2), np.nan)
-    projected = points[valid] @ np.asarray(K).T
-    pixels[valid] = projected[:, :2] / projected[:, 2:3]
-    return pixels, valid
-
-
 def validate_pose(pose):
     """检查 SE(3)，不投影或修补旋转。"""
     if np.iscomplexobj(pose):
@@ -71,22 +62,6 @@ def validate_pose(pose):
     if not np.isclose(np.linalg.det(rotation), 1.0, rtol=0, atol=1e-4):
         raise ValueError("Pose rotation must have determinant +1")
     return pose
-
-
-def transform_points(points, pose):
-    return (points @ pose[:3, :3].T + pose[:3, 3]).astype(np.float32)
-
-
-def save_points(path, points):
-    with Path(path).open("xb") as stream:
-        np.save(stream, points, allow_pickle=False)
-
-
-def load_points(path):
-    points = float32_points(validate_points(np.load(path, allow_pickle=False)))
-    if not len(points):
-        raise ValueError("A sampling asset must contain at least one point")
-    return points
 
 
 def load_mesh(path):

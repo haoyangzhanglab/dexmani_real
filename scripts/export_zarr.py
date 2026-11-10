@@ -98,6 +98,7 @@ def load_processing_config(path: Path | None, fields) -> ExportConfig:
         pointcloud=runtime.pointcloud,
         hand_pointcloud=runtime.hand_pointcloud,
         table_plane_abcd=plane,
+        hoi_max_skew_s=runtime.execution.hoi_max_skew_s,
     )
 
 

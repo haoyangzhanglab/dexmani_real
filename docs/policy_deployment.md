@@ -24,22 +24,22 @@
 | 配置领域 | 权威来源 |
 | --- | --- |
 | `observation_fields`、`action_mode`、`control_action_dim`、`n_obs_steps`、`n_action_steps`、`future_steps`、`supports_rtc`、`requires_prev_action` | Checkpoint 的模型契约，本地配置不覆盖。 |
-| 模型使用的 PointCloud／HandCloud recipe、Fingertip Link 顺序、Depth shape／scale、HOI 任务与模板 manifest | Checkpoint。 |
+| 模型使用的 PointCloud recipe、Fingertip Link 顺序、Depth shape／scale | Checkpoint。 |
 | Arm／Hand、关节与运动限制、反馈 TTL、传感器和相机、环境与碰撞、HOME、遥操作 | RealConfig；相机等本地标定仍由现有标定入口加载。 |
 
 | ExecutionConfig 参数 | 优先级 |
 | --- | --- |
 | `control_dt_s` | 非 `None` 的 RealConfig 值 > Checkpoint；两处缺失时报错。 |
 | `action_steps` | 非 `None` 的 RealConfig 值 > Checkpoint `n_action_steps`。 |
-| `mode`、`prefetch_steps`、`rtc_guidance_cap`、`hoi_max_age_s` | RealConfig。 |
+| `mode`、`prefetch_steps`、`rtc_guidance_cap`、`hoi_max_age_s`、`hoi_max_skew_s` | RealConfig。 |
 
 显式非法值直接报错，不回退到 Checkpoint。控制周期缺失时，在 `--config` 指定的 Python 实验文件中设置 `CONFIG.execution.control_dt_s`。覆盖值仍须通过现有控制频率、预测长度和 ODE 限制检查。
 
-模型使用 `point_cloud`／`hand_pointcloud` 时必须保存对应 recipe；recipe 内有默认值的字段可以省略，未知字段和非法值拒绝。未使用的几何配置保留本地值。`fingertip_xyz` 使用 Checkpoint 的 `fingertip_link_names` 顺序。`pointcloud.workspace` 是模型点云裁剪范围，与 RealConfig 的机器人安全 `environment.workspace` 职责不同。
+模型使用 `point_cloud` 时必须保存对应 recipe；`hand_pointcloud` 使用 RealConfig.hand_pointcloud；recipe 内有默认值的字段可以省略，未知字段和非法值拒绝。未使用的几何配置保留本地值。`fingertip_xyz` 使用 Checkpoint 的 `fingertip_link_names` 顺序。`pointcloud.workspace` 是模型点云裁剪范围，与 RealConfig 的机器人安全 `environment.workspace` 职责不同。
 
 Depth 必须保存 `depth_config.shape`（height, width）和 `depth_scale_m`。shape 必须等于本地 `camera.height`、`camera.width`，不自动 resize。设备实际 depth scale 在相机启动后、机器人保持停止时核对；不自动修改比例、内参或坐标系。
 
-HOI 由 `observation_fields` 中的 `object_pointcloud` 自动识别，无需额外 CLI 开关。任务名、项目资产目录、manifest、对象顺序及模板／Mesh SHA256 在连接设备前校验；仍拒绝同时使用普通 `point_cloud`。非 HOI 模型即使附带 HOI 元数据，也不加载模板或启动 HOI Worker。
+HOI 由 `observation_fields` 中的 `object_pointcloud` 自动识别，无需额外 CLI 开关。使用 info.task_name 定位任务目录并校验模板结构；手模板点数取 RealConfig.hand_pointcloud，不从 checkpoint 覆盖；仍拒绝同时使用普通 `point_cloud`。非 HOI 模型不加载模板或启动 HOI Worker。
 
 `--print-config` 只打印声明的 RealConfig，不加载模型或标定，因此不是最终有效部署配置。启动摘要另显示 Checkpoint、Action Mode、有效周期／频率与来源、Action Steps 与来源、Execution Mode、实际使用的几何／Depth recipe 和输出路径；`run_config.yaml` 继续使用原有归档结构。
 
@@ -66,6 +66,9 @@ HOI 由 `observation_fields` 中的 `object_pointcloud` 自动识别，无需额
 `--inference-steps` 对 ODE 设置每个控制周期的积分子步数，不是整个 chunk 的场计算次数；它不改变 H 或控制周期。
 
 ## 来源时间与时效
+
+物体点云与手几何或 joint_state 联合消费时，必须显式配置 execution.hoi_max_skew_s（有限正数秒值，无默认值）。HOI 原始相机时间、臂反馈时间、手反馈时间的 max−min 超限报告 hoi_source_skew 并停止本轮；不以推理完成时间替代来源时间。导出使用同一实验预算。此检查不代表物理同步，以下年龄检查仍独立生效。
+
 
 观测采用 latest-value 语义：有效样本可重复读取，读取不刷新来源时间。年龄按主机 `time.monotonic_ns()` 计算；Arm／Hand 使用 SDK 查询开始时间，Camera 使用新帧首次接收时间，VR 使用完整腕部／关键点观测中较早的接收时间。这些均非同步硬件采样时间，Hand SDK 也没有可靠的硬件采样序号或时间戳。
 
@@ -126,7 +129,7 @@ Sensor Worker 与模型线程跨段保留；段间只回收本段 Recorder 和�
 ## Raw 录制与连续区间
 
 - 模型所需 RGB／Depth 与 HOI 或普通点云同源；Raw 独立读取控制采样时最新的 Camera RGB-D，按普通 Camera TTL 检查并保留实际 `camera_ns`、`camera_sequence`。
-- 录制要求两个触觉通道均在 Hand TTL 内，读取缓存不刷新来源时间；显式 reset 使旧值失效。模型不需要的相机／触觉只在启用录制时成为依赖。导出仅诊断来源时间非正、未来或回退，不修补历史样本。
+- 录制要求两个触觉通道均在 Hand TTL 内，读取缓存不刷新来源时间；显式 reset 使旧值失效。模型不需要的相机／触觉只在启用录制时成为依赖。普通字段导出对来源时钟问题作诊断；联合 HOI 对来源时间缺失、未来或时间差超预算直接拒绝，不修补历史样本。
 - 相机或触觉来源失效、质量拒绝、队列满都会结束本段。先停止设备，再排空已经接收的完整行；写入和关闭正常时保存有效前缀，保留结束原因。所有已启动的必需 Worker（包括仅用于录制的 Camera）退出都会终止会话。
 - 文件／编码 I/O 失败结束本段，保留 staging 并报告，不发布失败录制。初始化失败时不开始运动；Writer 实际退出并完成收尾后才能重新按 B。发布与失败以 `EpisodeRecorder.result()` 为准，`poll_finish()` 仅表示收尾完成。停止、录制关闭和迟到预测的失败都会更新本段结果；程序错误、停止失败和无法回收的资源继续退出会话。
 - RGB／Depth／状态逐行对应，MP4 PTS 相对首行控制时间。调度跳槽后，在下一条已保存行记录 `/timing/segment_starts`；非空录制从 0 开始、严格递增，`recording_truncated_reason` 仅作诊断。质量拒绝与队列满之后不再接收新行。

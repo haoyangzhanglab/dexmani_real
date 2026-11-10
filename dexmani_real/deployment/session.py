@@ -224,7 +224,7 @@ class PolicySession:
         print(f"评估：{self.num_episodes if self.num_episodes is not None else '不限'} 轮 | 每轮预算 {duration} | 输入：{', '.join(self.info.observation_fields)}")
         for name, field in (("pointcloud", "point_cloud"), ("hand_pointcloud", "hand_pointcloud")):
             if field in self.info.observation_fields:
-                print(f"{field} (Checkpoint): {asdict(getattr(self.runtime, name))}")
+                print(f"{field} ({'RealConfig' if field == 'hand_pointcloud' else 'Checkpoint'}): {asdict(getattr(self.runtime, name))}")
         if "depth" in self.info.observation_fields:
             print(f"depth (Checkpoint): {self.info.depth_config}")
         print(f"输出：{self.output_dir}" if self.output_dir is not None else "输出：仅终端")

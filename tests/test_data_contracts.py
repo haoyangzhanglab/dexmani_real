@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import h5py
 import numpy as np
@@ -153,7 +153,7 @@ class DataContracts(unittest.TestCase):
                 self.assertEqual(len(list(reader.iter_rgb_frames())), 4)
                 validate.assert_not_called()
                 with self.assertRaises(KeyError):
-                    _ = reader.hoi_metadata
+                    reader.require_fields(*HOI_FIELDS)
                 for name in HOI_FIELDS:
                     with self.subTest(field=name):
                         with self.assertRaises(KeyError):
@@ -166,37 +166,94 @@ class DataContracts(unittest.TestCase):
                 export_zarr(path, self.root / 'hoi.zarr', processing=ExportConfig(), fields=('object_pointcloud',))
         self.assertFalse((self.root / 'hoi.zarr').exists())
 
-    def test_hoi_validation_is_cached_and_preserves_task_identity(self):
+    def test_annotation_stops_failed_episode_and_deduplicates(self):
+        from scripts.cordvip.annotate_episodes import annotate_episodes
+        failed, good = self.record('policy_rollout'), self.record('teleop')
+        for path in (failed, good):
+            with h5py.File(path / 'data.h5', 'r+') as data:
+                data['meta'].attrs['camera_T_xarm_base_from_color'] = np.eye(4).ravel()
+        with h5py.File(failed / 'data.h5', 'r+') as data:
+            rows = data['timing/rows'][:]
+            rows['camera_sequence'][1] = rows['camera_sequence'][0]
+            rows['camera_ns'][1] = rows['camera_ns'][0]
+            data['timing/rows'][:] = rows
+        template = {'points_local': np.zeros((1024, 3), np.float32),
+                    'offsets': np.array([0, 1024]), 'object_names': np.array(['object'])}
+        valid = {'objects': {'object': {'pose': np.eye(4), 'pose_valid': True, 'error': None}}}
+        invalid = {'objects': {'object': {'pose': None, 'pose_valid': False, 'error': 'depth lost'}}}
+        tracker = MagicMock()
+        tracker.step.side_effect = [valid, invalid, valid, valid, valid, valid]
+        with patch('scripts.cordvip.annotate_episodes.load_task_template', return_value=template), \
+                patch('scripts.cordvip.annotate_episodes.task_objects', return_value=[{'name': 'object', 'prompt': 'object'}]), \
+                patch('scripts.cordvip.annotate_episodes.SceneTracker.open') as opened, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            opened.return_value.__enter__.return_value = tracker
+            annotate_episodes([failed, good], self.root)
+            self.assertIn('首次失败行 2', output.getvalue())
+            self.assertEqual(tracker.step.call_count, 6)
+            tracker.reset.assert_called_once()
+            with h5py.File(failed / 'data.h5') as data:
+                self.assertNotIn('hoi', data)
+            with h5py.File(good / 'data.h5') as data:
+                self.assertEqual(set(data['hoi']), set(HOI_FIELDS))
+            tracker.step.side_effect = RuntimeError('model failed')
+            with self.assertRaisesRegex(RuntimeError, 'model failed'):
+                annotate_episodes([failed], self.root)
+
+    def test_joint_hoi_export_preserves_rows_across_chunks_and_episodes(self):
+        template = {'points_local': np.zeros((1024, 3), np.float32), 'offsets': [0, 1024]}
+        for episode_index, (source, frames) in enumerate((('policy_rollout', 131), ('teleop', 3))):
+            recorded = self.record(source)
+            path = recorded.rename(self.root / f'episode_{episode_index}')
+            with h5py.File(path / 'data.h5', 'r+') as data:
+                rows = np.resize(data['timing/rows'][:], frames)
+                for name in rows.dtype.names:
+                    rows[name] += (np.arange(frames) // 4) * (4 if name == 'camera_sequence' else 400_000_000)
+                del data['timing/rows']
+                data['timing'].create_dataset('rows', data=rows)
+                del data['timing/segment_starts']
+                data['timing'].create_dataset('segment_starts', data=[0])
+                for name in ('arm_qpos', 'hand_qpos', 'action_arm_joint_target', 'action_hand_joint_target'):
+                    values = np.resize(data[name][:], (frames, data[name].shape[1]))
+                    del data[name]
+                    data.create_dataset(name, data=values)
+            poses = np.tile(np.eye(4), (frames, 1, 1, 1))
+            poses[:, 0, 0, 3] = episode_index * 1000 + np.arange(frames)
+            write_hoi(path / 'data.h5', template, poses, np.eye(4))
+        destination = self.root / 'combined.zarr'
+        result = export_zarr(self.root, destination, processing=ExportConfig(hoi_max_skew_s=.01),
+                             fields=('object_pointcloud', 'joint_state', 'action'))
+        self.assertEqual(result['total_frames'], 134)
+        store = zarr.open_group(str(destination), mode='r')
+        try:
+            np.testing.assert_array_equal(store['meta/episode_ends'][:], [131, 134])
+            for key in ('object_pointcloud', 'joint_state', 'action'):
+                self.assertEqual(store['data/' + key].shape[0], 134)
+            np.testing.assert_array_equal(store['data/object_pointcloud'][:, 0, 0],
+                                          np.r_[np.arange(131), 1000 + np.arange(3)])
+        finally:
+            store.store.close()
+
+    def test_minimal_hoi_export_and_skew(self):
         path = self.record('policy_rollout')
-        manifest = {'task_name': 'offline', 'object_names': ['object'], 'template_sha256': 'a' * 64}
-        write_hoi(path / 'data.h5',
-                  {'points_local': np.zeros((1024, 3), np.float32), 'offsets': np.array([0, 1024])},
-                  manifest, np.tile(np.eye(4), (4, 1, 1, 1)), np.ones((4, 1), bool),
-                  np.ones((4, 1), np.float32), np.eye(4))
-        with patch('dexmani_real.data.raw.validate_hoi', wraps=validate_hoi) as validate, \
-                RawReader(path) as reader:
-            reader.require_fields('arm_qpos')
-            validate.assert_not_called()
-            reader.require_fields(*HOI_FIELDS)
-            self.assertEqual(reader.hoi_metadata, manifest)
-            for name in HOI_FIELDS:
-                reader[name]
-                reader.require_fields(name)
-            validate.assert_called_once()
+        template = {'points_local': np.zeros((1024, 3), np.float32), 'offsets': np.array([0, 1024])}
+        write_hoi(path / 'data.h5', template, np.tile(np.eye(4), (4, 1, 1, 1)), np.eye(4))
+        fields = ('object_pointcloud', 'joint_state', 'action')
+        with self.assertRaisesRegex(ValueError, 'hoi_max_skew_s'):
+            export_zarr(path, self.root / 'missing.zarr', processing=ExportConfig(), fields=fields)
+        export_zarr(path, self.root / 'valid.zarr', processing=ExportConfig(hoi_max_skew_s=.01), fields=fields)
         with h5py.File(path / 'data.h5', 'r+') as data:
-            data['meta'].attrs['task_label'] = 'other'
-        with RawReader(path) as reader, self.assertRaisesRegex(ValueError, 'task_name differs'):
-            reader['object_pointcloud']
+            self.assertEqual(set(data['hoi']), set(HOI_FIELDS))
+            self.assertFalse(dict(data['hoi'].attrs))
+            rows = data['timing/rows'][:]
+            rows['camera_ns'][0] -= 100_000_000
+            data['timing/rows'][:] = rows
+        with self.assertRaisesRegex(ValueError, 'skew.*row 0'):
+            export_zarr(path, self.root / 'skew.zarr', processing=ExportConfig(hoi_max_skew_s=.01), fields=fields)
         with h5py.File(path / 'data.h5', 'r+') as data:
-            del data['meta'].attrs['task_label']
-        with RawReader(path) as reader, self.assertRaisesRegex(ValueError, 'requires /meta task_label'):
-            _ = reader.hoi_metadata
-        with h5py.File(path / 'data.h5', 'r+') as data:
-            data['meta'].attrs['task_label'] = 'offline'
-            del data['hoi/object_pointcloud']
-            data['hoi'].create_dataset('object_pointcloud', shape=(4, 1024, 3), dtype='f8')
-        with RawReader(path) as reader, self.assertRaisesRegex(ValueError, 'shape/dtype'):
-            reader.require_fields('object_pointcloud')
+            data['hoi/object_pointcloud_valid'][0] = False
+        with self.assertRaisesRegex(ValueError, 'invalid at row 0'):
+            export_zarr(path, self.root / 'invalid.zarr', processing=ExportConfig(), fields=('object_pointcloud',))
 
     def test_absent_and_staging_hoi_are_not_published(self):
         path = self.record('policy_rollout')
@@ -206,7 +263,6 @@ class DataContracts(unittest.TestCase):
                     data.create_group('_hoi_staging')
             with self.subTest(staging=staging), RawReader(path) as reader, \
                     patch('dexmani_real.data.raw.validate_hoi') as validate:
-                self.assertIsNone(reader.hoi_metadata)
                 self.assertTrue(set(HOI_FIELDS).isdisjoint(reader.fields))
                 with self.assertRaisesRegex(ValueError, 'missing fields'):
                     reader.require_fields('object_pointcloud')

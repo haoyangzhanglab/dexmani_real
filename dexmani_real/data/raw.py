@@ -6,7 +6,6 @@ import json
 import logging
 from datetime import datetime, timezone
 from fractions import Fraction
-from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -457,18 +456,6 @@ class RawReader:
     def meta(self):
         return self.data_file["meta"].attrs
 
-    @cached_property
-    def hoi_metadata(self):
-        """首次使用已发布 HOI 时校验结构与任务身份，成功后复用结果。"""
-        if "hoi" not in self.data_file:
-            return None
-        metadata = validate_hoi(self.data_file["hoi"], self.num_frames)
-        if "meta" not in self.data_file or "task_label" not in self.meta:
-            raise ValueError(f"Raw {self.path}: /hoi requires /meta task_label")
-        if metadata["task_name"] != self.meta["task_label"]:
-            raise ValueError(f"Raw {self.path}: /hoi task_name differs from /meta task_label")
-        return metadata
-
     @property
     def control_hz(self):
         hz = float(self.meta["control_hz"])
@@ -527,12 +514,12 @@ class RawReader:
         if missing:
             raise ValueError(f"Raw {self.path}: missing fields {sorted(missing)}")
         if requested.intersection(HOI_FIELDS):
-            _ = self.hoi_metadata
+            validate_hoi(self.data_file["hoi"], self.num_frames)
 
     def __getitem__(self, name):
         if name not in self.dataset_cache:
             if name in HOI_FIELDS:
-                _ = self.hoi_metadata
+                validate_hoi(self.data_file["hoi"], self.num_frames)
             if name in {"hand_contact", "hand_tactile_force"}:
                 self.validate_tactile_metadata()
             elif name in {"arm_qpos", "action_arm_joint_target"}:

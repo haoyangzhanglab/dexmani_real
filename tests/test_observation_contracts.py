@@ -38,6 +38,23 @@ class ObservationContracts(unittest.TestCase):
         self.record = ObservationNeeds(camera_fields=('rgb', 'depth'),
                                        required_tactile=('aggregate', 'dense'))
 
+    def test_joint_hoi_source_skew(self):
+        from dexmani_real.runtime.observation import check_device_feedback
+        now = 10**10
+        runtime = replace(self.runtime, execution=replace(self.runtime.execution, hoi_max_skew_s=.05))
+        arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+        hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
+        arm['timestamp_ns'] = now - 10_000_000
+        hand['timestamp_ns'] = now - 20_000_000
+        row = Observation(arm, hand, None, None, None, now,
+                          hoi={'valid': True, 'timestamp_ns': now - 200_000_000})
+        needs = ObservationNeeds(hoi=True, hoi_joint_input=True)
+        self.assertEqual(check_device_feedback(row, runtime, now_ns=now), [])
+        self.assertEqual(check_observation(row, runtime, needs, now_ns=now), ['hoi_source_skew'])
+        row = replace(row, hoi=dict(row.hoi, timestamp_ns=now-60_000_000))
+        self.assertEqual(check_observation(row, runtime, needs, now_ns=now), [])
+        self.assertEqual(check_observation(row, runtime, ObservationNeeds(), now_ns=now), [])
+
     def test_union_order_and_immutability(self):
         for bits in itertools.product((False, True), repeat=7):
             needs = ObservationNeeds(
@@ -92,7 +109,6 @@ class ObservationContracts(unittest.TestCase):
         # 只替换外部加载和启动边界，保留真实需求推导、Ring 和读取代码。
         module = types.ModuleType('dexmani_policy.deployment')
         module.load_policy = lambda *a, **k: self.fail('unexpected model load')
-        manifest = {'task_name': 'test', 'object_names': ['object'], 'template_sha256': 'a' * 64}
         scenarios = [('joint_state',), ('camera_intrinsic',)]
         for derived in ((), ('point_cloud',), ('object_pointcloud',)):
             scenarios.extend(derived + images for images in ((), ('rgb',), ('depth',), ('rgb', 'depth')))
@@ -104,7 +120,7 @@ class ObservationContracts(unittest.TestCase):
                           pointcloud_config=asdict(self.runtime.pointcloud),
                           depth_config={'shape': (16, 16), 'depth_scale_m': 0.001},
                           checkpoint_path=Path('offline.pt'), weights='ema', inference_steps=1,
-                          task_name='test', hoi_pcd=manifest)
+                          task_name='test')
                 state = SessionState(stop_signal=threading.Event(), emergency_signal=threading.Event())
                 stack.enter_context(patch.dict(sys.modules, {'dexmani_policy.deployment': module}))
                 stack.enter_context(patch('dexmani_real.deployment.session.SessionState', return_value=state))
@@ -114,7 +130,7 @@ class ObservationContracts(unittest.TestCase):
                 stack.enter_context(patch('dexmani_real.deployment.session.Robot'))
                 stack.enter_context(patch('dexmani_real.deployment.session.session_directory', return_value=Path('/tmp/not-created')))
                 stack.enter_context(patch.object(PolicySession, 'wait_model', return_value=info))
-                loader = stack.enter_context(patch('dexmani_real.geometry.hoi.load_task_template', return_value=({}, manifest)))
+                loader = stack.enter_context(patch('dexmani_real.geometry.hoi.load_task_template', return_value={}))
                 output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
                 session = PolicySession(self.runtime, 'offline.pt', weights=None, inference_steps=None,
                                         output_root=None, device='cpu', seed=0, max_running_s=1,

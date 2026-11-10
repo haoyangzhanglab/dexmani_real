@@ -26,3 +26,12 @@ def sampling_clock_ns(control_hz: float) -> int:
 def sample_is_fresh(timestamp_ns, max_age_s, now_ns):
     stamp = int(timestamp_ns)
     return 0 < stamp <= now_ns and now_ns - stamp < int(max_age_s * 1e9)
+
+
+def validate_hoi_skew_budget(value):
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise ValueError("联合 HOI 输入必须显式配置有限正数 hoi_max_skew_s")
+
+
+def hoi_sources_within_skew(stamps, budget_s):
+    return min(stamps) > 0 and max(stamps) - min(stamps) <= budget_s * 1e9

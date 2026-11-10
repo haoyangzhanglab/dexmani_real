@@ -5,13 +5,6 @@ import sys
 from pathlib import Path
 
 
-def positive_int(value):
-    number = int(value)
-    if number <= 0:
-        raise argparse.ArgumentTypeError("必须是正整数")
-    return number
-
-
 def probability(value):
     number = float(value)
     if not 0 < number < 1:
@@ -56,64 +49,6 @@ def add_grounding_arguments(parser):
     parser.add_argument("--text-threshold", type=probability, default=0.25)
 
 
-def parse_tracking_args(argv=None, *, workspace=None):
-    workspace = Path(workspace or Path.cwd()).expanduser().resolve()
-    parser = argparse.ArgumentParser(
-        description="确认 Raw 首帧实例，逐行保存位姿和几何。"
-    )
-    parser.set_defaults(workspace=workspace)
-    parser.add_argument(
-        "--episode", required=True, help="只读 Raw episode 目录"
-    )
-    parser.add_argument(
-        "--scene", help="多物体 JSON；对象 id 使用唯一、非空的合法单级目录名"
-    )
-    parser.add_argument(
-        "--asset", help="米制物体资产；省略时只处理 mask 和实测点"
-    )
-    parser.add_argument(
-        "--prompt", help="首帧目标文本；未提供 --initial-selection 时必需"
-    )
-    parser.add_argument(
-        "--initial-selection",
-        help=(
-            "当前首帧原始 RGB 网格的 1/L/P PNG（P 按调色板转灰度，非零为前景）、"
-            "bool/uint8 单通道 NPY，或含 selection.json 的目录"
-        ),
-    )
-    parser.add_argument("--headless", action="store_true")
-    parser.add_argument(
-        "--with-hand", action="store_true", help="附加同行实测关节的 FK 手点云"
-    )
-    parser.add_argument("--hand-points", type=int, default=1024)
-    parser.add_argument("--pixel-stride", type=positive_int, default=2)
-    parser.add_argument("--depth-tolerance-m", type=float, default=0.015)
-    parser.add_argument("--min-matched-pixels", type=int, default=30)
-    parser.add_argument("--min-matched-fraction", type=float, default=0.15)
-    parser.add_argument("--max-frames", type=positive_int, help="显式限制处理前缀")
-    parser.add_argument("--output", type=Path, help="尚不存在的新输出目录")
-    add_sam_arguments(parser, workspace)
-    add_grounding_arguments(parser)
-    args = parser.parse_args(argv)
-    for name in ("episode", "scene", "asset", "initial_selection"):
-        value = getattr(args, name)
-        if value is not None:
-            if not value:
-                parser.error(f"--{name.replace('_', '-')} 需要非空路径")
-            setattr(args, name, (workspace / Path(value).expanduser()).resolve())
-    if args.scene is not None and any(
-        value is not None for value in (args.asset, args.initial_selection, args.prompt)
-    ):
-        parser.error("--scene 不能混用单物体参数")
-    if args.headless and args.initial_selection is None and args.scene is None:
-        parser.error("--headless 需要 --initial-selection 或 --scene")
-    if args.scene is None and args.initial_selection is None and (
-        args.prompt is None or not args.prompt.strip()
-    ):
-        parser.error("未提供初始 mask 时需要非空 --prompt，或通过 --scene 指定对象")
-    return args
-
-
 def add_segment_arguments(parser, workspace):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--image", type=Path, help="按 EXIF 纠正朝向的物体照片")
@@ -137,7 +72,6 @@ def add_scale_arguments(parser):
     parser.add_argument("--scale-to-meters", type=float)
     parser.add_argument("--size-axis", choices=("x", "y", "z"))
     parser.add_argument("--size-meters", type=float)
-    parser.add_argument("--num-points", type=int, default=1024)
 
 
 def parse_object_args(argv=None, *, workspace=None):
@@ -177,7 +111,6 @@ def parse_object_args(argv=None, *, workspace=None):
     add_scale_arguments(build)
     prepare = commands.add_parser("prepare", help="将已有 mesh 校准为米制资产")
     prepare.add_argument("--mesh", type=Path, required=True)
-    prepare.add_argument("--seed", type=int, default=0)
     prepare.add_argument("--preview", action="store_true")
     add_scale_arguments(prepare)
     preview = commands.add_parser("preview", help="查看 mesh，无需加载模型")

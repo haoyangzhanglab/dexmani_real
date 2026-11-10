@@ -16,7 +16,7 @@ class HandPointCloud:
         path = HAND_TEMPLATE_DIR / f"hand_{num_points}.npz"
         try:
             with np.load(path, allow_pickle=False) as template:
-                points = template["points"]
+                points = template["points"][:, :3]
                 names = template["part_names"]
                 offsets = template["part_offsets"]
         except FileNotFoundError as exc:
@@ -25,10 +25,9 @@ class HandPointCloud:
                 f"python scripts/generate_hand_template.py --num-points {num_points}"
             ) from exc
         if (
-            points.shape != (num_points, 6)
+            points.shape != (num_points, 3)
             or points.dtype != np.float32
             or not np.isfinite(points).all()
-            or np.any((points[:, 3:] < 0) | (points[:, 3:] > 1))
             or names.ndim != 1
             or names.dtype.kind != "U"
             or not len(names)

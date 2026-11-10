@@ -1,8 +1,7 @@
-"""按表面积冻结任务级 1024 点模板，不复制原始资产。"""
+"""按表面积配额直接采样并冻结任务级 1024 点模板。"""
 
 # Usage: python scripts/cordvip/allocate_points.py assets/pointcloud_template/object/pnp_apple_banana
 import argparse
-import json
 import sys
 import tempfile
 from pathlib import Path
@@ -12,8 +11,9 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 from cordvip_geometry.assets import load_asset
+from cordvip_geometry.geometry import sample_mesh_surface
 
-from dexmani_real.geometry.hoi import load_task_template, task_objects, template_digest
+from dexmani_real.geometry.hoi import load_task_template, task_objects
 from dexmani_real.utils.io import publish
 
 
@@ -31,19 +31,6 @@ def allocate_counts(areas):
     return counts
 
 
-def select_indices(points, count):
-    points = np.asarray(points, dtype=np.float64)
-    selected = np.empty(count, dtype=np.int64)
-    distances = np.full(len(points), np.inf)
-    index = 0
-    for i in range(count):
-        selected[i] = index
-        distances = np.minimum(distances, np.sum((points - points[index]) ** 2, axis=1))
-        distances[selected[: i + 1]] = -1
-        index = int(np.argmax(distances))
-    return selected
-
-
 def allocate_task(task):
     task = Path(task).resolve()
     output = task / "hoi"
@@ -53,29 +40,16 @@ def allocate_task(task):
     objects = task_objects(task)
     names = [obj["name"] for obj in objects]
     loaded = [load_asset(task / name) for name in names]
-    counts = allocate_counts([mesh.area for mesh, _, _, _ in loaded])
-    points, meshes = [], []
-    for name, (_, p, _, metadata), count in zip(names, loaded, counts):
-        if len(p) != 1024:
-            raise ValueError(f"{name}: 单物体必须有 1024 个点")
-        indices = select_indices(p, int(count))
-        points.append(p[indices])
-        meshes.append(task / name / metadata["mesh_file"])
+    counts = allocate_counts([mesh.area for mesh, _ in loaded])
+    points = [sample_mesh_surface(mesh, int(count), seed=0)[0]
+              for (mesh, _), count in zip(loaded, counts)]
     with tempfile.TemporaryDirectory(prefix=".hoi-", dir=task) as temporary:
         staging = Path(temporary)
         np.savez(
             staging / "template.npz",
             points_local=np.concatenate(points),
+            object_names=np.asarray(names),
             offsets=np.r_[0, np.cumsum(counts)].astype(np.int64),
-        )
-        manifest = {
-            "task_name": task.name,
-            "object_names": names,
-            "template_sha256": template_digest(staging / "template.npz", objects, meshes),
-        }
-        (staging / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
-            + "\n"
         )
         publish(staging, output)
     return output

@@ -77,7 +77,6 @@ class GroundedSAM2:
         self.dino_weights = Path(dino_weights).expanduser().resolve()
         self.processor: Any = None
         self.detector: Any = None
-        self._detection_rgb = None
         self.state: dict[str, Any]
         self.ids: list[str]
         self.shape: tuple[int, int]
@@ -151,12 +150,7 @@ class GroundedSAM2:
             return empty, []
         boxes = boxes[valid]
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            # 同一冻结首帧的不同文本复用 image embedding。
-            if self._detection_rgb is None or not np.array_equal(
-                rgb, self._detection_rgb
-            ):
-                self.image_predictor.set_image(np.ascontiguousarray(rgb))
-                self._detection_rgb = rgb.copy()
+            self.image_predictor.set_image(np.ascontiguousarray(rgb))
             masks, mask_scores, _ = self.image_predictor.predict(
                 point_coords=None, point_labels=None, box=boxes, multimask_output=False
             )
@@ -210,7 +204,6 @@ class GroundedSAM2:
     def initialize(self, rgb, ids, masks):
         import torch
 
-        self._detection_rgb = None
         self.image_predictor.reset_predictor()
         gc.collect()
         torch.cuda.empty_cache()
@@ -266,7 +259,6 @@ def main():
                 if operation == "reset":
                     engine.state = {}
                     engine.index = -1
-                    engine._detection_rgb = None
                     engine.image_predictor.reset_predictor()
                 elif operation == "predict":
                     output, reply["labels"] = engine.predict(

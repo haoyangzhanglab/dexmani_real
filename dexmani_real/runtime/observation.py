@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.ipc.sensors import read_camera_frame
-from dexmani_real.utils.timing import sample_is_fresh
+from dexmani_real.utils.timing import sample_is_fresh, hoi_sources_within_skew
 
 _HOI_METADATA_FIELDS = ("episode_id", "timestamp_ns", "source_camera_sequence", "valid")
 
@@ -14,6 +14,7 @@ _HOI_METADATA_FIELDS = ("episode_id", "timestamp_ns", "source_camera_sequence", 
 class ObservationNeeds:
     camera_fields: tuple[str, ...] = ()
     hoi: bool = False
+    hoi_joint_input: bool = False
     point_cloud: bool = False
     vr: bool = False
     required_tactile: tuple[str, ...] = ()
@@ -29,6 +30,7 @@ class ObservationNeeds:
                 if name in self.camera_fields or name in other.camera_fields
             ),
             hoi=self.hoi or other.hoi,
+            hoi_joint_input=self.hoi_joint_input or other.hoi_joint_input,
             point_cloud=self.point_cloud or other.point_cloud,
             vr=self.vr or other.vr,
             required_tactile=tuple(
@@ -129,6 +131,11 @@ def check_observation(row, runtime, needs, *, now_ns=None):
                 issues.append("pointcloud_stale")
     if needs.hoi:
         issues.extend(_hoi_issues(row.hoi, runtime, now))
+        if needs.hoi_joint_input and row.hoi is not None:
+            stamps = (int(row.hoi["timestamp_ns"]), int(row.arm["timestamp_ns"][0]),
+                      int(row.hand["timestamp_ns"][0]) if row.hand is not None else 0)
+            if not hoi_sources_within_skew(stamps, runtime.execution.hoi_max_skew_s):
+                issues.append("hoi_source_skew")
     if needs.vr:
         if row.vr is None:
             issues.append("vr_unavailable")
