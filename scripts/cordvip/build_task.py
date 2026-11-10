@@ -2,17 +2,18 @@
 
 # Usage: python scripts/cordvip/build_task.py --task pnp_apple_banana
 import argparse
-import json
 import sys
 import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
+from cordvip_geometry.assets import load_asset, validate_asset_parameters
 from cordvip_geometry.cli.arguments import parse_object_args
 from cordvip_geometry.cli.object import build
-from cordvip_geometry.assets import load_asset, validate_asset_parameters
+
 from dexmani_real.geometry.hoi import task_objects
+from dexmani_real.utils.io import write_json
 
 
 def build_task(task):
@@ -72,8 +73,7 @@ def build_task(task):
         asset.rmdir()
         (work / "result").rename(directory / "reconstruction")
         work.rmdir()
-        with (directory / "asset.json").open("x") as stream:
-            json.dump(metadata, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        write_json(metadata, directory / "asset.json", overwrite=False)
         print(f"发布资产：{directory}")
 
 

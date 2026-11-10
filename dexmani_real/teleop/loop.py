@@ -138,8 +138,9 @@ class TeleopLoop:
             raw = recorder.result() if recorder is not None else None
             level, text = format_recording_result(raw)
             status = "结束" if self.recorder is None else "控制结束，录制收尾未完成"
-            logger.log(level, "Teleop 本段%s\nEnd reason: %s\nDetails: %s\n%s\nTask outcome: unknown",
+            logger.log(level, "Teleop 本段%s\nEnd reason: %s\nDetails: %s\n%s",
                        status, self.pending_termination_reason, self.termination_details, text)
+            logger.info("Task outcome: unknown")
         if (failure is None and self.recorder is None
                 and not self.runtime_state.quit_requested and not self.runtime_state.estop_request):
             logger.info("停止流程已完成；遥操作控制锚点已清空。检查上方结束原因及录制结果后按 B 开始新段。")

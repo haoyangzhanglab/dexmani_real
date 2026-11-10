@@ -75,7 +75,7 @@ python scripts/visualize_episode.py episodes/task/episode_xxx --info
 
 标签为 `success`、`failure` 或 `unknown`，独立保存在 `outcome.json`，含程序生成的 UTC 时间与可选备注；默认拒绝覆盖，`--overwrite` 原子替换整个标注（未传备注则移除旧备注）。只有 Episode 目录存在且缺少 `outcome.json` 时才视为 `unknown`；目录不存在或不是目录时抛出 `NotADirectoryError`。已有标注必须包含合法的 `outcome` 和 `annotated_at_utc`：时间戳须为带 UTC 时区的 ISO 8601 日期时间（例如 `2026-11-10T08:00:00Z` 或 `2026-11-10T08:00:00+00:00`），`note` 若存在须为字符串。缺字段、非法时间、无时区或非 UTC 时区均明确报错，`--info` 同样执行此检查。
 
-任务结果、控制结束原因和 Raw 保存状态互相独立；在线摘要不读取离线标签，显示 `unknown`。标注不改写 HDF5/MP4 或已有 Zarr，不改变导出或训练选择；未标注 Episode 仍可使用，现有数据集不需重新生成。不提供 success-only 筛选、Raw 来源映射或标签快照。
+标注入口只检查 Raw 基本身份、录制完成状态和基础文件，不承担各模态或 HOI 的完整质量校验。任务结果、控制结束原因和 Raw 保存状态互相独立；在线摘要不读取离线标签，以 INFO 显示 `unknown`；Raw 录制结果独立使用对应日志级别。标注不改写 HDF5/MP4 或已有 Zarr，不改变导出或训练选择；未标注 Episode 仍可使用，现有数据集不需重新生成。不提供 success-only 筛选、Raw 来源映射或标签快照。
 
 采集和评估均按 B 开始新段，S/C 保存结束，D 丢弃，Q 保存退出，Esc 急停。来源失效或录制失败会结束本段；停止与收尾完成后才能再次按 B。触觉录制与模型输入共用默认 200 ms 时效预算。
 

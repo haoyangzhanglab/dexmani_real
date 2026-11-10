@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import logging
 import tempfile
 import threading
 import unittest
@@ -15,7 +16,11 @@ import numpy as np
 
 from dexmani_real.config.real import RealConfig
 from dexmani_real.control.actions import ActionMapper
-from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
+from dexmani_real.data.recorder import (
+    EpisodeRecorder,
+    RecordingError,
+    format_recording_result,
+)
 from dexmani_real.deployment.inference import PolicyWorker
 from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.rollout import EpisodeResult, Rollout
@@ -310,6 +315,9 @@ class SafetyContracts(unittest.TestCase):
                 with self.assertLogs('dexmani_real.teleop.loop', level='INFO') as logs:
                     loop.end_episode()
                 self.assert_recording_hint('\n'.join(logs.output), raw)
+                outcome_logs = [record for record in logs.records if 'Task outcome:' in record.getMessage()]
+                self.assertEqual([(record.levelno, record.getMessage()) for record in outcome_logs],
+                                 [(logging.INFO, 'Task outcome: unknown')])
                 self.assertEqual(loop.failed, history or status == 'failed')
                 self.assertEqual(any(d['stage'] == 'recording' for d in loop.termination_details),
                                  status == 'failed')
@@ -372,9 +380,19 @@ class SafetyContracts(unittest.TestCase):
                 old = EpisodeResult(0, errors=[{'stage': 'recording', 'message': 'previous disk failure'}])
                 if history:
                     session.episodes.append(old)
-                with contextlib.redirect_stdout(io.StringIO()) as output:
+                with self.assertLogs('dexmani_real.deployment.session', level='INFO') as logs, \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
                     self.run_policy_episode(session, episode)
-                self.assert_recording_hint(output.getvalue(), raw)
+                self.assert_recording_hint('\n'.join(logs.output) + output.getvalue(), raw)
+                level, text = format_recording_result(raw)
+                raw_logs = [record for record in logs.records if record.getMessage().startswith('Raw：')]
+                self.assertEqual([(record.levelno, record.getMessage()) for record in raw_logs], [(level, text)])
+                outcome_logs = [record for record in logs.records if 'Task outcome:' in record.getMessage()]
+                self.assertEqual([(record.levelno, record.getMessage()) for record in outcome_logs],
+                                 [(logging.INFO, 'Task outcome: unknown')])
+                self.assertNotIn('ERROR: ERROR:', '\n'.join(logs.output))
+                if status == 'failed':
+                    self.assertEqual('\n'.join(logs.output).count(raw['error']), 1)
                 self.assertEqual(episode.result.raw, raw)
                 self.assertEqual(bool(episode.result.errors), status == 'failed')
                 if status == 'failed':
@@ -409,9 +427,10 @@ class SafetyContracts(unittest.TestCase):
                     else:
                         episode, _ = self.make_rollout()
                         episode.recorder = recorder
-                        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                        with self.assertLogs('dexmani_real.deployment.session', level='INFO') as logs, \
+                                contextlib.redirect_stdout(io.StringIO()) as stdout:
                             self.run_policy_episode(self.make_policy_session(episode), episode)
-                        output = stdout.getvalue()
+                        output = '\n'.join(logs.output) + stdout.getvalue()
                     self.assertIn('Staging：不可用', output)
                     self.assertIn(raw['error'], output)
                     if missing:
@@ -466,7 +485,7 @@ class SafetyContracts(unittest.TestCase):
                         return False
 
                     recorder.poll_finish.side_effect = poll_finish
-                    with patch('dexmani_real.teleop.loop.logger') as log, \
+                    with self.assertLogs('dexmani_real', level='INFO') as logs, \
                             contextlib.redirect_stdout(io.StringIO()) as output:
                         if mode == 'teleop':
                             owner.end_episode()
@@ -474,7 +493,11 @@ class SafetyContracts(unittest.TestCase):
                             session = self.make_policy_session(owner)
                             self.run_policy_episode(session, owner)
                             self.assertIs(session.episode, owner)
-                    text = str(log.mock_calls) + output.getvalue()
+                    raw_logs = [record for record in logs.records if 'Raw：' in record.getMessage()]
+                    self.assertEqual(len(raw_logs), 1)
+                    self.assertEqual(raw_logs[0].levelno, logging.WARNING)
+                    self.assertIn('尚无最终录制结果', raw_logs[0].getMessage())
+                    text = '\n'.join(logs.output) + output.getvalue()
                     self.assertNotIn('停止流程已完成', text)
                     self.assertNotIn('按 B 开始', text)
                     self.assertIs(owner.recorder, recorder)

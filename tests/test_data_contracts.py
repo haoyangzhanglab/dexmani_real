@@ -16,6 +16,7 @@ import zarr
 
 from dexmani_real.config.real import RealConfig
 from dexmani_real.data.export import ExportConfig, export_zarr, select_episodes
+from dexmani_real.data.hoi import HOI_FIELDS, validate_hoi, write_hoi
 from dexmani_real.data.raw import (
     RawReader,
     camera_metadata,
@@ -136,6 +137,82 @@ class DataContracts(unittest.TestCase):
             self.assertEqual(store.attrs['dt'], 0.1)
         finally:
             store.store.close()
+
+    def test_broken_hoi_only_blocks_hoi_consumers(self):
+        path = self.record('policy_rollout')
+        with h5py.File(path / 'data.h5', 'r+') as data:
+            data.create_group('hoi')
+        with patch('dexmani_real.data.raw.validate_hoi', wraps=validate_hoi) as validate:
+            with RawReader(path) as reader:
+                self.assertEqual(reader.meta['task_label'], 'offline')
+                self.assertTrue(set(HOI_FIELDS).issubset(reader.fields))
+                reader.require_fields('arm_qpos', 'rgb', 'depth')
+                self.assertEqual(reader['arm_qpos'].shape, (4, 7))
+                self.assertEqual(reader['depth'].shape, (4, 16, 16))
+                reader.read_timing()
+                self.assertEqual(len(list(reader.iter_rgb_frames())), 4)
+                validate.assert_not_called()
+                with self.assertRaises(KeyError):
+                    _ = reader.hoi_metadata
+                for name in HOI_FIELDS:
+                    with self.subTest(field=name):
+                        with self.assertRaises(KeyError):
+                            reader.require_fields(name)
+                        with self.assertRaises(KeyError):
+                            reader[name]
+            self.assertEqual(len(load_trajectory(path, self.runtime, segment=0)), 2)
+            export_zarr(path, self.root / 'ordinary.zarr', processing=ExportConfig(), fields=('joint_state',))
+            with self.assertRaises(ValueError):
+                export_zarr(path, self.root / 'hoi.zarr', processing=ExportConfig(), fields=('object_pointcloud',))
+        self.assertFalse((self.root / 'hoi.zarr').exists())
+
+    def test_hoi_validation_is_cached_and_preserves_task_identity(self):
+        path = self.record('policy_rollout')
+        manifest = {'task_name': 'offline', 'object_names': ['object'], 'template_sha256': 'a' * 64}
+        write_hoi(path / 'data.h5',
+                  {'points_local': np.zeros((1024, 3), np.float32), 'offsets': np.array([0, 1024])},
+                  manifest, np.tile(np.eye(4), (4, 1, 1, 1)), np.ones((4, 1), bool),
+                  np.ones((4, 1), np.float32), np.eye(4))
+        with patch('dexmani_real.data.raw.validate_hoi', wraps=validate_hoi) as validate, \
+                RawReader(path) as reader:
+            reader.require_fields('arm_qpos')
+            validate.assert_not_called()
+            reader.require_fields(*HOI_FIELDS)
+            self.assertEqual(reader.hoi_metadata, manifest)
+            for name in HOI_FIELDS:
+                reader[name]
+                reader.require_fields(name)
+            validate.assert_called_once()
+        with h5py.File(path / 'data.h5', 'r+') as data:
+            data['meta'].attrs['task_label'] = 'other'
+        with RawReader(path) as reader, self.assertRaisesRegex(ValueError, 'task_name differs'):
+            reader['object_pointcloud']
+        with h5py.File(path / 'data.h5', 'r+') as data:
+            del data['meta'].attrs['task_label']
+        with RawReader(path) as reader, self.assertRaisesRegex(ValueError, 'requires /meta task_label'):
+            _ = reader.hoi_metadata
+        with h5py.File(path / 'data.h5', 'r+') as data:
+            data['meta'].attrs['task_label'] = 'offline'
+            del data['hoi/object_pointcloud']
+            data['hoi'].create_dataset('object_pointcloud', shape=(4, 1024, 3), dtype='f8')
+        with RawReader(path) as reader, self.assertRaisesRegex(ValueError, 'shape/dtype'):
+            reader.require_fields('object_pointcloud')
+
+    def test_absent_and_staging_hoi_are_not_published(self):
+        path = self.record('policy_rollout')
+        for staging in (False, True):
+            if staging:
+                with h5py.File(path / 'data.h5', 'r+') as data:
+                    data.create_group('_hoi_staging')
+            with self.subTest(staging=staging), RawReader(path) as reader, \
+                    patch('dexmani_real.data.raw.validate_hoi') as validate:
+                self.assertIsNone(reader.hoi_metadata)
+                self.assertTrue(set(HOI_FIELDS).isdisjoint(reader.fields))
+                with self.assertRaisesRegex(ValueError, 'missing fields'):
+                    reader.require_fields('object_pointcloud')
+                with self.assertRaises(KeyError):
+                    reader['object_pointcloud']
+                validate.assert_not_called()
 
     def test_no_attempt_nan_rejected_by_export_and_replay(self):
         path = self.record('policy_rollout', command=False)
@@ -291,13 +368,54 @@ class DataContracts(unittest.TestCase):
             write_episode_outcome(path, 'success')
         with h5py.File(path / 'data.h5', 'r+') as data:
             data['meta'].attrs['termination_reason'] = 'operator'
-            data['arm_qpos'].resize(3, axis=0)
+        (path / 'rgb.mp4').unlink()
+        with self.assertRaisesRegex(ValueError, 'missing fields'):
+            write_episode_outcome(path, 'success')
+        self.assertFalse((path / 'outcome.json').exists())
+
+    def test_outcome_is_independent_of_modality_quality(self):
+        path = self.record('teleop')
+        with h5py.File(path / 'data.h5', 'r+') as data:
+            data.create_group('hoi')
+            for name in ('arm_qpos', 'hand_tactile_force', 'vr_landmarks'):
+                data[name].resize(3, axis=0)
+            del data['depth']
+            del data['meta'].attrs['hand_tactile_scale_divisor']
+            del data['meta'].attrs['camera_color_intrinsics']
+        original = {name: (path / name).read_bytes() for name in ('data.h5', 'rgb.mp4')}
+        with patch.object(RawReader, 'read_camera', side_effect=AssertionError('camera read')), \
+                patch.object(RawReader, 'read_timing', side_effect=AssertionError('timing scan')), \
+                patch.object(RawReader, 'iter_rgb_frames', side_effect=AssertionError('video decode')), \
+                patch('dexmani_real.data.raw.validate_hoi', side_effect=AssertionError('HOI validation')):
+            write_episode_outcome(path, 'success')
+        self.assertEqual(read_episode_outcome(path)['outcome'], 'success')
+        for name, content in original.items():
+            self.assertEqual((path / name).read_bytes(), content)
+
+    def test_outcome_requires_core_metadata_and_rows(self):
+        path = self.record('policy_rollout')
+        for name in ('task_label', 'control_hz', 'collection_source', 'termination_reason'):
+            with h5py.File(path / 'data.h5', 'r+') as data:
+                value = data['meta'].attrs[name]
+                del data['meta'].attrs[name]
+            with self.subTest(missing=name), self.assertRaises(KeyError):
+                write_episode_outcome(path, 'success')
+            with h5py.File(path / 'data.h5', 'r+') as data:
+                data['meta'].attrs[name] = value
+        with h5py.File(path / 'data.h5', 'r+') as data:
+            data['timing/segment_starts'][:] = [0, 0]
+        with self.assertRaisesRegex(ValueError, 'invalid timing/segment_starts'):
+            write_episode_outcome(path, 'success')
+        with h5py.File(path / 'data.h5', 'r+') as data:
+            data['timing/segment_starts'][:] = [0, 2]
+            del data['timing/rows']
+            data['timing'].create_dataset('rows', data=np.zeros(4))
         with self.assertRaisesRegex(ValueError, 'incompatible shape/dtype'):
             write_episode_outcome(path, 'success')
         with h5py.File(path / 'data.h5', 'r+') as data:
-            data['arm_qpos'].resize(4, axis=0)
-        (path / 'rgb.mp4').unlink()
-        with self.assertRaisesRegex(ValueError, 'missing fields'):
+            del data['timing/rows']
+            data['timing'].create_dataset('rows', data=np.zeros(0))
+        with self.assertRaisesRegex(ValueError, 'no rows'):
             write_episode_outcome(path, 'success')
         self.assertFalse((path / 'outcome.json').exists())
 

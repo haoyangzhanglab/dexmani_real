@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from fractions import Fraction
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -75,7 +76,7 @@ def read_episode_outcome(episode_path: str | Path) -> dict[str, str]:
 def write_episode_outcome(
     episode_path: str | Path, outcome: str, *, note: str | None = None, overwrite: bool = False,
 ) -> Path:
-    """只对已发布 Raw 写独立标签；结构校验不读取整段数组或解码视频。"""
+    """检查 Raw 基本身份与录制完成状态后写独立标签，不承担全模态质检。"""
     if outcome not in EPISODE_OUTCOMES:
         raise ValueError(f"outcome must be one of {EPISODE_OUTCOMES}")
     if note is not None and not isinstance(note, str):
@@ -89,20 +90,13 @@ def write_episode_outcome(
         if not isinstance(reason, str) or not reason or reason == "recording_incomplete":
             raise ValueError(f"Raw {path}: recording is incomplete")
         validate_task_label(reader.meta["task_label"])
+        _ = reader.meta["collection_source"]
         _ = reader.control_hz
         if reader.num_frames <= 0:
             raise ValueError(f"Raw {path}: episode contains no rows")
-        specs = ROBOT_DATASET_SPECS
-        if reader.meta["collection_source"] == "teleop":
-            specs = specs | VR_DATASET_SPECS
-        reader.require_fields("rgb", "depth", *specs)
-        for name in (*specs, "timing/rows"):
-            reader[name]
+        reader.require_fields("rgb")
+        reader["timing/rows"]
         _ = reader.segment_starts
-        camera = reader.read_camera()
-        depth = reader["depth"]
-        if depth.shape != (reader.num_frames, camera.color.height, camera.color.width) or depth.dtype != np.uint16:
-            raise ValueError(f"Raw {path}: incompatible depth shape/dtype")
     annotation = {
         "outcome": outcome,
         "annotated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
@@ -452,13 +446,6 @@ class RawReader:
         self.data_file = h5py.File(self.path / "data.h5", "r")
         try:
             self.num_frames = len(self.data_file["timing/rows"])
-            self.hoi_metadata = None
-            if "hoi" in self.data_file:
-                self.hoi_metadata = validate_hoi(self.data_file["hoi"], self.num_frames)
-                if "meta" not in self.data_file or "task_label" not in self.meta:
-                    raise ValueError(f"Raw {self.path}: /hoi requires /meta task_label")
-                if self.hoi_metadata["task_name"] != self.meta["task_label"]:
-                    raise ValueError(f"Raw {self.path}: /hoi task_name differs from /meta task_label")
         except BaseException:
             try:
                 self.close()
@@ -469,6 +456,18 @@ class RawReader:
     @property
     def meta(self):
         return self.data_file["meta"].attrs
+
+    @cached_property
+    def hoi_metadata(self):
+        """首次使用已发布 HOI 时校验结构与任务身份，成功后复用结果。"""
+        if "hoi" not in self.data_file:
+            return None
+        metadata = validate_hoi(self.data_file["hoi"], self.num_frames)
+        if "meta" not in self.data_file or "task_label" not in self.meta:
+            raise ValueError(f"Raw {self.path}: /hoi requires /meta task_label")
+        if metadata["task_name"] != self.meta["task_label"]:
+            raise ValueError(f"Raw {self.path}: /hoi task_name differs from /meta task_label")
+        return metadata
 
     @property
     def control_hz(self):
@@ -511,23 +510,29 @@ class RawReader:
 
     @property
     def fields(self):
+        """枚举可见字段；HOI 分组存在不代表其结构已经通过校验。"""
         import h5py
 
         names = {key for key, value in self.data_file.items()
                  if isinstance(value, h5py.Dataset) and key not in HOI_FIELDS}
-        if self.hoi_metadata is not None:
+        if "hoi" in self.data_file:
             names.update(HOI_FIELDS)
         if self.rgb_path.is_file():
             names.add("rgb")
         return frozenset(names)
 
     def require_fields(self, *names):
-        missing = set(names) - self.fields
+        requested = set(names)
+        missing = requested - self.fields
         if missing:
             raise ValueError(f"Raw {self.path}: missing fields {sorted(missing)}")
+        if requested.intersection(HOI_FIELDS):
+            _ = self.hoi_metadata
 
     def __getitem__(self, name):
         if name not in self.dataset_cache:
+            if name in HOI_FIELDS:
+                _ = self.hoi_metadata
             if name in {"hand_contact", "hand_tactile_force"}:
                 self.validate_tactile_metadata()
             elif name in {"arm_qpos", "action_arm_joint_target"}:

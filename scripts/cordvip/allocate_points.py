@@ -12,7 +12,9 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 from cordvip_geometry.assets import load_asset
-from dexmani_real.geometry.hoi import template_digest, task_objects, load_task_template
+
+from dexmani_real.geometry.hoi import load_task_template, task_objects, template_digest
+from dexmani_real.utils.io import publish
 
 
 def allocate_counts(areas):
@@ -65,16 +67,16 @@ def allocate_task(task):
             points_local=np.concatenate(points),
             offsets=np.r_[0, np.cumsum(counts)].astype(np.int64),
         )
-        manifest = dict(
-            task_name=task.name,
-            object_names=names,
-            template_sha256=template_digest(staging / "template.npz", names, meshes),
-        )
+        manifest = {
+            "task_name": task.name,
+            "object_names": names,
+            "template_sha256": template_digest(staging / "template.npz", names, meshes),
+        }
         (staging / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
             + "\n"
         )
-        staging.rename(output)
+        publish(staging, output)
     return output
 
 

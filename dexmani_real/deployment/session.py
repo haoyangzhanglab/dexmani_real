@@ -571,7 +571,8 @@ class PolicySession:
             logger.info("第 %03d 段%s\nDuration: %.1f s\nEnd reason: %s\nDetails: %s\nSkipped slots: %d",
                         result.index, status, result.duration_s, result.termination_reason,
                         result.termination_details, result.skipped_slots)
-            print(f"{logging.getLevelName(level)}: {text}\nTask outcome: unknown", flush=True)
+            logger.log(level, "%s", text)
+            logger.info("Task outcome: unknown")
             if result.started_utc is not None:
                 completed = sum(item.started_utc is not None for item in self.episodes)
                 if self.num_episodes is not None and completed >= self.num_episodes:

@@ -57,7 +57,7 @@ Raw `/hoi` 用 HDF5 属性保存上述字段及 `offsets`；Zarr 与 Checkpoint 
 
 已有模板校验后复用，已发布且模板一致的标注跳过，不覆盖正式结果。模板身份检查只读取冻结点、对象清单及 Mesh 文件；跟踪器启动时再加载并检查完整资产。
 
-标注先写入 `_hoi_staging`，所有数组写完并 flush 后发布为 `/hoi`，分组名是唯一的发布标志。中断可留 staging，下次重算后发布，HDF5 group move 不保证断电事务。RawReader 只读取已发布的 `/hoi`，检查数组结构与任务身份；数值在写入、显示及分块导出时校验。
+标注先写入 `_hoi_staging`，所有数组写完并 flush 后发布为 `/hoi`，分组名是唯一的发布标志。中断可留 staging，下次重算后发布，HDF5 group move 不保证断电事务。RawReader 只识别已发布的 `/hoi`，首次请求 HOI 字段或元数据时检查数组结构与任务身份并缓存结果；打开基础 Raw、枚举字段和请求普通字段不会触发 HOI 校验；数值在写入、显示及分块导出时校验。
 
 无效物体帧用 false 掩码和零点云占位，Viewer 清除物体点，导出拒绝整个 Episode 并提示 `--exclude`。`--no-point-cloud` 仅关闭普通场景点云显示，HOI 与手部几何仍按各自标签展示。
 
