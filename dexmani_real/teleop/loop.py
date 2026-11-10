@@ -358,74 +358,9 @@ class TeleopLoop:
                     "discard" if cmd == "d" else "stop", run_end_reason=RunEndReason.OPERATOR,
                 )
         elif cmd == "t":
-            if not self.runtime.hand.enabled:
-                logger.info("T ignored: hand is disabled")
-                return False
-            if (
-                self.phase is not TeleopPhase.IDLE or self.recorder is not None
-                or self.runtime_state.cancel_epoch != expected_cancel_epoch
-                or not self.runtime_state.requests_allow_motion()
-            ):
-                logger.warning("T ignored: tactile reset requires idle, no capture or preparation")
-                return False
-            try:
-                logger.info("正在请求触觉传感器复位，请保持手部无接触；S/Q/Esc 可中断后续请求。")
-                self.robot.reset_tactile_sensors(
-                    cancel_epoch=expected_cancel_epoch,
-                    cancel_requested=self.poll_blocking_commands,
-                )
-            except OperationCancelled as exc:
-                self.robot.check()
-                logger.info("%s", exc)
-            return True
+            return self._reset_tactile(expected_cancel_epoch)
         elif cmd == "h":
-            with self.runtime_state.motion_lock:
-                if self.phase is not TeleopPhase.IDLE or self.recorder is not None:
-                    logger.warning("H ignored: 请先按 S 结束本段，再回初始位。")
-                    return True
-                if (self.runtime_state.cancel_epoch != expected_cancel_epoch
-                        or not self.runtime_state.requests_allow_motion()):
-                    logger.info("忽略已被停止指令撤销的 HOME。")
-                    return False
-                self.runtime_state.stop_signal.set()
-                expected_cancel_epoch = self.runtime_state.cancel_epoch
-            if not self.poll_blocking_commands():
-                logger.info("正在回初始位…")
-                self.audio.play("home")
-                try:
-                    home_hand(
-                        self.runtime_state, self.robot,
-                        cancel_epoch=expected_cancel_epoch,
-                        cancel_requested=self.poll_blocking_commands,
-                    )
-                    home_arm(
-                        self.runtime_state, self.robot,
-                        cancel_epoch=expected_cancel_epoch,
-                        cancel_requested=self.poll_blocking_commands,
-                    )
-                except (FeedbackUnavailable, HomeTimeout) as exc:
-                    # hand HOME 的 finally、arm 生命周期协议已完成停止收尾。
-                    interrupted = self.poll_blocking_commands()
-                    if (interrupted or self.runtime_state.cancel_epoch != expected_cancel_epoch
-                            or not self.runtime_state.requests_allow_motion()):
-                        logger.info("HOME cancelled: %s", exc)
-                    else:
-                        logger.warning("本次 HOME 未完成：%s", exc)
-                except OperationCancelled as exc:
-                    self.robot.stop()
-                    self.robot.check()
-                    if (self.runtime_state.cancel_epoch == expected_cancel_epoch
-                            and self.runtime_state.requests_allow_motion()):
-                        raise
-                    logger.info("HOME cancelled: %s", exc)
-                except HomeConfigurationError as exc:
-                    self.robot.check()
-                    logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
-                else:
-                    logger.info("已回初始位。")
-                    self.audio.play("home_done")
-            self.poll_blocking_commands()
-            return True
+            return self._run_home(expected_cancel_epoch)
         elif cmd == "b":
             if (self.phase is TeleopPhase.IDLE
                     and self.runtime_state.cancel_epoch == expected_cancel_epoch
@@ -434,6 +369,77 @@ class TeleopLoop:
                 return True
             return False
         return False
+
+    def _reset_tactile(self, expected_cancel_epoch):
+        if not self.runtime.hand.enabled:
+            logger.info("T ignored: hand is disabled")
+            return False
+        if (
+            self.phase is not TeleopPhase.IDLE or self.recorder is not None
+            or self.runtime_state.cancel_epoch != expected_cancel_epoch
+            or not self.runtime_state.requests_allow_motion()
+        ):
+            logger.warning("T ignored: tactile reset requires idle, no capture or preparation")
+            return False
+        try:
+            logger.info("正在请求触觉传感器复位，请保持手部无接触；S/Q/Esc 可中断后续请求。")
+            self.robot.reset_tactile_sensors(
+                cancel_epoch=expected_cancel_epoch,
+                cancel_requested=self.poll_blocking_commands,
+            )
+        except OperationCancelled as exc:
+            self.robot.check()
+            logger.info("%s", exc)
+        return True
+
+    def _run_home(self, expected_cancel_epoch):
+        with self.runtime_state.motion_lock:
+            if self.phase is not TeleopPhase.IDLE or self.recorder is not None:
+                logger.warning("H ignored: 请先按 S 结束本段，再回初始位。")
+                return True
+            if (self.runtime_state.cancel_epoch != expected_cancel_epoch
+                    or not self.runtime_state.requests_allow_motion()):
+                logger.info("忽略已被停止指令撤销的 HOME。")
+                return False
+            self.runtime_state.stop_signal.set()
+            expected_cancel_epoch = self.runtime_state.cancel_epoch
+        if not self.poll_blocking_commands():
+            logger.info("正在回初始位…")
+            self.audio.play("home")
+            try:
+                home_hand(
+                    self.runtime_state, self.robot,
+                    cancel_epoch=expected_cancel_epoch,
+                    cancel_requested=self.poll_blocking_commands,
+                )
+                home_arm(
+                    self.runtime_state, self.robot,
+                    cancel_epoch=expected_cancel_epoch,
+                    cancel_requested=self.poll_blocking_commands,
+                )
+            except (FeedbackUnavailable, HomeTimeout) as exc:
+                # hand HOME 的 finally、arm 生命周期协议已完成停止收尾。
+                interrupted = self.poll_blocking_commands()
+                if (interrupted or self.runtime_state.cancel_epoch != expected_cancel_epoch
+                        or not self.runtime_state.requests_allow_motion()):
+                    logger.info("HOME cancelled: %s", exc)
+                else:
+                    logger.warning("本次 HOME 未完成：%s", exc)
+            except OperationCancelled as exc:
+                self.robot.stop()
+                self.robot.check()
+                if (self.runtime_state.cancel_epoch == expected_cancel_epoch
+                        and self.runtime_state.requests_allow_motion()):
+                    raise
+                logger.info("HOME cancelled: %s", exc)
+            except HomeConfigurationError as exc:
+                self.robot.check()
+                logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
+            else:
+                logger.info("已回初始位。")
+                self.audio.play("home_done")
+        self.poll_blocking_commands()
+        return True
 
     def handle_commands(self, commands: Sequence[str]):
         if (self.pending_termination_reason is not None and self.recorder is not None

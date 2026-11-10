@@ -200,3 +200,64 @@ class ObservationContracts(unittest.TestCase):
         row = replace(row, camera={'timestamp_ns': now}, hoi={'timestamp_ns': now-300_000_000, 'valid': False})
         self.assertEqual(check_observation(row, self.runtime, self.record, now_ns=now), [])
         self.assertEqual(check_observation(row, self.runtime, model_needs, now_ns=now), ['hoi_pose_invalid', 'hoi_stale'])
+
+    def test_hoi_request_boundaries_and_metadata_only_reads(self):
+        import multiprocessing as mp
+
+        from dexmani_real.ipc.sensors import SensorChannels
+        from dexmani_real.runtime.observation import check_hoi_status, read_observation
+        now = 10**10
+        cases = [
+            ({}, {}, []),
+            ({'episode_id': 2}, {}, ['hoi_unavailable']),
+            ({'episode_id': 0}, {'episode_id': 0}, ['hoi_unavailable']),
+            ({'after_ns': now}, {}, ['hoi_unavailable']),
+            ({'after_ns': now+1}, {}, ['hoi_unavailable']),
+            ({'after_sequence': 5}, {}, ['hoi_unavailable']),
+            ({'after_sequence': 6}, {}, ['hoi_unavailable']),
+            ({}, {'valid': False}, ['hoi_pose_invalid']),
+            ({}, {'timestamp_ns': now-1_000_000_000}, ['hoi_stale']),
+            ({}, {'timestamp_ns': now+1}, ['hoi_stale']),
+            ({}, {'valid': False, 'timestamp_ns': now-1_000_000_000}, ['hoi_pose_invalid', 'hoi_stale']),
+        ]
+        for request_changes, result_changes, expected in cases:
+            with self.subTest(request=request_changes, result=result_changes):
+                channels = SensorChannels(mp.get_context('spawn'), camera=self.runtime.camera, hoi=True)
+                request = {'episode_id': 1, 'after_ns': 1, 'after_sequence': 1}
+                request.update(request_changes)
+                result = {'episode_id': 1, 'timestamp_ns': now, 'source_camera_sequence': 5,
+                              'valid': True, 'object_pointcloud': np.zeros((1024, 3), np.float32)}
+                result.update(result_changes)
+                channels.hoi_request.write(**request)
+                channels.hoi_ring.write(**result)
+                with patch.object(channels.hoi_ring, 'read', wraps=channels.hoi_ring.read) as read:
+                    self.assertEqual(check_hoi_status(channels, self.runtime, now_ns=now), expected)
+                    if request["episode_id"] == 0:
+                        read.assert_not_called()
+                    else:
+                        read.assert_called_once()
+                        self.assertEqual(set(read.call_args.kwargs['fields']),
+                                         {'episode_id', 'timestamp_ns', 'source_camera_sequence', 'valid'})
+                robot = Mock(read_state=Mock(return_value=RobotState(np.zeros(1, dtype=ARM_STATE_DTYPE), None)))
+                needs = ObservationNeeds(hoi=True)
+                row = read_observation(channels, robot, needs=needs)
+                self.assertEqual(check_observation(row, self.runtime, needs, now_ns=now), expected)
+        channels = SensorChannels(mp.get_context('spawn'), camera=self.runtime.camera, hoi=True)
+        self.assertEqual(check_hoi_status(channels, self.runtime, now_ns=now), ['hoi_unavailable'])
+        channels.hoi_ring.write(episode_id=1, timestamp_ns=now, source_camera_sequence=5,
+                                valid=True, object_pointcloud=np.zeros((1024, 3)))
+        self.assertEqual(check_hoi_status(channels, self.runtime, now_ns=now), ['hoi_unavailable'])
+        channels.hoi_request.write(episode_id=1, after_ns=1, after_sequence=1)
+        self.assertEqual(check_hoi_status(channels, self.runtime, now_ns=now), [])
+        channels.hoi_request.write(episode_id=2, after_ns=now, after_sequence=5)
+        self.assertEqual(check_hoi_status(channels, self.runtime, now_ns=now), ['hoi_unavailable'])
+
+    def test_active_hoi_request_without_result_is_unavailable(self):
+        import multiprocessing as mp
+
+        from dexmani_real.ipc.sensors import SensorChannels
+        from dexmani_real.runtime.observation import check_hoi_status
+
+        channels = SensorChannels(mp.get_context('spawn'), camera=self.runtime.camera, hoi=True)
+        channels.hoi_request.write(episode_id=1, after_ns=1, after_sequence=1)
+        self.assertEqual(check_hoi_status(channels, self.runtime, now_ns=10**10), ['hoi_unavailable'])

@@ -81,6 +81,8 @@ HOI 由 `observation_fields` 中的 `object_pointcloud` 自动识别，无需额
 
 配置见 [config](../dexmani_real/config/)。HOI 预算来自已记录回放，依据与验证范围见[性能结论](object_reconstruction.md#当前实现与性能结论)；普通点云延迟和 VR 真实生产频率仍待测量。
 
+共享 Ring 返回独立字段字典和只读数组；需要修改数据的消费者须自行复制。字段子集可复用同序列完整缓存，不重新复制大数组。并发复制重试后可能返回上一份完整快照，来源序列和时间保持不变，仍须通过消费者的时效检查。该协议限定 Linux x86_64、单写多读。
+
 `ObservationNeeds` 只检查消费者实际需要的模态。必需输入缺失、过期或失效时结束本段，清空历史与动作计划；来源恢复后需要重新按 B。每段首次有效观测填满 `n_obs_steps`，不在同段重新填充恢复。关键机器人反馈始终须有效，耗时动作映射后还会复核反馈和输入时效。
 
 模型需求由 `ObservationBuilder.needs` 定义；PolicySession 将它与共用的 `RAW_RECORDING_NEEDS` 一次性解析为传感器需求 `sensor_needs` 和读取需求 `read_needs`。前者决定相机、Depth 和 Worker 的初始化，后者决定派生 Ring 携带的模型图像及 Rollout 的读取字段。Rollout 直接接收解析结果，保留独立的 Raw 质量检查；HOI／普通点云模式下，Raw 仍另外读取原始 Camera RGB-D。
@@ -101,6 +103,8 @@ HOI 由 `observation_fields` 中的 `object_pointcloud` 自动识别，无需额
 | 必需 Worker 退出、SDK 通信故障、停止失败 | Session 故障退出；检查原因后重新启动程序，不能按 B 原地继续。 |
 
 终端按段编号报告结束原因，包括未进入运行的准备失败；只有实际开始运行的段计入 `--num-episodes`。停止和收尾完成的提示出现后，检查来源，再显式按 B 建立新段。每个新段重新进行有界观测等待和 TTL 检查，首次有效观测填满 `n_obs_steps`，首个预测重置模型；不要求等待 `n_obs_steps` 个不同来源帧，也不复用旧历史和动作。
+
+HOI 接纳监测和提交前最新状态检查仅读取 Episode ID、来源时间、相机序列和有效标志，不读取 RobotState、点云或图像。完整模型观测仍读取所需数据，并在动作映射后重新校验原输入时效。两条 HOI 读取路径共用请求匹配：请求必须存在且 ID 非零，结果 ID 必须匹配，来源时间和相机序列都必须严格晚于请求边界；不匹配统一报告 `hoi_unavailable`，位姿无效和过期分别报告 `hoi_pose_invalid`、`hoi_stale`。
 
 Sensor Worker 与模型线程跨段保留；段间只回收本段 Recorder 和在途模型任务。HOI 段结束发布零 Episode ID，下一次 B 用新 ID 重置场景，旧 ID 结果不能进入新段。初次 HOI 观测等待保持 120 s，其他启动观测等待保持 1 s。取消、退出、急停仍优先，不增加自动重试或恢复状态。
 

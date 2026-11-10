@@ -38,6 +38,7 @@ from dexmani_real.runtime.observation import (
     Observation,
     ObservationNeeds,
     check_device_feedback,
+    check_hoi_status,
     check_observation,
     read_observation,
 )
@@ -487,9 +488,7 @@ class Rollout:
             self.stop("model_input before submission: " + "; ".join(issues))
             return None
         if self.observations.needs.hoi:
-            needs = ObservationNeeds(hoi=True)
-            latest = read_observation(self.sensors.channels, self.robot, needs=needs)
-            issues = check_observation(latest, self.runtime, needs)
+            issues = check_hoi_status(self.sensors.channels, self.runtime)
             if issues:
                 self.stop("HOI before submission: " + "; ".join(issues))
                 return None
@@ -515,18 +514,16 @@ class Rollout:
                 logger.exception("recording also failed during control failure")
 
     def step(self):
+        """由 run 在反馈服务与健康检查成功后调用。"""
         if self.finished:
             return
-        self.robot.check()
         self.check_motion()
         if self.recorder is not None:
             self.recorder.check_error()
         if self.duration_expired():
             return
         if self.observations.needs.hoi:
-            needs = ObservationNeeds(hoi=True)
-            row = read_observation(self.sensors.channels, self.robot, needs=needs)
-            issues = check_observation(row, self.runtime, needs)
+            issues = check_hoi_status(self.sensors.channels, self.runtime)
             if issues:
                 self.stop("HOI admission: " + "; ".join(issues))
                 return

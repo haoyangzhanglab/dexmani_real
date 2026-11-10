@@ -146,8 +146,8 @@ class Robot:
 
     def service_feedback(self) -> bool:
         """服务反馈与故障；返回本次是否到采样机会，供一次性目标有限补发。"""
-        self.check()
         try:
+            self.check()
             now = time.monotonic_ns()
             sampled = now >= self.feedback_next_ns
             if sampled:

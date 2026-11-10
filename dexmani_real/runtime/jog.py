@@ -20,10 +20,7 @@ from dexmani_real.robot.commands import (
 )
 from dexmani_real.runtime.ik_reference import IKReference, prepare_reference
 from dexmani_real.runtime.keyboard import JOG_KEY_PAIRS
-from dexmani_real.runtime.observation import (
-    check_device_feedback,
-    read_observation,
-)
+from dexmani_real.runtime.observation import check_device_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +51,7 @@ class CartesianJog:
             if not (state.requests_allow_motion() and not state.stop_signal.is_set()):
                 raise OperationCancelled("jog authority revoked")
 
-        row = read_observation(None, robot)
+        row = robot.read_state()
         issues = check_device_feedback(row, runtime)
         if issues:
             raise OperationCancelled("jog feedback rejected: " + "; ".join(issues))

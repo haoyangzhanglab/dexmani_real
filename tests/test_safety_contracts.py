@@ -548,3 +548,247 @@ class SafetyContracts(unittest.TestCase):
             stack.enter_context(self.assertLogs('dexmani_real.teleop.loop', level='INFO'))
             self.assertEqual(run_teleop(self.runtime, record=False, episodes_dir='/tmp', max_duration_s=1), 1)
         self.assertTrue(loop.failed)
+
+    def make_robot(self):
+        robot = Robot(self.runtime.arm, self.runtime.hand, runtime_state=self.state)
+        robot.connected = True
+        robot.arm = Mock(is_connected=True)
+        robot.hand = Mock(is_connected=True)
+        frame = np.zeros(1, dtype=HAND_STATE_DTYPE)
+        frame['timestamp_ns'] = self.now
+        robot.hand_feedback.latest = frame
+        return robot
+
+    def test_feedback_failures_latch_stop(self):
+        from dexmani_real.robot.commands import FeedbackUnavailable
+        for stage in ('service_false', 'service_raise', 'arm', 'read', 'freshness'):
+            with self.subTest(stage=stage):
+                self.state.stop_signal.clear()
+                robot = self.make_robot()
+                error = RobotError(stage)
+                if stage == 'service_false':
+                    robot.check_services = lambda: False
+                elif stage == 'service_raise':
+                    robot.check_services = Mock(side_effect=error)
+                elif stage == 'arm':
+                    robot.arm.check_error.side_effect = error
+                elif stage == 'read':
+                    robot.read_hand = Mock(side_effect=error)
+                else:
+                    robot.feedback_next_ns = self.now + 1
+                    robot.hand_feedback.latest['timestamp_ns'] = 0
+                with (patch('dexmani_real.robot.system.time.monotonic_ns', return_value=self.now),
+                      self.assertRaises((RobotError, FeedbackUnavailable)) as caught):
+                    robot.service_feedback()
+                if stage not in ('service_false', 'freshness'):
+                    self.assertIs(caught.exception, error)
+                self.assertTrue(self.state.stop_signal.is_set())
+
+    def test_feedback_sampling_schedule(self):
+        from dexmani_real.robot.system import FEEDBACK_PERIOD_NS
+        robot = self.make_robot()
+        robot.read_hand = Mock()
+        with patch('dexmani_real.robot.system.time.monotonic_ns', return_value=self.now):
+            self.assertTrue(robot.service_feedback())
+            self.assertEqual(robot.feedback_next_ns, self.now + FEEDBACK_PERIOD_NS)
+            self.assertFalse(robot.service_feedback())
+            robot.read_hand.assert_called_once()
+            self.state.stop_signal.set()
+            robot.feedback_next_ns = 0
+            robot._check_hand_feedback = Mock(side_effect=AssertionError('stopped freshness check'))
+            self.assertTrue(robot.service_feedback())
+            self.assertEqual(robot.read_hand.call_count, 2)
+
+    def test_partial_submission_and_stop_responsibility(self):
+        from dexmani_real.robot.commands import CommandExpired
+        command = RobotCommand(np.asarray(self.runtime.arm.home_qpos), np.zeros(12))
+        for stage in ('validation', 'arm', 'hand', 'expired', 'stop_failure'):
+            with self.subTest(stage=stage):
+                self.state.stop_signal.clear()
+                robot = self.make_robot()
+                error = RobotError(stage)
+                target = command
+                expires = self.now + 100
+                if stage == 'validation':
+                    target = RobotCommand(command.arm_qpos, np.full(12, np.nan))
+                elif stage == 'arm':
+                    robot.arm.submit.side_effect = error
+                elif stage == 'expired':
+                    expires = self.now
+                else:
+                    robot.hand._send_action.side_effect = error
+                with (patch('dexmani_real.robot.system.time.monotonic_ns', return_value=self.now),
+                      self.assertRaises((ValueError, RobotError, CommandExpired)) as caught):
+                    robot.send_action(target, expires_ns=expires)
+                if stage in ('arm', 'hand', 'stop_failure'):
+                    self.assertIs(caught.exception, error)
+                if stage == 'validation':
+                    robot.arm.submit.assert_not_called()
+                    robot.hand._send_action.assert_not_called()
+                    continue
+                self.assertTrue(self.state.stop_signal.is_set())
+                if stage in ('arm', 'expired'):
+                    robot.hand._send_action.assert_not_called()
+                else:
+                    robot.arm.submit.assert_called_once()
+                    robot.hand._send_action.assert_called_once()
+                    self.assertTrue(robot.hand_stop_required)
+                if stage == 'stop_failure':
+                    robot.hand.stop.side_effect = error
+                    with self.assertRaises(RobotError):
+                        robot.stop()
+                    self.assertTrue(robot.hand_stop_required)
+                else:
+                    robot.stop()
+                    self.assertFalse(robot.hand_stop_required)
+                robot.arm.wait_stopped.assert_called_once()
+                if stage in ('hand', 'stop_failure'):
+                    robot.hand.stop.assert_called_once()
+
+    def test_teleop_private_operations_preserve_admission_and_order(self):
+        loop = self.make_teleop()
+        loop.phase = TeleopPhase.IDLE
+        loop.pending_termination_reason = None
+        calls = []
+        with patch('dexmani_real.teleop.loop.home_hand', side_effect=lambda *a, **kw: calls.append('hand')), \
+                patch('dexmani_real.teleop.loop.home_arm', side_effect=lambda *a, **kw: calls.append('arm')):
+            self.assertTrue(loop.handle_operator_command('h'))
+            self.assertEqual(calls, ['hand', 'arm'])
+            calls.clear()
+            for phase in (TeleopPhase.PREPARING, TeleopPhase.ACTIVE):
+                loop.phase = phase
+                loop.handle_operator_command('h')
+                loop.handle_operator_command('t')
+            self.assertEqual(calls, [])
+            loop.robot.reset_tactile_sensors.assert_not_called()
+            loop.phase = TeleopPhase.IDLE
+            self.state.request_stop()
+            self.assertFalse(loop.handle_operator_command('h'))
+            self.assertFalse(loop.handle_operator_command('t'))
+            loop.keyboard.accept_operation.return_value = self.state.cancel_epoch
+            self.assertTrue(loop.handle_operator_command('t'))
+            loop.robot.reset_tactile_sensors.assert_called_once()
+            loop.handle_commands(('b', 'h', 'esc'))
+            self.assertTrue(self.state.estop_request)
+            self.assertEqual(calls, [])
+
+    def test_home_cancellation_does_not_start_arm(self):
+        loop = self.make_teleop()
+        loop.phase = TeleopPhase.IDLE
+        loop.pending_termination_reason = None
+        def cancel(*args, **kwargs):
+            self.state.request_stop()
+            raise OperationCancelled('offline cancellation')
+        with patch('dexmani_real.teleop.loop.home_hand', side_effect=cancel), \
+                patch('dexmani_real.teleop.loop.home_arm') as arm:
+            loop.handle_operator_command('h')
+        arm.assert_not_called()
+        loop.robot.stop.assert_called_once()
+
+    def test_session_shutdown_attempts_all_stages_in_order(self):
+        episode, _ = self.make_rollout()
+        session = self.make_policy_session(episode)
+        session.episode = episode
+        session.episodes = [episode.result]
+        calls = []
+        def fail_runtime(*args, **kwargs):
+            calls.append('runtime')
+            raise RobotError('shutdown')
+        def finish():
+            calls.append('recording')
+            raise RecordingError('writer')
+        def close_model():
+            calls.append('model')
+            future = Future()
+            future.set_exception(RuntimeError('model close'))
+            return future
+        session.model = Mock(close=close_model)
+        with patch('dexmani_real.deployment.session.close_runtime', side_effect=fail_runtime), \
+                patch.object(episode, 'finish_recording', side_effect=finish), \
+                patch.object(session, 'save_results', side_effect=lambda: calls.append('results')), \
+                self.assertLogs(level='ERROR'):
+            self.assertEqual(session.close(), 1)
+        self.assertEqual(calls, ['runtime', 'recording', 'model', 'results'])
+        self.assertEqual(session.errors[0]['stage'], 'shutdown')
+        self.assertEqual([error['stage'] for error in episode.result.errors], ['recording_finalize', 'model_close'])
+
+    def test_hoi_rejection_prevents_submission_at_both_boundaries(self):
+        import multiprocessing as mp
+
+        from dexmani_real.deployment.schedule import ActionChunk
+        from dexmani_real.ipc.sensors import SensorChannels
+        for boundary in ('admission', 'submission', 'original_input', 'success'):
+            cases = ((True, self.now),) if boundary == 'success' else (
+                (False, self.now), (True, self.now-1_000_000_000),
+            )
+            for valid, stamp in cases:
+                with self.subTest(boundary=boundary, valid=valid):
+                    self.state.stop_signal.clear()
+                    rollout, row = self.make_rollout()
+                    channels = SensorChannels(mp.get_context('spawn'), camera=self.runtime.camera, hoi=True)
+                    channels.hoi_request.write(episode_id=1, after_ns=1, after_sequence=1)
+                    def publish(valid=True, stamp=self.now, channels=channels):
+                        channels.hoi_ring.write(episode_id=1, timestamp_ns=stamp,
+                            source_camera_sequence=2, valid=valid, object_pointcloud=np.zeros((1024, 3)))
+                    publish()
+                    rollout.sensors = NS(channels=channels)
+                    rollout.observations = ObservationBuilder(NS(observation_fields=('object_pointcloud',)), rollout.runtime)
+                    row = replace(row, hoi={'valid': True, 'timestamp_ns': self.now, 'object_pointcloud': np.zeros((1024, 3))})
+                    rollout.plan = ActionChunk(np.zeros((2, 19)), 0)
+                    rollout.next_step_ns = rollout.started_ns = self.now
+                    rollout.sample_observation = Mock(return_value=(row, row))
+                    rollout.poll_model = Mock()
+                    rollout.select_action = Mock(return_value=np.zeros(19))
+                    def map_command(action, observation, boundary=boundary, valid=valid, stamp=stamp, publish=publish):
+                        if boundary == 'submission':
+                            publish(valid, stamp)
+                        return RobotCommand(np.asarray(self.runtime.arm.home_qpos), np.zeros(12)), None
+                    rollout.map_command = Mock(side_effect=map_command)
+                    with patch('dexmani_real.deployment.rollout.time.monotonic_ns', return_value=self.now):
+                        if boundary == 'admission':
+                            publish(valid, stamp)
+                            rollout.step()
+                            rollout.sample_observation.assert_not_called()
+                        elif boundary == 'original_input':
+                            stale = replace(row, hoi=dict(row.hoi, valid=valid, timestamp_ns=stamp))
+                            self.assertIsNone(rollout.prepare_command(np.zeros(19), stale))
+                        else:
+                            rollout.step()
+                    rollout.robot.read_state.assert_not_called()
+                    if boundary == 'success':
+                        rollout.robot.send_action.assert_called_once()
+                        self.assertFalse(rollout.finished)
+                        self.assertFalse(self.state.stop_signal.is_set())
+                    else:
+                        rollout.robot.send_action.assert_not_called()
+                        self.assertTrue(rollout.finished)
+                        self.assertTrue(self.state.stop_signal.is_set())
+
+    def test_rollout_feedback_failure_prevents_step(self):
+        rollout, _ = self.make_rollout()
+        error = RobotError('offline owner failure')
+        rollout.robot.feedback_next_ns = self.now
+        rollout.robot.service_feedback.side_effect = error
+        with (patch.object(rollout, 'prepare'), patch.object(rollout, 'step') as step,
+              self.assertRaises(RobotError) as caught):
+            rollout.run(poll_operator=Mock())
+        self.assertIs(caught.exception, error)
+        step.assert_not_called()
+        rollout.robot.stop.assert_called_once()
+
+    def test_idle_jog_uses_feedback_snapshot_without_sensor_observation(self):
+        from dexmani_real.robot.system import RobotState
+        from dexmani_real.runtime.jog import CartesianJog
+
+        _, row = self.make_rollout()
+        robot = Mock(read_state=Mock(return_value=RobotState(row.arm, row.hand)))
+        jog = CartesianJog(None, self.runtime.teleop, (None, None))
+        keys = Mock(snapshot=Mock(return_value=set()))
+        with patch('dexmani_real.runtime.jog.time.monotonic_ns', return_value=self.now):
+            jog.step(robot, keys, self.state, self.runtime)
+        robot.read_state.assert_called_once()
+        command = robot.send_action.call_args.args[0]
+        self.assertTrue(command.arm_hold)
+        self.assertIsNone(command.arm_qpos)
+        self.assertEqual(robot.send_action.call_args.kwargs['expires_ns'],
+                         self.now + int(self.runtime.teleop.target_max_age_s * 1e9))

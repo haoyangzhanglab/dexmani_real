@@ -8,6 +8,7 @@ import numpy as np
 from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.utils.timing import sample_is_fresh
 
+_HOI_METADATA_FIELDS = ("episode_id", "timestamp_ns", "source_camera_sequence", "valid")
 
 @dataclass(frozen=True)
 class ObservationNeeds:
@@ -56,7 +57,7 @@ class Observation:
     hoi: dict | None = None
 
 
-def read_observation(channels, robot, *, needs=ObservationNeeds()):
+def read_observation(channels, robot, *, needs: ObservationNeeds) -> Observation:
     control_ns = time.monotonic_ns()
     state = robot.read_state()
     cloud_result = None
@@ -66,12 +67,7 @@ def read_observation(channels, robot, *, needs=ObservationNeeds()):
     cloud = cloud_result[0] if cloud_result else None
     hoi = None
     if needs.hoi:
-        fields = ("episode_id", "timestamp_ns", "source_camera_sequence", "valid",
-                  "object_pointcloud", *needs.camera_fields)
-        result = channels.hoi_ring.read(fields=fields)
-        request = channels.hoi_request.read()
-        if result is not None and request is not None and result[0]["episode_id"] == request[0]["episode_id"]:
-            hoi = result[0]
+        hoi = _read_hoi(channels, fields=("object_pointcloud", *needs.camera_fields))
     camera = None
     if needs.camera_fields:
         if needs.hoi or needs.point_cloud:
@@ -132,13 +128,7 @@ def check_observation(row, runtime, needs, *, now_ns=None):
             if not sample_is_fresh(stamp, runtime.camera.max_frame_age_s, now):
                 issues.append("pointcloud_stale")
     if needs.hoi:
-        if row.hoi is None:
-            issues.append("hoi_unavailable")
-        else:
-            if not row.hoi["valid"]:
-                issues.append("hoi_pose_invalid")
-            if not sample_is_fresh(int(row.hoi["timestamp_ns"]), runtime.execution.hoi_max_age_s, now):
-                issues.append("hoi_stale")
+        issues.extend(_hoi_issues(row.hoi, runtime, now))
     if needs.vr:
         if row.vr is None:
             issues.append("vr_unavailable")
@@ -148,3 +138,39 @@ def check_observation(row, runtime, needs, *, now_ns=None):
             if not sample_is_fresh(stamp, age, now):
                 issues.append("vr_stale")
     return issues
+
+
+
+def _read_hoi(channels, *, fields=()):
+    """完整观测与状态读取共用请求边界；请求由父控制流程独占写入。"""
+    request = channels.hoi_request.read()
+    if request is None or int(request[0]["episode_id"]) == 0:
+        return None
+    result = channels.hoi_ring.read(fields=(*_HOI_METADATA_FIELDS, *fields))
+    if result is None:
+        return None
+    data, _ = result
+    command, _ = request
+    if (data["episode_id"] != command["episode_id"]
+            or data["timestamp_ns"] <= command["after_ns"]
+            or data["source_camera_sequence"] <= command["after_sequence"]):
+        return None
+    return data
+
+
+def _hoi_issues(hoi, runtime, now_ns):
+    if hoi is None:
+        return ["hoi_unavailable"]
+    issues = []
+    if not hoi["valid"]:
+        issues.append("hoi_pose_invalid")
+    if not sample_is_fresh(int(hoi["timestamp_ns"]), runtime.execution.hoi_max_age_s, now_ns):
+        issues.append("hoi_stale")
+    return issues
+
+
+def check_hoi_status(channels, runtime, *, now_ns=None) -> list[str]:
+    """仅读取当前请求及 HOI 元数据，不读取机器人、点云或图像。"""
+    hoi = _read_hoi(channels)
+    now = time.monotonic_ns() if now_ns is None else now_ns
+    return _hoi_issues(hoi, runtime, now)
