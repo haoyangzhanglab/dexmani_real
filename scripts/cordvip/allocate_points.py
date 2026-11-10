@@ -50,7 +50,8 @@ def allocate_task(task):
     if output.exists():
         load_task_template(task)
         return output
-    names = [obj["name"] for obj in task_objects(task)]
+    objects = task_objects(task)
+    names = [obj["name"] for obj in objects]
     loaded = [load_asset(task / name) for name in names]
     counts = allocate_counts([mesh.area for mesh, _, _, _ in loaded])
     points, meshes = [], []
@@ -70,7 +71,7 @@ def allocate_task(task):
         manifest = {
             "task_name": task.name,
             "object_names": names,
-            "template_sha256": template_digest(staging / "template.npz", names, meshes),
+            "template_sha256": template_digest(staging / "template.npz", objects, meshes),
         }
         (staging / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)

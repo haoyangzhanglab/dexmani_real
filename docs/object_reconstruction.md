@@ -43,6 +43,30 @@ python scripts/run_policy.py CHECKPOINT
 
 `objects` 决定对象顺序，省略时按目录名排序；Prompt 缺省为对象名。Prompt 须有实际文本，按 `strip().lower().rstrip(".")` 比较时不得重复，场景首帧中各自须匹配唯一候选。`instance` 仅选择重建参考图候选，不能在在线场景中区分同 Prompt 的多个实例。尺度也可用 `scale_to_meters`，与轴尺寸二选一。
 
+### 资产交付与恢复边界
+
+2026-11-10 在源码基线 `e6284d5d28f9f72b1d352fd33c682519609bd58b` 的本地审计：任务根目录为 `assets/pointcloud_template/object/pnp_apple_banana/`，三个 `asset.json` 均引用各自的 `mesh/mesh_m.obj`。
+
+| 物体 | Mesh 相对任务根目录的路径 | 字节数 | 本地／Git 状态 |
+| --- | --- | ---: | --- |
+| apple | `apple/mesh/mesh_m.obj` | 51,771,812 | 本地存在，被忽略，未跟踪 |
+| banana | `banana/mesh/mesh_m.obj` | 11,711,749 | 本地存在，被忽略，未跟踪 |
+| bowl | `bowl/mesh/mesh_m.obj` | 58,925,041 | 本地存在，被忽略，未跟踪 |
+
+三个物体的 `asset.json`、`points.npy`、`normals.npy` 均已跟踪且本地存在，数组文件头均为 `float32[1024,3]`。单物体正式文件集合齐全，但本次未运行加载器验证。任务级 `hoi/template.npz` 和 `hoi/manifest.json` 在 Git 与本地均缺失，没有可交付的历史冻结模板；不存在 `task.json`，当前按 apple、banana、bowl 排序并使用同名默认 Prompt。未发现重建中间产物目录。
+
+Mesh 总计 122,408,602 字节，仓库未配置 Git LFS，采用独立归档交付并保留现有忽略规则。以下为交付清单，仓库不提供归档下载；Git checkout 本身不足以恢复完整 HOI 任务。
+
+独立归档保留 `assets/pointcloud_template/object/<task>/` 的相对目录结构，只复制以下正式文件：
+
+- 各对象的 `asset.json` 以及其中 `mesh_file`、`points_file`、`normals_file` 实际引用的文件；不要假定所有 Mesh 都使用上述文件名。
+- 原始冻结的 `hoi/template.npz`、`hoi/manifest.json`，两者必须成对来自同一次冻结。
+- 任务原有的 `task.json`（若存在），以保留对象顺序、自定义 Prompt；不在 Manifest 或 Checkpoint 另存一套 Prompt。
+
+参考图、预览图及 `reconstruction/` 中间产物不是加载已发布资产所必需的文件，不需递归打包。恢复时将正式文件复制到新 checkout 的同名任务目录，保留原始字节；不要覆盖已有实验目录。校验方法见[实验入口的恢复说明](../scripts/cordvip/README.md#复制资产后的只读检查)。
+
+当前三份 Mesh 可从本机复制，但缺失的历史 Template／Manifest 只能向原始保存方索取。点云和法向不能无损恢复 Mesh；重新生成 Mesh 或运行模板分配不能证明恢复了历史身份。取得原始文件前不能校验历史 Hash。
+
 ### 模板与数据契约
 
 `hoi/template.npz` 保存物体局部坐标的 `points_local` 与对象分段 `offsets`，点序固定。`hoi/manifest.json` 的三个字段贯穿 Raw、Zarr 和 Checkpoint：
@@ -51,15 +75,25 @@ python scripts/run_policy.py CHECKPOINT
 | --- | --- |
 | `task_name` | 非空任务名，与资产目录、Raw `/meta` 的 `task_label` 和训练任务一致。 |
 | `object_names` | 非空、无重复的对象名列表，顺序固定。 |
-| `template_sha256` | 模板发布时生成的小写 SHA-256，绑定模板文件、物体顺序与实际跟踪 Mesh；训练原样保存。 |
+| `template_sha256` | 新冻结任务使用 v2 小写 SHA-256，绑定物体几何、固定点序、物体顺序及检测 Prompt；训练原样保存。 |
 
 Raw `/hoi` 用 HDF5 属性保存上述字段及 `offsets`；Zarr 与 Checkpoint 保存为 `hoi_pcd`。物体点云为 `float32[T,1024,3]`，单位米、坐标系为 xArm base。恢复训练与部署均拒绝任务、对象顺序或模板失配，HOI Checkpoint 缺少元数据也会拒绝部署；普通非 HOI 数据无需该属性。
 
-已有模板校验后复用，已发布且模板一致的标注跳过，不覆盖正式结果。模板身份检查只读取冻结点、对象清单及 Mesh 文件；跟踪器启动时再加载并检查完整资产。
+v2 Hash 以 `b"dexmani-hoi-task-v2\0"` 为域分隔前缀，随后输入 `task_objects(task)` 返回顺序下的 `(name, prompt)` 列表，使用 `json.dumps(identity, ensure_ascii=False, separators=(",", ":")).encode("utf-8")` 编码；再依次输入 `template.npz` 和各对象实际跟踪 Mesh 的原始字节。保留原有分块读取方式，不散列路径、模型权重或环境信息。
+
+身份绑定原始 Prompt 文本。`SceneTracker.detect_masks()` 按对象顺序用 `". "` 拼接 Prompt 并追加句点，模型侧另做首尾处理、小写转换及末尾句点补齐；标签匹配的规范化仅用于匹配，不用于 Hash。即使某些文本变化经过模型预处理后相同，也会产生不同任务身份。
+
+已有模板校验后复用，已发布且模板一致的标注跳过，不覆盖正式结果。模板身份检查读取冻结模板、对象名称／顺序、Prompt 及 Mesh 文件；跟踪器启动时再加载并检查完整资产。修改 Prompt 会在 `resolve_hoi_inputs()` 调用 `load_task_template()` 时失败，位于机器人连接与传感器启动之前；不在实时 Worker 中增加逐帧校验。
 
 标注先写入 `_hoi_staging`，所有数组写完并 flush 后发布为 `/hoi`，分组名是唯一的发布标志。中断可留 staging，下次重算后发布，HDF5 group move 不保证断电事务。RawReader 只识别已发布的 `/hoi`，首次请求 HOI 字段或元数据时检查数组结构与任务身份并缓存结果；打开基础 Raw、枚举字段和请求普通字段不会触发 HOI 校验；数值在写入、显示及分块导出时校验。
 
 无效物体帧用 false 掩码和零点云占位，Viewer 清除物体点，导出拒绝整个 Episode 并提示 `--exclude`。`--no-point-cloud` 仅关闭普通场景点云显示，HOI 与手部几何仍按各自标签展示。
+
+### 历史身份兼容
+
+v2 与旧算法不兼容，即使两者都是 64 位十六进制 SHA-256。旧 Hash 未绑定 Prompt，不能反推出历史检测文本；新代码会拒绝旧 Manifest，`allocate_points.py` 也不会覆盖或升级已有 `hoi/`。历史实验须保留对应旧源码和原始资产，新实验在独立 checkout 的任务目录首次冻结，保留与 Raw task_label 一致的任务名；不得重写旧 Manifest、Raw `/hoi`、Zarr 或 Checkpoint 来消除不匹配。
+
+现有 Zarr → Checkpoint 链原样传递三个字段；恢复训练比较保存的 `hoi_pcd`，部署比较 Checkpoint、Manifest 及实际任务文件。三个字段沿同一条身份链传递，无需另存 Prompt 或配置副本。该身份不是完整算法、模型或 Tracking Provenance：权重、代码版本和环境仍需独立记录；在线零重注册与离线最多三次连续重注册的区别保持不变。
 
 ### 离线标注与在线观测
 

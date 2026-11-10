@@ -24,6 +24,8 @@
 - 可选 `task.json` 的 `objects` 列表决定对象顺序；省略时按物体目录名排序，默认 Prompt 为对象名。各 Prompt 必须互不冲突，且在场景首帧中分别匹配唯一候选。
 - 待标注的已发布 Raw 位于 `episodes/<task_name>/episode_*`，需包含 RGB-D、记录的相机外参，且 `task_label` 与任务名一致。
 
+仅从 Git 获取的新 checkout 不含三个物体的 Mesh，也不含历史冻结 Template／Manifest。Mesh 只在审计机器本地存在，采用独立归档交付；准确路径和缺失清单见[资产交付与恢复边界](../../docs/object_reconstruction.md#资产交付与恢复边界)。以下模板冻结命令用于新实验首次冻结，不能用于恢复或替代历史模板。
+
 ```bash
 # 1. 构建或复用单物体资产
 python scripts/cordvip/build_task.py --task pnp_apple_banana
@@ -37,7 +39,9 @@ python scripts/cordvip/annotate_episodes.py --task pnp_apple_banana
 
 `build_task.py` 和 `annotate_episodes.py` 的 `--task` 接收任务名，`allocate_points.py` 的位置参数接收任务目录路径。只处理单段时，在标注命令后追加 `--episode episodes/pnp_apple_banana/episode_20261101_165909`。
 
-重复运行会复用合法资产、校验并复用已有模板，以及跳过模板一致的完整 HOI 标注；不覆盖已有正式结果。修改照片或构建参数不会重建已发布资产，需要重建时使用新的资产目录。模板冻结后应保持物体顺序与几何一致。
+重复运行会复用合法资产、校验并复用已有模板，以及跳过模板一致的完整 HOI 标注；不覆盖已有正式结果。修改照片或构建参数不会重建已发布资产，需要重建时使用新的资产目录。模板冻结后应保持物体顺序、几何及原始 Prompt 一致，自定义 Prompt 的 `task.json` 必须随资产交付。
+
+新冻结模板采用 Prompt-bound v2 Hash，旧 Manifest 会被新代码拒绝，不会自动升级。旧实验使用对应旧源码与原始资产；新实验使用独立 checkout，任务目录名仍须与 Raw task_label 一致，不修改历史 Raw、Zarr 或 Checkpoint。详见[身份契约与兼容边界](../../docs/object_reconstruction.md#历史身份兼容)。
 
 使用主项目入口查看和导出：
 
@@ -49,6 +53,29 @@ python scripts/export_zarr.py episodes/pnp_apple_banana \
 ```
 
 `object_pointcloud` 需要显式选择；默认导出不包含它。HOI 物体点云以 xArm base 为坐标系、米为单位。存在无效物体帧的 Episode 会被拒绝导出，可用 `--exclude` 显式排除。
+
+### 复制资产后的只读检查
+
+按归档清单将正式文件复制到新 checkout 的同名任务目录后，在相应源码版本及已配置依赖的环境中运行以下示例。它只调用现有加载器，不生成文件或启动模型；旧冻结资产须切换到对应旧源码再检查。
+
+```bash
+python -B - <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path("third_party/cordvip_geometry/src").resolve()))
+from cordvip_geometry.assets import load_asset
+from dexmani_real.geometry.hoi import load_task_template, task_objects
+
+task = Path("assets/pointcloud_template/object/pnp_apple_banana")
+for obj in task_objects(task):
+    load_asset(task / obj["name"])
+template, manifest = load_task_template(task)
+print(manifest)
+PY
+```
+
+缺少 Mesh 时会报告所引用的文件；缺少冻结 Template／Manifest 时不能完成任务校验，不会改用点云或自动重建。当前任务缺少冻结文件，仅复制三个 Mesh 后仍不能完成上述检查。
 
 ## 单物体重建
 

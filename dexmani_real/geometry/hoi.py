@@ -8,9 +8,11 @@ from pathlib import Path
 import numpy as np
 
 
-def template_digest(template_path, names, mesh_paths):
-    """绑定固定点、物体顺序和跟踪 Mesh 的模板身份。"""
-    digest = hashlib.sha256(json.dumps(names, ensure_ascii=False).encode())
+def template_digest(template_path, objects, mesh_paths):
+    """绑定固定点、物体顺序、跟踪 Mesh 和原始检测 Prompt 的 v2 任务身份。"""
+    identity = [(obj["name"], obj["prompt"]) for obj in objects]
+    digest = hashlib.sha256(b"dexmani-hoi-task-v2\0")
+    digest.update(json.dumps(identity, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     for path in (template_path, *mesh_paths):
         with Path(path).open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -57,14 +59,15 @@ def load_task_template(task):
     if manifest["task_name"] != task.name:
         raise ValueError(f"{task}: Manifest task_name 与任务目录名不匹配")
     names = manifest["object_names"]
-    if [obj["name"] for obj in task_objects(task)] != names:
+    objects = task_objects(task)
+    if [obj["name"] for obj in objects] != names:
         raise ValueError("任务对象顺序已改变")
     meshes = []
     for name in names:
         metadata = json.loads((task / name / "asset.json").read_text())
         meshes.append(task / name / metadata["mesh_file"])
-    if template_digest(task / "hoi/template.npz", names, meshes) != manifest["template_sha256"]:
-        raise ValueError(f"{task}: HOI 模板或 Mesh 已改变")
+    if template_digest(task / "hoi/template.npz", objects, meshes) != manifest["template_sha256"]:
+        raise ValueError(f"{task}: HOI 任务身份不匹配：模板、Mesh 或检测 Prompt 与冻结任务不一致")
     with np.load(task / "hoi/template.npz", allow_pickle=False) as saved:
         template = {key: saved[key] for key in ("points_local", "offsets")}
     points, offsets = template["points_local"], template["offsets"]

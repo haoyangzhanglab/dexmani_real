@@ -1,6 +1,7 @@
 """部署解析与用户输出契约；不加载实际 Checkpoint。"""
 
 import contextlib
+import hashlib
 import io
 import json
 import subprocess
@@ -88,9 +89,15 @@ class DeploymentContracts(unittest.TestCase):
                                                hoi_pcd=dict(manifest, template_sha256='b' * 64)))
 
     def test_real_template_digest_and_contents(self):
-        from dexmani_real.geometry.hoi import load_task_template, template_digest
+        from dexmani_real.geometry.hoi import (
+            load_task_template,
+            task_objects,
+            template_digest,
+        )
+        from scripts.cordvip.allocate_points import allocate_task
+
         with tempfile.TemporaryDirectory(dir='/tmp') as directory:
-            task = Path(directory) / 'test'
+            task = Path(directory) / 'assets/pointcloud_template/object/test'
             (task / 'hoi').mkdir(parents=True)
             (task / 'object').mkdir()
             with self.assertRaises(FileNotFoundError):
@@ -100,21 +107,104 @@ class DeploymentContracts(unittest.TestCase):
             (task / 'object/asset.json').write_text(json.dumps({'mesh_file': 'mesh.obj'}))
             template = task / 'hoi/template.npz'
             np.savez(template, points_local=np.zeros((1024, 3), np.float32), offsets=np.array([0, 1024]))
+            objects = task_objects(task)
             manifest = {'task_name': 'test', 'object_names': ['object'],
-                        'template_sha256': template_digest(template, ['object'], [mesh])}
+                        'template_sha256': template_digest(template, objects, [mesh])}
             (task / 'hoi/manifest.json').write_text(json.dumps(manifest))
             self.assertEqual(load_task_template(task)[1], manifest)
+            self.assertEqual(allocate_task(task), task / 'hoi')
+            config = task / 'task.json'
+            config.write_text(json.dumps({'objects': objects}))
+            self.assertEqual(load_task_template(task)[1], manifest)
+            for prompt in ('red object', 'Object', ' object ', 'object.'):
+                config.write_text(json.dumps({'objects': [{'name': 'object', 'prompt': prompt}]}))
+                with self.subTest(prompt=prompt), self.assertRaisesRegex(ValueError, 'HOI 任务身份不匹配'):
+                    load_task_template(task)
+
+            with patch('dexmani_real.deployment.preflight.__file__',
+                       str(Path(directory) / 'dexmani_real/deployment/preflight.py')), \
+                    self.assertRaisesRegex(ValueError, 'HOI 任务身份不匹配'):
+                resolve_hoi_inputs(policy_info(observation_fields=('object_pointcloud',), hoi_pcd=manifest))
+            config.unlink()
+
             for path in (mesh, template):
                 original = path.read_bytes()
                 path.write_bytes(original + b'changed')
-                with self.assertRaisesRegex(ValueError, '模板或 Mesh 已改变'):
+                with self.assertRaisesRegex(ValueError, 'HOI 任务身份不匹配'):
                     load_task_template(task)
                 path.write_bytes(original)
+            original_mesh = mesh.read_bytes()
+            mesh.unlink()
+            with self.assertRaises(FileNotFoundError) as missing:
+                load_task_template(task)
+            self.assertEqual(missing.exception.filename, str(mesh))
+            mesh.write_bytes(original_mesh)
+
+            # 旧算法仅用于构造测试夹具；生产路径不接受也不重写旧身份。
+            legacy = hashlib.sha256(json.dumps(['object'], ensure_ascii=False).encode())
+            legacy.update(template.read_bytes())
+            legacy.update(mesh.read_bytes())
+            manifest_path = task / 'hoi/manifest.json'
+            manifest_path.write_text(json.dumps(dict(manifest, template_sha256=legacy.hexdigest())))
+            original_files = {path: path.read_bytes() for path in (manifest_path, template, mesh)}
+            for operation in (load_task_template, allocate_task):
+                with self.subTest(operation=operation.__name__), self.assertRaisesRegex(ValueError, 'HOI 任务身份不匹配'):
+                    operation(task)
+                self.assertEqual({path: path.read_bytes() for path in original_files}, original_files)
+
             np.savez(template, points_local=np.zeros((1023, 3), np.float32), offsets=np.array([0, 1024]))
-            manifest['template_sha256'] = template_digest(template, ['object'], [mesh])
+            manifest['template_sha256'] = template_digest(template, objects, [mesh])
             (task / 'hoi/manifest.json').write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, '非法 HOI 模板点'):
                 load_task_template(task)
+
+    def test_task_digest_binds_names_order_and_raw_prompts(self):
+        from dexmani_real.geometry.hoi import template_digest
+
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+            template, mesh = (Path(directory) / name for name in ('template.npz', 'mesh.obj'))
+            template.write_bytes(b'template bytes')
+            mesh.write_bytes(b'mesh bytes')
+            objects = [{'name': 'apple', 'prompt': '红苹果'}, {'name': 'bowl', 'prompt': 'bowl'}]
+            baseline = template_digest(template, objects, [mesh, mesh])
+            reordered_keys = [{'prompt': obj['prompt'], 'name': obj['name']} for obj in objects]
+            self.assertEqual(baseline, template_digest(template, reordered_keys, [mesh, mesh]))
+            for changed in (
+                [dict(objects[0], name='fruit'), objects[1]],
+                list(reversed(objects)),
+                [dict(objects[0], prompt='青苹果'), objects[1]],
+            ):
+                with self.subTest(objects=changed):
+                    self.assertNotEqual(baseline, template_digest(template, changed, [mesh, mesh]))
+
+    def test_allocate_task_freezes_custom_prompt(self):
+        from dexmani_real.geometry.hoi import load_task_template
+        from scripts.cordvip.allocate_points import allocate_task
+
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+            task = Path(directory) / 'test'
+            asset = task / 'object'
+            asset.mkdir(parents=True)
+            (asset / 'mesh.obj').write_text('v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n')
+            (asset / 'asset.json').write_text(json.dumps({
+                'mesh_file': 'mesh.obj', 'points_file': 'points.npy', 'normals_file': 'normals.npy',
+                'units': 'm', 'frame': 'object', 'scale_to_meters': 1,
+            }))
+            np.save(asset / 'points.npy', np.zeros((1024, 3), np.float32))
+            np.save(asset / 'normals.npy', np.tile(np.array([0, 0, 1], np.float32), (1024, 1)))
+            config = task / 'task.json'
+            config.write_text(json.dumps({'objects': [{'name': 'object', 'prompt': 'red object'}]}))
+            output = allocate_task(task)
+            template, manifest = load_task_template(task)
+            self.assertEqual(set(manifest), {'task_name', 'object_names', 'template_sha256'})
+            self.assertEqual(manifest['object_names'], ['object'])
+            self.assertEqual(template['offsets'].tolist(), [0, 1024])
+            frozen = {path: path.read_bytes() for path in output.iterdir()}
+            self.assertEqual(allocate_task(task), output)
+            config.unlink()
+            with self.assertRaisesRegex(ValueError, 'HOI 任务身份不匹配'):
+                allocate_task(task)
+            self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
 
     def test_geometry_precedence_defaults_and_errors(self):
         runtime = RealConfig()
@@ -171,12 +261,16 @@ class DeploymentContracts(unittest.TestCase):
         for metadata, fields in ((None, ('object_pointcloud',)),
                 (dict(manifest, task_name='wrong'), ('object_pointcloud',)),
                 (dict(manifest, template_sha256='b' * 64), ('object_pointcloud',)),
-                (manifest, ('object_pointcloud', 'point_cloud'))):
+                (manifest, ('object_pointcloud', 'point_cloud')),
+                (manifest, ('object_pointcloud',))):
             with self.subTest(metadata=metadata), contextlib.ExitStack() as stack:
                 stack.enter_context(patch.dict(sys.modules, {'dexmani_policy.deployment': module}))
                 stack.enter_context(patch('dexmani_real.deployment.session.PolicyWorker'))
                 robot = stack.enter_context(patch('dexmani_real.deployment.session.Robot'))
-                stack.enter_context(patch('dexmani_real.geometry.hoi.load_task_template', return_value=({}, manifest)))
+                loader = stack.enter_context(patch('dexmani_real.geometry.hoi.load_task_template',
+                                                   return_value=({}, manifest)))
+                if metadata == manifest and fields == ('object_pointcloud',):
+                    loader.side_effect = ValueError('HOI 任务身份不匹配')
                 state = SessionState(stop_signal=threading.Event(), emergency_signal=threading.Event())
                 stack.enter_context(patch('dexmani_real.deployment.session.SessionState', return_value=state))
                 session = PolicySession(RealConfig(), 'offline.pt', weights=None, inference_steps=None,
