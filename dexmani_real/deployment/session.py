@@ -8,6 +8,7 @@ import time
 from collections.abc import Sequence
 from concurrent.futures import wait
 from dataclasses import asdict, replace
+from os.path import isdir
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -572,6 +573,29 @@ class PolicySession:
                     self.runtime_state.request_quit()
             if self.runtime_state.quit_requested or self.runtime_state.estop_request:
                 break
+            raw = result.raw
+            if raw is not None and raw["status"] == "failed":
+                staging = raw["staging_path"]
+                if staging is None or not isdir(staging):
+                    staging = f"不可用（{staging or 'Recorder 未提供路径'}）"
+                print(
+                    "警告：机器人停止流程已完成，但本段 Raw 录制失败，未发布有效 Episode。\n"
+                    f"原因：{raw['error']}\nStaging：{staging}\n"
+                    "请检查磁盘空间、输出目录权限及 Recorder 日志。"
+                    "本段数据不可作为已成功保存的 Episode 使用。\n"
+                    "检查问题并确认输入正常后，可按 B 开始新轮，按需 H 回初始位；Q 退出。"
+                    "本次录制失败仍会保留在实验错误记录中。",
+                    flush=True,
+                )
+                continue
+            if raw is not None and raw["status"] == "published":
+                if raw["recording_truncated_reason"] is not None:
+                    print("本段 Raw 部分数据已保存，录制发生截断。"
+                          f"原因：{raw['recording_truncated_reason']}；保存路径：{raw['path']}。", flush=True)
+                else:
+                    print(f"本段 Raw 保存成功：{raw['path']}。", flush=True)
+            elif raw is not None:
+                print("本段 Raw 未发布（已丢弃或未录到数据）。", flush=True)
             print("停止流程已完成；本轮观测历史与动作计划已清空。检查上方结束原因并确认输入正常后按 B 开始新轮，按需 H 回初始位；Q 退出。", flush=True)
 
     def finish_episode(self):

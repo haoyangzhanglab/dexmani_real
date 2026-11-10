@@ -7,6 +7,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import asdict
 from enum import Enum
+from os.path import isdir
 from typing import cast
 
 from dexmani_real.control.actions import StartPoseRejected
@@ -96,6 +97,8 @@ class TeleopLoop:
     def end_episode(self):
         primary_failure = sys.exc_info()[1]
         failure = primary_failure
+        # 仅在本次收尾保留引用，owner 释放后仍可读取当前段的最终录制结果。
+        recorder = self.recorder
         try:
             self.robot.stop()
         except BaseException as exc:
@@ -133,10 +136,33 @@ class TeleopLoop:
             raise failure
         if (failure is None and self.recorder is None
                 and not self.runtime_state.quit_requested and not self.runtime_state.estop_request):
+            raw = recorder.result() if recorder is not None else None
+            if raw is not None and raw["status"] == "failed":
+                staging = raw["staging_path"]
+                if staging is None or not isdir(staging):
+                    staging = f"不可用（{staging or 'Recorder 未提供路径'}）"
+                logger.warning(
+                    "机器人停止流程已完成，但本段 Raw 录制失败，未发布有效 Episode。\n"
+                    "原因：%s\nStaging：%s\n"
+                    "请检查磁盘空间、输出目录权限及 Recorder 日志。"
+                    "本段数据不可作为已成功保存的 Episode 使用。\n"
+                    "检查问题并确认输入正常后，可按 B 开始新段。"
+                    "本次录制失败仍会保留在实验错误记录中。",
+                    raw["error"], staging,
+                )
+                return
+            if raw is not None and raw["status"] == "published":
+                if raw["recording_truncated_reason"] is not None:
+                    logger.warning("本段 Raw 部分数据已保存，录制发生截断。原因：%s；保存路径：%s。",
+                                   raw["recording_truncated_reason"], raw["path"])
+                else:
+                    logger.info("本段 Raw 保存成功：%s。", raw["path"])
+            elif raw is not None:
+                logger.info("本段 Raw 未发布（已丢弃或未录到数据）。")
             logger.info("停止流程已完成；遥操作控制锚点已清空。检查上方结束原因并确认输入正常后按 B 开始新段。")
 
     def finish_recording(self, *, wait=True) -> bool:
-        """pending 返回 False；轮询完成时仍可能执行发布或目录删除。"""
+        """True 仅表示收尾完成；录制成败由 Recorder 结果报告。"""
         recorder = self.recorder
         if recorder is None:
             return True
@@ -151,8 +177,7 @@ class TeleopLoop:
             recorder.request_finish(**finish_kwargs)
             if not recorder.poll_finish():
                 return False
-        published = recorder.published_path
-        # 程序或资源故障仍向外传播，并保留未释放的 writer。
+        # 仅收尾完成后释放 owner；pending 或异常仍保留资源。
         self.recorder = None
         request = recorder.finish_request
         if recorder.error is not None:
@@ -164,8 +189,7 @@ class TeleopLoop:
             return True
         if request.reason not in {"operator", "quit", "duration_complete"}:
             return True
-        if published is not None and recorder.recording_truncated_reason is None:
-            logger.info("本段已保存。")
+        if recorder.published_path is not None and recorder.recording_truncated_reason is None:
             self.audio.play("save")
         elif not request.save:
             logger.info("本段已丢弃。")

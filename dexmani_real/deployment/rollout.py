@@ -79,7 +79,7 @@ class Rollout:
         self.read_needs = read_needs
         self.record_needs = record_needs
         self.action_mapper, self.model = action_mapper, model
-        self.recorder = None
+        self.recorder: EpisodeRecorder | None = None
         self.output_dir, self.record_raw = output_dir, record_raw
         self.result = EpisodeResult(index)
         self.camera_snapshot = camera_snapshot
@@ -89,8 +89,8 @@ class Rollout:
         self.plan: ActionChunk | None = None
         self.query: Prediction | None = None
         self.cursor = 0
-        self.preparation_issue = None
-        self.run_deadline_ns = None
+        self.preparation_issue: str | None = None
+        self.run_deadline_ns: int | None = None
         self.last_slot = -1
         self.dt_ns = round(self.execution.control_dt_s * 1e9)
         self.started_ns = self.next_step_ns = 0
@@ -133,6 +133,7 @@ class Rollout:
                                        after_sequence=channels.camera_ring.latest_sequence)
 
     def finish_recording(self, *, wait=True) -> bool:
+        """True 仅表示收尾完成；录制成败保留在本段 result 中。"""
         result = self.result
         if self.recorder is not None:
             recorder = self.recorder
@@ -152,7 +153,7 @@ class Rollout:
             self.recorder = None
             if recorder.error is not None:
                 self.fail("recording", recorder.error)
-            if not recorder.finish_request.save and recorder.error is None:
+            elif not recorder.finish_request.save:
                 logger.info("Raw 已丢弃。")
         return True
 

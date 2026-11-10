@@ -1,9 +1,13 @@
 """只验证现有边界；设备、时钟与反馈使用离线替身。"""
 
+import contextlib
+import io
+import tempfile
 import threading
 import unittest
 from concurrent.futures import Future
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
@@ -11,9 +15,10 @@ import numpy as np
 
 from dexmani_real.config.real import RealConfig
 from dexmani_real.control.actions import ActionMapper
+from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
 from dexmani_real.deployment.inference import PolicyWorker
 from dexmani_real.deployment.observation import ObservationBuilder
-from dexmani_real.deployment.rollout import Rollout
+from dexmani_real.deployment.rollout import EpisodeResult, Rollout
 from dexmani_real.deployment.session import PolicySession
 from dexmani_real.robot.commands import (
     HomeTimeout,
@@ -34,6 +39,7 @@ from dexmani_real.runtime.observation import (
 )
 from dexmani_real.runtime.state import SessionState
 from dexmani_real.teleop.loop import TeleopLoop, TeleopPhase
+from dexmani_real.teleop.run import run_teleop
 
 
 class SafetyContracts(unittest.TestCase):
@@ -189,15 +195,11 @@ class SafetyContracts(unittest.TestCase):
         self.assertEqual(rollout.result.errors[-1]['stage'], 'stop')
 
     def test_episode_finalization_consumes_late_prediction_before_idle(self):
-        with patch('dexmani_real.deployment.session.SessionState', return_value=self.state):
-            session = PolicySession(self.runtime, 'offline.pt', weights=None, inference_steps=None,
-                output_root=None, device='cpu', seed=0, max_running_s=1, num_episodes=1,
-                record_raw=False, camera_calibration_path=None)
         episode, _ = self.make_rollout()
         episode.stop('camera_source_stale')
+        session = self.make_policy_session(episode)
         session.episode = episode
-        session.robot = episode.robot
-        future = Future()
+        future: Future[np.ndarray] = Future()
         future.set_result(np.ones((2, 19)))
         session.model = PolicyWorker(lambda: None, build_observation=lambda rows: rows)
         session.model.future = future
@@ -213,15 +215,119 @@ class SafetyContracts(unittest.TestCase):
         self.assertIsNone(session.handle_command_batch([]))
 
     def test_preparation_end_is_reported_before_restart_hint(self):
-        import contextlib
-        import io
-
-        with patch('dexmani_real.deployment.session.SessionState', return_value=self.state):
-            session = PolicySession(self.runtime, 'offline.pt', weights=None, inference_steps=None,
-                output_root=None, device='cpu', seed=0, max_running_s=1, num_episodes=1,
-                record_raw=False, camera_calibration_path=None)
         episode, _ = self.make_rollout()
         episode.stop('device feedback: arm_feedback_stale')
+        session = self.make_policy_session(episode)
+        with self.assertLogs('dexmani_real.deployment.session', level='INFO') as logs, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.run_policy_episode(session, episode)
+        self.assertIn('arm_feedback_stale', logs.output[0])
+        self.assertIn('停止流程已完成', output.getvalue())
+        self.assertIsNone(episode.result.started_utc)
+        self.assertIsNone(session.episode)
+        episode.robot.stop.assert_called_once()
+
+    def test_teleop_restart_hint_only_after_successful_stop(self):
+        for error in (None, RobotError('stop failed')):
+            recorder, _ = self.make_recorder('published')
+            loop = self.make_teleop(recorder)
+            loop.robot.stop.side_effect = error
+            with self.assertLogs('dexmani_real.teleop.loop', level='INFO') as logs:
+                if error:
+                    with self.assertRaises(RobotError):
+                        loop.end_episode()
+                else:
+                    loop.end_episode()
+            output = '\n'.join(logs.output)
+            self.assertEqual('停止流程已完成' in output, error is None)
+            self.assertEqual('按 B 开始' in output, error is None)
+            if error:
+                self.assertIs(loop.recorder, recorder)
+                recorder.poll_finish.assert_not_called()
+            loop.controller.clear.assert_called_once()
+
+    def make_recorder(self, status, *, truncated=None, staging_available=True):
+        temporary = tempfile.TemporaryDirectory(prefix='dexmani_hint_', dir='/tmp')
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name)
+        recorder = Mock(spec=EpisodeRecorder,
+                        error=RecordingError('disk write failed') if status == 'failed' else None,
+                        writer_pending=False, written_frames=0 if status == 'not_published' else 3,
+                        published_path=path if status == 'published' else None,
+                        staging_path=path if status == 'failed' and staging_available else None,
+                        recording_truncated_reason=truncated, finish_request=NS(save=True, reason='operator'))
+        # 复用真实结果生成逻辑，避免测试另行维护一套 Raw 字段和状态规则。
+        recorder.result.side_effect = lambda: EpisodeRecorder.result(recorder)
+        recorder.poll_finish.return_value = True
+        return recorder, recorder.result()
+
+    def make_teleop(self, recorder=None):
+        loop = TeleopLoop(self.state, self.runtime, Mock(), task_label='test', sensors=None,
+                          controller=Mock(), recording_dir='/tmp' if recorder is not None else None,
+                          max_duration_s=1, keyboard=Mock(), audio=Mock())
+        loop.recorder = recorder
+        loop.phase = TeleopPhase.ACTIVE
+        loop.pending_termination_reason = 'operator'
+        loop.keyboard.poll.return_value = ([], False)
+        loop.keyboard.accept_operation.return_value = self.state.cancel_epoch
+        return loop
+
+    def assert_recording_hint(self, output, raw):
+        if raw is not None and raw['status'] == 'failed':
+            self.assertIn('Raw 录制失败，未发布有效 Episode', output)
+            self.assertIn(raw['error'], output)
+            self.assertIn('Staging：' + (raw['staging_path'] or '不可用'), output)
+            self.assertIn('本次录制失败仍会保留在实验错误记录中', output)
+            self.assertNotIn('停止流程已完成；', output)
+            self.assertNotIn('Raw 保存成功', output)
+            self.assertNotIn('部分数据已保存', output)
+        else:
+            self.assertIn('停止流程已完成；', output)
+            self.assertNotIn('Raw 录制失败', output)
+            if raw is not None and raw['status'] == 'published':
+                self.assertIn(raw['path'], output)
+                if raw['recording_truncated_reason']:
+                    self.assertIn('部分数据已保存，录制发生截断', output)
+                    self.assertIn(raw['recording_truncated_reason'], output)
+                    self.assertNotIn('Raw 保存成功', output)
+                else:
+                    self.assertIn('Raw 保存成功', output)
+                    self.assertNotIn('部分数据已保存', output)
+            elif raw is not None:
+                self.assertIn('Raw 未发布', output)
+                self.assertNotIn('Raw 保存成功', output)
+        self.assertIn('按 B 开始', output)
+
+    def test_teleop_recording_result_hints_and_history(self):
+        for status, truncated, history in (
+            ('failed', None, False), ('published', None, False),
+            ('published', 'recording_queue_full', False), (None, None, False),
+            ('not_published', None, False), ('published', None, True),
+        ):
+            with self.subTest(status=status, truncated=truncated, history=history):
+                recorder, raw = self.make_recorder(status, truncated=truncated) if status else (None, None)
+                loop = self.make_teleop(recorder)
+                loop.failed = history
+                with self.assertLogs('dexmani_real.teleop.loop', level='INFO') as logs:
+                    loop.end_episode()
+                self.assert_recording_hint('\n'.join(logs.output), raw)
+                self.assertEqual(loop.failed, history or status == 'failed')
+                self.assertEqual(any(d['stage'] == 'recording' for d in loop.termination_details),
+                                 status == 'failed')
+                self.assertIsNone(loop.recorder)
+                self.assertIs(loop.phase, TeleopPhase.IDLE)
+                loop.robot.stop.assert_called_once()
+                if recorder is not None:
+                    recorder.poll_finish.assert_called_once()
+                with patch.object(loop, 'run_episode') as run:
+                    self.assertTrue(loop.handle_operator_command('b'))
+                    run.assert_called_once_with(self.state.cancel_epoch)
+
+    def make_policy_session(self, episode):
+        with patch('dexmani_real.deployment.session.SessionState', return_value=self.state):
+            session = PolicySession(self.runtime, 'offline.pt', weights=None, inference_steps=None,
+                output_root=None, device='cpu', seed=0, max_running_s=1, num_episodes=None,
+                record_raw=episode.recorder is not None, camera_calibration_path=None)
         session.robot = episode.robot
         session.info = episode.policy_info
         session.observations = episode.observations
@@ -229,39 +335,216 @@ class SafetyContracts(unittest.TestCase):
         session.record_needs = episode.record_needs
         session.action_mapper = None
         session.keyboard = Mock()
-        calls = []
+        session.keyboard.accept_operation.return_value = self.state.cancel_epoch
+        session.model = episode.model
+        closed: Future[None] = Future()
+        closed.set_result(None)
+        session.model.close.return_value = closed
+        return session
 
-        def poll():
-            if calls:
+    def run_policy_episode(self, session, episode):
+        def poll(**kwargs):
+            if session.episode is not None:
+                return None
+            epoch = session.handle_command_batch(['b'])
+            self.assertEqual(epoch, self.state.cancel_epoch)
+            if episode.result in session.episodes:
                 self.state.request_quit()
                 return None
-            calls.append('B')
-            return self.state.cancel_epoch
+            return epoch
 
         with patch('dexmani_real.deployment.session.Rollout', return_value=episode), \
-                patch.object(episode, 'run'), patch.object(session, 'finish_episode'), \
-                patch.object(session, 'poll_operator', side_effect=poll), \
-                self.assertLogs('dexmani_real.deployment.session', level='INFO') as logs, \
-                contextlib.redirect_stdout(io.StringIO()) as output:
+                patch.object(episode, 'prepare', side_effect=lambda poll: episode.stop('operator')), \
+                patch.object(session, 'poll_operator', side_effect=poll):
             session.run_control_loop()
-        self.assertIn('arm_feedback_stale', logs.output[0])
-        self.assertIn('停止流程已完成', output.getvalue())
-        self.assertIsNone(episode.result.started_utc)
 
-    def test_teleop_restart_hint_only_after_successful_stop(self):
-        for error in (None, RobotError('stop failed')):
-            robot, controller = Mock(), Mock()
-            robot.stop.side_effect = error
-            loop = TeleopLoop(self.state, self.runtime, robot, task_label='test', sensors=None,
-                              controller=controller, recording_dir=None, max_duration_s=1,
-                              keyboard=Mock(), audio=Mock())
+    def test_policy_recording_result_hints_and_history(self):
+        for status, truncated, history in (
+            ('failed', None, False), ('published', None, False),
+            ('published', 'recording_queue_full', False), (None, None, False),
+            ('not_published', None, False), ('published', None, True),
+        ):
+            with self.subTest(status=status, truncated=truncated, history=history):
+                self.state.quit_requested = False
+                episode, _ = self.make_rollout()
+                recorder, raw = self.make_recorder(status, truncated=truncated) if status else (None, None)
+                episode.recorder = recorder
+                session = self.make_policy_session(episode)
+                old = EpisodeResult(0, errors=[{'stage': 'recording', 'message': 'previous disk failure'}])
+                if history:
+                    session.episodes.append(old)
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.run_policy_episode(session, episode)
+                self.assert_recording_hint(output.getvalue(), raw)
+                self.assertEqual(episode.result.raw, raw)
+                self.assertEqual(bool(episode.result.errors), status == 'failed')
+                if status == 'failed':
+                    assert raw is not None
+                    self.assertEqual(episode.result.errors[-1]['stage'], 'recording')
+                    self.assertEqual(episode.result.errors[-1]['message'], raw['error'])
+                self.assertIsNone(session.episode)
+                self.assertIsNone(episode.recorder)
+                episode.robot.stop.assert_called_once()
+                with patch('dexmani_real.deployment.session.close_runtime'):
+                    self.assertEqual(session.close(), int(history or status == 'failed'))
+                if history:
+                    self.assertEqual(old.errors[0]['message'], 'previous disk failure')
+                if status == 'failed':
+                    self.assertTrue(episode.result.errors)
+
+    def test_recording_failure_reports_unavailable_staging(self):
+        for mode in ('teleop', 'policy'):
+            for missing in (None, 'removed'):
+                with self.subTest(mode=mode, missing=missing):
+                    self.state.quit_requested = False
+                    recorder, raw = self.make_recorder('failed', staging_available=False)
+                    if missing:
+                        temporary = tempfile.TemporaryDirectory(prefix='dexmani_removed_', dir='/tmp')
+                        recorder.staging_path = Path(temporary.name)
+                        raw = recorder.result()
+                        temporary.cleanup()
+                    if mode == 'teleop':
+                        with self.assertLogs('dexmani_real.teleop.loop', level='INFO') as logs:
+                            self.make_teleop(recorder).end_episode()
+                        output = '\n'.join(logs.output)
+                    else:
+                        episode, _ = self.make_rollout()
+                        episode.recorder = recorder
+                        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                            self.run_policy_episode(self.make_policy_session(episode), episode)
+                        output = stdout.getvalue()
+                    self.assertIn('Staging：不可用', output)
+                    self.assertIn(raw['error'], output)
+                    if missing:
+                        self.assertIn(raw['staging_path'], output)
+
+    def test_recording_pending_defers_release_and_restart_hint(self):
+        for mode in ('teleop', 'policy'):
+            with self.subTest(mode=mode):
+                self.state.quit_requested = False
+                recorder, raw = self.make_recorder('failed')
+                recorder.writer_pending = True
+                owner = self.make_teleop(recorder) if mode == 'teleop' else self.make_rollout()[0]
+                owner.recorder = recorder
+                output = io.StringIO()
+
+                def poll_finish(owner=owner, recorder=recorder, output=output):
+                    owner.robot.stop.assert_called_once()
+                    self.assertIs(owner.recorder, recorder)
+                    self.assertEqual(recorder.result()['status'], 'pending')
+                    text = '\n'.join(logs.output) + output.getvalue()
+                    self.assertNotIn('停止流程已完成', text)
+                    self.assertNotIn('按 B 开始', text)
+                    if recorder.poll_finish.call_count == 1:
+                        return False
+                    recorder.writer_pending = False
+                    return True
+
+                recorder.poll_finish.side_effect = poll_finish
+                with self.assertLogs('dexmani_real', level='INFO') as logs, \
+                        contextlib.redirect_stdout(output):
+                    if mode == 'teleop':
+                        owner.end_episode()
+                    else:
+                        self.run_policy_episode(self.make_policy_session(owner), owner)
+                self.assertEqual(recorder.poll_finish.call_count, 2)
+                self.assertIsNone(owner.recorder)
+                self.assert_recording_hint('\n'.join(logs.output) + output.getvalue(), raw)
+
+    def test_recording_interruption_retains_owner_without_restart_hint(self):
+        for mode in ('teleop', 'policy'):
+            for interrupt in (self.state.request_quit, self.state.request_emergency_stop):
+                with self.subTest(mode=mode, interrupt=interrupt):
+                    self.state.quit_requested = False
+                    self.state.emergency_signal.clear()
+                    recorder, _ = self.make_recorder('failed')
+                    recorder.writer_pending = True
+                    owner = self.make_teleop(recorder) if mode == 'teleop' else self.make_rollout()[0]
+                    owner.recorder = recorder
+
+                    def poll_finish(interrupt=interrupt):
+                        interrupt()
+                        return False
+
+                    recorder.poll_finish.side_effect = poll_finish
+                    with patch('dexmani_real.teleop.loop.logger') as log, \
+                            contextlib.redirect_stdout(io.StringIO()) as output:
+                        if mode == 'teleop':
+                            owner.end_episode()
+                        else:
+                            session = self.make_policy_session(owner)
+                            self.run_policy_episode(session, owner)
+                            self.assertIs(session.episode, owner)
+                    text = str(log.mock_calls) + output.getvalue()
+                    self.assertNotIn('停止流程已完成', text)
+                    self.assertNotIn('按 B 开始', text)
+                    self.assertIs(owner.recorder, recorder)
+                    self.assertEqual(recorder.result()['status'], 'pending')
+                    recorder.poll_finish.assert_called_once()
+
+    def test_recording_timeout_propagates_without_restart_hint(self):
+        for mode in ('teleop', 'policy'):
+            with self.subTest(mode=mode):
+                recorder, _ = self.make_recorder('failed')
+                recorder.writer_pending = True
+                recorder.poll_finish.side_effect = TimeoutError('writer still running')
+                owner = self.make_teleop(recorder) if mode == 'teleop' else self.make_rollout()[0]
+                owner.recorder = recorder
+                with patch('dexmani_real.teleop.loop.logger') as log, \
+                        contextlib.redirect_stdout(io.StringIO()) as output, \
+                        self.assertRaisesRegex(TimeoutError, 'writer still running'):
+                    if mode == 'teleop':
+                        owner.end_episode()
+                    else:
+                        self.run_policy_episode(self.make_policy_session(owner), owner)
+                text = str(log.mock_calls) + output.getvalue()
+                self.assertNotIn('停止流程已完成', text)
+                self.assertNotIn('按 B 开始', text)
+                self.assertIs(owner.recorder, recorder)
+
+    def test_policy_stop_failure_never_prints_restart_hint(self):
+        episode, _ = self.make_rollout()
+        recorder, _ = self.make_recorder('published')
+        episode.recorder = recorder
+        session = self.make_policy_session(episode)
+        episode.robot.stop.side_effect = RobotError('stop failed')
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+                self.assertRaisesRegex(RobotError, 'stop failed'):
+            self.run_policy_episode(session, episode)
+        self.assertNotIn('停止流程已完成', output.getvalue())
+        self.assertNotIn('按 B 开始', output.getvalue())
+        self.assertEqual(episode.result.errors[-1]['stage'], 'stop')
+        self.assertIs(episode.recorder, recorder)
+        self.assertIs(session.episode, episode)
+        recorder.poll_finish.assert_not_called()
+
+    def test_teleop_failure_exit_code_survives_later_success(self):
+        recorder, _ = self.make_recorder('failed')
+        loop = self.make_teleop(recorder)
+
+        def run():
+            loop.end_episode()
+            self.assertTrue(loop.failed)
+            # 新段重置结束详情，但必须保留会话失败；硬件准备完全由替身隔离。
             loop.phase = TeleopPhase.ACTIVE
-            with patch('dexmani_real.teleop.loop.logger.info') as log:
-                if error:
-                    with self.assertRaises(RobotError):
-                        loop.end_episode()
-                else:
-                    loop.end_episode()
-                hints = [c for c in log.call_args_list if '停止流程已完成' in c.args[0]]
-                self.assertEqual(len(hints), int(error is None))
-            controller.clear.assert_called_once()
+            loop.pending_termination_reason = 'operator'
+            loop.termination_details = []
+            loop.recorder, raw = self.make_recorder('published')
+            with self.assertLogs('dexmani_real.teleop.loop', level='INFO') as logs:
+                loop.end_episode()
+            self.assert_recording_hint('\n'.join(logs.output), raw)
+            self.state.request_quit()
+
+        with contextlib.ExitStack() as stack:
+            for name in ('configure_logging', 'load_vr_transform', 'ActionMapper',
+                         'build_hand_retargeter', 'VRController', 'SensorChannels',
+                         'SensorWorkers', 'AudioFeedback', 'initialize_teleop', 'close_runtime'):
+                stack.enter_context(patch('dexmani_real.teleop.run.' + name))
+            stack.enter_context(patch('dexmani_real.teleop.run.SessionState', return_value=self.state))
+            stack.enter_context(patch('dexmani_real.teleop.run.Robot', return_value=loop.robot))
+            stack.enter_context(patch('dexmani_real.teleop.run.Keyboard', return_value=Mock(bindings={})))
+            stack.enter_context(patch('dexmani_real.teleop.run.TeleopLoop', return_value=loop))
+            stack.enter_context(patch.object(loop, 'run', side_effect=run))
+            stack.enter_context(self.assertLogs('dexmani_real.teleop.loop', level='INFO'))
+            self.assertEqual(run_teleop(self.runtime, record=False, episodes_dir='/tmp', max_duration_s=1), 1)
+        self.assertTrue(loop.failed)
