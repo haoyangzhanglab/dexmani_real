@@ -7,17 +7,20 @@ import multiprocessing as mp
 import time
 from collections.abc import Sequence
 from concurrent.futures import wait
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.calibration_data import CAMERAS_PATH
-from dexmani_real.config.deployment import RUNTIME_SECTIONS
+from dexmani_real.config.deployment import POLICY_RUNTIME_SECTIONS
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.data.raw import camera_metadata
 from dexmani_real.deployment.inference import MODEL_SHUTDOWN_TIMEOUT_S, PolicyWorker
 from dexmani_real.deployment.observation import ObservationBuilder
-from dexmani_real.deployment.preflight import resolve_deployment_config
+from dexmani_real.deployment.preflight import (
+    resolve_deployment_config,
+    resolve_hoi_inputs,
+)
 from dexmani_real.deployment.rollout import Rollout, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import (
@@ -36,6 +39,7 @@ from dexmani_real.runtime.lifecycle import (
     close_runtime,
 )
 from dexmani_real.runtime.observation import (
+    RAW_RECORDING_NEEDS,
     ObservationNeeds,
     check_device_feedback,
     check_observation,
@@ -81,7 +85,6 @@ class PolicySession:
         self.weights, self.inference_steps = weights, inference_steps
         self.info: PolicyInfo
         self.observations: ObservationBuilder
-        self.model_needs = ObservationNeeds()
         self.table_plane_abcd = None
         self.device, self.seed = device, seed
         self.max_running_s, self.num_episodes = max_running_s, num_episodes
@@ -112,7 +115,7 @@ class PolicySession:
             return
         payload = {
             "policy": self.info.to_dict(),
-            "runtime": {name: asdict(getattr(self.runtime, name)) for name in RUNTIME_SECTIONS},
+            "runtime": {name: asdict(getattr(self.runtime, name)) for name in POLICY_RUNTIME_SECTIONS},
             "camera_calibration_path": str(self.camera_calibration_path or CAMERAS_PATH),
             "effective_camera": ({"camera_T_xarm_base_from_color": None,
                                   **camera_metadata(self.camera_snapshot)}
@@ -182,17 +185,18 @@ class PolicySession:
         )
         self.model.load()
         self.info = self.wait_model()
-        from dexmani_real.deployment.preflight import validate_hoi_deployment
-        self.hoi_inputs = validate_hoi_deployment(self.info, self.enable_hoi_pcd)
+        self.hoi_inputs = resolve_hoi_inputs(self.info, self.enable_hoi_pcd)
         self.runtime = resolve_deployment_config(self.info, self.runtime)
         self.observations = ObservationBuilder(self.info, self.runtime)
-        self.record_needs = (
-            ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
-            if self.record_raw else ObservationNeeds()
+        self.record_needs = RAW_RECORDING_NEEDS if self.record_raw else ObservationNeeds()
+        model_needs = self.observations.needs
+        self.sensor_needs = model_needs.union(self.record_needs)
+        # 派生 Ring 仅携带模型图像；Raw 在 Rollout 独立读取原始 RGB-D。
+        self.read_needs = (
+            replace(self.sensor_needs, camera_fields=model_needs.camera_fields)
+            if model_needs.hoi or model_needs.point_cloud else self.sensor_needs
         )
-        self.model_needs = self.observations.needs
-        self.capture_needs = self.model_needs.union(self.record_needs)
-        needs = self.capture_needs
+        needs = self.sensor_needs
         camera_required = needs.camera_worker or self.observations.camera_static
         if camera_required:
             self.runtime.camera.validate()
@@ -223,7 +227,7 @@ class PolicySession:
                 depth_enabled=needs.hoi or needs.point_cloud or "depth" in needs.camera_fields,
                 hoi=needs.hoi,
                 pointcloud_num_points=self.runtime.pointcloud.num_points if needs.point_cloud else None,
-                camera_fields=self.model_needs.camera_fields if needs.hoi or needs.point_cloud else needs.camera_fields,
+                camera_fields=self.read_needs.camera_fields,
             ) if camera_required else None
         )
         self.sensors.channels = channels
@@ -241,7 +245,7 @@ class PolicySession:
         return True
 
     def start_devices(self):
-        needs = self.capture_needs
+        needs = self.sensor_needs
         robot = cast(Robot, self.robot)
         self.check_startup()
         robot.connect()
@@ -398,9 +402,9 @@ class PolicySession:
         observation_deadline = time.monotonic() + INITIAL_STATE_TIMEOUT_S
         while True:
             self.check_startup()
-            row = read_observation(self.sensors.channels, self.robot, needs=self.model_needs)
+            row = read_observation(self.sensors.channels, self.robot, needs=self.observations.needs)
             issues = (check_device_feedback(row, self.runtime)
-                      + check_observation(row, self.runtime, self.model_needs))
+                      + check_observation(row, self.runtime, self.observations.needs))
             if not issues:
                 break
             if time.monotonic() >= observation_deadline:
@@ -540,7 +544,8 @@ class PolicySession:
             episode = self.episode = Rollout(
                 self.runtime_state, self.runtime, self.info, cancel_epoch=cancel_epoch,
                 robot=self.robot, sensors=self.sensors, observations=self.observations,
-                record_needs=self.record_needs, action_mapper=self.action_mapper, model=self.model,
+                read_needs=self.read_needs, record_needs=self.record_needs,
+                action_mapper=self.action_mapper, model=self.model,
                 max_running_s=self.max_running_s,
                 index=len(self.episodes) + 1, output_dir=self.output_dir, record_raw=self.record_raw,
                 camera_snapshot=self.camera_snapshot,

@@ -114,8 +114,8 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     return runtime
 
 
-def validate_hoi_deployment(info, enabled):
-    """显式启用与模型需求一致，模板身份失配在设备连接前失败。"""
+def resolve_hoi_inputs(info, enabled):
+    """解析并加载 HOI 任务模板；显式启用或模板身份失配在设备连接前失败。"""
     from pathlib import Path
 
     required = "object_pointcloud" in info.observation_fields

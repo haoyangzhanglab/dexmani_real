@@ -66,7 +66,8 @@ class EpisodeResult:
 class Rollout:
     def __init__(
         self, runtime_state, runtime, policy_info, *, cancel_epoch, robot,
-        observations, record_needs, sensors, action_mapper, model, max_running_s,
+        observations, read_needs: ObservationNeeds, record_needs: ObservationNeeds,
+        sensors, action_mapper, model, max_running_s,
         index, output_dir, record_raw, camera_snapshot=None,
     ):
         self.runtime_state = runtime_state
@@ -75,10 +76,7 @@ class Rollout:
         self.execution = runtime.execution
         self.robot, self.sensors = robot, sensors
         self.observations = observations
-        self.model_needs = observations.needs
-        self.capture_needs = self.model_needs.union(record_needs)
-        if self.model_needs.hoi or self.model_needs.point_cloud:
-            self.capture_needs = replace(self.capture_needs, camera_fields=self.model_needs.camera_fields)
+        self.read_needs = read_needs
         self.record_needs = record_needs
         self.action_mapper, self.model = action_mapper, model
         self.recorder = None
@@ -129,7 +127,7 @@ class Rollout:
         self.run_deadline_ns = None
         self.ik_reference = None
         self.prev_action = None
-        if self.model_needs.hoi:
+        if self.observations.needs.hoi:
             channels = self.sensors.channels
             channels.hoi_request.write(episode_id=0, after_ns=ended_ns,
                                        after_sequence=channels.camera_ring.latest_sequence)
@@ -219,9 +217,9 @@ class Rollout:
 
     def read_observations(self) -> tuple[Observation, Observation]:
         """共享关节采样；派生模型图像同源，Raw 独立取最新相机帧。"""
-        row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
+        row = read_observation(self.sensors.channels, self.robot, needs=self.read_needs)
         raw = row
-        if self.record_raw and (self.model_needs.hoi or self.model_needs.point_cloud):
+        if self.record_raw and (self.observations.needs.hoi or self.observations.needs.point_cloud):
             camera = read_camera_frame(self.sensors.channels, fields=self.record_needs.camera_fields)
             raw = replace(row, camera=camera, hoi=None, observation_timestamp_ns=time.monotonic_ns())
         return row, raw
@@ -236,7 +234,7 @@ class Rollout:
             self.robot.service_feedback()
             row, raw = self.read_observations()
             devices = check_device_feedback(row, self.runtime)
-            model_issues = check_observation(row, self.runtime, self.model_needs)
+            model_issues = check_observation(row, self.runtime, self.observations.needs)
             if "hoi_pose_invalid" in model_issues:
                 self.preparation_issue = "model_input_hoi_pose_invalid"
                 logger.warning("本轮 HOI 初始化/位姿失效；详见 Worker 日志，可再次按 B。")
@@ -279,16 +277,16 @@ class Rollout:
         if not self.preparation_valid():
             raise OperationCancelled("cancelled before preparation")
         self.robot.stop()
-        if self.model_needs.hoi:
+        if self.observations.needs.hoi:
             channels = self.sensors.channels
             channels.hoi_request.write(episode_id=self.result.index, after_ns=time.monotonic_ns(),
                                        after_sequence=channels.camera_ring.latest_sequence)
         # 全模态初值先于 writer；等待与资源初始化期间设备保持停止。
-        row = self.start_observation(poll_operator, initial_hoi=self.model_needs.hoi)
+        row = self.start_observation(poll_operator, initial_hoi=self.observations.needs.hoi)
         if row is None:
             self.stop(self.preparation_issue)
             return
-        if self.model_needs.hoi:
+        if self.observations.needs.hoi:
             kwargs = ({"rtc_delay": self.execution.prefetch_steps, "rtc_guidance_cap": self.execution.rtc_guidance_cap}
                       if self.execution.mode == "rtc" else {})
             self.model.warmup((self.observations.project(row),) * self.policy_info.n_obs_steps, **kwargs)
@@ -451,7 +449,7 @@ class Rollout:
         return row, raw
 
     def update_history(self, row):
-        issues = check_observation(row, self.runtime, self.model_needs)
+        issues = check_observation(row, self.runtime, self.observations.needs)
         if issues:
             self.stop("model_input: " + "; ".join(issues))
             return False
@@ -483,11 +481,11 @@ class Rollout:
         issues = check_device_feedback(row, self.runtime)
         if issues:
             raise FeedbackUnavailable("device feedback: " + "; ".join(issues))
-        issues = check_observation(row, self.runtime, self.model_needs)
+        issues = check_observation(row, self.runtime, self.observations.needs)
         if issues:
             self.stop("model_input before submission: " + "; ".join(issues))
             return None
-        if self.model_needs.hoi:
+        if self.observations.needs.hoi:
             needs = ObservationNeeds(hoi=True)
             latest = read_observation(self.sensors.channels, self.robot, needs=needs)
             issues = check_observation(latest, self.runtime, needs)
@@ -524,7 +522,7 @@ class Rollout:
             self.recorder.check_error()
         if self.duration_expired():
             return
-        if self.model_needs.hoi:
+        if self.observations.needs.hoi:
             needs = ObservationNeeds(hoi=True)
             row = read_observation(self.sensors.channels, self.robot, needs=needs)
             issues = check_observation(row, self.runtime, needs)

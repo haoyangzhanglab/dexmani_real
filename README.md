@@ -80,6 +80,16 @@ python scripts/run_policy.py /path/to/checkpoints/latest.pt --record-raw
 
 [config](dexmani_real/config/) 保存实验配置，[utils](dexmani_real/utils/) 提供标定与可视化工具，[assets](assets/) 保存机器人模型和几何模板。
 
+## 离线验证
+
+离线契约测试在已安装项目依赖和 `control` 可选依赖（Ruckig）的 `real_robot` 环境运行：
+
+```bash
+python -B -m unittest discover -s tests -v
+```
+
+测试使用合成观测、设备替身和 `/tmp` 临时数据，不连接硬件或加载实际策略模型；不覆盖真机停止效果、实时延迟和实际 Checkpoint 推理。
+
 ## 主题文档
 
 - [手部重定向](docs/hand_retargeting.md)：人体关键点到 XHand 关节目标的映射。

@@ -25,6 +25,7 @@ from dexmani_real.robot.commands import (
 )
 from dexmani_real.runtime.home import HomeConfigurationError, home_arm, home_hand
 from dexmani_real.runtime.observation import (
+    RAW_RECORDING_NEEDS,
     ObservationNeeds,
     check_device_feedback,
     check_observation,
@@ -63,10 +64,7 @@ class TeleopLoop:
         self.runtime = runtime
         self.robot = robot
         self.sensors = sensors
-        record_needs = (
-            ObservationNeeds(camera_fields=("rgb", "depth"), required_tactile=("aggregate", "dense"))
-            if recording_dir is not None else ObservationNeeds()
-        )
+        record_needs = RAW_RECORDING_NEEDS if recording_dir is not None else ObservationNeeds()
         self.capture_needs = ObservationNeeds(vr=True).union(record_needs)
         self.controller = controller
         self.recording_dir = recording_dir

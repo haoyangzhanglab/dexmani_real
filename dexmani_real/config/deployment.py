@@ -20,6 +20,6 @@ class ExecutionConfig:
     # 回放测量后的暂定来源年龄预算，非真机安全保证。
     hoi_max_age_s: float = 0.25
 
-RUNTIME_SECTIONS = (
+POLICY_RUNTIME_SECTIONS = (
     "execution", "arm", "hand", "motion", "camera", "pointcloud", "hand_pointcloud", "environment",
 )

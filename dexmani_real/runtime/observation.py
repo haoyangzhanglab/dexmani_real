@@ -37,6 +37,12 @@ class ObservationNeeds:
         )
 
 
+RAW_RECORDING_NEEDS = ObservationNeeds(
+    camera_fields=("rgb", "depth"),
+    required_tactile=("aggregate", "dense"),
+)
+
+
 @dataclass(frozen=True)
 class Observation:
     arm: np.ndarray

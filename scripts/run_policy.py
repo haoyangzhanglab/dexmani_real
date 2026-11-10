@@ -13,7 +13,7 @@ from pathlib import Path
 from dexmani_real.config.deployment import (
     DEFAULT_MAX_RUNNING_S,
     DEFAULT_NUM_EPISODES,
-    RUNTIME_SECTIONS,
+    POLICY_RUNTIME_SECTIONS,
 )
 
 
@@ -112,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
 
     runtime = load_config(args.config)
     if args.print_config:
-        declared = {name: asdict(getattr(runtime, name)) for name in RUNTIME_SECTIONS}
+        declared = {name: asdict(getattr(runtime, name)) for name in POLICY_RUNTIME_SECTIONS}
         print(json.dumps(declared, ensure_ascii=False, indent=2, allow_nan=False))
         return 0
 

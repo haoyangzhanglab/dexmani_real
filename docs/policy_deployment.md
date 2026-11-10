@@ -61,6 +61,8 @@
 
 `ObservationNeeds` 只检查消费者实际需要的模态。必需输入缺失、过期或失效时结束本段，清空历史与动作计划；来源恢复后需要重新按 B。每段首次有效观测填满 `n_obs_steps`，不在同段重新填充恢复。关键机器人反馈始终须有效，耗时动作映射后还会复核反馈和输入时效。
 
+模型需求由 `ObservationBuilder.needs` 定义；PolicySession 将它与共用的 `RAW_RECORDING_NEEDS` 一次性解析为传感器需求 `sensor_needs` 和读取需求 `read_needs`。前者决定相机、Depth 和 Worker 的初始化，后者决定派生 Ring 携带的模型图像及 Rollout 的读取字段。Rollout 直接接收解析结果，保留独立的 Raw 质量检查；HOI／普通点云模式下，Raw 仍另外读取原始 Camera RGB-D。
+
 三种执行模式共用采样、动作提交和录制流程；只有动作选择与接续方式不同。控制循环等待下一控制步或反馈采样机会，键盘事件可唤醒等待，其他服务的协作检查间隔上限为 5 ms。这个等待上限不代表 SDK 调用或物理停止的延迟保证。
 
 ## Raw 录制与连续区间
