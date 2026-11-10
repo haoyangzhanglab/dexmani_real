@@ -22,6 +22,39 @@ RECORDER_START_TIMEOUT_S = 10.0
 RECORDER_STOP_TIMEOUT_S = 60.0
 
 
+def format_recording_result(raw: dict | None) -> tuple[int, str]:
+    """展示 Recorder 的观察结果；不判断设备停止或是否允许开始新段。"""
+    if raw is None:
+        return logging.INFO, "Raw：未启用或尚未开始录制。"
+    status = raw["status"]
+    level, description = {
+        "published": (logging.INFO, "Raw 保存成功，已发布"),
+        "failed": (logging.ERROR, "Raw 录制失败，未发布有效 Episode"),
+        "not_published": (logging.INFO, "Raw 未发布"),
+        "pending": (logging.WARNING, "仍在收尾，尚无最终录制结果"),
+    }[status]
+    truncated = raw["recording_truncated_reason"]
+    if status == "published" and truncated is not None:
+        description = "部分数据已保存，录制发生截断"
+        level = logging.WARNING
+    lines = [f"Raw：{status}（{description}）。",
+             f"Recorded rows{' (当前)' if status == 'pending' else ''}: {raw['row_count']}"]
+    if raw["path"] is not None:
+        lines.append(f"Path: {raw['path']}")
+    if truncated is not None:
+        lines.append(f"录制截断原因：{truncated}")
+    if raw["error"] is not None:
+        lines.append(f"录制错误：{raw['error']}")
+    staging = raw["staging_path"]
+    if staging is not None or status in {"failed", "pending"}:
+        if staging is None or not os.path.isdir(staging) or not os.access(staging, os.R_OK | os.X_OK):
+            staging = f"不可用（{staging or 'Recorder 未提供路径'}）"
+        else:
+            staging = f"{staging}（当前可访问，不代表数据完整或可恢复）"
+        lines.append(f"Staging：{staging}")
+    return level, "\n".join(lines)
+
+
 class RecordingError(RuntimeError):
     """明确的录制 I/O 失败；不代表控制或设备故障。"""
 

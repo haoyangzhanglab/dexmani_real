@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="EPISODE",
-        help="Exclude a whole episode by directory name; may be repeated. Unknown names are ignored.",
+        help="Exclude a whole episode by directory name; may be repeated. Unknown names are rejected.",
     )
     return parser
 

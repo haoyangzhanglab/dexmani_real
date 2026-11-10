@@ -7,7 +7,6 @@ import time
 from collections.abc import Sequence
 from dataclasses import asdict
 from enum import Enum
-from os.path import isdir
 from typing import cast
 
 from dexmani_real.control.actions import StartPoseRejected
@@ -16,6 +15,7 @@ from dexmani_real.data.raw import snapshot_recording_metadata
 from dexmani_real.data.recorder import (
     EpisodeRecorder,
     RecordingError,
+    format_recording_result,
 )
 from dexmani_real.robot.commands import (
     CommandExpired,
@@ -134,32 +134,15 @@ class TeleopLoop:
             self.cancel_epoch = None
         if failure is not None and primary_failure is None:
             raise failure
+        if failure is None:
+            raw = recorder.result() if recorder is not None else None
+            level, text = format_recording_result(raw)
+            status = "结束" if self.recorder is None else "控制结束，录制收尾未完成"
+            logger.log(level, "Teleop 本段%s\nEnd reason: %s\nDetails: %s\n%s\nTask outcome: unknown",
+                       status, self.pending_termination_reason, self.termination_details, text)
         if (failure is None and self.recorder is None
                 and not self.runtime_state.quit_requested and not self.runtime_state.estop_request):
-            raw = recorder.result() if recorder is not None else None
-            if raw is not None and raw["status"] == "failed":
-                staging = raw["staging_path"]
-                if staging is None or not isdir(staging):
-                    staging = f"不可用（{staging or 'Recorder 未提供路径'}）"
-                logger.warning(
-                    "机器人停止流程已完成，但本段 Raw 录制失败，未发布有效 Episode。\n"
-                    "原因：%s\nStaging：%s\n"
-                    "请检查磁盘空间、输出目录权限及 Recorder 日志。"
-                    "本段数据不可作为已成功保存的 Episode 使用。\n"
-                    "检查问题并确认输入正常后，可按 B 开始新段。"
-                    "本次录制失败仍会保留在实验错误记录中。",
-                    raw["error"], staging,
-                )
-                return
-            if raw is not None and raw["status"] == "published":
-                if raw["recording_truncated_reason"] is not None:
-                    logger.warning("本段 Raw 部分数据已保存，录制发生截断。原因：%s；保存路径：%s。",
-                                   raw["recording_truncated_reason"], raw["path"])
-                else:
-                    logger.info("本段 Raw 保存成功：%s。", raw["path"])
-            elif raw is not None:
-                logger.info("本段 Raw 未发布（已丢弃或未录到数据）。")
-            logger.info("停止流程已完成；遥操作控制锚点已清空。检查上方结束原因并确认输入正常后按 B 开始新段。")
+            logger.info("停止流程已完成；遥操作控制锚点已清空。检查上方结束原因及录制结果后按 B 开始新段。")
 
     def finish_recording(self, *, wait=True) -> bool:
         """True 仅表示收尾完成；录制成败由 Recorder 结果报告。"""
@@ -208,7 +191,7 @@ class TeleopLoop:
         ):
             self.pending_termination_reason = run_end_reason.name.lower()
             self.termination_details.append({"stage": "termination", "reason": reason})
-            logger.info("本段结束：%s（%s）。", self.pending_termination_reason, reason)
+            logger.info("请求结束本段：%s（%s）。", self.pending_termination_reason, reason)
 
     def poll_blocking_commands(self):
         self.robot.check()

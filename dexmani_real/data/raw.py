@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -22,6 +23,7 @@ from dexmani_real.robot.model import (
     XHAND_SDK_JOINT_NAMES,
     XHAND_TACTILE_SCALE_DIVISOR,
 )
+from dexmani_real.utils.io import write_json
 from dexmani_real.utils.timing import sampling_clock_ns
 
 if TYPE_CHECKING:
@@ -34,6 +36,64 @@ ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
 TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
 # 离线导出的来源年龄诊断阈值；在线采集使用实际 Hand TTL。
 TACTILE_AGE_WARNING_NS = 500_000_000
+EPISODE_OUTCOMES = ("success", "failure", "unknown")
+
+
+def read_episode_outcome(episode_path: str | Path) -> dict[str, str]:
+    """缺少人工标注表示 unknown；损坏的标注与 I/O 错误直接报告。"""
+    path = Path(episode_path).expanduser() / "outcome.json"
+    try:
+        with path.open(encoding="utf-8") as stream:
+            annotation = json.load(stream)
+    except FileNotFoundError:
+        if path.is_symlink():
+            raise  # 失效链接不是缺少标注，不能静默降级为 unknown。
+        return {"outcome": "unknown"}
+    if not isinstance(annotation, dict) or annotation.get("outcome") not in EPISODE_OUTCOMES:
+        raise ValueError(f"{path}: outcome must be one of {EPISODE_OUTCOMES}")
+    if "note" in annotation and not isinstance(annotation["note"], str):
+        raise ValueError(f"{path}: note must be a string")
+    return annotation
+
+
+def write_episode_outcome(
+    episode_path: str | Path, outcome: str, *, note: str | None = None, overwrite: bool = False,
+) -> Path:
+    """只对已发布 Raw 写独立标签；结构校验不读取整段数组或解码视频。"""
+    if outcome not in EPISODE_OUTCOMES:
+        raise ValueError(f"outcome must be one of {EPISODE_OUTCOMES}")
+    if note is not None and not isinstance(note, str):
+        raise ValueError("note must be a string")
+    path = Path(episode_path).expanduser()
+    if not path.is_dir():
+        raise NotADirectoryError(path)
+    require_published_raw(path)
+    with RawReader(path) as reader:
+        reason = reader.meta["termination_reason"]
+        if not isinstance(reason, str) or not reason or reason == "recording_incomplete":
+            raise ValueError(f"Raw {path}: recording is incomplete")
+        validate_task_label(reader.meta["task_label"])
+        _ = reader.control_hz
+        if reader.num_frames <= 0:
+            raise ValueError(f"Raw {path}: episode contains no rows")
+        specs = ROBOT_DATASET_SPECS
+        if reader.meta["collection_source"] == "teleop":
+            specs = specs | VR_DATASET_SPECS
+        reader.require_fields("rgb", "depth", *specs)
+        for name in (*specs, "timing/rows"):
+            reader[name]
+        _ = reader.segment_starts
+        camera = reader.read_camera()
+        depth = reader["depth"]
+        if depth.shape != (reader.num_frames, camera.color.height, camera.color.width) or depth.dtype != np.uint16:
+            raise ValueError(f"Raw {path}: incompatible depth shape/dtype")
+    annotation = {
+        "outcome": outcome,
+        "annotated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    if note is not None:
+        annotation["note"] = note
+    return write_json(annotation, path / "outcome.json", overwrite=overwrite)
 
 
 ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {

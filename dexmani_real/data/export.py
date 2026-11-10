@@ -469,7 +469,10 @@ def append_rows(arrays, offset, blocks, frames):
 
 def select_episodes(source, exclude):
     episodes = discover_episode_dirs(source)
-    excluded = set(exclude) & {episode.name for episode in episodes}
+    excluded = set(exclude)
+    unknown = excluded - {episode.name for episode in episodes}
+    if unknown:
+        raise ValueError(f"unknown excluded episode(s): {sorted(unknown)}")
     selected = [episode for episode in episodes if episode.name not in excluded]
     if not selected:
         raise ValueError("export has no selected episodes")

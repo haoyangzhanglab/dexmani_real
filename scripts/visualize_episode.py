@@ -20,7 +20,7 @@ import numpy as np
 
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.config.real import load_config
-from dexmani_real.data.raw import TACTILE_FINGER_ORDER, RawReader
+from dexmani_real.data.raw import TACTILE_FINGER_ORDER, RawReader, read_episode_outcome
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
@@ -56,6 +56,7 @@ def print_episode_info(episode_path: str) -> None:
 
     path = Path(episode_path).expanduser()
     print(f"Episode: {path} -> {path.resolve()}")
+    print(f"Task outcome: {read_episode_outcome(path)['outcome']}")
     print(f"RGB file exists: {(path / 'rgb.mp4').is_file()}")
     with h5py.File(path / "data.h5", "r") as data:
         if "meta" in data:

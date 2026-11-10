@@ -1,7 +1,11 @@
 """用临时 RGB-D 样本验证现有 Raw 发布、导出和回放读取契约。"""
 
+import contextlib
+import io
+import logging
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,9 +14,19 @@ import numpy as np
 import zarr
 
 from dexmani_real.config.real import RealConfig
-from dexmani_real.data.export import ExportConfig, export_zarr
-from dexmani_real.data.raw import RawReader, camera_metadata, require_published_raw
-from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
+from dexmani_real.data.export import ExportConfig, export_zarr, select_episodes
+from dexmani_real.data.raw import (
+    RawReader,
+    camera_metadata,
+    read_episode_outcome,
+    require_published_raw,
+    write_episode_outcome,
+)
+from dexmani_real.data.recorder import (
+    EpisodeRecorder,
+    RecordingError,
+    format_recording_result,
+)
 from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.replay.trajectory import load_trajectory
 from dexmani_real.robot.commands import RobotCommand
@@ -156,3 +170,120 @@ class DataContracts(unittest.TestCase):
             data['timing/rows'][:] = timing
         with RawReader(path) as reader, self.assertRaisesRegex(ValueError, 'control_clock_not_increasing'):
             reader.read_timing()
+
+    def test_exclude_names_are_checked_before_selection(self):
+        for name in ('episode_a', 'episode_b'):
+            (self.root / name).mkdir()
+        selected, excluded = select_episodes(self.root, ('episode_a', 'episode_a'))
+        self.assertEqual([p.name for p in selected], ['episode_b'])
+        self.assertEqual(excluded, {'episode_a'})
+        with self.assertRaisesRegex(ValueError, "unknown excluded episode.*'bad_a'.*'bad_b'"):
+            select_episodes(self.root, ('episode_a', 'bad_b', 'bad_a'))
+        with self.assertRaisesRegex(ValueError, 'no selected episodes'):
+            select_episodes(self.root, ('episode_a', 'episode_b'))
+
+    def test_outcome_sidecar_and_explicit_replacement(self):
+        from scripts.label_episode import main as label
+        from scripts.visualize_episode import main as info
+
+        # 合成样本包含调度断点：截断不妨碍人工评价。
+        path = self.record('policy_rollout')
+        original = {name: (path / name).read_bytes() for name in ('data.h5', 'rgb.mp4')}
+        self.assertEqual(read_episode_outcome(path), {'outcome': 'unknown'})
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(info([str(path), '--info']), 0)
+        self.assertIn('Task outcome: unknown', output.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(label([str(path), 'failure', '--note', '抓取后滑落']), 0)
+        annotation = read_episode_outcome(path)
+        self.assertEqual(annotation['note'], '抓取后滑落')
+        self.assertTrue(annotation['annotated_at_utc'].endswith('Z'))
+        self.assertIsNotNone(datetime.fromisoformat(annotation['annotated_at_utc'].replace('Z', '+00:00')).tzinfo)
+        with self.assertRaises(FileExistsError):
+            write_episode_outcome(path, 'success')
+        self.assertEqual(read_episode_outcome(path), annotation)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(label([str(path), 'success', '--overwrite']), 0)
+        self.assertNotIn('note', read_episode_outcome(path))
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+                patch('scripts.visualize_episode.EpisodeVisualizer', side_effect=AssertionError('viewer initialized')):
+            self.assertEqual(info([str(path), '--info']), 0)
+        self.assertIn('Task outcome: success', output.getvalue())
+        for name, data in original.items():
+            self.assertEqual((path / name).read_bytes(), data)
+
+    def test_invalid_outcome_is_not_unknown(self):
+        path = self.record('policy_rollout')
+        for content in ('{', '[]', '{}', '{"outcome":"typo"}', '{"outcome":"success","note":2}'):
+            with self.subTest(content=content):
+                (path / 'outcome.json').write_text(content)
+                with self.assertRaises(ValueError):
+                    read_episode_outcome(path)
+        with self.assertRaises(ValueError):
+            write_episode_outcome(path, 'typo', overwrite=True)
+
+    def test_outcome_requires_published_raw_structure(self):
+        missing = self.root / 'missing'
+        with self.assertRaises(NotADirectoryError):
+            write_episode_outcome(missing, 'success')
+        missing.mkdir()
+        with self.assertRaises(OSError):
+            write_episode_outcome(missing, 'success')
+        path = self.record('policy_rollout')
+        staging = path.rename(path.with_name('.tmp_episode'))
+        with self.assertRaisesRegex(ValueError, 'unpublished Raw'):
+            write_episode_outcome(staging, 'success')
+        alias = self.root / 'episode_alias'
+        alias.symlink_to(staging, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'unpublished Raw'):
+            write_episode_outcome(alias, 'success')
+        staging.rename(path)
+        with h5py.File(path / 'data.h5', 'r+') as data:
+            data['meta'].attrs['termination_reason'] = 'recording_incomplete'
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            write_episode_outcome(path, 'success')
+        with h5py.File(path / 'data.h5', 'r+') as data:
+            data['meta'].attrs['termination_reason'] = 'operator'
+            data['arm_qpos'].resize(3, axis=0)
+        with self.assertRaisesRegex(ValueError, 'incompatible shape/dtype'):
+            write_episode_outcome(path, 'success')
+        with h5py.File(path / 'data.h5', 'r+') as data:
+            data['arm_qpos'].resize(4, axis=0)
+        (path / 'rgb.mp4').unlink()
+        with self.assertRaisesRegex(ValueError, 'missing fields'):
+            write_episode_outcome(path, 'success')
+        self.assertFalse((path / 'outcome.json').exists())
+
+    def test_pending_and_inaccessible_staging_formatting(self):
+        raw = {'status': 'pending', 'path': None, 'staging_path': str(self.root), 'row_count': 3,
+               'error': 'writer close delayed', 'recording_truncated_reason': None}
+        with patch('dexmani_real.data.recorder.os.access', return_value=False):
+            level, text = format_recording_result(raw)
+        self.assertEqual(level, logging.WARNING)
+        self.assertIn('尚无最终录制结果', text)
+        self.assertIn('Staging：不可用', text)
+        self.assertIn('writer close delayed', text)
+        self.assertNotIn('按 B', text)
+        self.assertNotIn('保存成功', text)
+
+    def test_unpublished_result_does_not_infer_discard(self):
+        recorder = EpisodeRecorder(self.root, control_hz=10)
+        recorder.staging_path = self.root
+        level, text = format_recording_result(recorder.result())
+        self.assertEqual(level, logging.INFO)
+        self.assertIn('Raw 未发布', text)
+        self.assertNotIn('丢弃', text)
+        self.assertNotIn('未录到数据', text)
+
+    def test_unreadable_outcome_is_not_unknown(self):
+        path = self.root / 'outcome.json'
+        path.symlink_to(self.root / 'missing.json')
+        with self.assertRaises(FileNotFoundError):
+            read_episode_outcome(self.root)
+        path.unlink()
+        path.mkdir()
+        with self.assertRaises(IsADirectoryError):
+            read_episode_outcome(self.root)
+        with (patch('pathlib.Path.open', side_effect=PermissionError('denied')),
+              self.assertRaises(PermissionError)):
+            read_episode_outcome(self.root)

@@ -8,7 +8,6 @@ import time
 from collections.abc import Sequence
 from concurrent.futures import wait
 from dataclasses import asdict, replace
-from os.path import isdir
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -16,6 +15,7 @@ from dexmani_real.config.calibration_data import CAMERAS_PATH
 from dexmani_real.config.deployment import POLICY_RUNTIME_SECTIONS
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.data.raw import camera_metadata
+from dexmani_real.data.recorder import format_recording_result
 from dexmani_real.deployment.inference import MODEL_SHUTDOWN_TIMEOUT_S, PolicyWorker
 from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import (
@@ -565,38 +565,21 @@ class PolicySession:
                 self.episodes.append(episode.result)
             self.finish_episode()
             result = episode.result
-            logger.info("第 %d 段结束：%s（%s，%.1f s）。", result.index,
-                        result.termination_reason, result.termination_details, result.duration_s)
+            raw = episode.recorder.result() if episode.recorder is not None else result.raw
+            level, text = format_recording_result(raw)
+            status = "结束" if self.episode is None else "控制结束，资源收尾未完成"
+            logger.info("第 %03d 段%s\nDuration: %.1f s\nEnd reason: %s\nDetails: %s\nSkipped slots: %d",
+                        result.index, status, result.duration_s, result.termination_reason,
+                        result.termination_details, result.skipped_slots)
+            print(f"{logging.getLevelName(level)}: {text}\nTask outcome: unknown", flush=True)
             if result.started_utc is not None:
                 completed = sum(item.started_utc is not None for item in self.episodes)
                 if self.num_episodes is not None and completed >= self.num_episodes:
                     self.runtime_state.request_quit()
             if self.runtime_state.quit_requested or self.runtime_state.estop_request:
                 break
-            raw = result.raw
-            if raw is not None and raw["status"] == "failed":
-                staging = raw["staging_path"]
-                if staging is None or not isdir(staging):
-                    staging = f"不可用（{staging or 'Recorder 未提供路径'}）"
-                print(
-                    "警告：机器人停止流程已完成，但本段 Raw 录制失败，未发布有效 Episode。\n"
-                    f"原因：{raw['error']}\nStaging：{staging}\n"
-                    "请检查磁盘空间、输出目录权限及 Recorder 日志。"
-                    "本段数据不可作为已成功保存的 Episode 使用。\n"
-                    "检查问题并确认输入正常后，可按 B 开始新轮，按需 H 回初始位；Q 退出。"
-                    "本次录制失败仍会保留在实验错误记录中。",
-                    flush=True,
-                )
-                continue
-            if raw is not None and raw["status"] == "published":
-                if raw["recording_truncated_reason"] is not None:
-                    print("本段 Raw 部分数据已保存，录制发生截断。"
-                          f"原因：{raw['recording_truncated_reason']}；保存路径：{raw['path']}。", flush=True)
-                else:
-                    print(f"本段 Raw 保存成功：{raw['path']}。", flush=True)
-            elif raw is not None:
-                print("本段 Raw 未发布（已丢弃或未录到数据）。", flush=True)
-            print("停止流程已完成；本轮观测历史与动作计划已清空。检查上方结束原因并确认输入正常后按 B 开始新轮，按需 H 回初始位；Q 退出。", flush=True)
+            if self.episode is None:
+                print("停止流程已完成；本轮观测历史与动作计划已清空。检查上方结束原因及录制结果后按 B 开始新轮，按需 H 回初始位；Q 退出。", flush=True)
 
     def finish_episode(self):
         """停止后回收本段资源；退出意图交由最终关闭先释放设备。"""

@@ -277,8 +277,7 @@ class SafetyContracts(unittest.TestCase):
             self.assertIn('Raw 录制失败，未发布有效 Episode', output)
             self.assertIn(raw['error'], output)
             self.assertIn('Staging：' + (raw['staging_path'] or '不可用'), output)
-            self.assertIn('本次录制失败仍会保留在实验错误记录中', output)
-            self.assertNotIn('停止流程已完成；', output)
+            self.assertIn('停止流程已完成；', output)
             self.assertNotIn('Raw 保存成功', output)
             self.assertNotIn('部分数据已保存', output)
         else:

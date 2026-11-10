@@ -29,6 +29,7 @@ flowchart LR
 | --- | --- |
 | VR 示教／键盘点动 | [collect_teleop.py](scripts/collect_teleop.py) / [keyboard_teleop.py](scripts/keyboard_teleop.py) |
 | Raw 查看与分析 | [visualize_episode.py](scripts/visualize_episode.py) |
+| 离线任务结果标注 | [label_episode.py](scripts/label_episode.py) |
 | Zarr 训练数据导出 | [export_zarr.py](scripts/export_zarr.py) |
 | Checkpoint 策略评估 | [run_policy.py](scripts/run_policy.py) |
 | Raw 关节目标回放 | [replay_episode.py](scripts/replay_episode.py) |
@@ -56,12 +57,23 @@ python scripts/collect_teleop.py pnp_apple_banana --print-config
 python scripts/collect_teleop.py pnp_apple_banana
 python scripts/visualize_episode.py episodes/pnp_apple_banana/episode_20261101_165909 --info
 python scripts/export_zarr.py episodes/pnp_apple_banana \
-  --output datasets/pnp_apple_banana.zarr \
-  --fields joint_state action finger_tactile_force taxel_tactile_force
+  --output datasets/pnp_apple_banana.zarr
 python scripts/run_policy.py /path/to/checkpoints/latest.pt --record-raw
 ```
 
 需要修改实验参数时，在本地 Python 文件中导出 `CONFIG: RealConfig`，通过 `--config` 传入。模型需要的几何处理参数从 Checkpoint 恢复，缺失会报错。Raw 保存实际配置和标定结果；导出按训练所需字段选择，目标目录必须不存在。HOI 先按 [CordVIP 流程](scripts/cordvip/README.md) 完成标注，再选择 `object_pointcloud` 导出。
+
+省略 `--fields` 默认导出全部现有常用模态（不含 `object_pointcloud`），供不同策略复用同一份 Canonical Zarr；也可显式选择字段子集。`--exclude EPISODE` 按目录名排除整段，可重复指定；任何未知名称都会报错，全部排除也会拒绝导出。
+
+已发布的 Raw 可离线标注任务结果，包含录制截断的 Episode：
+
+```bash
+python scripts/label_episode.py episodes/task/episode_xxx success
+python scripts/label_episode.py episodes/task/episode_xxx failure --note "抓取后滑落" --overwrite
+python scripts/visualize_episode.py episodes/task/episode_xxx --info
+```
+
+标签为 `success`、`failure` 或 `unknown`，独立保存在 `outcome.json`，含程序生成的 UTC 时间与可选备注；默认拒绝覆盖，`--overwrite` 原子替换整个标注（未传备注则移除旧备注）。无文件表示 `unknown`，损坏标注明确报错。任务结果、控制结束原因和 Raw 保存状态互相独立；在线摘要不读取离线标签，显示 `unknown`。标注不改写 HDF5/MP4 或已有 Zarr，不改变导出或训练选择；未标注 Episode 仍可使用，现有数据集不需重新生成。不提供 success-only 筛选、Raw 来源映射或标签快照。
 
 采集和评估均按 B 开始新段，S/C 保存结束，D 丢弃，Q 保存退出，Esc 急停。来源失效或录制失败会结束本段；停止与收尾完成后才能再次按 B。触觉录制与模型输入共用默认 200 ms 时效预算。
 
