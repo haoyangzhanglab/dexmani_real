@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
-from dexmani_real.data.hoi import HOI_FIELDS, validate_hoi
+from dexmani_real.data.hoi import HOI_FIELDS
 from dexmani_real.geometry.camera import (
     CameraIntrinsics,
     CameraSnapshot,
@@ -502,8 +502,7 @@ class RawReader:
 
         names = {key for key, value in self.data_file.items()
                  if isinstance(value, h5py.Dataset) and key not in HOI_FIELDS}
-        if "hoi" in self.data_file:
-            names.update(HOI_FIELDS)
+        names.update(name for name in HOI_FIELDS if f"hoi/{name}" in self.data_file)
         if self.rgb_path.is_file():
             names.add("rgb")
         return frozenset(names)
@@ -513,13 +512,9 @@ class RawReader:
         missing = requested - self.fields
         if missing:
             raise ValueError(f"Raw {self.path}: missing fields {sorted(missing)}")
-        if requested.intersection(HOI_FIELDS):
-            validate_hoi(self.data_file["hoi"], self.num_frames)
 
     def __getitem__(self, name):
         if name not in self.dataset_cache:
-            if name in HOI_FIELDS:
-                validate_hoi(self.data_file["hoi"], self.num_frames)
             if name in {"hand_contact", "hand_tactile_force"}:
                 self.validate_tactile_metadata()
             elif name in {"arm_qpos", "action_arm_joint_target"}:
@@ -537,6 +532,13 @@ class RawReader:
                 ((), TIMING_ROW_DTYPE) if name == "timing/rows"
                 else ROBOT_DATASET_SPECS.get(name, VR_DATASET_SPECS.get(name))
             )
+            if name in HOI_FIELDS:
+                hoi_shape, hoi_dtype = (
+                    ((self.num_frames, 1024, 3), np.float32) if name == "object_pointcloud"
+                    else ((self.num_frames,), np.bool_)
+                )
+                if array.shape != hoi_shape or array.dtype != hoi_dtype:
+                    raise ValueError(f"Raw /hoi/{name}: shape/dtype 错误")
             if spec is not None:
                 shape, dtype = spec
                 valid_dtype = array.dtype.kind == "f" if dtype.kind == "f" else array.dtype == dtype

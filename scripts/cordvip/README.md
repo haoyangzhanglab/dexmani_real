@@ -11,14 +11,13 @@ python scripts/cordvip/allocate_points.py assets/pointcloud_template/object/pnp_
 python scripts/cordvip/annotate_episodes.py --task pnp_apple_banana
 python scripts/visualize_episode.py episodes/pnp_apple_banana/episode_20261101_165909
 python scripts/export_zarr.py episodes/pnp_apple_banana \
-  --config /path/to/experiment.py \
   --output datasets/pnp_apple_banana.cordvip.zarr \
   --fields joint_state action hand_pointcloud object_pointcloud
 ```
 
-实验文件导出的 CONFIG 必须显式设置 execution.hoi_max_skew_s，没有预设安全数值。标注可追加 `--episode` 指定单段。已发布结果不覆盖；首次 pose 失效即结束该段且不发布。导出遇到无效帧、非有限坐标或来源时间差超限时拒绝，不丢行拼接。
+默认无需 --config，execution.hoi_max_skew_s=None 关闭额外来源时间差限制。需要启用时，通过 --config 的 CONFIG.execution.hoi_max_skew_s 设置有限正数秒值；程序调用使用 ExportConfig.hoi_max_skew_s。标注可追加 `--episode` 指定单段。已发布结果不覆盖；首次 pose 失效即结束该段且不发布。导出遇到无效帧、非有限坐标或已启用的来源时间差检查超限时拒绝，不丢行拼接。
 
-新模板直接按面积配额与固定 seed 表面采样。单物体点云、法向文件与独立场景诊断输出已退役；统一通过正式标注和 visualize_episode 查看。独立 track/view CLI 不再提供。
+新模板直接按面积配额与固定 seed 表面采样；通过正式标注和 visualize_episode 查看结果。
 
 手点云导出为 XYZ，普通 RGB-D point_cloud 仍为 XYZRGB。Zarr 可以直接用于 CordViP 训练，接触预训练为可选步骤。相机标定、动作语义和 Raw 连续段边界保持不变。
 

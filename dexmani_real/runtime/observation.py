@@ -131,7 +131,7 @@ def check_observation(row, runtime, needs, *, now_ns=None):
                 issues.append("pointcloud_stale")
     if needs.hoi:
         issues.extend(_hoi_issues(row.hoi, runtime, now))
-        if needs.hoi_joint_input and row.hoi is not None:
+        if needs.hoi_joint_input and row.hoi is not None and runtime.execution.hoi_max_skew_s is not None:
             stamps = (int(row.hoi["timestamp_ns"]), int(row.arm["timestamp_ns"][0]),
                       int(row.hand["timestamp_ns"][0]) if row.hand is not None else 0)
             if not hoi_sources_within_skew(stamps, runtime.execution.hoi_max_skew_s):

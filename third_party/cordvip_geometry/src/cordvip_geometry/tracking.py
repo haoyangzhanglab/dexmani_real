@@ -9,13 +9,9 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 
-from .foundationpose import MIN_DEPTH_PIXELS, PoseTracker, PoseRegistrationError, prepare_tracking_frame
-from .geometry import RectificationMaps
+from .foundationpose import MIN_DEPTH_PIXELS, PoseTracker, TrackingFailure, prepare_tracking_frame
+from .geometry import RectificationMaps, validate_intrinsics, validate_distortion
 from .model_depth import ModelDepthRenderer, camera_rays
-
-
-class SceneInitializationError(ValueError):
-    """当前场景无法初始化；新一轮可重新尝试，模型和协议错误不属于此类。"""
 
 
 def validate_object_name(name):
@@ -59,9 +55,7 @@ class SceneTracker:
         self.min_matched_pixels = min_matched_pixels
         self.min_matched_fraction = min_matched_fraction
         self.trackers, self.renderers = {}, {}
-        self.lost_objects = {}
         self.directions = self.maps = None
-        self._camera: tuple[np.ndarray, tuple[int, int], str, tuple[float, ...]]
         shared = None
         for name, mesh in assets.items():
             tracker = PoseTracker(
@@ -148,7 +142,6 @@ class SceneTracker:
         """重置场景状态，保留模型权重和固定资产。"""
         self.segmenter.reset()
         self.maps = self.directions = None
-        self.lost_objects.clear()
         for tracker in self.trackers.values():
             tracker.estimator.pose_last = None
 
@@ -158,12 +151,12 @@ class SceneTracker:
         for name, prompt in prompts.items():
             matches = [item for item in candidates if item["label"].strip().lower().rstrip(".") == prompt.strip().lower().rstrip(".")]
             if len(matches) != 1:
-                raise SceneInitializationError(f"{name}: 首帧候选数 {len(matches)}，无法无歧义初始化")
+                raise TrackingFailure(f"{name}: 首帧候选数 {len(matches)}，无法无歧义初始化")
             masks[name] = matches[0]["mask"]
         return masks
 
-    def step(self, frame, *, initial_masks=None):
-        """输入原 color 网格，按调用顺序处理每一帧。"""
+    def step(self, frame, *, initial_masks=None) -> dict[str, np.ndarray]:
+        """返回完整物体位姿；预期失败抛 TrackingFailure，本段不得继续。"""
         maps = self.maps
         first = maps is None
         if first:
@@ -171,18 +164,9 @@ class SceneTracker:
                 raise ValueError("The first frame requires one initial mask per Mesh")
         elif initial_masks is not None:
             raise ValueError("Call reset() before initializing another scene")
-        if not first:
-            K, shape, model, distortion = self._camera
-            if (
-                frame.depth_m.shape != shape
-                or not np.array_equal(frame.K, K)
-                or frame.distortion_coeffs != distortion
-                or frame.distortion_model.removeprefix("distortion.") != model
-            ):
-                raise ValueError(
-                    "A tracker requires one fixed camera calibration and image grid"
-                )
         if maps is None:
+            validate_intrinsics(frame.K)
+            validate_distortion(frame.distortion_model, frame.distortion_coeffs)
             maps = RectificationMaps(
                 frame.depth_m.shape, frame.K, frame.distortion_coeffs
             )
@@ -203,15 +187,9 @@ class SceneTracker:
             masks = {name: mask & unique for name, mask in masks.items()}
             for name, mask in masks.items():
                 if not mask.any():
-                    raise SceneInitializationError(f"{name}: initial mask empty after rectification/overlap exclusion")
+                    raise TrackingFailure(f"{name}: initial mask empty after rectification/overlap exclusion")
             masks = self.segmenter.initialize(rgb, masks)
             self.maps = maps
-            self._camera = (
-                K.copy(),
-                frame.depth_m.shape,
-                frame.distortion_model.removeprefix("distortion."),
-                frame.distortion_coeffs,
-            )
             self.directions = camera_rays(depth_m.shape, K, self.pixel_stride)
         else:
             masks = self.segmenter.track(rgb)
@@ -219,25 +197,17 @@ class SceneTracker:
         poses = {}
         prepared_frame = None
         for name, tracker in self.trackers.items():
-            if name in self.lost_objects:
-                continue
             mask = masks[name]
             selected = mask[::self.pixel_stride, ::self.pixel_stride] & (sampled_depth > 0)
             observed_depth = sampled_depth[selected]
             count = len(observed_depth)
             fp_count = np.count_nonzero(mask & (depth_m >= 0.001))
             if count < self.min_matched_pixels or fp_count < MIN_DEPTH_PIXELS:
-                if first:
-                    raise SceneInitializationError(
-                        f"{name}: pose initialization has {count} independent depth points "
-                        f"after segmentation/stride and {fp_count} FoundationPose depth pixels; "
-                        f"requires {self.min_matched_pixels} and {MIN_DEPTH_PIXELS}, respectively. "
-                        "Select a supported instance and reset the scene."
-                    )
-                self.lost_objects[name] = (
-                    "Insufficient independently segmented depth; pose lost"
+                raise TrackingFailure(
+                    f"{name}: insufficient segmented depth: {count} independent points, "
+                    f"{fp_count} FoundationPose pixels; requires "
+                    f"{self.min_matched_pixels} and {MIN_DEPTH_PIXELS}"
                 )
-                continue
             if not first and prepared_frame is None:
                 prepared_frame = prepare_tracking_frame(rgb, depth_m, K)
             try:
@@ -246,9 +216,8 @@ class SceneTracker:
                     if first
                     else tracker.track(K, mask, prepared_frame=prepared_frame)
                 )
-            except PoseRegistrationError as error:
-                self.lost_objects[name] = str(error)
-                continue
+            except TrackingFailure as error:
+                raise TrackingFailure(f"{name}: {error}") from error
             v, u = np.nonzero(selected)
             pixels = np.column_stack((v * self.pixel_stride, u * self.pixel_stride)).astype(np.int32)
             model_z = self.renderers[name].render(pixels, pose, directions=self.directions)
@@ -256,11 +225,6 @@ class SceneTracker:
                 (model_z > 0) & (np.abs(observed_depth - model_z) <= self.depth_tolerance_m)
             )
             if supported < self.min_matched_pixels or supported / count < self.min_matched_fraction:
-                self.lost_objects[name] = "Semantic depth/model disagreement; pose lost"
-            else:
-                poses[name] = pose
-        return {"objects": {
-            name: {"pose": poses.get(name), "pose_valid": name in poses,
-                   "error": self.lost_objects.get(name)}
-            for name in self.trackers
-        }}
+                raise TrackingFailure(f"{name}: Semantic depth/model disagreement; pose lost")
+            poses[name] = pose
+        return poses

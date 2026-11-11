@@ -22,10 +22,10 @@ def load_rgb(args):
         with Image.open(path) as image:
             rgb = np.asarray(ImageOps.exif_transpose(image).convert("RGB")).copy()
     else:
-        from ..rgbd import load_frame
-
-        frame = load_frame(path)
-        rgb = frame.rgb
+        with np.load(path, allow_pickle=False) as saved:
+            rgb = saved["rgb"]
+        if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3 or min(rgb.shape[:2]) < 2:
+            raise ValueError("RGB must be uint8 [H,W,3]")
     return rgb, path
 
 
@@ -81,7 +81,6 @@ def select(args):
         masks = saved["masks"]
         boxes = saved["boxes"]
         scores = saved["scores"]
-        mask_scores = saved["mask_scores"]
         labels = saved["labels"]
     if (
         masks.dtype != np.bool_
@@ -92,12 +91,12 @@ def select(args):
         raise ValueError("保存的候选 mask 与 RGB 不一致")
     count = len(masks)
     if boxes.shape != (count, 4) or any(
-        array.shape != (count,) for array in (scores, mask_scores, labels)
+        array.shape != (count,) for array in (scores, labels)
     ):
         raise ValueError("候选框、分数和标签必须与 mask 数量及数组形状一致")
     if labels.dtype.kind != "U" or any(
         array.dtype.kind not in "fiu" or not np.isfinite(array).all()
-        for array in (boxes, scores, mask_scores)
+        for array in (boxes, scores)
     ):
         raise ValueError("候选标签必须为字符串，框和分数必须为有限实数")
     candidates = [
@@ -105,7 +104,6 @@ def select(args):
             "mask": masks[i],
             "box_xyxy": boxes[i],
             "score": float(scores[i]),
-            "mask_score": float(mask_scores[i]),
             "label": str(labels[i]),
         }
         for i in range(count)

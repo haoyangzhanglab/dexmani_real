@@ -145,7 +145,6 @@ class SAM2Client:
                 "mask": mask,
                 "box_xyxy": arrays["boxes"][i],
                 "score": float(arrays["scores"][i]),
-                "mask_score": float(arrays["mask_scores"][i]),
                 "label": reply["labels"][i],
             }
             for i, mask in enumerate(arrays["masks"])

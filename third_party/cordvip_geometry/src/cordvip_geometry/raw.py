@@ -25,6 +25,8 @@ def iter_raw_rows(reader, camera):
         rgb = next(images, None)
         if rgb is None:
             raise ValueError(f"Raw RGB ended before row {row_index}")
+        if rgb.dtype != np.uint8 or rgb.shape != (*expected_shape, 3):
+            raise ValueError(f"Raw RGB grid invalid at row {row_index}")
         depth_m = depth[row_index].astype(np.float32) * depth_scale
         yield (
             RGBDFrame(
@@ -33,8 +35,6 @@ def iter_raw_rows(reader, camera):
                 K=K,
                 distortion_model=intrinsics.distortion_model,
                 distortion_coeffs=intrinsics.distortion_coeffs,
-                timestamp_ns=int(timing[row_index]["camera_ns"]),
-                row_index=row_index,
             ),
             timing[row_index],
         )

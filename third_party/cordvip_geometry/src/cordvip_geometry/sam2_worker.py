@@ -144,32 +144,27 @@ class GroundedSAM2:
             "masks": np.empty((0, *rgb.shape[:2]), bool),
             "boxes": np.empty((0, 4), np.float32),
             "scores": np.empty(0, np.float32),
-            "mask_scores": np.empty(0, np.float32),
         }
         if not len(valid):
             return empty, []
         boxes = boxes[valid]
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             self.image_predictor.set_image(np.ascontiguousarray(rgb))
-            masks, mask_scores, _ = self.image_predictor.predict(
+            masks, _, _ = self.image_predictor.predict(
                 point_coords=None, point_labels=None, box=boxes, multimask_output=False
             )
         masks = np.asarray(masks)
         if masks.ndim == 4 and masks.shape[1] == 1:
             masks = masks[:, 0]
-        mask_scores = np.asarray(mask_scores).reshape(-1)
-        if masks.shape != (len(valid), *rgb.shape[:2]) or mask_scores.shape != (
-            len(valid),
-        ):
+        if masks.shape != (len(valid), *rgb.shape[:2]):
             raise RuntimeError("SAM2 returned invalid candidate shapes")
-        if not np.isfinite(mask_scores).all() or not np.isfinite(masks).all():
-            raise RuntimeError("SAM2 returned nonfinite candidate masks/scores")
+        if not np.isfinite(masks).all():
+            raise RuntimeError("SAM2 returned nonfinite candidate masks")
         order = [i for i in np.argsort(-scores[valid], kind="stable") if masks[i].any()]
         return {
             "masks": masks[order].astype(bool),
             "boxes": boxes[order],
             "scores": scores[valid][order],
-            "mask_scores": mask_scores[order],
         }, [str(labels[valid[i]]) for i in order]
 
     def append(self, rgb):

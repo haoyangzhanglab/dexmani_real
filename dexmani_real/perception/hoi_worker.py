@@ -15,7 +15,7 @@ def run_hoi_worker(shared, camera, task, template):
     root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(root / "third_party/cordvip_geometry/src"))
     from cordvip_geometry.rgbd import RGBDFrame
-    from cordvip_geometry.tracking import SceneInitializationError, SceneTracker
+    from cordvip_geometry.tracking import TrackingFailure, SceneTracker
     from dexmani_real.geometry.hoi import task_objects, transform_task_points
 
     def terminate(signum, frame):
@@ -60,32 +60,24 @@ def run_hoi_worker(shared, camera, task, template):
             try:
                 masks = tracker.detect_masks(frame, prompts) if first else None
                 scene = tracker.step(frame, initial_masks=masks)
-            except SceneInitializationError as error:
-                valid = False
+            except TrackingFailure as error:
                 failure = str(error)
+                points = np.zeros((1024, 3), np.float32)
             else:
-                valid = all(scene["objects"][name]["pose_valid"] for name in prompts)
-                if not valid:
-                    failure = "; ".join(
-                        f"{name}: {scene['objects'][name]['error']}"
-                        for name in prompts if not scene["objects"][name]["pose_valid"]
-                    )
-            first = False
-            points = np.zeros((1024, 3), np.float32)
-            if valid:
-                poses = np.stack([scene["objects"][name]["pose"] for name in prompts])
+                poses = np.stack([scene[name] for name in template["object_names"]])
                 points = transform_task_points(template, poses, camera.T_xarm_base_from_color)
+            first = False
             # 不将上一轮在途结果发布为新轮次观测。
             if int(shared.hoi_request.read()[0]["episode_id"]) != epoch:
                 continue
-            if not valid:
+            if failure is not None:
                 episode_failed = True
                 logger.warning("HOI Episode %d 失败：%s；等待下一轮 B 请求。", epoch, failure)
             shared.hoi_ring.write(
                 episode_id=epoch,
                 timestamp_ns=data["timestamp_ns"],
                 source_camera_sequence=sequence,
-                valid=valid,
+                valid=failure is None,
                 object_pointcloud=points,
                 **{name: data[name] for name in camera_fields},
             )

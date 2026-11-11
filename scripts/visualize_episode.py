@@ -89,6 +89,8 @@ class EpisodeVisualizer:
             self.has_hoi = "object_pointcloud" in self.reader.fields
             if self.has_hoi:
                 self.reader.require_fields("object_pointcloud", "object_pointcloud_valid")
+                self.reader["object_pointcloud"]
+                self.reader["object_pointcloud_valid"]
 
             self.reader.require_fields(
                 "rgb",

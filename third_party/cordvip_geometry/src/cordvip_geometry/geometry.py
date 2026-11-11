@@ -39,14 +39,6 @@ def validate_points(points):
     return points
 
 
-def float32_points(points):
-    with np.errstate(over="ignore", invalid="ignore"):
-        points = np.array(points, dtype=np.float32, copy=True)
-    if not np.isfinite(points).all():
-        raise ValueError("Point coordinates exceed the finite float32 range")
-    return points
-
-
 def validate_pose(pose):
     """检查 SE(3)，不投影或修补旋转。"""
     if np.iscomplexobj(pose):
@@ -90,7 +82,7 @@ def mesh_scale_from_extent(mesh, axis, extent_m):
 
 
 def sample_mesh_surface(mesh, num_points=1024, seed=0):
-    """采样固定表面点与三角面法向，法向不代表真实接触。"""
+    """按面积采样固定表面 XYZ。"""
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
     faces = np.asarray(mesh.faces)
     triangles = vertices[faces]
@@ -109,8 +101,7 @@ def sample_mesh_surface(mesh, num_points=1024, seed=0):
     root_u = np.sqrt(uv[:, 0])
     weights = np.column_stack((1 - root_u, root_u * (1 - uv[:, 1]), root_u * uv[:, 1]))
     points = np.sum(selected * weights[:, :, None], axis=1)
-    normals = crosses[indices] / twice_area[indices, None]
-    return float32_points(points), float32_points(normals)
+    return points.astype(np.float32)
 
 
 def validate_intrinsics(intrinsics):

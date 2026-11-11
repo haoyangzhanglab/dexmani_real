@@ -257,7 +257,6 @@ def iter_canonical_blocks(
         block = {}
         if "object_pointcloud" in fields:
             valid = reader["object_pointcloud_valid"][start:end]
-            valid &= np.isfinite(raw["object_pointcloud"]).all(axis=(1, 2))
             if not valid.all():
                 row = start + int(np.flatnonzero(~valid)[0])
                 raise ValueError(f"object_pointcloud invalid at row {row}; use --exclude {reader.path.name}")

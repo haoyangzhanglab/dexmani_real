@@ -45,18 +45,20 @@ class DeploymentContracts(unittest.TestCase):
                      offsets=[0, 512, 1024], object_names=['a', 'b'])
             template = load_task_template(task)
             poses = np.tile(np.eye(4), (2, 1, 1))
+            poses[0, :3, :3] = [[1, 0, 0], [0, 0, -1], [0, 1, 0]]
             poses[0, :3, 3] = [1, 0, 0]
             poses[1, :3, 3] = [0, 2, 0]
             base = np.eye(4)
             base[:3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
+            base[:3, 3] = [3, 4, 5]
             cloud = transform_task_points(template, poses, base)
-            np.testing.assert_array_equal(cloud[0], [-2, 2, 3])
-            np.testing.assert_array_equal(cloud[-1], [-4, 1, 3])
+            np.testing.assert_array_equal(cloud[0], [6, 6, 7])
+            np.testing.assert_array_equal(cloud[-1], [-1, 5, 8])
             self.assertEqual(template['object_names'].tolist(), ['a', 'b'])
 
-    def test_tracking_depth_gate_and_no_recovery(self):
+    def test_tracking_depth_gate_failure(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
-        from cordvip_geometry.tracking import SceneTracker
+        from cordvip_geometry.tracking import SceneTracker, TrackingFailure
         from cordvip_geometry.rgbd import RGBDFrame
         segmenter = Mock()
         masks = {'object': np.ones((40, 40), bool)}
@@ -76,13 +78,33 @@ class DeploymentContracts(unittest.TestCase):
                 return values
             renderer.render.side_effect = [depths(60), depths(59)]
             tracker = SceneTracker(segmenter, {'object': Mock()}, foundationpose_root='.', debug_dir='.')
-            self.assertTrue(tracker.step(frame, initial_masks=masks)['objects']['object']['pose_valid'])
-            for _ in range(2):
-                result = tracker.step(frame)['objects']['object']
-                self.assertFalse(result['pose_valid'])
-                self.assertIsNone(result['pose'])
+            np.testing.assert_array_equal(tracker.step(frame, initial_masks=masks)['object'], np.eye(4))
+            later = Mock()
+            tracker.trackers['later'] = later
+            masks['later'] = masks['object']
+            with self.assertRaisesRegex(TrackingFailure, 'object: Semantic depth'):
+                tracker.step(frame)
             pose.register.assert_called_once()
             pose.track.assert_called_once()
+            later.track.assert_not_called()
+
+    def test_tracking_failure_preserves_program_errors(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
+        from cordvip_geometry import TrackingFailure
+        from cordvip_geometry.foundationpose import PoseTracker, guide_centered_pose
+        pose = np.eye(4)
+        pose[2, 3] = -1
+        with self.assertRaisesRegex(TrackingFailure, 'in front'):
+            guide_centered_pose(pose, np.eye(3), np.ones((2, 2), bool))
+        tracker = PoseTracker.__new__(PoseTracker)
+        tracker.estimator = Mock()
+        with self.assertRaisesRegex(TrackingFailure, 'did not initialize'):
+            tracker.register(None, None, None, None)
+        for error in (RuntimeError('CUDA failed'), OSError('model file failed')):
+            tracker.estimator.register.side_effect = error
+            with self.assertRaises(type(error)) as raised:
+                tracker.register(None, None, None, None)
+            self.assertIs(raised.exception, error)
 
     def test_hand_xyz_and_joint_mapping(self):
         from dexmani_real.geometry.kinematics import ArmFK, HandFK
@@ -110,23 +132,50 @@ class DeploymentContracts(unittest.TestCase):
         rgb = np.full((30, 40, 3), 127, np.uint8)
         mask = np.zeros((30, 40), bool)
         mask[5:20, 10:30] = True
-        candidate = dict(mask=mask, box_xyxy=np.array([10, 5, 30, 20]), label='object', score=.9, mask_score=.8)
+        candidate = dict(mask=mask, box_xyxy=np.array([10, 5, 30, 20]), label='object', score=.9)
         self.assertEqual(choose(rgb, [candidate], None, headless=True), 0)
         with self.assertRaisesRegex(ValueError, '多个候选'):
             choose(rgb, [candidate, candidate], None, headless=True)
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             save_selection(output, rgb, [candidate], 0)
-            metadata = json.loads((output / 'selection.json').read_text())
-            with Image.open(output / metadata['mask_file']) as image:
+            with Image.open(output / 'mask.png') as image:
                 np.testing.assert_array_equal(np.asarray(image), mask.astype(np.uint8) * 255)
-            with Image.open(output / metadata['foreground_file']) as image:
+            with Image.open(output / 'foreground_rgba.png') as image:
                 rgba = np.asarray(image)
                 np.testing.assert_array_equal(rgba[:, :, :3], rgb)
                 np.testing.assert_array_equal(rgba[:, :, 3], mask.astype(np.uint8) * 255)
 
+    def test_rgb_only_npz_and_saved_candidates(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
+        from PIL import Image
+        from cordvip_geometry.cli.object import load_rgb, select
+        from cordvip_geometry.cli.selection import save_candidates
+        rgb = np.full((12, 16, 3), 123, np.uint8)
+        mask = np.ones((12, 16), bool)
+        candidate = dict(mask=mask, box_xyxy=np.array([0, 0, 16, 12]), score=.9, label='object')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            Image.fromarray(rgb).save(root / 'rgb.png')
+            np.savez(root / 'rgb.npz', rgb=rgb)
+            for args in (NS(image=root / 'rgb.png', rgbd=None), NS(image=None, rgbd=root / 'rgb.npz')):
+                np.testing.assert_array_equal(load_rgb(args)[0], rgb)
+            source = root / "candidates"
+            source.mkdir()
+            Image.fromarray(rgb).save(source / "rgb.png")
+            save_candidates(source, rgb, [candidate, candidate])
+            select(NS(segmentation_dir=source, output=root / 'chosen', instance=1, headless=True))
+            with Image.open(root / 'chosen/foreground_rgba.png') as image:
+                np.testing.assert_array_equal(np.asarray(image)[:, :, :3], rgb)
+                np.testing.assert_array_equal(np.asarray(image)[:, :, 3], 255)
+
     def test_modes_and_ode(self):
         base = ExecutionConfig(control_dt_s=0.1, action_steps=4)
+        info = policy_info(observation_fields=('joint_state', 'object_pointcloud'))
+        validate_execution_config(info, base)
+        for value in (0, -1, float('nan'), float('inf')):
+            with self.assertRaises(ValueError):
+                validate_execution_config(info, replace(base, hoi_max_skew_s=value))
         for mode in ('sync', 'async', 'rtc'):
             validate_execution_config(policy_info(), replace(base, mode=mode))
         for changes in ({'control_dt_s': 0}, {'control_dt_s': float('nan')}, {'action_steps': 0},

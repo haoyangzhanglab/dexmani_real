@@ -20,6 +20,7 @@ class ExecutionConfig:
     rtc_guidance_cap: float = 10.0
     # 回放测量后的暂定来源年龄预算，非真机安全保证。
     hoi_max_age_s: float = 0.25
+    # None 关闭额外来源时间差限制；不代表物理同步。
     hoi_max_skew_s: float | None = None
 
 POLICY_RUNTIME_SECTIONS = (

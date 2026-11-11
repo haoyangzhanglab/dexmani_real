@@ -10,8 +10,8 @@ import numpy as np
 from .geometry import simplify_mesh, validate_pose
 
 
-class PoseRegistrationError(RuntimeError):
-    """模型未建立有效位姿，不能使用推测或历史位姿。"""
+class TrackingFailure(RuntimeError):
+    """当前场景的预期跟踪失败；调用方须结束本段，不沿用历史位姿。"""
 
 
 MIN_DEPTH_PIXELS = 4
@@ -39,7 +39,7 @@ def guide_centered_pose(pose_camera_centered, intrinsics, mask):
     pose = np.array(pose_camera_centered, copy=True)
     z = pose[2, 3]
     if z <= 0:
-        raise ValueError("Previous centered pose must be in front of the camera")
+        raise TrackingFailure("Previous centered pose must be in front of the camera")
     rows, cols = np.nonzero(mask)
     center = np.array(
         [(cols.min() + cols.max()) / 2.0, (rows.min() + rows.max()) / 2.0, 1.0]
@@ -106,13 +106,13 @@ class PoseTracker:
             iteration=5,
         )
         if self.estimator.pose_last is None:
-            raise PoseRegistrationError(
+            raise TrackingFailure(
                 "FoundationPose registration did not initialize tracking"
             )
         try:
             return validate_pose(pose)
         except ValueError as exc:
-            raise PoseRegistrationError(f"invalid FoundationPose output: {exc}") from exc
+            raise TrackingFailure(f"invalid FoundationPose output: {exc}") from exc
 
     def track(self, intrinsics, mask, *, prepared_frame):
         import torch
@@ -148,4 +148,4 @@ class PoseTracker:
         try:
             return validate_pose(pose)
         except ValueError as exc:
-            raise PoseRegistrationError(f"invalid FoundationPose output: {exc}") from exc
+            raise TrackingFailure(f"invalid FoundationPose output: {exc}") from exc

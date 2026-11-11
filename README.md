@@ -46,7 +46,7 @@ python scripts/run_policy.py --print-config
 
 `run_policy.py --print-config` 打印本地声明的 RealConfig（declared config），不加载 Checkpoint 或标定，不代表部署后的全部有效参数。模型输入输出契约由 Checkpoint 决定；硬件、安全限制、传感器和环境由 RealConfig 决定。`execution.control_dt_s` 和 `action_steps` 的非 `None` 本地值优先，否则使用 Checkpoint；其余执行参数使用 RealConfig。完整规则见[配置来源](docs/policy_deployment.md#配置来源与启动信息)。
 
-部署自动从 `observation_fields` 识别 HOI：包含 `object_pointcloud` 才校验并加载任务模板、启动 HOI Worker；普通策略不加载 HOI。以 info.task_name 定位任务目录，模板保存对象名与点分段；资产由研究者固定，不比较哈希。手物联合输入须显式设置 execution.hoi_max_skew_s，来源时间差超限则停止。
+部署自动从 `observation_fields` 识别 HOI：包含 `object_pointcloud` 才校验并加载任务模板、启动 HOI Worker；普通策略不加载 HOI。以 info.task_name 定位任务目录，模板保存对象名与点分段；资产由研究者固定，不比较哈希。execution.hoi_max_skew_s 默认 None，关闭额外来源时间差限制；显式设置有限正数秒值后，手物联合输入超限则停止。
 
 ## 一次实验
 
@@ -61,7 +61,7 @@ python scripts/export_zarr.py episodes/pnp_apple_banana \
 python scripts/run_policy.py /path/to/checkpoints/latest.pt --record-raw
 ```
 
-需要修改实验参数时，在本地 Python 文件中导出 `CONFIG: RealConfig`，通过 `--config` 传入。模型需要的几何处理参数从 Checkpoint 恢复，缺失会报错。Raw 保存实际配置和标定结果；导出按训练所需字段选择，目标目录必须不存在。HOI 先按 [CordVIP 流程](scripts/cordvip/README.md) 完成标注，再选择 `object_pointcloud` 导出。
+需要修改实验参数时，在本地 Python 文件中导出 `CONFIG: RealConfig`，通过 `--config` 传入。普通 point_cloud 的 recipe 从 Checkpoint 恢复；hand_pointcloud 使用 RealConfig.hand_pointcloud。Raw 保存实际配置和标定结果；导出按训练所需字段选择，目标目录必须不存在。HOI 先按 [CordVIP 流程](scripts/cordvip/README.md) 完成标注，再选择 `object_pointcloud` 导出。
 
 省略 `--fields` 默认导出全部现有常用模态（不含 `object_pointcloud`），供不同策略复用同一份 Canonical Zarr；也可显式选择字段子集。`--exclude EPISODE` 按目录名排除整段，可重复指定；任何未知名称都会报错，全部排除也会拒绝导出。
 

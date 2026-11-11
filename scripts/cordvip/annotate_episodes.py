@@ -11,7 +11,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 from cordvip_geometry.raw import iter_raw_rows
-from cordvip_geometry.tracking import SceneInitializationError, SceneTracker
+from cordvip_geometry.tracking import TrackingFailure, SceneTracker
 from dexmani_real.data.raw import RawReader, require_published_raw
 from dexmani_real.data.hoi import write_hoi
 from dexmani_real.geometry.hoi import load_task_template, task_objects
@@ -29,8 +29,10 @@ def annotate_episodes(episodes, task):
             episode = Path(episode)
             require_published_raw(episode)
             with RawReader(episode) as reader:
-                if "object_pointcloud" in reader.fields:
+                if "hoi" in reader.data_file:
                     reader.require_fields("object_pointcloud", "object_pointcloud_valid")
+                    reader["object_pointcloud"]
+                    reader["object_pointcloud_valid"]
                     print(f"跳过已发布 HOI：{episode}")
                     continue
                 camera = reader.read_camera()
@@ -39,7 +41,7 @@ def annotate_episodes(episodes, task):
                 frames, count = reader.num_frames, len(objects)
                 if frames == 0:
                     raise ValueError("空 Episode")
-                poses = np.full((frames, count, 4, 4), np.nan, np.float32)
+                poses = np.empty((frames, count, 4, 4), np.float32)
                 failure = None
                 if tracker is None:
                     tracker = stack.enter_context(
@@ -64,15 +66,10 @@ def annotate_episodes(episodes, task):
                         try:
                             masks = tracker.detect_masks(frame, prompts) if index == 0 else None
                             result = tracker.step(frame, initial_masks=masks)
-                        except SceneInitializationError as error:
+                        except TrackingFailure as error:
                             failure = str(error)
                             break
-                    failed = [(name, result["objects"][name]["error"]) for name in prompts
-                              if not result["objects"][name]["pose_valid"]]
-                    if failed:
-                        failure = str(failed)
-                        break
-                    poses[index] = np.stack([result["objects"][name]["pose"] for name in prompts])
+                    poses[index] = np.stack([result[name] for name in template["object_names"]])
                     previous_sequence, previous_stamp = sequence, stamp
             if failure is not None:
                 print(f"{episode}: 首次失败行 {index}: {failure}；不发布 HOI")

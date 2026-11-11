@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help="Trusted Python experiment file exporting CONFIG: RealConfig",
+        help="Trusted Python experiment file exporting CONFIG: RealConfig; execution.hoi_max_skew_s optionally limits joint HOI source skew (default None/off)",
     )
     parser.add_argument(
         "--fields", nargs="+", choices=tuple(FIELD_INPUTS),

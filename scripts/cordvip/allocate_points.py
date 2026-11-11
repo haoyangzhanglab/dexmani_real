@@ -41,7 +41,7 @@ def allocate_task(task):
     names = [obj["name"] for obj in objects]
     loaded = [load_asset(task / name) for name in names]
     counts = allocate_counts([mesh.area for mesh, _ in loaded])
-    points = [sample_mesh_surface(mesh, int(count), seed=0)[0]
+    points = [sample_mesh_surface(mesh, int(count), seed=0)
               for (mesh, _), count in zip(loaded, counts)]
     with tempfile.TemporaryDirectory(prefix=".hoi-", dir=task) as temporary:
         staging = Path(temporary)

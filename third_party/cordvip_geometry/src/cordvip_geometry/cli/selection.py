@@ -1,6 +1,6 @@
 """物体候选预览、显式确认与选择产物；不持有分割模型。"""
 
-from ..io import write_json, write_npz
+from ..io import write_npz
 from ..viewer import display_available
 
 
@@ -34,7 +34,6 @@ def save_candidates(output, rgb, candidates):
             "masks": np.stack([c["mask"] for c in candidates]),
             "boxes": np.stack([c["box_xyxy"] for c in candidates]),
             "scores": np.asarray([c["score"] for c in candidates]),
-            "mask_scores": np.asarray([c["mask_score"] for c in candidates]),
             "labels": np.asarray([c["label"] for c in candidates], dtype=str),
         },
     )
@@ -122,13 +121,4 @@ def save_selection(output, rgb, candidates, index):
 
     Image.fromarray(mask.astype(np.uint8) * 255).save(output / "mask.png")
     Image.fromarray(np.dstack((rgb, mask.astype(np.uint8) * 255))).save(output / "foreground_rgba.png")
-    write_json(output / "selection.json", {
-        "selected_instance": index,
-        "label": candidate["label"],
-        "box_xyxy": candidate["box_xyxy"].tolist(),
-        "detection_score": candidate["score"],
-        "mask_score": candidate["mask_score"],
-        "mask_file": "mask.png",
-        "foreground_file": "foreground_rgba.png",
-    })
     print(f"已确认候选 {index}；全分辨率 mask、RGBA 与 overlay：{output}", flush=True)

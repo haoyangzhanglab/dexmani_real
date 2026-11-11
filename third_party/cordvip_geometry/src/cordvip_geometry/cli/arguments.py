@@ -52,7 +52,7 @@ def add_grounding_arguments(parser):
 def add_segment_arguments(parser, workspace):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--image", type=Path, help="按 EXIF 纠正朝向的物体照片")
-    source.add_argument("--rgbd", type=Path, help="保存的单帧 RGB-D NPZ")
+    source.add_argument("--rgbd", type=Path, help="含 rgb uint8 [H,W,3] 的 NPZ（仅读取 rgb）")
     parser.add_argument("--prompt", required=True, help="英文物体描述")
     parser.add_argument("--instance", type=int, help="零起始候选索引")
     parser.add_argument("--headless", action="store_true")
@@ -89,7 +89,7 @@ def parse_object_args(argv=None, *, workspace=None):
         help="从已有候选确认物体",
         description=(
             "从 rgb.png 和 candidates.npz 选择物体，写出 mask.png、foreground_rgba.png、"
-            "overlay.png 和 selection.json。"
+            "overlay.png。"
             "再次选择仍使用原候选目录。"
         ),
     )

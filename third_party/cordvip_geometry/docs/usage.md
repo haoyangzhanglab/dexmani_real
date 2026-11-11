@@ -4,12 +4,14 @@
 
 `RGBDFrame` 接收 color 网格 RGB、米制深度、内参与畸变参数；`from_camera()` 使用实测相机标定转换。`iter_raw_rows()` 保持逐行 RGB-D 读取，Reader 由调用者关闭。
 
+`RGBDFrame`、`SceneTracker` 和 `TrackingFailure` 均可从 `cordvip_geometry` 导入。
+
 `SceneTracker.open(assets, ...)` 要求每个名字对应一个 Mesh 资产。首帧由 `detect_masks(frame, prompts)` 获取 initial_masks，调用 `step(frame, initial_masks=masks)`；后续直接 `step(frame)`。新 Episode 调用 reset()，模型权重和资产继续复用。
 
-step 返回 `{"objects": {name: {"pose": ..., "pose_valid": ..., "error": ...}}}`。pose 是原物体坐标系到相机系的变换，无效时为 None。首次失效保持失效直到 reset，不重注册、不沿用旧 pose。初始化歧义用 SceneInitializationError 报告；模型和程序异常不转成普通跟踪失败。
+step 成功返回 `{object_name: pose_camera}`，位姿将原物体坐标系变换到相机系。任一物体预期跟踪失败立即抛出 TrackingFailure（含物体及原因），不返回部分结果。调用方结束当前 Episode，下一段先 reset；在线 Worker 保留整轮失败锁存。模型、IPC、文件和程序错误保持原异常传播。
 
 语义支持与模型深度一致性保持原判定：pixel_stride=2、depth_tolerance_m=0.015、min_matched_pixels=30、min_matched_fraction=0.15，同时保留 FoundationPose 最小有效深度要求。内部只保留判定所需深度和像素，不输出展示 mask、颜色或三维诊断载荷。
 
-正式离线入口为 annotate_episodes.py；它按 camera_sequence 去重并在首次失效停止该 Episode。结果通过主项目 visualize_episode.py 查看。独立 track/view、逐帧场景 NPZ 与第二套手 FK 已退役；重建选择、Mesh 预览及 RGB-D 文件读写保留。
+正式离线入口为 annotate_episodes.py；它按 camera_sequence 去重并在首次失效停止该 Episode。结果通过主项目 visualize_episode.py 查看。重建选择支持图片或含 rgb 的 NPZ，选择结果使用固定的 mask.png、foreground_rgba.png、overlay.png 文件名。
 
 FoundationPose 权重与同帧预处理复用、SAM 子进程隔离及有界时序状态继续保留。参见[实验命令](../../../scripts/cordvip/README.md)和[资产约定](../../../docs/object_reconstruction.md)。

@@ -29,8 +29,8 @@ def sample_is_fresh(timestamp_ns, max_age_s, now_ns):
 
 
 def validate_hoi_skew_budget(value):
-    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-        raise ValueError("联合 HOI 输入必须显式配置有限正数 hoi_max_skew_s")
+    if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
+        raise ValueError("hoi_max_skew_s 必须为 None 或有限正数")
 
 
 def hoi_sources_within_skew(stamps, budget_s):

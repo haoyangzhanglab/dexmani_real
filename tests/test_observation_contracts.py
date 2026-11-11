@@ -49,11 +49,54 @@ class ObservationContracts(unittest.TestCase):
         row = Observation(arm, hand, None, None, None, now,
                           hoi={'valid': True, 'timestamp_ns': now - 200_000_000})
         needs = ObservationNeeds(hoi=True, hoi_joint_input=True)
+        self.assertEqual(check_observation(row, self.runtime, needs, now_ns=now), [])
         self.assertEqual(check_device_feedback(row, runtime, now_ns=now), [])
+        self.assertEqual(check_observation(row, runtime, needs, now_ns=now), ['hoi_source_skew'])
+        row = replace(row, hoi=dict(row.hoi, timestamp_ns=now-60_000_001))
         self.assertEqual(check_observation(row, runtime, needs, now_ns=now), ['hoi_source_skew'])
         row = replace(row, hoi=dict(row.hoi, timestamp_ns=now-60_000_000))
         self.assertEqual(check_observation(row, runtime, needs, now_ns=now), [])
         self.assertEqual(check_observation(row, runtime, ObservationNeeds(), now_ns=now), [])
+
+    def test_hoi_worker_failure_latch_and_inflight_epoch(self):
+        from dexmani_real.perception.hoi_worker import run_hoi_worker
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
+        from cordvip_geometry.tracking import TrackingFailure
+        shared = NS(is_running=NS(value=True), hoi_ready=NS(value=False),
+                    hoi_request=Mock(), camera_ring=Mock(), hoi_ring=Mock(field_names=set()))
+        command = {'episode_id': 1, 'after_sequence': 0, 'after_ns': 0}
+        shared.hoi_request.read.side_effect = lambda: (command.copy(), 1)
+        shared.camera_ring.read.side_effect = [({'timestamp_ns': i}, i) for i in range(1, 5)]
+        tracker = Mock()
+        calls = []
+        def step(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise TrackingFailure('object: depth lost')
+            if len(calls) == 3:
+                command['episode_id'] = 3
+            return {'object': np.eye(4)}
+        tracker.step.side_effect = step
+        def sleep(_):
+            self.assertEqual(len(calls), 2)
+            command['episode_id'] = 2
+        def publish(**values):
+            if values['episode_id'] == 3:
+                shared.is_running.value = False
+        shared.hoi_ring.write.side_effect = publish
+        template = {'object_names': ['object'], 'offsets': [0, 1024],
+                    'points_local': np.ones((1024, 3), np.float32)}
+        with patch('cordvip_geometry.tracking.SceneTracker.open') as opened, \
+                patch('cordvip_geometry.rgbd.RGBDFrame.from_camera'), \
+                patch('dexmani_real.geometry.hoi.task_objects', return_value=[{'name': 'object', 'prompt': 'object'}]), \
+                patch('dexmani_real.perception.hoi_worker.signal.signal'), \
+                patch('dexmani_real.perception.hoi_worker.time.sleep', side_effect=sleep):
+            opened.return_value.__enter__.return_value = tracker
+            run_hoi_worker(shared, NS(T_xarm_base_from_color=np.eye(4)), Path('/tmp'), template)
+        published = [call.kwargs for call in shared.hoi_ring.write.call_args_list]
+        self.assertEqual([(v['episode_id'], v['valid']) for v in published], [(1, True), (1, False), (3, True)])
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(tracker.reset.call_count, 3)
 
     def test_union_order_and_immutability(self):
         for bits in itertools.product((False, True), repeat=7):

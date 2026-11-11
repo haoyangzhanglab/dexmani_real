@@ -2,6 +2,6 @@
 
 from .assets import load_asset, prepare_asset
 from .rgbd import RGBDFrame
-from .tracking import SceneTracker
+from .tracking import SceneTracker, TrackingFailure
 
-__all__ = ["RGBDFrame", "SceneTracker", "load_asset", "prepare_asset"]
+__all__ = ["RGBDFrame", "SceneTracker", "TrackingFailure", "load_asset", "prepare_asset"]

@@ -10,7 +10,7 @@
 
 ### 任务配置
 
-任务目录为 `assets/pointcloud_template/object/<task_name>/`，各物体占一个子目录。新资产默认读取 `reference.jpg`；已有合法资产直接复用，无需原图或模型权重，需带齐 `asset.json` 指向的 Mesh、点云和法向。更改照片或参数不会替换已发布资产，重建应使用新的资产目录。
+任务目录为 `assets/pointcloud_template/object/<task_name>/`，各物体占一个子目录。新资产默认读取 `reference.jpg`；已有合法资产直接复用，无需原图或模型权重，只需带齐 `asset.json` 指向的米制 Mesh。更改照片或参数不会替换已发布资产，重建应使用新的资产目录。
 
 `task.json` 示例，尺寸需替换为实测值：
 
@@ -28,7 +28,7 @@
 
 示例任务三个米制 Mesh 在本机存在但未纳入 Git；任务级冻结模板缺失。新 checkout 需要自行提供 Mesh 与实验对应的冻结模板。不能用新采样宣称恢复历史模板。
 
-模板要求显式的 object_names 分段映射，资产文件不由运行时修改。手模板只消费 XYZ 通道。
+模板要求显式的 object_names 分段映射，资产文件不由运行时修改。手模板只消费 XYZ 通道。历史单物体采样文件因用途未能确认保留，不参与当前链路。
 
 ### 模板与数据契约
 
@@ -40,11 +40,13 @@ Raw `/hoi` 只包含 `object_pointcloud[T,1024,3]` 和 `object_pointcloud_valid[
 
 手点云使用唯一的冻结手模板与 FK，运行时及导出为 XYZ。部署从 info.task_name 定位任务；手点数由 RealConfig.hand_pointcloud 决定，不从 checkpoint 覆盖。
 
-### 显式来源时间差预算
+### 可选来源时间差预算
 
-物体点云与手几何或 joint_state 联合消费时，必须在实验 CONFIG.execution.hoi_max_skew_s 填入实测选择的有限正数秒值；没有默认值。导出使用同一个 `--config`，程序调用可直接设置 ExportConfig.hoi_max_skew_s。
+最新关节与滞后物体点云的组合仍是实验近似；时间差预算只限制这种近似，不代表物理同步，关闭它也不会关闭年龄或跟踪有效性检查。
 
-在线使用 HOI 原始相机来源时间与臂、手反馈时间；离线使用 camera_ns、arm_ns、hand_ns。三者 max−min 不得超过预算，超限拒绝整次导出或停止本轮。各来源年龄检查继续保留，不以年龄预算替代时间差预算。主机记录时间差不证明物理同步，不进行插值、补洞或重采样。
+CONFIG.execution.hoi_max_skew_s 默认 None，关闭额外来源时间差限制；物体点云与手几何或 joint_state 联合消费时，可显式填写有限正数秒值启用。导出使用同一个 `--config`，程序调用可直接设置 ExportConfig.hoi_max_skew_s。
+
+在线使用 HOI 原始相机来源时间与臂、手反馈时间；离线使用 camera_ns、arm_ns、hand_ns。启用检查时三者 max−min 不得超过预算（等于预算允许），超限拒绝整次导出或停止本轮。各来源年龄检查继续保留，不以年龄预算替代时间差预算。主机记录时间差不证明物理同步，不进行插值、补洞或重采样。
 
 ## 当前实现与性能结论
 

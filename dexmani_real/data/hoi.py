@@ -1,19 +1,10 @@
-"""Raw HOI 的结构校验和分块发布。"""
+"""Raw HOI 字段与分块发布。"""
 
 import numpy as np
 
 from dexmani_real.geometry.hoi import transform_task_points
 
 HOI_FIELDS = ("object_pointcloud", "object_pointcloud_valid")
-
-
-def validate_hoi(group, frames):
-    for name, shape, dtype in (
-        ("object_pointcloud", (frames, 1024, 3), np.float32),
-        ("object_pointcloud_valid", (frames,), np.bool_),
-    ):
-        if group[name].shape != shape or group[name].dtype != dtype:
-            raise ValueError(f"Raw /hoi/{name}: shape/dtype 错误")
 
 
 def write_hoi(path, template, poses, base_from_camera):
