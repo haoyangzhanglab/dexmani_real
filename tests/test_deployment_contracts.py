@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
@@ -258,21 +258,16 @@ class DeploymentContracts(unittest.TestCase):
             session = PolicySession(runtime, 'offline.pt', weights=None, inference_steps=None,
                                     output_root=None, device='cpu', seed=0, max_running_s=1,
                                     num_episodes=1, record_raw=False, camera_calibration_path=None)
-        from dexmani_policy.deployment import PolicyInfo
-        session.info = PolicyInfo(
-            checkpoint_path='offline.pt', weights='raw', inference_steps=2,
-            task_name='test', observation_fields=('joint_state',), n_obs_steps=2,
-            n_action_steps=4, future_steps=8, control_action_dim=19, action_mode='joint',
-            rgb_preprocessing={}, supports_rtc=True, requires_prev_action=False,
-            control_dt_s=0.1, depth_config=None, pointcloud_config=None,
-            fingertip_link_names=None,
-        )
+        @dataclass
+        class FakePolicyInfo:
+            checkpoint_path: str = 'offline.pt'
+
+        session.info = FakePolicyInfo()
         session.output_dir = Path('/tmp/not-created')
         with patch('dexmani_real.deployment.session.write_yaml') as write:
             session.save_run_config()
         payload = write.call_args.args[0]
-        self.assertEqual(payload['policy'], asdict(session.info))
-        self.assertEqual(payload['policy']['checkpoint_path'], 'offline.pt')
+        self.assertEqual(payload['policy'], {'checkpoint_path': 'offline.pt'})
         sections = ('execution', 'arm', 'hand', 'motion', 'camera', 'pointcloud', 'hand_pointcloud', 'environment')
         self.assertEqual(tuple(payload['runtime']), sections)
         self.assertEqual(payload['runtime'], {name: asdict(getattr(runtime, name)) for name in sections})
