@@ -114,7 +114,7 @@ class PolicySession:
         if self.output_dir is None:
             return
         payload = {
-            "policy": self.info.to_dict(),
+            "policy": asdict(self.info),
             "runtime": {name: asdict(getattr(self.runtime, name)) for name in POLICY_RUNTIME_SECTIONS},
             "camera_calibration_path": str(self.camera_calibration_path or CAMERAS_PATH),
             "effective_camera": ({"camera_T_xarm_base_from_color": None,

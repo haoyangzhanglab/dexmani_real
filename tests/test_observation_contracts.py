@@ -119,7 +119,7 @@ class ObservationContracts(unittest.TestCase):
                           supports_rtc=False, requires_prev_action=False,
                           pointcloud_config=asdict(self.runtime.pointcloud),
                           depth_config={'shape': (16, 16), 'depth_scale_m': 0.001},
-                          checkpoint_path=Path('offline.pt'), weights='ema', inference_steps=1,
+                          checkpoint_path='offline.pt', weights='ema', inference_steps=1,
                           task_name='test')
                 state = SessionState(stop_signal=threading.Event(), emergency_signal=threading.Event())
                 stack.enter_context(patch.dict(sys.modules, {'dexmani_policy.deployment': module}))
