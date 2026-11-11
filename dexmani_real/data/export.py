@@ -14,11 +14,7 @@ import numpy as np
 import zarr
 
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
-from dexmani_real.data.raw import (
-    TACTILE_AGE_WARNING_NS,
-    RawReader,
-    require_published_raw,
-)
+from dexmani_real.data.raw import RawReader, require_published_raw
 from dexmani_real.geometry.camera import (
     camera_extrinsic_cv,
     depth_scales_match,
@@ -70,13 +66,6 @@ FIELD_INPUTS = {
 DEFAULT_FIELDS = tuple(FIELD_INPUTS)
 FIELD_INPUTS["object_pointcloud"] = ("object_pointcloud",)
 
-SOURCE_FIELDS = {
-    "arm_ns": {"joint_state", "eef_pose", "fingertip_xyz", "hand_pointcloud"},
-    "hand_ns": {"joint_state", "fingertip_xyz", "hand_pointcloud"},
-    "tactile_aggregate_ns": {"finger_tactile_force"},
-    "tactile_dense_ns": {"taxel_tactile_force"},
-    "camera_ns": {"rgb", "depth", "point_cloud", "object_pointcloud"},
-}
 ARM_FK_FIELDS = {"action_ee", "eef_pose", "fingertip_xyz", "hand_pointcloud"}
 HAND_FK_FIELDS = {"fingertip_xyz", "hand_pointcloud"}
 
@@ -154,7 +143,7 @@ def canonical_array_specs(fields, processing, camera):
 
 
 def validate_export_episode(reader: RawReader, fields, *, hoi_max_skew_s=None):
-    """校验输入及控制时间；联合 HOI 额外限制来源时间差。"""
+    """校验输入及控制时间；显式启用预算时检查 HOI 来源时间差。"""
     frames = reader.num_frames
     if frames <= 0:
         raise ValueError("episode contains no rows")
@@ -171,39 +160,6 @@ def validate_export_episode(reader: RawReader, fields, *, hoi_max_skew_s=None):
                     or max(stamps) > int(row["observation_ns"])):
                 raise ValueError(f"HOI source time invalid/skew exceeds hoi_max_skew_s at row {row_index}")
 
-    def first_bad(bad):
-        indices = np.flatnonzero(bad)
-        return int(indices[0]) if len(indices) else None
-
-    control, observation = rows["control_ns"], rows["observation_ns"]
-    if frames == 1:
-        logger.warning("%s: single row, no sampling interval to verify", reader.path)
-    if np.any(observation[:-1] >= control[1:]):
-        logger.warning("%s: observation readout overlaps the next control sample", reader.path)
-
-    diagnostics = []
-    for name, used_by in SOURCE_FIELDS.items():
-        if not used_by.intersection(fields):
-            continue
-        values = rows[name]
-        bad = (values <= 0) | (values > observation)
-        bad[1:] |= np.diff(values) < 0
-        row = first_bad(bad)
-        if row is not None:
-            diagnostics.append(f"{name} invalid/regressed at row {row}")
-        if name.startswith("tactile_"):
-            row = first_bad((values > 0) & (observation - values > TACTILE_AGE_WARNING_NS))
-            if row is not None:
-                diagnostics.append(f"{name} held beyond {TACTILE_AGE_WARNING_NS / 1e9:g}s at row {row}")
-    if SOURCE_FIELDS["camera_ns"].intersection(fields):
-        sequence = rows["camera_sequence"]
-        bad = sequence <= 0
-        bad[1:] |= np.diff(sequence) < 0
-        row = first_bad(bad)
-        if row is not None:
-            diagnostics.append(f"camera_sequence invalid/regressed at row {row}")
-    if diagnostics:
-        logger.warning("%s: %s; 保留全部原始行，不修补来源时间", reader.path, "; ".join(diagnostics))
     return camera
 
 

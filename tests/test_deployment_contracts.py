@@ -169,6 +169,8 @@ class DeploymentContracts(unittest.TestCase):
                 rgba = np.asarray(image)
                 np.testing.assert_array_equal(rgba[:, :, :3], rgb)
                 np.testing.assert_array_equal(rgba[:, :, 3], mask.astype(np.uint8) * 255)
+            with self.assertRaisesRegex(ValueError, '前景'):
+                save_selection(output, rgb, [dict(candidate, mask=np.zeros_like(mask))], 0)
 
     def test_rgb_only_npz_and_saved_candidates(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
@@ -183,15 +185,65 @@ class DeploymentContracts(unittest.TestCase):
             Image.fromarray(rgb).save(root / 'rgb.png')
             np.savez(root / 'rgb.npz', rgb=rgb)
             for args in (NS(image=root / 'rgb.png', rgbd=None), NS(image=None, rgbd=root / 'rgb.npz')):
-                np.testing.assert_array_equal(load_rgb(args)[0], rgb)
+                np.testing.assert_array_equal(load_rgb(args), rgb)
             source = root / "candidates"
             source.mkdir()
             Image.fromarray(rgb).save(source / "rgb.png")
             save_candidates(source, rgb, [candidate, candidate])
-            select(NS(segmentation_dir=source, output=root / 'chosen', instance=1, headless=True))
-            with Image.open(root / 'chosen/foreground_rgba.png') as image:
+            select(NS(segmentation_dir=source, output=source / 'chosen', instance=1, headless=True))
+            with Image.open(source / 'chosen/foreground_rgba.png') as image:
                 np.testing.assert_array_equal(np.asarray(image)[:, :, :3], rgb)
                 np.testing.assert_array_equal(np.asarray(image)[:, :, 3], 255)
+            with Image.open(source / 'chosen/overlay.png') as image:
+                self.assertEqual(image.size, (16, 12))
+            with patch('cordvip_geometry.cli.object.choose', return_value=0) as choose:
+                select(NS(segmentation_dir=source, output=source / 'manual', instance=None, headless=False))
+                np.testing.assert_array_equal(choose.call_args.args[0], rgb)
+                np.testing.assert_array_equal(choose.call_args.args[1][0]['mask'], mask)
+                self.assertFalse(choose.call_args.kwargs['headless'])
+            with self.assertRaisesRegex(ValueError, '多个候选'):
+                select(NS(segmentation_dir=source, output=source / 'ambiguous', instance=None, headless=True))
+            single = root / 'single'
+            single.mkdir()
+            Image.fromarray(rgb).save(single / 'rgb.png')
+            save_candidates(single, rgb, [candidate])
+            select(NS(segmentation_dir=single, output=single / 'chosen', instance=None, headless=True))
+
+    def test_geometry_output_paths(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
+        from cordvip_geometry.io import output_path
+        from cordvip_geometry.reconstruction import generate_mesh
+        from cordvip_geometry.cli.download import main as download
+        from cordvip_geometry.models import SAM_MODELS
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('candidates', 'asset', 'raw'):
+                parent = root / name
+                parent.mkdir()
+                if name == 'raw':
+                    (parent / 'data.h5').write_bytes(b'raw')
+                target = output_path(parent / 'new')
+                target.mkdir(exist_ok=False)
+                with self.assertRaises(FileExistsError):
+                    output_path(target)
+            target = root / 'existing.obj'
+            target.write_bytes(b'original')
+            image = root / 'input.png'
+            image.write_bytes(b'input')
+            pipeline = Mock()
+            with patch.dict(sys.modules, {'hy3dshape': NS(Hunyuan3DDiTFlowMatchingPipeline=pipeline)}):
+                with self.assertRaises(FileExistsError):
+                    generate_mesh(image, root / 'missing-source', root / 'missing-weights', target)
+            pipeline.from_single_file.assert_not_called()
+            self.assertEqual(target.read_bytes(), b'original')
+            models = root / 'models'
+            models.mkdir()
+            weight = models / SAM_MODELS['small']['weight']
+            weight.parent.mkdir(parents=True, exist_ok=True)
+            weight.write_bytes(b'local weights')
+            self.assertEqual(output_path(models, allow_existing=True), models)
+            self.assertEqual(download(['--models', 'sam', '--models-dir', str(models)]), 0)
+            self.assertEqual(weight.read_bytes(), b'local weights')
 
     def test_modes_and_ode(self):
         base = ExecutionConfig(control_dt_s=0.1, action_steps=4)

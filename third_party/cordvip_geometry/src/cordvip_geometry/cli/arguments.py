@@ -90,7 +90,7 @@ def parse_object_args(argv=None, *, workspace=None):
         description=(
             "从 rgb.png 和 candidates.npz 选择物体，写出 mask.png、foreground_rgba.png、"
             "overlay.png。"
-            "再次选择仍使用原候选目录。"
+            "再次选择时复用原候选目录作为输入，并指定新的输出目录。"
         ),
     )
     select.add_argument(
@@ -118,7 +118,7 @@ def parse_object_args(argv=None, *, workspace=None):
     preview.add_argument("--units", choices=("unscaled", "m"), default="unscaled")
     for command in (segment, select, generate, build, prepare):
         command.add_argument(
-            "--output", type=Path, required=True, help="尚不存在的新输出目录"
+            "--output", type=Path, required=True, help="尚不存在的新输出目录，可位于候选、资产或 Raw 目录内"
         )
     args = parser.parse_args(argv)
     if args.command == "build" and args.headless and args.preview:

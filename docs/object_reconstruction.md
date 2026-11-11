@@ -46,7 +46,7 @@ Raw `/hoi` 只包含 `object_pointcloud[T,1024,3]` 和 `object_pointcloud_valid[
 
 CONFIG.execution.hoi_max_skew_s 默认 None，关闭额外来源时间差限制；物体点云与手几何或 joint_state 联合消费时，可显式填写有限正数秒值启用。导出使用同一个 `--config`，程序调用可直接设置 ExportConfig.hoi_max_skew_s。
 
-在线使用 HOI 原始相机来源时间与臂、手反馈时间；离线使用 camera_ns、arm_ns、hand_ns。启用检查时三者 max−min 不得超过预算（等于预算允许），超限拒绝整次导出或停止本轮。各来源年龄检查继续保留，不以年龄预算替代时间差预算。主机记录时间差不证明物理同步，不进行插值、补洞或重采样。
+在线使用 HOI 原始相机来源时间与臂、手反馈时间；离线使用 camera_ns、arm_ns、hand_ns。启用检查时三者 max−min 不得超过预算（等于预算允许），超限拒绝整次导出或停止本轮。在线各来源年龄检查继续保留，不以年龄预算替代时间差预算。主机记录时间差不证明物理同步，不进行插值、补洞或重采样。
 
 ## 当前实现与性能结论
 

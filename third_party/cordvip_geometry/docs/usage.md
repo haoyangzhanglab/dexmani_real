@@ -15,3 +15,5 @@ step 成功返回 `{object_name: pose_camera}`，位姿将原物体坐标系变�
 正式离线入口为 annotate_episodes.py；它按 camera_sequence 去重并在首次失效停止该 Episode。结果通过主项目 visualize_episode.py 查看。重建选择支持图片或含 rgb 的 NPZ，选择结果使用固定的 mask.png、foreground_rgba.png、overlay.png 文件名。
 
 FoundationPose 权重与同帧预处理复用、SAM 子进程隔离及有界时序状态继续保留。参见[实验命令](../../../scripts/cordvip/README.md)和[资产约定](../../../docs/object_reconstruction.md)。
+
+输出使用尚不存在的新目标，可位于候选、资产或 Raw 目录内部，由研究者选择位置；已有输出仍拒绝覆盖。模型下载目录允许复用。

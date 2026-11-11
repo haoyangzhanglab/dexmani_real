@@ -33,8 +33,6 @@ logger = logging.getLogger(__name__)
 
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
 TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
-# 离线导出的来源年龄诊断阈值；在线采集使用实际 Hand TTL。
-TACTILE_AGE_WARNING_NS = 500_000_000
 EPISODE_OUTCOMES = ("success", "failure", "unknown")
 
 

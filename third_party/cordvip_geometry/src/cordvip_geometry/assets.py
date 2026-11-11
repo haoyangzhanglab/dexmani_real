@@ -51,7 +51,7 @@ def prepare_asset(
 ):
     validate_asset_parameters(scale_to_meters, size_axis, size_meters)
     source = existing_file(mesh_path)
-    output = output_path(output, protected=(source,))
+    output = output_path(output)
     mesh = load_mesh(source)
     if scale_to_meters is None:
         scale_to_meters = mesh_scale_from_extent(

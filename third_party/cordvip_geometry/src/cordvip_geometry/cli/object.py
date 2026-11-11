@@ -26,7 +26,7 @@ def load_rgb(args):
             rgb = saved["rgb"]
         if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3 or min(rgb.shape[:2]) < 2:
             raise ValueError("RGB must be uint8 [H,W,3]")
-    return rgb, path
+    return rgb
 
 
 def segment(args, *, output=None, list_only=False):
@@ -36,8 +36,8 @@ def segment(args, *, output=None, list_only=False):
 
     if not args.headless and not list_only:
         display_available()
-    rgb, source = load_rgb(args)
-    output = output_path(output or args.output, protected=(source,))
+    rgb = load_rgb(args)
+    output = output_path(output or args.output)
     output.mkdir(parents=True, exist_ok=False)
     Image.fromarray(rgb).save(output / "rgb.png")
     print(f"Segmentation: prompt={args.prompt!r}, box_threshold={args.box_threshold}, text_threshold={args.text_threshold}", flush=True)
@@ -74,7 +74,7 @@ def select(args):
     from PIL import Image
 
     source = args.segmentation_dir.expanduser().resolve()
-    output = output_path(args.output, protected=(source,))
+    output = output_path(args.output)
     with Image.open(existing_file(source / "rgb.png")) as image:
         rgb = np.asarray(image.convert("RGB")).copy()
     with np.load(existing_file(source / "candidates.npz"), allow_pickle=False) as saved:
@@ -82,23 +82,6 @@ def select(args):
         boxes = saved["boxes"]
         scores = saved["scores"]
         labels = saved["labels"]
-    if (
-        masks.dtype != np.bool_
-        or masks.ndim != 3
-        or masks.shape[1:] != rgb.shape[:2]
-        or len(masks) == 0
-    ):
-        raise ValueError("保存的候选 mask 与 RGB 不一致")
-    count = len(masks)
-    if boxes.shape != (count, 4) or any(
-        array.shape != (count,) for array in (scores, labels)
-    ):
-        raise ValueError("候选框、分数和标签必须与 mask 数量及数组形状一致")
-    if labels.dtype.kind != "U" or any(
-        array.dtype.kind not in "fiu" or not np.isfinite(array).all()
-        for array in (boxes, scores)
-    ):
-        raise ValueError("候选标签必须为字符串，框和分数必须为有限实数")
     candidates = [
         {
             "mask": masks[i],
@@ -106,7 +89,7 @@ def select(args):
             "score": float(scores[i]),
             "label": str(labels[i]),
         }
-        for i in range(count)
+        for i in range(len(masks))
     ]
     index = choose(rgb, candidates, args.instance, headless=args.headless)
     output.mkdir(parents=True, exist_ok=False)
@@ -118,7 +101,7 @@ def generate(args, image=None, output=None):
     if args.preview:
         display_available()
     image = existing_file(image or args.image)
-    output = output_path(output or args.output, protected=(image,))
+    output = output_path(output or args.output)
     output.mkdir(parents=True, exist_ok=False)
     root = args.workspace / "third_party/Hunyuan3D-2.1"
     weights = args.models_dir / "Hunyuan3D-2.1"
@@ -171,8 +154,7 @@ def build(args):
     validate_generation_parameters(
         args.seed, args.steps, args.octree_resolution, args.num_chunks
     )
-    source = args.image if args.image is not None else args.rgbd
-    output = output_path(args.output, protected=(source,))
+    output = output_path(args.output)
     output.mkdir(parents=True, exist_ok=False)
     segment(args, output=output / "segmentation")
     # 生成进程退出后释放 CUDA，再准备米制资产。

@@ -44,7 +44,7 @@ def generate_mesh(
         int, (seed, steps, octree_resolution, num_chunks)
     )
     image_path = existing_file(image_rgba_path)
-    output = output_path(output_mesh_path, protected=(image_path,))
+    output = output_path(output_mesh_path)
     if output.suffix.lower() != ".obj":
         raise ValueError("Generated mesh output must use .obj")
 
