@@ -114,11 +114,7 @@ def select(args):
 
 
 def generate(args, image=None, output=None):
-    from ..reconstruction import generate_mesh, validate_generation_parameters
-
-    validate_generation_parameters(
-        args.seed, args.steps, args.octree_resolution, args.num_chunks
-    )
+    from ..reconstruction import generate_mesh
     if args.preview:
         display_available()
     image = existing_file(image or args.image)

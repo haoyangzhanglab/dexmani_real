@@ -120,7 +120,7 @@ Sensor Worker 与模型线程跨段保留；段间只回收本段 Recorder 和�
 | 未创建 Recorder（未启用录制或准备提前结束） | 明确显示未启用或尚未开始录制。 |
 | Raw 已发布，未截断 | 明确提示 Raw 保存成功及保存路径。 |
 | Raw 已发布，有 `recording_truncated_reason` | 提示部分数据已保存、录制截断、原因及保存路径，不称为完整保存或完全失败。 |
-| Raw 写入或收尾失败 | 用失败警告替代普通成功提示，列出错误和 Recorder 提供的 staging 路径；路径缺失或不可访问时标为不可用。staging 不是正式发布的 Episode。 |
+| Raw 写入或收尾失败 | 用失败警告替代普通成功提示，列出错误和 Recorder 提供的 staging 路径；路径缺失时显示未提供，不探测可访问性或推断可恢复性。staging 不是正式发布的 Episode。 |
 | Raw 未发布 | 只报告未发布，不推断是丢弃、零帧还是尚未执行发布。 |
 | Writer pending | 明确显示仍在收尾、尚无最终结果，不显示正常完成或重启提示。 |
 
@@ -135,7 +135,7 @@ Sensor Worker 与模型线程跨段保留；段间只回收本段 Recorder 和�
 - 相机或触觉来源失效、质量拒绝、队列满都会结束本段。先停止设备，再排空已经接收的完整行；写入和关闭正常时保存有效前缀，保留结束原因。所有已启动的必需 Worker（包括仅用于录制的 Camera）退出都会终止会话。
 - 文件／编码 I/O 失败结束本段，保留 staging 并报告，不发布失败录制。初始化失败时不开始运动；Writer 实际退出并完成收尾后才能重新按 B。发布与失败以 `EpisodeRecorder.result()` 为准，`poll_finish()` 仅表示收尾完成。停止、录制关闭和迟到预测的失败都会更新本段结果；程序错误、停止失败和无法回收的资源继续退出会话。
 - RGB／Depth／状态逐行对应，MP4 PTS 相对首行控制时间。调度跳槽后，在下一条已保存行记录 `/timing/segment_starts`；非空录制从 0 开始、严格递增，`recording_truncated_reason` 仅作诊断。质量拒绝与队列满之后不再接收新行。
-- Raw 的 `runtime_config_json` 保存本次实际配置；遥操作还保存相机参数、VR 变换和 `hand_retargeting_calibration_json` 中的骨长与掌宽。部署继续保存已有的模型、配置和每段结果归档。
+- Raw 保留相机参数、深度与触觉尺度、坐标变换、关节顺序及来源时间；遥操作还保存 VR 变换和 `hand_retargeting_calibration_json` 中的骨长与掌宽。部署完整配置保存在已有 run_config.yaml；遥操作完整配置由研究者自行管理。
 - 导出与回放必须有合法 `segment_starts`，不从时间间隔猜测断点。导出保留有效行，每个连续区间形成一个 Zarr `meta/episode_ends` 边界，训练窗口不跨断点；`raw_episode_count` 统计文件，`episode_count` 统计区间。区间按标称频率使用，周期抖动只告警、不重采样；控制时间倒退、非法数组和所选字段非有限值仍拒绝。
 
 策略等待预测时仍可记录观测；没有指令提交尝试的行，其动作字段为 NaN。选择动作字段导出或进行物理回放时，这些行会被拒绝，不填充旧动作。

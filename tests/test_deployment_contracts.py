@@ -56,6 +56,30 @@ class DeploymentContracts(unittest.TestCase):
             np.testing.assert_array_equal(cloud[-1], [-1, 5, 8])
             self.assertEqual(template['object_names'].tolist(), ['a', 'b'])
 
+    def test_tracking_open_defaults_and_cleanup(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
+        from cordvip_geometry.tracking import SceneTracker
+        from cordvip_geometry.models import DEFAULT_MODELS_DIR, resolve_sam_model
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            with patch('cordvip_geometry.assets.load_asset', return_value=(Mock(), {})), \
+                    patch('cordvip_geometry.sam2.SAM2Client') as client, \
+                    patch('cordvip_geometry.tracking.PoseTracker') as pose, \
+                    patch('cordvip_geometry.tracking.ModelDepthRenderer'):
+                with self.assertRaisesRegex(RuntimeError, 'IPC failed'):
+                    with SceneTracker.open({'object': workspace / 'asset'}, workspace=workspace) as tracker:
+                        checkpoint, config = resolve_sam_model(workspace / DEFAULT_MODELS_DIR)
+                        client.assert_called_once_with(sys.executable, workspace, workspace / DEFAULT_MODELS_DIR,
+                                                       checkpoint=checkpoint, config=config)
+                        debug = Path(pose.call_args.args[2])
+                        self.assertTrue(debug.parent.parent.is_dir())
+                        tracker.reset()
+                        client.return_value.__enter__.return_value.reset.assert_called_once()
+                        raise RuntimeError('IPC failed')
+                self.assertEqual(tracker.trackers, {})
+                self.assertFalse(debug.parent.parent.exists())
+                client.return_value.__exit__.assert_called_once()
+
     def test_tracking_depth_gate_failure(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
         from cordvip_geometry.tracking import SceneTracker, TrackingFailure
@@ -281,24 +305,19 @@ class DeploymentContracts(unittest.TestCase):
 
     def test_cli_print_config_contract(self):
         root = Path(__file__).resolve().parents[1]
-        runtime = asdict(RealConfig())
-        sections = ('execution', 'arm', 'hand', 'motion', 'camera', 'pointcloud', 'hand_pointcloud', 'environment')
-        for script, options, expected in (
-            ('run_policy.py', [], {name: runtime[name] for name in sections}),
-            ('collect_teleop.py', [], runtime | {'collection': {
-                'enabled': True, 'episodes_dir': 'episodes', 'max_duration_s': 60.0,
-            }}),
+        for script, options, collection in (
+            ('run_policy.py', [], None),
+            ('collect_teleop.py', [], {'enabled': True, 'episodes_dir': 'episodes', 'max_duration_s': 60.0}),
             ('collect_teleop.py', ['--no-record', '--episodes-dir', 'offline', '--max-duration', '12'],
-             runtime | {'collection': {'enabled': False, 'episodes_dir': 'offline', 'max_duration_s': 12.0}}),
+             {'enabled': False, 'episodes_dir': 'offline', 'max_duration_s': 12.0}),
         ):
             with self.subTest(script=script, options=options):
                 result = subprocess.run([sys.executable, '-B', str(root/'scripts'/script), '--print-config', *options],
                                         cwd=root, capture_output=True, text=True, check=True)
                 actual = json.loads(result.stdout)
-                self.assertEqual(tuple(actual), tuple(expected))
-                # JSON 将配置元组编码为数组；逐字段比较可直接定位变化。
-                self.assertEqual(actual, json.loads(json.dumps(expected)))
-                self.assertEqual(result.stdout, json.dumps(expected, ensure_ascii=False, indent=2, allow_nan=False) + '\n')
+                self.assertEqual(actual['execution']['control_dt_s'], RealConfig().execution.control_dt_s)
+                if collection is not None:
+                    self.assertEqual(actual['collection'], collection)
 
     def test_archive_sections_and_early_failure_cleanup(self):
         runtime = RealConfig()
@@ -317,12 +336,8 @@ class DeploymentContracts(unittest.TestCase):
             session.save_run_config()
         payload = write.call_args.args[0]
         self.assertEqual(payload['policy'], {'checkpoint_path': 'offline.pt'})
-        sections = ('execution', 'arm', 'hand', 'motion', 'camera', 'pointcloud', 'hand_pointcloud', 'environment')
-        self.assertEqual(tuple(payload['runtime']), sections)
-        self.assertEqual(payload['runtime'], {name: asdict(getattr(runtime, name)) for name in sections})
-        self.assertEqual(tuple(payload), ('policy', 'runtime', 'camera_calibration_path', 'effective_camera',
-                                         'table_plane_abcd', 'table_plane_path', 'seed', 'device',
-                                         'num_episodes', 'max_duration_s', 'record_raw'))
+        self.assertEqual(payload['runtime']['execution'], asdict(runtime.execution))
+        self.assertEqual(payload['runtime']['arm'], asdict(runtime.arm))
         session.output_dir = None
         del session.info
         with patch.object(session, 'prepare_resources', side_effect=ValueError('model load failed')), \

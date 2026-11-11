@@ -5,7 +5,6 @@ import logging
 import sys
 import time
 from collections.abc import Sequence
-from dataclasses import asdict
 from enum import Enum
 from typing import cast
 
@@ -277,7 +276,6 @@ class TeleopLoop:
                     tactile_reset_metadata=self.robot.hand.tactile_reset_metadata,
                 )
                 metadata["vr_to_robot_rotation"] = self.controller.rotation.as_matrix().tolist()
-                metadata["runtime_config_json"] = json.dumps(asdict(self.runtime), allow_nan=False)
                 retargeter = self.controller.hand_retargeter
                 if retargeter is not None:
                     calibration = retargeter.calibration

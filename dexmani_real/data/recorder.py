@@ -47,11 +47,7 @@ def format_recording_result(raw: dict | None) -> tuple[int, str]:
         lines.append(f"录制错误：{raw['error']}")
     staging = raw["staging_path"]
     if staging is not None or status in {"failed", "pending"}:
-        if staging is None or not os.path.isdir(staging) or not os.access(staging, os.R_OK | os.X_OK):
-            staging = f"不可用（{staging or 'Recorder 未提供路径'}）"
-        else:
-            staging = f"{staging}（当前可访问，不代表数据完整或可恢复）"
-        lines.append(f"Staging：{staging}")
+        lines.append(f"Staging：{staging if staging is not None else 'Recorder 未提供路径'}")
     return level, "\n".join(lines)
 
 

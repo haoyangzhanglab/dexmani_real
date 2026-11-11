@@ -61,11 +61,11 @@ python scripts/export_zarr.py episodes/pnp_apple_banana \
 python scripts/run_policy.py /path/to/checkpoints/latest.pt --record-raw
 ```
 
-需要修改实验参数时，在本地 Python 文件中导出 `CONFIG: RealConfig`，通过 `--config` 传入。普通 point_cloud 的 recipe 从 Checkpoint 恢复；hand_pointcloud 使用 RealConfig.hand_pointcloud。Raw 保存实际配置和标定结果；导出按训练所需字段选择，目标目录必须不存在。HOI 先按 [CordVIP 流程](scripts/cordvip/README.md) 完成标注，再选择 `object_pointcloud` 导出。
+需要修改实验参数时，在本地 Python 文件中导出 `CONFIG: RealConfig`，通过 `--config` 传入。普通 point_cloud 的 recipe 从 Checkpoint 恢复；hand_pointcloud 使用 RealConfig.hand_pointcloud。Raw 保存数据解释所需标定，部署完整配置保存在 run_config.yaml；遥操作完整配置由研究者自行管理；导出按训练所需字段选择，目标目录必须不存在。HOI 先按 [CordVIP 流程](scripts/cordvip/README.md) 完成标注，再选择 `object_pointcloud` 导出。
 
 省略 `--fields` 默认导出全部现有常用模态（不含 `object_pointcloud`），供不同策略复用同一份 Canonical Zarr；也可显式选择字段子集。`--exclude EPISODE` 按目录名排除整段，可重复指定；任何未知名称都会报错，全部排除也会拒绝导出。
 
-已发布的 Raw 可离线标注任务结果，包含录制截断的 Episode：
+已有 Episode 目录可离线标注人工任务结果：
 
 ```bash
 python scripts/label_episode.py episodes/task/episode_xxx success
@@ -73,9 +73,9 @@ python scripts/label_episode.py episodes/task/episode_xxx failure --note "抓取
 python scripts/visualize_episode.py episodes/task/episode_xxx --info
 ```
 
-标签为 `success`、`failure` 或 `unknown`，独立保存在 `outcome.json`，含程序生成的 UTC 时间与可选备注；默认拒绝覆盖，`--overwrite` 原子替换整个标注（未传备注则移除旧备注）。只有 Episode 目录存在且缺少 `outcome.json` 时才视为 `unknown`；目录不存在或不是目录时抛出 `NotADirectoryError`。已有标注必须包含合法的 `outcome` 和 `annotated_at_utc`：时间戳须为带 UTC 时区的 ISO 8601 日期时间（例如 `2026-11-10T08:00:00Z` 或 `2026-11-10T08:00:00+00:00`），`note` 若存在须为字符串。缺字段、非法时间、无时区或非 UTC 时区均明确报错，`--info` 同样执行此检查。
+标签为 `success`、`failure` 或 `unknown`，独立保存在 `outcome.json`，新标注只含 outcome 和用户提供的可选 note。默认拒绝覆盖，`--overwrite` 原子替换整个标注（未传备注则移除旧备注）。读取仅要求 JSON 对象含合法 outcome；旧时间戳、备注和其他额外字段不参与验证。已有目录缺少标签时返回 unknown，损坏 JSON、非法 outcome 和权限错误直接报错。
 
-标注入口只检查 Raw 基本身份、录制完成状态和基础文件，不承担各模态或 HOI 的完整质量校验。任务结果、控制结束原因和 Raw 保存状态互相独立；在线摘要不读取离线标签，以 INFO 显示 `unknown`；Raw 录制结果独立使用对应日志级别。标注不改写 HDF5/MP4 或已有 Zarr，不改变导出或训练选择；未标注 Episode 仍可使用，现有数据集不需重新生成。不提供 success-only 筛选、Raw 来源映射或标签快照。
+写标签只要求目录已存在，不打开 Raw 或检查录制质量。任务结果、控制结束原因和 Raw 保存状态互相独立；在线摘要不读取离线标签，以 INFO 显示 `unknown`；Raw 录制结果独立使用对应日志级别。标注不改写 HDF5/MP4 或已有 Zarr，不改变导出或训练选择；未标注 Episode 仍可使用，现有数据集不需重新生成。不提供 success-only 筛选、Raw 来源映射或标签快照。
 
 采集和评估均按 B 开始新段，S/C 保存结束，D 丢弃，Q 保存退出，Esc 急停。来源失效或录制失败会结束本段；停止与收尾完成后才能再次按 B。触觉录制与模型输入共用默认 200 ms 时效预算。
 

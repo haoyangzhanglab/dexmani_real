@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import cast
 
@@ -313,7 +312,6 @@ class Rollout:
                 self.camera_snapshot,
                 tactile_reset_metadata=self.robot.hand.tactile_reset_metadata,
             )
-            metadata["runtime_config_json"] = json.dumps(asdict(self.runtime), allow_nan=False)
             self.recorder.start(
                 task_label=self.policy_info.task_name,
                 episode_name=f"episode_{self.result.index:03d}", collection_source="policy_rollout", metadata=metadata,

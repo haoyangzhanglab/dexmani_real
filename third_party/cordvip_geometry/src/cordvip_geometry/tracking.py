@@ -2,8 +2,6 @@
 
 import sys
 from contextlib import contextmanager
-from math import isfinite
-from numbers import Real
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -14,26 +12,10 @@ from .geometry import RectificationMaps, validate_intrinsics, validate_distortio
 from .model_depth import ModelDepthRenderer, camera_rays
 
 
-def validate_object_name(name):
-    if (
-        not isinstance(name, str)
-        or not name
-        or name in {".", ".."}
-        or "\0" in name
-        or Path(name).name != name
-    ):
-        raise ValueError("Object names must be nonempty single directory names")
-
-
-def _validate_tracking_parameters(*, pixel_stride, depth_tolerance_m, min_matched_pixels, min_matched_fraction):
-    for name, value in (("pixel_stride", pixel_stride), ("min_matched_pixels", min_matched_pixels)):
-        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
-            raise ValueError(f"{name} must be a positive integer")
-    for name, value in (("depth_tolerance_m", depth_tolerance_m), ("min_matched_fraction", min_matched_fraction)):
-        if isinstance(value, bool) or not isinstance(value, Real) or not isfinite(value) or value <= 0:
-            raise ValueError(f"{name} must be finite and positive")
-    if min_matched_fraction > 1:
-        raise ValueError("min_matched_fraction must be in (0,1]")
+PIXEL_STRIDE = 2
+DEPTH_TOLERANCE_M = 0.015
+MIN_MATCHED_PIXELS = 30
+MIN_MATCHED_FRACTION = 0.15
 
 
 class SceneTracker:
@@ -44,16 +26,8 @@ class SceneTracker:
         *,
         foundationpose_root,
         debug_dir,
-        pixel_stride=2,
-        depth_tolerance_m=0.015,
-        min_matched_pixels=30,
-        min_matched_fraction=0.15,
     ):
         self.segmenter = segmenter
-        self.pixel_stride = pixel_stride
-        self.depth_tolerance_m = depth_tolerance_m
-        self.min_matched_pixels = min_matched_pixels
-        self.min_matched_fraction = min_matched_fraction
         self.trackers, self.renderers = {}, {}
         self.directions = self.maps = None
         shared = None
@@ -64,73 +38,41 @@ class SceneTracker:
             shared = shared or tracker
             self.trackers[name] = tracker
             self.renderers[name] = ModelDepthRenderer(
-                tracker.mesh, pixel_stride=pixel_stride
+                tracker.mesh, pixel_stride=PIXEL_STRIDE
             )
 
     @classmethod
     @contextmanager
-    def open(
-        cls,
-        assets,
-        *,
-        workspace=None,
-        models_dir=None,
-        sam_python=None,
-        sam_variant=None,
-        sam_checkpoint=None,
-        sam_config=None,
-        log_dir=None,
-        pixel_stride=2,
-        depth_tolerance_m=0.015,
-        min_matched_pixels=30,
-        min_matched_fraction=0.15,
-    ):
+    def open(cls, assets, *, workspace):
         """一次加载资产与模型，退出时释放 SAM 子进程。"""
-        _validate_tracking_parameters(
-            pixel_stride=pixel_stride, depth_tolerance_m=depth_tolerance_m,
-            min_matched_pixels=min_matched_pixels, min_matched_fraction=min_matched_fraction,
-        )
         from .assets import load_asset
         from .models import DEFAULT_MODELS_DIR, resolve_sam_model
         from .sam2 import SAM2Client
 
         if not assets or any(path is None for path in assets.values()):
             raise ValueError("Every task object requires a Mesh asset")
-        for name in assets:
-            validate_object_name(name)
-        workspace = Path(workspace or Path.cwd()).expanduser().resolve()
-        models_dir = (
-            Path(models_dir or workspace / DEFAULT_MODELS_DIR).expanduser().resolve()
-        )
-        checkpoint, config = resolve_sam_model(
-            models_dir, sam_variant, sam_checkpoint, sam_config
-        )
+        workspace = Path(workspace).expanduser().resolve()
+        models_dir = workspace / DEFAULT_MODELS_DIR
+        checkpoint, config = resolve_sam_model(models_dir)
         loaded = {}
         for name, path in assets.items():
             path = Path(path).expanduser()
             mesh, _ = load_asset(path if path.is_absolute() else workspace / path)
             loaded[name] = mesh
         with TemporaryDirectory(prefix="cordvip_") as temporary:
-            debug_dir = (
-                Path(log_dir).expanduser().resolve() if log_dir else Path(temporary)
-            )
+            debug_dir = Path(temporary)
             with SAM2Client(
-                sam_python or sys.executable,
+                sys.executable,
                 workspace,
                 models_dir,
                 checkpoint=checkpoint,
                 config=config,
-                log_path=debug_dir / "sam2_worker.log" if log_dir else None,
             ) as segmenter:
                 tracker = cls(
                     segmenter,
                     loaded,
                     foundationpose_root=workspace / "third_party/FoundationPose",
                     debug_dir=debug_dir / "foundationpose",
-                    pixel_stride=pixel_stride,
-                    depth_tolerance_m=depth_tolerance_m,
-                    min_matched_pixels=min_matched_pixels,
-                    min_matched_fraction=min_matched_fraction,
                 )
                 try:
                     yield tracker
@@ -190,23 +132,23 @@ class SceneTracker:
                     raise TrackingFailure(f"{name}: initial mask empty after rectification/overlap exclusion")
             masks = self.segmenter.initialize(rgb, masks)
             self.maps = maps
-            self.directions = camera_rays(depth_m.shape, K, self.pixel_stride)
+            self.directions = camera_rays(depth_m.shape, K, PIXEL_STRIDE)
         else:
             masks = self.segmenter.track(rgb)
-        sampled_depth = depth_m[::self.pixel_stride, ::self.pixel_stride]
+        sampled_depth = depth_m[::PIXEL_STRIDE, ::PIXEL_STRIDE]
         poses = {}
         prepared_frame = None
         for name, tracker in self.trackers.items():
             mask = masks[name]
-            selected = mask[::self.pixel_stride, ::self.pixel_stride] & (sampled_depth > 0)
+            selected = mask[::PIXEL_STRIDE, ::PIXEL_STRIDE] & (sampled_depth > 0)
             observed_depth = sampled_depth[selected]
             count = len(observed_depth)
             fp_count = np.count_nonzero(mask & (depth_m >= 0.001))
-            if count < self.min_matched_pixels or fp_count < MIN_DEPTH_PIXELS:
+            if count < MIN_MATCHED_PIXELS or fp_count < MIN_DEPTH_PIXELS:
                 raise TrackingFailure(
                     f"{name}: insufficient segmented depth: {count} independent points, "
                     f"{fp_count} FoundationPose pixels; requires "
-                    f"{self.min_matched_pixels} and {MIN_DEPTH_PIXELS}"
+                    f"{MIN_MATCHED_PIXELS} and {MIN_DEPTH_PIXELS}"
                 )
             if not first and prepared_frame is None:
                 prepared_frame = prepare_tracking_frame(rgb, depth_m, K)
@@ -219,12 +161,12 @@ class SceneTracker:
             except TrackingFailure as error:
                 raise TrackingFailure(f"{name}: {error}") from error
             v, u = np.nonzero(selected)
-            pixels = np.column_stack((v * self.pixel_stride, u * self.pixel_stride)).astype(np.int32)
+            pixels = np.column_stack((v * PIXEL_STRIDE, u * PIXEL_STRIDE)).astype(np.int32)
             model_z = self.renderers[name].render(pixels, pose, directions=self.directions)
             supported = np.count_nonzero(
-                (model_z > 0) & (np.abs(observed_depth - model_z) <= self.depth_tolerance_m)
+                (model_z > 0) & (np.abs(observed_depth - model_z) <= DEPTH_TOLERANCE_M)
             )
-            if supported < self.min_matched_pixels or supported / count < self.min_matched_fraction:
+            if supported < MIN_MATCHED_PIXELS or supported / count < MIN_MATCHED_FRACTION:
                 raise TrackingFailure(f"{name}: Semantic depth/model disagreement; pose lost")
             poses[name] = pose
         return poses

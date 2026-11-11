@@ -6,7 +6,6 @@ import json
 import logging
 import tempfile
 import unittest
-from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -359,9 +358,7 @@ class DataContracts(unittest.TestCase):
             self.assertEqual(label([str(path), 'failure', '--note', '抓取后滑落']), 0)
         annotation = read_episode_outcome(path)
         self.assertEqual(annotation['note'], '抓取后滑落')
-        self.assertTrue(annotation['annotated_at_utc'].endswith('Z'))
-        self.assertEqual(datetime.fromisoformat(annotation['annotated_at_utc'].replace('Z', '+00:00')).tzinfo,
-                         timezone.utc)
+        self.assertEqual(annotation, {'outcome': 'failure', 'note': '抓取后滑落'})
         with self.assertRaises(FileExistsError):
             write_episode_outcome(path, 'success')
         self.assertEqual(read_episode_outcome(path), annotation)
@@ -381,8 +378,7 @@ class DataContracts(unittest.TestCase):
             ('{', 'Expecting property name'),
             ('[]', 'outcome must be'),
             ('{}', 'outcome must be'),
-            ('{"outcome":"typo","annotated_at_utc":"2026-11-10T08:00:00Z"}', 'outcome must be'),
-            ('{"outcome":"success","annotated_at_utc":"2026-11-10T08:00:00Z","note":2}', 'note must be'),
+            ('{"outcome":"typo"}', 'outcome must be'),
         ):
             with self.subTest(content=content):
                 (path / 'outcome.json').write_text(content)
@@ -400,116 +396,41 @@ class DataContracts(unittest.TestCase):
             read_episode_outcome(path)
         self.assertEqual(read_episode_outcome(self.root), {'outcome': 'unknown'})
 
-    def test_outcome_requires_valid_utc_timestamp(self):
-        path = self.root / 'outcome.json'
-        path.write_text(json.dumps({'outcome': 'success'}))
-        with self.assertRaisesRegex(ValueError, 'annotated_at_utc'):
-            read_episode_outcome(self.root)
-        for timestamp in (None, 123, '', 'invalid', '2026-02-30T08:00:00Z',
-                          '2026-11-10', '2026-11-10T08:00:00', '2026-11-10T08:00:00+08:00'):
-            with self.subTest(timestamp=timestamp):
-                path.write_text(json.dumps({'outcome': 'success', 'annotated_at_utc': timestamp}))
-                with self.assertRaisesRegex(ValueError, 'annotated_at_utc'):
-                    read_episode_outcome(self.root)
-        for timestamp in ('2026-11-10T08:00:00Z', '2026-11-10T08:00:00+00:00',
-                          '2026-11-10T08:00:00.123456Z'):
-            with self.subTest(timestamp=timestamp):
-                annotation = {'outcome': 'success', 'annotated_at_utc': timestamp, 'note': '完成'}
-                path.write_text(json.dumps(annotation))
-                self.assertEqual(read_episode_outcome(self.root), annotation)
+    def test_outcome_ignores_extra_fields(self):
+        for extra in ({}, {'annotated_at_utc': '2026-11-10T08:00:00+08:00'},
+                      {'annotated_at_utc': 'invalid', 'note': 2, 'extra': []}):
+            annotation = {'outcome': 'success', **extra}
+            (self.root / 'outcome.json').write_text(json.dumps(annotation))
+            self.assertEqual(read_episode_outcome(self.root), annotation)
 
     def test_info_rejects_invalid_outcome_before_visualization(self):
         from scripts.visualize_episode import main as info
 
-        # 显式 unknown 也必须有合法时间戳，不能等同于缺少 Sidecar。
-        (self.root / 'outcome.json').write_text(json.dumps({'outcome': 'unknown'}))
+        (self.root / 'outcome.json').write_text(json.dumps({'outcome': 'invalid'}))
         with contextlib.redirect_stdout(io.StringIO()) as output, \
                 patch('scripts.visualize_episode.EpisodeVisualizer') as viewer, \
-                self.assertRaisesRegex(ValueError, 'annotated_at_utc'):
+                self.assertRaisesRegex(ValueError, 'outcome must be'):
             info([str(self.root), '--info'])
         viewer.assert_not_called()
         self.assertNotIn('Task outcome: unknown', output.getvalue())
 
-    def test_outcome_requires_published_raw_structure(self):
-        missing = self.root / 'missing'
+    def test_outcome_only_requires_existing_directory(self):
+        path = self.root / 'episode'
         with self.assertRaises(NotADirectoryError):
-            write_episode_outcome(missing, 'success')
-        missing.mkdir()
-        with self.assertRaises(OSError):
-            write_episode_outcome(missing, 'success')
-        path = self.record('policy_rollout')
-        staging = path.rename(path.with_name('.tmp_episode'))
-        with self.assertRaisesRegex(ValueError, 'unpublished Raw'):
-            write_episode_outcome(staging, 'success')
-        alias = self.root / 'episode_alias'
-        alias.symlink_to(staging, target_is_directory=True)
-        with self.assertRaisesRegex(ValueError, 'unpublished Raw'):
-            write_episode_outcome(alias, 'success')
-        staging.rename(path)
-        with h5py.File(path / 'data.h5', 'r+') as data:
-            data['meta'].attrs['termination_reason'] = 'recording_incomplete'
-        with self.assertRaisesRegex(ValueError, 'incomplete'):
             write_episode_outcome(path, 'success')
-        with h5py.File(path / 'data.h5', 'r+') as data:
-            data['meta'].attrs['termination_reason'] = 'operator'
-        (path / 'rgb.mp4').unlink()
-        with self.assertRaisesRegex(ValueError, 'missing fields'):
+        path.mkdir()
+        with patch('dexmani_real.data.raw.RawReader', side_effect=AssertionError('Raw opened')), \
+                patch('dexmani_real.data.raw.require_published_raw', side_effect=AssertionError('Raw checked')):
             write_episode_outcome(path, 'success')
-        self.assertFalse((path / 'outcome.json').exists())
+        self.assertEqual(read_episode_outcome(path), {'outcome': 'success'})
 
-    def test_outcome_is_independent_of_modality_quality(self):
-        path = self.record('teleop')
-        with h5py.File(path / 'data.h5', 'r+') as data:
-            data.create_group('hoi')
-            for name in ('arm_qpos', 'hand_tactile_force', 'vr_landmarks'):
-                data[name].resize(3, axis=0)
-            del data['depth']
-            del data['meta'].attrs['hand_tactile_scale_divisor']
-            del data['meta'].attrs['camera_color_intrinsics']
-        original = {name: (path / name).read_bytes() for name in ('data.h5', 'rgb.mp4')}
-        with patch.object(RawReader, 'read_camera', side_effect=AssertionError('camera read')), \
-                patch.object(RawReader, 'read_timing', side_effect=AssertionError('timing scan')), \
-                patch.object(RawReader, 'iter_rgb_frames', side_effect=AssertionError('video decode')):
-            write_episode_outcome(path, 'success')
-        self.assertEqual(read_episode_outcome(path)['outcome'], 'success')
-        for name, content in original.items():
-            self.assertEqual((path / name).read_bytes(), content)
-
-    def test_outcome_requires_core_metadata_and_rows(self):
-        path = self.record('policy_rollout')
-        for name in ('task_label', 'control_hz', 'collection_source', 'termination_reason'):
-            with h5py.File(path / 'data.h5', 'r+') as data:
-                value = data['meta'].attrs[name]
-                del data['meta'].attrs[name]
-            with self.subTest(missing=name), self.assertRaises(KeyError):
-                write_episode_outcome(path, 'success')
-            with h5py.File(path / 'data.h5', 'r+') as data:
-                data['meta'].attrs[name] = value
-        with h5py.File(path / 'data.h5', 'r+') as data:
-            data['timing/segment_starts'][:] = [0, 0]
-        with self.assertRaisesRegex(ValueError, 'invalid timing/segment_starts'):
-            write_episode_outcome(path, 'success')
-        with h5py.File(path / 'data.h5', 'r+') as data:
-            data['timing/segment_starts'][:] = [0, 2]
-            del data['timing/rows']
-            data['timing'].create_dataset('rows', data=np.zeros(4))
-        with self.assertRaisesRegex(ValueError, 'incompatible shape/dtype'):
-            write_episode_outcome(path, 'success')
-        with h5py.File(path / 'data.h5', 'r+') as data:
-            del data['timing/rows']
-            data['timing'].create_dataset('rows', data=np.zeros(0))
-        with self.assertRaisesRegex(ValueError, 'no rows'):
-            write_episode_outcome(path, 'success')
-        self.assertFalse((path / 'outcome.json').exists())
-
-    def test_pending_and_inaccessible_staging_formatting(self):
+    def test_pending_staging_formatting(self):
         raw = {'status': 'pending', 'path': None, 'staging_path': str(self.root), 'row_count': 3,
                'error': 'writer close delayed', 'recording_truncated_reason': None}
-        with patch('dexmani_real.data.recorder.os.access', return_value=False):
-            level, text = format_recording_result(raw)
+        level, text = format_recording_result(raw)
         self.assertEqual(level, logging.WARNING)
         self.assertIn('尚无最终录制结果', text)
-        self.assertIn('Staging：不可用', text)
+        self.assertIn('Staging：' + raw['staging_path'], text)
         self.assertIn('writer close delayed', text)
         self.assertNotIn('按 B', text)
         self.assertNotIn('保存成功', text)
@@ -525,10 +446,6 @@ class DataContracts(unittest.TestCase):
 
     def test_unreadable_outcome_is_not_unknown(self):
         path = self.root / 'outcome.json'
-        path.symlink_to(self.root / 'missing.json')
-        with self.assertRaises(FileNotFoundError):
-            read_episode_outcome(self.root)
-        path.unlink()
         path.mkdir()
         with self.assertRaises(IsADirectoryError):
             read_episode_outcome(self.root)

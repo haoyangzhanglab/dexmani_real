@@ -1,4 +1,4 @@
-"""离线标注已发布 Raw Episode 的人工任务结果。"""
+"""为已有 Episode 目录标注人工任务结果。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from dexmani_real.data.raw import EPISODE_OUTCOMES, write_episode_outcome
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("episode", type=Path, help="已发布的 Raw Episode 目录")
+    parser.add_argument("episode", type=Path, help="已有的 Episode 目录")
     parser.add_argument("outcome", choices=EPISODE_OUTCOMES)
     parser.add_argument("--note", help="可选任务结果备注")
     parser.add_argument("--overwrite", action="store_true", help="原子替换已有标注（不保留旧备注）")

@@ -281,7 +281,7 @@ class SafetyContracts(unittest.TestCase):
         if raw is not None and raw['status'] == 'failed':
             self.assertIn('Raw 录制失败，未发布有效 Episode', output)
             self.assertIn(raw['error'], output)
-            self.assertIn('Staging：' + (raw['staging_path'] or '不可用'), output)
+            self.assertIn('Staging：' + (raw['staging_path'] or 'Recorder 未提供路径'), output)
             self.assertIn('停止流程已完成；', output)
             self.assertNotIn('Raw 保存成功', output)
             self.assertNotIn('部分数据已保存', output)
@@ -409,7 +409,7 @@ class SafetyContracts(unittest.TestCase):
                 if status == 'failed':
                     self.assertTrue(episode.result.errors)
 
-    def test_recording_failure_reports_unavailable_staging(self):
+    def test_recording_failure_reports_provided_staging(self):
         for mode in ('teleop', 'policy'):
             for missing in (None, 'removed'):
                 with self.subTest(mode=mode, missing=missing):
@@ -431,7 +431,7 @@ class SafetyContracts(unittest.TestCase):
                                 contextlib.redirect_stdout(io.StringIO()) as stdout:
                             self.run_policy_episode(self.make_policy_session(episode), episode)
                         output = '\n'.join(logs.output) + stdout.getvalue()
-                    self.assertIn('Staging：不可用', output)
+                    self.assertIn('Staging：' + (raw['staging_path'] or 'Recorder 未提供路径'), output)
                     self.assertIn(raw['error'], output)
                     if missing:
                         self.assertIn(raw['staging_path'], output)

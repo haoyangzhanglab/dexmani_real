@@ -6,11 +6,11 @@
 
 `RGBDFrame`、`SceneTracker` 和 `TrackingFailure` 均可从 `cordvip_geometry` 导入。
 
-`SceneTracker.open(assets, ...)` 要求每个名字对应一个 Mesh 资产。首帧由 `detect_masks(frame, prompts)` 获取 initial_masks，调用 `step(frame, initial_masks=masks)`；后续直接 `step(frame)`。新 Episode 调用 reset()，模型权重和资产继续复用。
+`SceneTracker.open(assets, *, workspace)` 要求每个名字对应一个 Mesh 资产。首帧由 `detect_masks(frame, prompts)` 获取 initial_masks，调用 `step(frame, initial_masks=masks)`；后续直接 `step(frame)`。新 Episode 调用 reset()，模型权重和资产继续复用。
 
 step 成功返回 `{object_name: pose_camera}`，位姿将原物体坐标系变换到相机系。任一物体预期跟踪失败立即抛出 TrackingFailure（含物体及原因），不返回部分结果。调用方结束当前 Episode，下一段先 reset；在线 Worker 保留整轮失败锁存。模型、IPC、文件和程序错误保持原异常传播。
 
-语义支持与模型深度一致性保持原判定：pixel_stride=2、depth_tolerance_m=0.015、min_matched_pixels=30、min_matched_fraction=0.15，同时保留 FoundationPose 最小有效深度要求。内部只保留判定所需深度和像素，不输出展示 mask、颜色或三维诊断载荷。
+跟踪使用 workspace 下默认模型目录、默认 SAM 配对、当前解释器和临时调试目录。语义支持与模型深度一致性阈值为 tracking 模块常量：pixel_stride=2、depth_tolerance_m=0.015、min_matched_pixels=30、min_matched_fraction=0.15，同时保留 FoundationPose 最小有效深度要求。内部只保留判定所需深度和像素，不输出展示 mask、颜色或三维诊断载荷。
 
 正式离线入口为 annotate_episodes.py；它按 camera_sequence 去重并在首次失效停止该 Episode。结果通过主项目 visualize_episode.py 查看。重建选择支持图片或含 rgb 的 NPZ，选择结果使用固定的 mask.png、foreground_rgba.png、overlay.png 文件名。
 

@@ -31,7 +31,7 @@ class SAM2Client:
         )
         self.log_path = Path(log_path) if log_path is not None else None
         self._process = self._log = None
-        self._ids = self._shape = None
+        self._ids = None
 
     def __enter__(self):
         try:
@@ -125,7 +125,7 @@ class SAM2Client:
 
     def reset(self):
         self._call("reset")
-        self._ids = self._shape = None
+        self._ids = None
 
     def predict(self, rgb, text, *, box_threshold=0.3, text_threshold=0.25):
         if self._ids is not None:
@@ -151,30 +151,20 @@ class SAM2Client:
         ]
 
     def initialize(self, rgb, masks):
-        rgb = self._rgb(rgb)
         if self._ids is not None:
             raise RuntimeError("Call reset() before initializing another scene")
-        if not masks:
-            raise ValueError("Provide fixed named masks for the scene")
-        for name, mask in masks.items():
-            if not isinstance(name, str) or not name:
-                raise ValueError("Object IDs must be nonempty strings")
-            mask = np.asarray(mask)
-            if mask.dtype != np.bool_ or mask.shape != rgb.shape[:2] or not mask.any():
-                raise ValueError(f"Initial mask {name} must be nonempty bool [H,W]")
         ids = list(masks)
         _, arrays = self._call(
             "initialize",
             {"rgb": rgb, "masks": np.stack(list(masks.values()))},
             ids=ids,
         )
-        self._ids, self._shape = ids, rgb.shape[:2]
+        self._ids = ids
         return dict(zip(ids, arrays["masks"]))
 
     def track(self, rgb):
-        rgb = self._rgb(rgb)
-        if self._ids is None or rgb.shape[:2] != self._shape:
-            raise ValueError("Initialize first; frame shape must remain fixed")
+        if self._ids is None:
+            raise ValueError("Initialize first")
         _, arrays = self._call("track", {"rgb": rgb})
         return dict(zip(self._ids, arrays["masks"]))
 
