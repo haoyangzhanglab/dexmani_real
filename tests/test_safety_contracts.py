@@ -10,7 +10,7 @@ from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, create_autospec, patch
 
 import numpy as np
 
@@ -255,7 +255,7 @@ class SafetyContracts(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix='dexmani_hint_', dir='/tmp')
         self.addCleanup(temporary.cleanup)
         path = Path(temporary.name)
-        recorder = Mock(spec=EpisodeRecorder,
+        recorder = create_autospec(EpisodeRecorder, instance=True,
                         error=RecordingError('disk write failed') if status == 'failed' else None,
                         writer_pending=False, written_frames=0 if status == 'not_published' else 3,
                         published_path=path if status == 'published' else None,
@@ -276,6 +276,31 @@ class SafetyContracts(unittest.TestCase):
         loop.keyboard.poll.return_value = ([], False)
         loop.keyboard.accept_operation.return_value = self.state.cancel_epoch
         return loop
+
+    def test_recording_finish_preserves_runtime_diagnostics(self):
+        for mode in ('teleop', 'policy'):
+            for wait in (True, False):
+                with self.subTest(mode=mode, wait=wait):
+                    recorder, _ = self.make_recorder('published')
+                    details = [{'stage': 'termination', 'reason': 'operator'}]
+                    if mode == 'teleop':
+                        owner = self.make_teleop(recorder)
+                        owner.termination_details = details.copy()
+                    else:
+                        owner = self.make_rollout()[0]
+                        owner.recorder = recorder
+                        owner.result.termination_reason = 'operator'
+                        owner.result.termination_details = 'operator'
+                        owner.result.errors = details.copy()
+                    self.assertTrue(owner.finish_recording(wait=wait))
+                    self.assertIsNone(owner.recorder)
+                    called = recorder.finish if wait else recorder.request_finish
+                    called.assert_called_once_with(save=True, reason='operator')
+                    if mode == 'teleop':
+                        self.assertEqual(owner.termination_details, details)
+                    else:
+                        self.assertEqual(owner.result.termination_details, 'operator')
+                        self.assertEqual(owner.result.errors, details)
 
     def assert_recording_hint(self, output, raw):
         if raw is not None and raw['status'] == 'failed':

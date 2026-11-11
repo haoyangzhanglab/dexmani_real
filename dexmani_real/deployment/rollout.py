@@ -137,15 +137,10 @@ class Rollout:
         result = self.result
         if self.recorder is not None:
             recorder = self.recorder
-            finish_kwargs = {
-                "save": not self.discard_requested, "reason": result.termination_reason,
-                "details": result.errors + ([{"stage": "termination", "reason": result.termination_details}]
-                                            if result.termination_details is not None else []),
-            }
             if wait:
-                recorder.finish(**finish_kwargs)
+                recorder.finish(save=not self.discard_requested, reason=result.termination_reason)
             else:
-                recorder.request_finish(**finish_kwargs)
+                recorder.request_finish(save=not self.discard_requested, reason=result.termination_reason)
                 if not recorder.poll_finish():
                     return False
             result.raw = recorder.result()

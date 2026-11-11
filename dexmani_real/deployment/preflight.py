@@ -93,11 +93,8 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     if "point_cloud" in names:
         if info.pointcloud_config is None:
             raise ValueError("point_cloud requires Checkpoint pointcloud_config")
-        try:
-            pointcloud = PointCloudConfig(**info.pointcloud_config)
-            pointcloud.validate()
-        except (TypeError, ValueError) as exc:
-            raise type(exc)(f"Checkpoint pointcloud_config: {exc}") from exc
+        pointcloud = PointCloudConfig(**info.pointcloud_config)
+        pointcloud.validate()
     if "fingertip_xyz" in names and info.fingertip_link_names is None:
         raise ValueError("fingertip_xyz requires Checkpoint fingertip_link_names in model input order")
     if "depth" in names:

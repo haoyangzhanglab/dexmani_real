@@ -59,7 +59,6 @@ class RecordingError(RuntimeError):
 class _FinishRequest:
     save: bool
     reason: str
-    details: tuple[dict, ...]
     deadline: float
 
 
@@ -209,12 +208,12 @@ class EpisodeRecorder:
         self.recording_truncated_reason = quality_issue
         return quality_issue
 
-    def request_finish(self, *, save, reason, details=None) -> _FinishRequest:
+    def request_finish(self, *, save, reason) -> _FinishRequest:
         """停止接纳新行；首次请求固定处置意图和整个收尾的等待预算。"""
         self.is_recording = False
         if self.finish_request is None:
             self.finish_request = _FinishRequest(
-                save, reason, tuple(dict(item) for item in (details or ())),
+                save, reason,
                 time.monotonic() + RECORDER_STOP_TIMEOUT_S,
             )
         return self.finish_request
@@ -257,9 +256,9 @@ class EpisodeRecorder:
                 self.check_error()
         return True
 
-    def finish(self, *, save, reason, details=None):
+    def finish(self, *, save, reason):
         """同步调用复用同一请求与完成检查；等待中断由调用方处理。"""
-        request = self.request_finish(save=save, reason=reason, details=details)
+        request = self.request_finish(save=save, reason=reason)
         while not self.poll_finish():
             # 中断 join 在当前 Python 中可能误报活线程已退出，不能据此发布文件。
             time.sleep(min(0.005, max(0.0, request.deadline - time.monotonic())))
@@ -295,7 +294,6 @@ class EpisodeRecorder:
                 elif finish.save:
                     writer.finish(
                         finish.reason,
-                        finish.details,
                         recording_truncated_reason=self.recording_truncated_reason,
                     )
             except BaseException as exc:  # noqa: BLE001 — writer 线程的失败由控制线程读取并抛出。

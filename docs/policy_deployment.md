@@ -37,6 +37,8 @@
 
 模型使用 `point_cloud` 时必须保存对应 recipe；`hand_pointcloud` 使用 RealConfig.hand_pointcloud；recipe 内有默认值的字段可以省略，未知字段和非法值拒绝。未使用的几何配置保留本地值。`fingertip_xyz` 使用 Checkpoint 的 `fingertip_link_names` 顺序。`pointcloud.workspace` 是模型点云裁剪范围，与 RealConfig 的机器人安全 `environment.workspace` 职责不同。
 
+缺少手模板时运行 `python scripts/generate_hand_template.py --num-points 1024`；使用其他点数时替换该参数。
+
 Depth 必须保存 `depth_config.shape`（height, width）和 `depth_scale_m`。shape 必须等于本地 `camera.height`、`camera.width`，不自动 resize。设备实际 depth scale 在相机启动后、机器人保持停止时核对；不自动修改比例、内参或坐标系。
 
 HOI 由 `observation_fields` 中的 `object_pointcloud` 自动识别，无需额外 CLI 开关。使用 info.task_name 定位任务目录并校验模板结构；手模板点数取 RealConfig.hand_pointcloud，不从 checkpoint 覆盖；仍拒绝同时使用普通 `point_cloud`。非 HOI 模型不加载模板或启动 HOI Worker。
@@ -135,7 +137,8 @@ Sensor Worker 与模型线程跨段保留；段间只回收本段 Recorder 和�
 - 相机或触觉来源失效、质量拒绝、队列满都会结束本段。先停止设备，再排空已经接收的完整行；写入和关闭正常时保存有效前缀，保留结束原因。所有已启动的必需 Worker（包括仅用于录制的 Camera）退出都会终止会话。
 - 文件／编码 I/O 失败结束本段，保留 staging 并报告，不发布失败录制。初始化失败时不开始运动；Writer 实际退出并完成收尾后才能重新按 B。发布与失败以 `EpisodeRecorder.result()` 为准，`poll_finish()` 仅表示收尾完成。停止、录制关闭和迟到预测的失败都会更新本段结果；程序错误、停止失败和无法回收的资源继续退出会话。
 - RGB／Depth／状态逐行对应，MP4 PTS 相对首行控制时间。调度跳槽后，在下一条已保存行记录 `/timing/segment_starts`；非空录制从 0 开始、严格递增，`recording_truncated_reason` 仅作诊断。质量拒绝与队列满之后不再接收新行。
-- Raw 保留相机参数、深度与触觉尺度、坐标变换、关节顺序及来源时间；遥操作还保存 VR 变换和 `hand_retargeting_calibration_json` 中的骨长与掌宽。部署完整配置保存在已有 run_config.yaml；遥操作完整配置由研究者自行管理。
+- Raw 保留 `termination_reason` 和可用的 `recording_truncated_reason`；详细错误仍由运行日志及已有 Policy 会话结果报告，不再复制到 Raw 的 `/meta/termination_details`。历史 Raw 无需改写。
+- Raw 保留相机参数、深度与触觉尺度、坐标变换、关节顺序及来源时间。遥操作按当前控制行保存 `vr_wrist_pos`（float64，N×3）、`vr_wrist_quat_wxyz`（float64，N×4，wxyz 顺序）、`vr_landmarks`（float64，N×21×3）、`vr_recv_ts_ns` 和 `vr_sequence_id`（uint64，N）；保留 `vr_to_robot_rotation`，启用手部重定向时还保存 `hand_retargeting_calibration_json` 中的 `bone_lengths` 与 `palm_width`。采样频率与行对应不变，不另建高频 VR 流；`collection_source=policy_rollout` 仍不含 VR 字段。部署完整配置保存在已有 run_config.yaml；遥操作完整配置由研究者自行管理。
 - 导出与回放必须有合法 `segment_starts`，不从时间间隔猜测断点。导出保留有效行，每个连续区间形成一个 Zarr `meta/episode_ends` 边界，训练窗口不跨断点；`raw_episode_count` 统计文件，`episode_count` 统计区间。区间按标称频率使用，周期抖动只告警、不重采样；控制时间倒退、非法数组和所选字段非有限值仍拒绝。
 
 策略等待预测时仍可记录观测；没有指令提交尝试的行，其动作字段为 NaN。选择动作字段导出或进行物理回放时，这些行会被拒绝，不填充旧动作。

@@ -79,7 +79,7 @@ ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
 }
 
 
-# 仅供遥操作调试，不作为训练导出字段。
+# 遥操作原始输入，与控制行对齐保存，不作为训练导出字段。
 VR_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
     "vr_wrist_pos": ((3,), np.dtype(np.float64)),
     "vr_wrist_quat_wxyz": ((4,), np.dtype(np.float64)),
@@ -362,15 +362,11 @@ class RawWriter:
         self.row_times[self.frame_count : end] = cast(np.ndarray, self.timing_rows)[:count]
         self.frame_count = end
 
-    def finish(self, reason, details, *, recording_truncated_reason=None):
+    def finish(self, reason, *, recording_truncated_reason=None):
         self.flush()
         if recording_truncated_reason is not None:
             self.meta.attrs["recording_truncated_reason"] = recording_truncated_reason
         # 关闭资源成功与否由 recorder 监督方确认，元数据本身不代表已发布。
-        if details:
-            self.meta.create_dataset(
-                "termination_details", data=json.dumps(details, allow_nan=False)
-            )
         self.meta.attrs["termination_reason"] = reason
 
     def close(self):

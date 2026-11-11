@@ -149,6 +149,14 @@ class DeploymentContracts(unittest.TestCase):
             [.2782891691, .06748141348, .03761848062],
             [.2365280837, .04420054704, .06319667399]], atol=1e-7)
 
+    def test_missing_hand_template(self):
+        from dexmani_real.perception.hand_cloud import HandPointCloud
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('dexmani_real.perception.hand_cloud.HAND_TEMPLATE_DIR', Path(directory)):
+            with self.assertRaises(FileNotFoundError) as raised:
+                HandPointCloud(Mock(), 1024)
+            self.assertEqual(raised.exception.filename, str(Path(directory) / 'hand_1024.npz'))
+
     def test_reconstruction_selection_outputs(self):
         from PIL import Image
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
@@ -318,7 +326,7 @@ class DeploymentContracts(unittest.TestCase):
         resolved = resolve_deployment_config(policy_info(observation_fields=('hand_pointcloud',)), local)
         self.assertEqual(resolved.hand_pointcloud, local.hand_pointcloud)
         for recipe, error in (({'num_points': 0}, ValueError), ({'unknown': 1}, TypeError)):
-            with self.assertRaisesRegex(error, 'Checkpoint pointcloud_config'):
+            with self.assertRaises(error):
                 resolve_deployment_config(policy_info(observation_fields=('point_cloud',), pointcloud_config=recipe), local)
         for dt in (0, float('nan')):
             with self.assertRaises(ValueError):

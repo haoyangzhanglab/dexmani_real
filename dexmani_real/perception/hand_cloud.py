@@ -3,7 +3,6 @@
 import numpy as np
 
 from dexmani_real import ASSET_DIR
-from dexmani_real.config.perception import HandCloudConfig
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
 from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE
 
@@ -12,18 +11,11 @@ HAND_TEMPLATE_DIR = ASSET_DIR / "pointcloud_template" / "hand"
 
 class HandPointCloud:
     def __init__(self, hand_fk: HandFK, num_points: int):
-        HandCloudConfig(num_points=num_points).validate()
         path = HAND_TEMPLATE_DIR / f"hand_{num_points}.npz"
-        try:
-            with np.load(path, allow_pickle=False) as template:
-                points = template["points"][:, :3]
-                names = template["part_names"]
-                offsets = template["part_offsets"]
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(
-                f"Hand point-cloud template missing: {path}. Generate it with "
-                f"python scripts/generate_hand_template.py --num-points {num_points}"
-            ) from exc
+        with np.load(path, allow_pickle=False) as template:
+            points = template["points"][:, :3]
+            names = template["part_names"]
+            offsets = template["part_offsets"]
         if (
             points.shape != (num_points, 3)
             or points.dtype != np.float32

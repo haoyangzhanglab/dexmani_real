@@ -6,6 +6,7 @@ import json
 import logging
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +19,7 @@ from dexmani_real.data.export import ExportConfig, export_zarr, select_episodes
 from dexmani_real.data.hoi import HOI_FIELDS, write_hoi
 from dexmani_real.data.raw import (
     RawReader,
+    RawWriter,
     camera_metadata,
     read_episode_outcome,
     require_published_raw,
@@ -46,6 +48,13 @@ class DataContracts(unittest.TestCase):
         self.hand = (np.array(self.runtime.hand.qpos_min_rad) + self.runtime.hand.qpos_max_rad)/2
         camera = CameraSnapshot('offline', CameraIntrinsics(16, 16, 10., 10., 8., 8., 'none', (0, 0, 0, 0, 0)), 0.001, None)
         self.metadata = camera_metadata(camera)
+        self.vr_metadata = {
+            'vr_to_robot_rotation': [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]],
+            'hand_retargeting_calibration_json': json.dumps({
+                'bone_lengths': (np.arange(20).reshape(5, 4) / 1000 + .02).tolist(),
+                'palm_width': .08,
+            }),
+        }
 
     def row(self, index):
         control = 10**10 + index * 100_000_000
@@ -58,13 +67,17 @@ class DataContracts(unittest.TestCase):
         hand['tactile_aggregate'], hand['tactile_dense'] = 0.5, 0.25
         camera = {'timestamp_ns': control-2_000_000, 'ring_sequence': index+1,
                       'rgb': np.full((16, 16, 3), index, np.uint8), 'depth': np.full((16, 16), 100+index, np.uint16)}
-        vr = {'wrist_pos': np.zeros(3), 'wrist_quat_wxyz': np.array([1., 0., 0., 0.]),
-                  'landmarks': np.zeros((21, 3)), 'recv_ts_ns': control-3_000_000, 'sequence_id': index+1}
+        quat = np.array([4., 1., -2., 3. + index])
+        vr = {'wrist_pos': np.array([.1, -.2, .3]) + index,
+                  'wrist_quat_wxyz': quat / np.linalg.norm(quat),
+                  'landmarks': (np.arange(63).reshape(21, 3) + index * 100) / 1000,
+                  'recv_ts_ns': control-3_000_000, 'sequence_id': index * 3 + 7}
         return Observation(arm, hand, camera, vr, None, control+1_000_000, control_timestamp_ns=control)
 
     def record(self, source, *, command=True):
         recorder = EpisodeRecorder(self.root, control_hz=10)
-        recorder.start(task_label='offline', collection_source=source, metadata=self.metadata, episode_name=source)
+        metadata = self.metadata | self.vr_metadata if source == 'teleop' else self.metadata
+        recorder.start(task_label='offline', collection_source=source, metadata=metadata, episode_name=source)
         try:
             with self.assertRaisesRegex(ValueError, 'unpublished Raw'):
                 require_published_raw(recorder.staging_path)
@@ -72,7 +85,10 @@ class DataContracts(unittest.TestCase):
                 if index == 2:
                     recorder.mark_gap()
                 target = RobotCommand(self.arm, self.hand) if command else None
-                self.assertIsNone(recorder.append(self.row(index), target))
+                row = self.row(index)
+                if source == 'policy_rollout':
+                    row = replace(row, vr=None)
+                self.assertIsNone(recorder.append(row, target))
         finally:
             published = recorder.finish(save=True, reason='operator')
         self.assertEqual(recorder.result()['status'], 'published')
@@ -93,6 +109,18 @@ class DataContracts(unittest.TestCase):
                                  vr_landmarks=((4, 21, 3), 'float64'), vr_recv_ts_ns=((4,), 'uint64'),
                                  vr_sequence_id=((4,), 'uint64'))
                 self.assertEqual(reader.fields, set(specs) | {'rgb'})
+                self.assertEqual(reader.meta['collection_source'], source)
+                self.assertEqual(reader.meta['termination_reason'], 'operator')
+                self.assertEqual(reader.meta['recording_truncated_reason'], 'control_slots_skipped')
+                self.assertNotIn('meta/termination_details', reader.data_file)
+                if source == 'teleop':
+                    for index in range(4):
+                        for name, value in self.row(index).vr.items():
+                            np.testing.assert_array_equal(reader[f'vr_{name}'][index], value)
+                    np.testing.assert_array_equal(reader.meta['vr_to_robot_rotation'],
+                                                  self.vr_metadata['vr_to_robot_rotation'])
+                    self.assertEqual(json.loads(reader.meta['hand_retargeting_calibration_json']),
+                                     json.loads(self.vr_metadata['hand_retargeting_calibration_json']))
                 for name, (shape, dtype) in specs.items():
                     self.assertEqual(reader[name].shape, shape)
                     self.assertEqual(reader[name].dtype, np.dtype(dtype))
@@ -317,6 +345,59 @@ class DataContracts(unittest.TestCase):
         self.assertEqual(recorder.result()['status'], 'failed')
         self.assertIsNone(recorder.published_path)
         self.assertTrue(recorder.staging_path.is_dir())
+
+    def test_finish_and_close_failure_never_publish(self):
+        close = RawWriter.close
+
+        def fail_close(writer):
+            close(writer)
+            raise OSError('close failure')
+
+        for stage in ('finish', 'close'):
+            with self.subTest(stage=stage):
+                recorder = EpisodeRecorder(self.root, control_hz=10)
+                failure = fail_close if stage == 'close' else OSError('finish failure')
+                with patch.object(RawWriter, stage, autospec=True, side_effect=failure), \
+                        self.assertLogs('dexmani_real.data.recorder', level='ERROR'):
+                    recorder.start(task_label='offline', collection_source='policy_rollout',
+                                   metadata=self.metadata, episode_name=stage)
+                    try:
+                        recorder.append(replace(self.row(0), vr=None))
+                    finally:
+                        recorder.finish(save=True, reason='operator')
+                self.assertEqual(recorder.result()['status'], 'failed')
+                self.assertIsNone(recorder.published_path)
+                self.assertTrue(recorder.staging_path.is_dir())
+                self.assertFalse(recorder.writer_pending)
+
+    def test_first_finish_request_controls_save_and_discard(self):
+        for save in (True, False):
+            with self.subTest(save=save):
+                recorder = EpisodeRecorder(self.root, control_hz=10)
+                recorder.start(task_label='offline', collection_source='policy_rollout',
+                               metadata=self.metadata, episode_name=f'finish_{save}')
+                staging = recorder.staging_path
+                try:
+                    recorder.append(replace(self.row(0), vr=None))
+                    request = recorder.request_finish(save=save, reason='operator')
+                    deadline = request.deadline
+                    self.assertIs(recorder.request_finish(save=not save, reason='quit'), request)
+                    self.assertEqual((request.save, request.reason, request.deadline),
+                                     (save, 'operator', deadline))
+                finally:
+                    recorder.finish(save=not save, reason='quit')
+                self.assertFalse(recorder.writer_pending)
+                self.assertTrue(recorder.queue.empty())
+                self.assertFalse(staging.exists())
+                self.assertEqual(recorder.result()['status'], 'published' if save else 'not_published')
+                if save:
+                    with RawReader(recorder.published_path) as reader:
+                        self.assertEqual(reader.num_frames, 1)
+                        self.assertEqual(reader.meta['termination_reason'], 'operator')
+                        self.assertNotIn('recording_truncated_reason', reader.meta)
+                        self.assertNotIn('meta/termination_details', reader.data_file)
+                else:
+                    self.assertIsNone(recorder.published_path)
 
     def test_invalid_segment_and_clock_rejected(self):
         path = self.record('policy_rollout')

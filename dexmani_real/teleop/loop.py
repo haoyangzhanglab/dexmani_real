@@ -149,15 +149,10 @@ class TeleopLoop:
         recorder = self.recorder
         if recorder is None:
             return True
-        finish_kwargs = {
-            "save": not self.discard_requested,
-            "reason": self.pending_termination_reason,
-            "details": self.termination_details,
-        }
         if wait:
-            recorder.finish(**finish_kwargs)
+            recorder.finish(save=not self.discard_requested, reason=self.pending_termination_reason)
         else:
-            recorder.request_finish(**finish_kwargs)
+            recorder.request_finish(save=not self.discard_requested, reason=self.pending_termination_reason)
             if not recorder.poll_finish():
                 return False
         # 仅收尾完成后释放 owner；pending 或异常仍保留资源。
