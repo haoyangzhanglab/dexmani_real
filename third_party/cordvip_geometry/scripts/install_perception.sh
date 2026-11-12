@@ -9,18 +9,33 @@ if [[ "${1:-}" == "--workspace" ]]; then
     shift 2
 fi
 cordvip_library="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cordvip_operation=tracking
+if [[ "${1:-}" == "reconstruction" ]]; then
+    cordvip_operation=reconstruction
+    shift
+fi
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     cat <<'USAGE'
 Usage: conda activate real_robot
-       bash third_party/cordvip_geometry/scripts/install_perception.sh [--workspace PATH]
+       bash third_party/cordvip_geometry/scripts/install_perception.sh [--workspace PATH] [reconstruction]
 
-Preserve the existing base environment, fetch missing official source checkouts
-at recorded revisions, install incremental requirements, and build
-nvdiffrast and FoundationPose mycpp. No model downloads or device access.
+Default: install tracking/shared requirements, fetch Grounded-SAM-2,
+FoundationPose and nvdiffrast, apply the FoundationPose tracking-cache patch,
+and build nvdiffrast and FoundationPose mycpp. Requires conda CUDA compiler/headers,
+CMake, C++, system Boost (system/program_options) and OpenMP development files.
+Next: python -m cordvip_geometry download
+Prepare FoundationPose weights separately, then: python -m cordvip_geometry check
+
+reconstruction: after default installation in the same environment, fetch
+Hunyuan3D and install only reconstruction's additional requirements.
+Does not repeat tracking installation or builds.
+Next: python -m cordvip_geometry download --models shape
+
+Both branches preserve the base environment and use recorded source revisions.
+No model downloads or device access.
 Existing source directories and local edits are reused without checkout or reset.
-Applies the small FoundationPose tracking-cache patch; conflicts fail explicitly.
-System Boost (system/program_options) and OpenMP development files are required.
+FoundationPose patch conflicts fail explicitly.
 The workspace defaults to the current directory; --workspace must be the first option.
 Logs and environment snapshots are saved under its reports/cordvip_install/.
 USAGE
@@ -45,15 +60,21 @@ if Path(sys.prefix).resolve() != Path(os.environ['CONDA_PREFIX']).resolve():
     raise SystemExit('python does not belong to the active conda environment')
 PY
 
-for cordvip_command in git cmake c++; do
-    if ! command -v "$cordvip_command" >/dev/null; then
-        printf 'Missing build tool: %s\n' "$cordvip_command" >&2
+if ! command -v git >/dev/null; then
+    printf 'Missing tool: git\n' >&2
+    exit 1
+fi
+if [[ "$cordvip_operation" == tracking ]]; then
+    for cordvip_command in cmake c++; do
+        if ! command -v "$cordvip_command" >/dev/null; then
+            printf 'Missing build tool: %s\n' "$cordvip_command" >&2
+            exit 1
+        fi
+    done
+    if [[ ! -x "$CONDA_PREFIX/bin/nvcc" || ! -d "$CONDA_PREFIX/targets/x86_64-linux/include" ]]; then
+        printf 'The conda prefix must contain the CUDA compiler and target headers.\n' >&2
         exit 1
     fi
-done
-if [[ ! -x "$CONDA_PREFIX/bin/nvcc" || ! -d "$CONDA_PREFIX/targets/x86_64-linux/include" ]]; then
-    printf 'The conda prefix must contain the CUDA compiler and target headers.\n' >&2
-    exit 1
 fi
 
 mkdir -p reports/cordvip_install
@@ -93,45 +114,56 @@ checkout_source() {
 }
 
 mkdir -p third_party
-checkout_source Grounded-SAM-2 https://github.com/IDEA-Research/Grounded-SAM-2.git b7a9c29f196edff0eb54dbe14588d7ae5e3dde28
-checkout_source Hunyuan3D-2.1 https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git 82920d643c0dc2f7bfd7255f45f62d386edfe60c
-checkout_source FoundationPose https://github.com/NVlabs/FoundationPose.git a1b694b83e633c2cb6115b9063d940a687759392
-checkout_source nvdiffrast https://github.com/NVlabs/nvdiffrast.git 253ac4fcea7de5f396371124af597e6cc957bfae
+if [[ "$cordvip_operation" == reconstruction ]]; then
+    checkout_source Hunyuan3D-2.1 https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git 82920d643c0dc2f7bfd7255f45f62d386edfe60c
+    python -m pip install \
+        --constraint "$cordvip_log_dir/base_constraints.txt" \
+        --requirement "$cordvip_library/requirements-reconstruction.txt"
+else
+    checkout_source Grounded-SAM-2 https://github.com/IDEA-Research/Grounded-SAM-2.git b7a9c29f196edff0eb54dbe14588d7ae5e3dde28
+    checkout_source FoundationPose https://github.com/NVlabs/FoundationPose.git a1b694b83e633c2cb6115b9063d940a687759392
+    checkout_source nvdiffrast https://github.com/NVlabs/nvdiffrast.git 253ac4fcea7de5f396371124af597e6cc957bfae
 
-# 幂等应用单姿态跟踪缓存优化；遇到冲突直接失败，不重置已有源码。
-cordvip_fp_patch="$cordvip_library/scripts/foundationpose_tracking_cache.patch"
-if ! git apply --directory=third_party/FoundationPose --reverse --check "$cordvip_fp_patch" 2>/dev/null; then
-    git apply --directory=third_party/FoundationPose --check "$cordvip_fp_patch"
-    git apply --directory=third_party/FoundationPose "$cordvip_fp_patch"
-fi
+    # 幂等应用单姿态跟踪缓存优化；遇到冲突直接失败，不重置已有源码。
+    cordvip_fp_patch="$cordvip_library/scripts/foundationpose_tracking_cache.patch"
+    if ! git apply --directory=third_party/FoundationPose --reverse --check "$cordvip_fp_patch" 2>/dev/null; then
+        git apply --directory=third_party/FoundationPose --check "$cordvip_fp_patch"
+        git apply --directory=third_party/FoundationPose "$cordvip_fp_patch"
+    fi
 
-python -m pip install \
-    --constraint "$cordvip_log_dir/base_constraints.txt" \
-    --requirement "$cordvip_library/requirements-perception.txt"
+    python -m pip install \
+        --constraint "$cordvip_log_dir/base_constraints.txt" \
+        --requirement "$cordvip_library/requirements-tracking.txt"
 
-# 使用现有 conda CUDA 编译，保留基础 Torch/CUDA 版本。
-export CUDA_HOME="$CONDA_PREFIX"
-export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include${CPATH:+:$CPATH}"
-export PATH="$CONDA_PREFIX/bin:$PATH"
-export MAX_JOBS="${MAX_JOBS:-4}"
-python -m pip install --no-build-isolation --no-deps \
-    -e "$cordvip_library"
-python -m pip install --no-build-isolation --no-deps third_party/nvdiffrast
+    # 使用现有 conda CUDA 编译，保留基础 Torch/CUDA 版本。
+    export CUDA_HOME="$CONDA_PREFIX"
+    export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include${CPATH:+:$CPATH}"
+    export PATH="$CONDA_PREFIX/bin:$PATH"
+    export MAX_JOBS="${MAX_JOBS:-4}"
+    python -m pip install --no-build-isolation --no-deps \
+        -e "$cordvip_library"
+    python -m pip install --no-build-isolation --no-deps third_party/nvdiffrast
 
-cordvip_pybind_dir="$(python -m pybind11 --cmakedir)"
-cordvip_cmeel_prefix="$(python - <<'PY'
+    cordvip_pybind_dir="$(python -m pybind11 --cmakedir)"
+    cordvip_cmeel_prefix="$(python - <<'PY'
 import sysconfig
 from pathlib import Path
 print(Path(sysconfig.get_path('purelib')) / 'cmeel.prefix')
 PY
-)"
-cmake -S third_party/FoundationPose/mycpp -B third_party/FoundationPose/mycpp/build \
-    -DPYTHON_EXECUTABLE="$CONDA_PREFIX/bin/python" \
-    -Dpybind11_DIR="$cordvip_pybind_dir" \
-    -DCMAKE_PREFIX_PATH="$cordvip_cmeel_prefix"
-cmake --build third_party/FoundationPose/mycpp/build -j"$MAX_JOBS"
+    )"
+    cmake -S third_party/FoundationPose/mycpp -B third_party/FoundationPose/mycpp/build \
+        -DPYTHON_EXECUTABLE="$CONDA_PREFIX/bin/python" \
+        -Dpybind11_DIR="$cordvip_pybind_dir" \
+        -DCMAKE_PREFIX_PATH="$cordvip_cmeel_prefix"
+    cmake --build third_party/FoundationPose/mycpp/build -j"$MAX_JOBS"
+fi
 
 python -m pip list --format=json > "$cordvip_log_dir/packages_after.json"
-printf 'Dependency installation and builds completed. No models or devices were opened.\n'
-printf 'Next, from the workspace root: python -m cordvip_geometry download\n'
-printf 'Prepare FoundationPose weights separately under third_party/FoundationPose/weights/; see third_party/cordvip_geometry/README.md.\n'
+if [[ "$cordvip_operation" == reconstruction ]]; then
+    printf 'Reconstruction additions installed. No models or devices were opened.\n'
+    printf 'Next, from the workspace root: python -m cordvip_geometry download --models shape\n'
+else
+    printf 'Tracking dependencies and builds completed. No models or devices were opened.\n'
+    printf 'Next, from the workspace root: python -m cordvip_geometry download\n'
+    printf 'Prepare FoundationPose weights separately under third_party/FoundationPose/weights/, then run python -m cordvip_geometry check; see third_party/cordvip_geometry/README.md.\n'
+fi

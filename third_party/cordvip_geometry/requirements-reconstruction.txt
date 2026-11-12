@@ -1,0 +1,4 @@
+# 已完成默认跟踪安装的同一 real_robot 环境；仅增加 Hunyuan3D 依赖。
+diffusers==0.30.3
+pymeshlab==2023.12.post3
+scikit-image==0.24.0

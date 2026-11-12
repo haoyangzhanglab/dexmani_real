@@ -358,6 +358,44 @@ class HomeContracts(unittest.TestCase):
             tuple(j.tor_max for j in hand.command.finger_command), self.cfg.hand.tor_max
         )
 
+    def test_owner_rejects_invalid_references_before_motion(self):
+        valid = np.array([self.q, self.q, self.cfg.arm.home_qpos])
+        cases = {
+            "scalar": np.array(0.0),
+            "one_dimension": valid[0],
+            "three_dimensions": valid[:, None, :],
+            "six_joints": valid[:, :6],
+            "eight_joints": np.zeros((3, 8)),
+            "empty": valid[:0],
+            "one_point": valid[-1:],
+        }
+        for name, joint, value in (
+            ("nan", 0, np.nan),
+            ("inf", 3, np.inf),
+            ("negative_inf", 6, -np.inf),
+            ("below_lower", 0, np.nextafter(self.cfg.arm.joint_limit_lower[0], -np.inf)),
+            ("above_upper", 6, np.nextafter(self.cfg.arm.joint_limit_upper[6], np.inf)),
+        ):
+            samples = valid.copy()
+            samples[1, joint] = value
+            cases[name] = samples
+        cases["end_not_home"] = valid.copy()
+        cases["end_not_home"][-1, 0] = np.nextafter(valid[-1, 0], np.inf)
+
+        for name, samples in cases.items():
+            with self.subTest(case=name):
+                driver = Mock()
+                owner = ArmController(self.cfg.arm, None, None, driver)
+                owner.wait_settled = Mock()
+                check_abort = Mock()
+                message = HomeRequest(10**10, samples, 0.2)
+                with self.assertRaises(ValueError):
+                    owner.home(message, check_abort=check_abort, deadline_ns=message.deadline_ns)
+                driver.prepare_motion.assert_not_called()
+                driver.servo.assert_not_called()
+                owner.wait_settled.assert_not_called()
+                check_abort.assert_not_called()
+
     def test_owner_sends_identical_samples_and_stops_on_deviation(self):
         clock = Clock()
         samples = np.array(
@@ -366,6 +404,12 @@ class HomeContracts(unittest.TestCase):
                 (self.q + np.asarray(self.cfg.arm.home_qpos)) / 2,
                 self.cfg.arm.home_qpos,
             ]
+        )
+        original = samples.copy()
+        cfg = replace(
+            self.cfg.arm,
+            joint_limit_lower=tuple(samples.min(axis=0)),
+            joint_limit_upper=tuple(samples.max(axis=0)),
         )
         for failure in (None, "start", "tracking", "late", "hand"):
             with self.subTest(failure=failure):
@@ -376,7 +420,7 @@ class HomeContracts(unittest.TestCase):
                 )
                 io.stop.wait.side_effect = clock.sleep
                 driver = Mock()
-                owner = ArmController(self.cfg.arm, io, None, driver)
+                owner = ArmController(cfg, io, None, driver)
                 owner.status["qpos"] = samples[0] + (0.1 if failure == "start" else 0)
                 owner.wait_settled = Mock()
 
@@ -410,8 +454,12 @@ class HomeContracts(unittest.TestCase):
                             deadline_ns=message.deadline_ns,
                         )
                         np.testing.assert_array_equal(
-                            [c.args[0] for c in driver.servo.call_args_list], samples
+                            [c.args[0] for c in driver.servo.call_args_list], original
                         )
+                        np.testing.assert_array_equal(samples, original)
+                        for call in driver.servo.call_args_list:
+                            self.assertEqual(call.args[0].dtype, samples.dtype)
+                            self.assertTrue(np.shares_memory(call.args[0], samples))
                 if failure in ("start", "tracking", "hand"):
                     driver.servo.assert_not_called()
 

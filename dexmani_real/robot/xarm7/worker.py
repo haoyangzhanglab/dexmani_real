@@ -9,7 +9,6 @@ from dexmani_real.robot.commands import (
     FeedbackUnavailable,
     HomeTimeout,
     OperationCancelled,
-    validate_arm_target,
 )
 from dexmani_real.robot.xarm7.protocol import (
     ARM_STATE_DTYPE,
@@ -119,8 +118,10 @@ class ArmController:
         samples = message.samples
         if samples.ndim != 2 or samples.shape[1] != 7 or len(samples) < 2:
             raise ValueError("invalid HOME reference array")
-        for point in samples:
-            validate_arm_target(point, self.cfg.joint_limit_lower, self.cfg.joint_limit_upper)
+        if not np.all(np.isfinite(samples)):
+            raise ValueError("HOME references must be finite")
+        if np.any(samples < self.cfg.joint_limit_lower) or np.any(samples > self.cfg.joint_limit_upper):
+            raise ValueError("HOME references violate joint limits")
         if not np.array_equal(samples[-1], self.cfg.home_qpos):
             raise ValueError("HOME references must end at home")
         last_hand_stamp = 0

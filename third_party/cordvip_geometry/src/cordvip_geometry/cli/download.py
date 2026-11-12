@@ -24,7 +24,8 @@ def build_parser(*, workspace=None):
         "--models",
         nargs="+",
         choices=("grounding", "sam", "shape"),
-        default=["grounding", "sam", "shape"],
+        default=["grounding", "sam"],
+        help="默认下载 grounding 和 sam；单图重建另行指定 shape",
     )
     parser.add_argument(
         "--models-dir", type=Path, default=workspace / DEFAULT_MODELS_DIR

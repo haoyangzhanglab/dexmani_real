@@ -25,10 +25,11 @@ flowchart LR
 
 在已配置设备与模型依赖的 `real_robot` 环境中，从仓库根目录运行脚本；完整参数通过对应入口的 `--help` 查看。
 
-VR 接收依赖包含 DR-004 接收时间修复的 `hand-tracking-sdk 1.1.0` 源码（基于上游
+VR 接收依赖包含 DR-004 接收时间及 DR-027 同时间更新修复的 `hand-tracking-sdk 1.1.0` 源码（基于上游
 `6ca05d1d5b00dfd89535aef74f698d6765bf1229`）。将[修复后的 SDK](https://github.com/haoyangzhanglab/hand-tracking-sdk) checkout 放在相邻的
 `../hand-tracking-sdk`，在 `real_robot` 环境执行 `python -m pip install --no-deps -e ../hand-tracking-sdk`。
 接收器须提供 `last_recv_ts_ns`，保留行在主机完整接收时的单调时间，供组帧与现有 TTL 检查使用。
+同次接收中的多条组件更新可共享时间戳，SDK 仍逐次输出并递增序号；手部标定按 Ring 发布序号识别新观测。
 
 | 任务 | 入口 |
 | --- | --- |
@@ -40,6 +41,8 @@ VR 接收依赖包含 DR-004 接收时间修复的 `hand-tracking-sdk 1.1.0` 源
 | Raw 关节目标回放 | [replay_episode.py](scripts/replay_episode.py) |
 | 相机／VR 朝向标定 | [calibrate_camera.py](scripts/calibrate_camera.py) / [calibrate_vr_heading.py](scripts/calibrate_vr_heading.py) |
 | 物体资产与 HOI 点云 | [CordVIP 实验入口](scripts/cordvip/README.md) |
+
+感知环境默认只安装跟踪能力；单图重建在同一环境中按需增量安装，见 [CordVIP 安装与模型下载](third_party/cordvip_geometry/README.md#安装与命令)。
 
 默认配置由 [config/real.py](dexmani_real/config/real.py) 组装。采集、部署与回放可用 `--config` 指定导出 `CONFIG: RealConfig` 的本地 Python 实验文件。可先查看参数与配置：
 

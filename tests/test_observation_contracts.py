@@ -93,6 +93,38 @@ class ObservationContracts(unittest.TestCase):
                     self.assertEqual(check_observation(row, self.runtime, ObservationNeeds(vr=True),
                                                       now_ns=clock.now), [] if case == 'fresh' else ['vr_stale'])
 
+    def test_hand_calibration_accepts_same_time_updates_once_per_publication(self):
+        from dexmani_real.teleop.run import calibrate_hand
+
+        now_ns = 10**10
+        first = {'recv_ts_ns': now_ns, 'landmarks': np.array([1.0])}
+        second = {'recv_ts_ns': now_ns, 'landmarks': np.array([2.0])}
+        stale = dict(first, recv_ts_ns=now_ns - 10**9)
+        ring = Mock()
+        ring.read.side_effect = [(stale, 1), (first, 2), (first, 2), (second, 3)]
+        retargeter = Mock()
+        loop = NS(
+            controller=NS(hand_retargeter=retargeter),
+            runtime=replace(self.runtime, hand_retargeting=replace(
+                self.runtime.hand_retargeting, calibration_samples=2)),
+            runtime_state=NS(cancel_epoch=0),
+            robot=Mock(),
+            sensors=NS(channels=NS(vr_ring=ring)),
+            poll_blocking_commands=Mock(return_value=False),
+        )
+        with patch('dexmani_real.teleop.run.time.monotonic', return_value=10.0), \
+                patch('dexmani_real.teleop.run.time.monotonic_ns', return_value=now_ns), \
+                patch('dexmani_real.teleop.run.time.sleep'), \
+                patch('dexmani_real.teleop.retargeting.landmarks.prepare_landmarks',
+                      side_effect=lambda points: points), \
+                patch('dexmani_real.teleop.retargeting.landmarks.hand_lengths',
+                      side_effect=lambda points: points) as lengths, \
+                contextlib.redirect_stdout(io.StringIO()):
+            calibrate_hand(loop, 0)
+        self.assertEqual(lengths.call_count, 2)
+        retargeter.calibrate.assert_called_once()
+        np.testing.assert_array_equal(retargeter.calibrate.call_args.args[0], [[1.0], [2.0]])
+
     def test_joint_hoi_source_skew(self):
         from dexmani_real.runtime.observation import check_device_feedback
         now = 10**10

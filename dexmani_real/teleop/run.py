@@ -250,7 +250,7 @@ def initialize_teleop(loop, vr_process, *, cancel_epoch) -> None:
 
 
 def calibrate_hand(loop, cancel_epoch) -> None:
-    """只消费新鲜、来源时间递增的 VR 帧；重复读取缓存不计作标定样本。"""
+    """按 Ring 发布序号消费新鲜 VR 帧；重复读取缓存不计作标定样本。"""
     retargeter = loop.controller.hand_retargeter
     if retargeter is None:
         return
@@ -264,7 +264,7 @@ def calibrate_hand(loop, cancel_epoch) -> None:
     print("正在标定手部骨长：请保持右手清晰可见；无需保持伸直。S/Q/Esc 可取消。", flush=True)
     deadline = time.monotonic() + config.calibration_timeout_s
     measurements: list[np.ndarray] = []
-    last_source_ns = 0
+    last_sequence = 0
     last_error = "no fresh hand frames"
     while len(measurements) < config.calibration_samples:
         if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
@@ -276,14 +276,14 @@ def calibrate_hand(loop, cancel_epoch) -> None:
             )
         result = loop.sensors.channels.vr_ring.read()
         if result is not None:
-            frame, _ = result
+            frame, sequence = result
             stamp = int(frame["recv_ts_ns"])
             now_ns = time.monotonic_ns()
             if (
-                stamp > last_source_ns
+                sequence > last_sequence
                 and sample_is_fresh(stamp, loop.runtime.teleop.vr_stale_threshold_s, now_ns)
             ):
-                last_source_ns = stamp
+                last_sequence = sequence
                 try:
                     measurement = hand_lengths(prepare_landmarks(frame["landmarks"]))
                 except HandGeometryRejected as exc:

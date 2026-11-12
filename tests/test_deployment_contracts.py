@@ -58,32 +58,32 @@ class DeploymentContracts(unittest.TestCase):
 
     def test_tracking_open_defaults_and_cleanup(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
-        from cordvip_geometry.tracking import SceneTracker
         from cordvip_geometry.models import DEFAULT_MODELS_DIR, resolve_sam_model
+        from cordvip_geometry.tracking import SceneTracker
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             with patch('cordvip_geometry.assets.load_asset', return_value=(Mock(), {})), \
                     patch('cordvip_geometry.sam2.SAM2Client') as client, \
                     patch('cordvip_geometry.tracking.PoseTracker') as pose, \
                     patch('cordvip_geometry.tracking.ModelDepthRenderer'):
-                with self.assertRaisesRegex(RuntimeError, 'IPC failed'):
-                    with SceneTracker.open({'object': workspace / 'asset'}, workspace=workspace) as tracker:
-                        checkpoint, config = resolve_sam_model(workspace / DEFAULT_MODELS_DIR)
-                        client.assert_called_once_with(sys.executable, workspace, workspace / DEFAULT_MODELS_DIR,
-                                                       checkpoint=checkpoint, config=config)
-                        debug = Path(pose.call_args.args[2])
-                        self.assertTrue(debug.parent.parent.is_dir())
-                        tracker.reset()
-                        client.return_value.__enter__.return_value.reset.assert_called_once()
-                        raise RuntimeError('IPC failed')
+                with self.assertRaisesRegex(RuntimeError, 'IPC failed'), \
+                        SceneTracker.open({'object': workspace / 'asset'}, workspace=workspace) as tracker:
+                    checkpoint, config = resolve_sam_model(workspace / DEFAULT_MODELS_DIR)
+                    client.assert_called_once_with(sys.executable, workspace, workspace / DEFAULT_MODELS_DIR,
+                                                   checkpoint=checkpoint, config=config)
+                    debug = Path(pose.call_args.args[2])
+                    self.assertTrue(debug.parent.parent.is_dir())
+                    tracker.reset()
+                    client.return_value.__enter__.return_value.reset.assert_called_once()
+                    raise RuntimeError('IPC failed')
                 self.assertEqual(tracker.trackers, {})
                 self.assertFalse(debug.parent.parent.exists())
                 client.return_value.__exit__.assert_called_once()
 
     def test_tracking_depth_gate_failure(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
-        from cordvip_geometry.tracking import SceneTracker, TrackingFailure
         from cordvip_geometry.rgbd import RGBDFrame
+        from cordvip_geometry.tracking import SceneTracker, TrackingFailure
         segmenter = Mock()
         masks = {'object': np.ones((40, 40), bool)}
         segmenter.initialize.return_value = masks
@@ -131,9 +131,9 @@ class DeploymentContracts(unittest.TestCase):
             self.assertIs(raised.exception, error)
 
     def test_hand_xyz_and_joint_mapping(self):
+        from dexmani_real.deployment.observation import ObservationBuilder
         from dexmani_real.geometry.kinematics import ArmFK, HandFK
         from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
-        from dexmani_real.deployment.observation import ObservationBuilder
         arm, hand = ArmFK(), HandFK()
         cloud = HandPointCloud(hand, 1024)
         np.testing.assert_array_equal(hand.sdk_to_urdf, [3, 4, 5, 6, 7, 10, 11, 8, 9, 0, 1, 2])
@@ -164,7 +164,7 @@ class DeploymentContracts(unittest.TestCase):
         rgb = np.full((30, 40, 3), 127, np.uint8)
         mask = np.zeros((30, 40), bool)
         mask[5:20, 10:30] = True
-        candidate = dict(mask=mask, box_xyxy=np.array([10, 5, 30, 20]), label='object', score=.9)
+        candidate = {'mask': mask, 'box_xyxy': np.array([10, 5, 30, 20]), 'label': 'object', 'score': .9}
         self.assertEqual(choose(rgb, [candidate], None, headless=True), 0)
         with self.assertRaisesRegex(ValueError, '多个候选'):
             choose(rgb, [candidate, candidate], None, headless=True)
@@ -182,12 +182,12 @@ class DeploymentContracts(unittest.TestCase):
 
     def test_rgb_only_npz_and_saved_candidates(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
-        from PIL import Image
         from cordvip_geometry.cli.object import load_rgb, select
         from cordvip_geometry.cli.selection import save_candidates
+        from PIL import Image
         rgb = np.full((12, 16, 3), 123, np.uint8)
         mask = np.ones((12, 16), bool)
-        candidate = dict(mask=mask, box_xyxy=np.array([0, 0, 16, 12]), score=.9, label='object')
+        candidate = {'mask': mask, 'box_xyxy': np.array([0, 0, 16, 12]), 'score': .9, 'label': 'object'}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             Image.fromarray(rgb).save(root / 'rgb.png')
@@ -219,10 +219,10 @@ class DeploymentContracts(unittest.TestCase):
 
     def test_geometry_output_paths(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
-        from cordvip_geometry.io import output_path
-        from cordvip_geometry.reconstruction import generate_mesh
         from cordvip_geometry.cli.download import main as download
+        from cordvip_geometry.io import output_path
         from cordvip_geometry.models import SAM_MODELS
+        from cordvip_geometry.reconstruction import generate_mesh
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in ('candidates', 'asset', 'raw'):
@@ -239,9 +239,9 @@ class DeploymentContracts(unittest.TestCase):
             image = root / 'input.png'
             image.write_bytes(b'input')
             pipeline = Mock()
-            with patch.dict(sys.modules, {'hy3dshape': NS(Hunyuan3DDiTFlowMatchingPipeline=pipeline)}):
-                with self.assertRaises(FileExistsError):
-                    generate_mesh(image, root / 'missing-source', root / 'missing-weights', target)
+            with patch.dict(sys.modules, {'hy3dshape': NS(Hunyuan3DDiTFlowMatchingPipeline=pipeline)}), \
+                    self.assertRaises(FileExistsError):
+                generate_mesh(image, root / 'missing-source', root / 'missing-weights', target)
             pipeline.from_single_file.assert_not_called()
             self.assertEqual(target.read_bytes(), b'original')
             models = root / 'models'
@@ -252,6 +252,25 @@ class DeploymentContracts(unittest.TestCase):
             self.assertEqual(output_path(models, allow_existing=True), models)
             self.assertEqual(download(['--models', 'sam', '--models-dir', str(models)]), 0)
             self.assertEqual(weight.read_bytes(), b'local weights')
+
+    def test_geometry_download_model_selection(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
+        from cordvip_geometry.cli.download import main as download
+        from cordvip_geometry.models import GROUNDING_MODEL, SAM_MODELS, SHAPE_MODEL
+
+        for arguments, models in (([], [GROUNDING_MODEL, SAM_MODELS['small']]),
+                                  (['--models', 'shape'], [SHAPE_MODEL])):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as directory:
+                snapshot = Mock()
+                with patch.dict(sys.modules, {'huggingface_hub': NS(snapshot_download=snapshot)}), \
+                        patch('cordvip_geometry.cli.download.existing_file'), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(download(arguments, workspace=directory), 0)
+                self.assertEqual(
+                    [(call.kwargs['repo_id'], call.kwargs['revision'])
+                     for call in snapshot.call_args_list],
+                    [(model['repo_id'], model['revision']) for model in models],
+                )
 
     def test_modes_and_ode(self):
         base = ExecutionConfig(control_dt_s=0.1, action_steps=4)
