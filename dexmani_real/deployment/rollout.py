@@ -148,8 +148,6 @@ class Rollout:
             self.recorder = None
             if recorder.error is not None:
                 self.fail("recording", recorder.error)
-            elif result.raw["status"] == "discarded":
-                logger.info("Raw 已丢弃。")
         return True
 
     def fail(self, stage, error):

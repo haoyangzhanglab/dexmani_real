@@ -21,6 +21,7 @@ from dexmani_real.data.hoi import write_hoi
 from dexmani_real.data.raw import (
     RawReader,
     RawWriter,
+    TIMING_ROW_DTYPE,
     camera_metadata,
     read_episode_outcome,
     require_published_raw,
@@ -216,8 +217,6 @@ class DataContracts(unittest.TestCase):
         for path in (failed, good):
             with h5py.File(path / 'data.h5', 'r+') as data:
                 data['meta'].attrs['camera_T_xarm_base_from_color'] = np.eye(4).ravel()
-        for path in (failed, good):
-            with h5py.File(path / 'data.h5', 'r+') as data:
                 rows = data['timing/rows'][:]
                 rows['camera_sequence'][1] = rows['camera_sequence'][0]
                 rows['camera_ns'][1] = rows['camera_ns'][0]
@@ -257,15 +256,13 @@ class DataContracts(unittest.TestCase):
         camera = CameraSnapshot('offline', CameraIntrinsics(16, 16, 10., 10., 8., 8.,
                                 'none', (0, 0, 0, 0, 0)), 0.001, np.eye(4))
         template = {'object_names': np.array(['object'])}
-        for scenario, error in (('success', None), ('time_conflict', '来源时间冲突'),
-                                ('short_rgb', 'ended before row 2'),
+        for scenario, error in (('success', None), ('short_rgb', 'ended before row 2'),
                                 ('extra_rgb', 'more frames'), ('bad_repeat_rgb', 'grid invalid at row 1'),
                                 ('bad_depth', 'Raw depth')):
             with self.subTest(scenario=scenario):
-                timing = np.array([(10, 100), (10, 100), (11, 200)],
-                                  dtype=[('camera_sequence', 'i8'), ('camera_ns', 'i8')])
-                if scenario == 'time_conflict':
-                    timing['camera_ns'][1] += 1
+                timing = np.zeros(3, dtype=TIMING_ROW_DTYPE)
+                timing['camera_sequence'] = [10, 10, 11]
+                timing['camera_ns'] = [100, 100, 200]
                 depth = MagicMock(shape=(3, 16, 16), dtype=np.dtype('uint16'))
                 if scenario == 'bad_depth':
                     depth.dtype = np.dtype('float32')
@@ -316,6 +313,73 @@ class DataContracts(unittest.TestCase):
                             self.assertEqual(frame.depth_m.dtype, np.float32)
                             np.testing.assert_array_equal(frame.depth_m,
                                 np.full((16, 16), 100 + index, np.float32) * np.float32(camera.depth_scale_m))
+
+    def test_annotation_rejects_clock_before_tracker_and_frame_io(self):
+        from scripts.cordvip.annotate_episodes import annotate_episodes
+        module = 'scripts.cordvip.annotate_episodes.'
+        camera = CameraSnapshot('offline', CameraIntrinsics(16, 16, 10., 10., 8., 8.,
+                                'none', (0, 0, 0, 0, 0)), 0.001, np.eye(4))
+        template = {'object_names': np.array(['object'])}
+        cases = (
+            ([0, 10, 11], [100, 100, 200], '非法相机时钟，行 0'),
+            ([-1, 10, 11], [100, 100, 200], '非法相机时钟，行 0'),
+            ([10, 10, 11], [0, 100, 200], '非法相机时钟，行 0'),
+            ([10, 10, 11], [-1, 100, 200], '非法相机时钟，行 0'),
+            ([10, 0, 11], [100, 100, 200], '非法相机时钟，行 1'),
+            ([10, 10, 11], [100, 0, 200], '非法相机时钟，行 1'),
+            ([10, 10, 9], [100, 100, 200], '非法相机时钟，行 2'),
+            ([10, 10, 11], [100, 100, 99], '非法相机时钟，行 2'),
+            ([10, 10, 11], [100, 101, 200], '相同相机序列的来源时间冲突，行 1'),
+            # 同行兼有倒退和冲突时，沿用普通时钟错误优先的顺序。
+            ([10, 10, 11], [100, 99, 200], '非法相机时钟，行 1'),
+            # 不同类别的坏行必须合并取最早行，不能按错误类别提前返回。
+            ([10, 10, 9], [100, 101, 200], '相同相机序列的来源时间冲突，行 1'),
+            ([10, 9, 9], [100, 100, 200], '非法相机时钟，行 1'),
+            ([0, 10, 10], [100, 100, 200], '非法相机时钟，行 0'),
+        )
+        for sequences, stamps, error in cases:
+            for after_good in (False, True):
+                with self.subTest(sequences=sequences, stamps=stamps, after_good=after_good):
+                    readers = []
+                    episodes = [self.root / 'good', self.root / 'bad'] if after_good else [self.root / 'bad']
+                    for episode in episodes:
+                        timing = np.zeros(3, dtype=TIMING_ROW_DTYPE)
+                        timing['camera_sequence'] = [10, 10, 11] if episode.name == 'good' else sequences
+                        timing['camera_ns'] = [100, 100, 200] if episode.name == 'good' else stamps
+                        depth = MagicMock(shape=(3, 16, 16), dtype=np.dtype('uint16'))
+                        depth.__getitem__.return_value = np.ones((16, 16), np.uint16)
+                        reader = MagicMock(num_frames=3, data_file={})
+                        reader.__enter__.return_value = reader
+                        reader.read_camera.return_value = camera
+                        reader.__getitem__.side_effect = {'depth': depth, 'timing/rows': timing}.__getitem__
+                        reader.iter_rgb_frames.return_value = iter(np.zeros((3, 16, 16, 3), np.uint8))
+                        readers.append(reader)
+                    tracker = MagicMock()
+                    tracker.step.return_value = {'object': np.eye(4)}
+                    with (patch(module + 'RawReader', side_effect=readers),
+                          patch(module + 'require_published_raw'),
+                          patch(module + 'load_task_template', return_value=template),
+                          patch(module + 'task_objects', return_value=[{'name': 'object', 'prompt': 'object'}]),
+                          patch(module + 'SceneTracker.open') as opened,
+                          patch(module + 'write_hoi') as publish,
+                          contextlib.redirect_stdout(io.StringIO())):
+                        opened.return_value.__enter__.return_value = tracker
+                        with self.assertRaisesRegex(ValueError, '^' + error + '$'):
+                            annotate_episodes(episodes, self.root)
+                        readers[-1].iter_rgb_frames.assert_not_called()
+                        depth.__getitem__.assert_not_called()
+                        tracker.reset.assert_not_called()
+                        if after_good:
+                            opened.assert_called_once()
+                            self.assertEqual(tracker.step.call_count, 2)
+                            tracker.detect_masks.assert_called_once()
+                            publish.assert_called_once()
+                            self.assertEqual(publish.call_args.args[0], episodes[0] / 'data.h5')
+                        else:
+                            opened.assert_not_called()
+                            tracker.step.assert_not_called()
+                            tracker.detect_masks.assert_not_called()
+                            publish.assert_not_called()
 
     def test_joint_hoi_export_preserves_rows_across_chunks_and_episodes(self):
         template = {'points_local': np.zeros((1024, 3), np.float32), 'offsets': [0, 1024]}

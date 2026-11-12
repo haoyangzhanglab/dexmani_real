@@ -39,11 +39,9 @@ def annotate_episodes(episodes, task):
                 camera = reader.read_camera()
                 if camera.T_xarm_base_from_color is None:
                     raise ValueError("HOI 必须有 Raw 中记录的相机外参")
-                frames, count = reader.num_frames, len(objects)
+                frames = reader.num_frames
                 if frames == 0:
                     raise ValueError("空 Episode")
-                poses = np.empty((frames, count, 4, 4), np.float32)
-                failure = None
                 reader.require_fields("rgb", "depth")
                 intrinsics = camera.color
                 K = intrinsics.matrix()
@@ -53,6 +51,22 @@ def annotate_episodes(episodes, task):
                 if depth.shape != (frames, *expected_shape) or depth.dtype != np.uint16:
                     raise ValueError("Raw depth must be uint16 [rows,H,W] matching color intrinsics")
                 timing = reader["timing/rows"][:]
+                sequences, stamps = timing["camera_sequence"], timing["camera_ns"]
+                new_sequence = np.ones(frames, dtype=bool)
+                new_sequence[1:] = sequences[1:] != sequences[:-1]
+                invalid_clock = (sequences <= 0) | (stamps <= 0)
+                invalid_clock[1:] |= (
+                    (sequences[1:] < sequences[:-1]) | (stamps[1:] < stamps[:-1])
+                )
+                time_conflict = np.zeros(frames, dtype=bool)
+                time_conflict[1:] = ~new_sequence[1:] & (stamps[1:] != stamps[:-1])
+                bad_rows = np.flatnonzero(invalid_clock | time_conflict)
+                if bad_rows.size:
+                    index = bad_rows[0]
+                    reason = "非法相机时钟" if invalid_clock[index] else "相同相机序列的来源时间冲突"
+                    raise ValueError(f"{reason}，行 {index}")
+                poses = np.empty((frames, len(objects), 4, 4), np.float32)
+                failure = None
                 images = iter(reader.iter_rgb_frames())
                 if tracker is None:
                     tracker = stack.enter_context(
@@ -60,25 +74,13 @@ def annotate_episodes(episodes, task):
                     )
                 else:
                     tracker.reset()
-                previous_sequence = previous_stamp = -1
                 for index in range(frames):
-                    sequence = int(timing[index]["camera_sequence"])
-                    stamp = int(timing[index]["camera_ns"])
-                    if (
-                        sequence <= 0
-                        or stamp <= 0
-                        or sequence < previous_sequence
-                        or stamp < previous_stamp
-                    ):
-                        raise ValueError(f"非法相机时钟，行 {index}")
-                    if sequence == previous_sequence and stamp != previous_stamp:
-                        raise ValueError("相同相机序列的来源时间冲突")
                     rgb = next(images, None)
                     if rgb is None:
                         raise ValueError(f"Raw RGB ended before row {index}")
                     if rgb.dtype != np.uint8 or rgb.shape != (*expected_shape, 3):
                         raise ValueError(f"Raw RGB grid invalid at row {index}")
-                    if sequence == previous_sequence:
+                    if not new_sequence[index]:
                         poses[index] = poses[index - 1]
                         continue
                     frame = RGBDFrame(
@@ -95,7 +97,6 @@ def annotate_episodes(episodes, task):
                         failure = str(error)
                         break
                     poses[index] = np.stack([result[name] for name in template["object_names"]])
-                    previous_sequence, previous_stamp = sequence, stamp
                 else:
                     if next(images, None) is not None:
                         raise ValueError("Raw RGB contains more frames than the HDF5 rows")
