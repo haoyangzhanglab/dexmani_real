@@ -115,6 +115,12 @@ HOI 接纳监测和提交前最新状态检查仅读取 Episode ID、来源时�
 
 Sensor Worker 与模型线程跨段保留；段间只回收本段 Recorder 和在途模型任务。HOI 段结束发布零 Episode ID，下一次 B 用新 ID 重置场景，旧 ID 结果不能进入新段。初次 HOI 观测等待保持 120 s，其他启动观测等待保持 1 s。取消、退出、急停仍优先，不增加自动重试或恢复状态。
 
+模型任务收尾共用固定 5 s 等待预算。会话退出先关闭机器人、传感器和 Recorder，再等待模型关闭并保存实验结果。
+仅当关键资源收尾成功、结果保存成功或无需落盘，且模型关闭 Future 仍未完成时，Session 抛出 `ModelShutdownTimeout`；
+`scripts/run_policy.py` 最外层刷新日志和标准输出后以状态 1 强制退出，避免解释器无限等待模型线程。
+关键收尾或结果保存失败时保留原错误报告，不自动强退；模型关闭任务已完成但抛出异常也走正常错误退出。
+库调用方自行处理此异常。这只处理关闭阶段，不能保证主线程自身卡在 native 调用时退出。
+
 “停止流程已完成”表示现有停止调用成功及资源收尾完成，不等于 Raw 保存成功，也不等于机器人整体物理停稳证明；Arm 新段准备仍检查实测停稳，Hand 没有等价证明。Teleop 和 Policy 均按当前段的 Recorder 最终结果显示录制情况：
 
 | 当前段结果 | 终端提示 |
@@ -137,7 +143,7 @@ Sensor Worker 与模型线程跨段保留；段间只回收本段 Recorder 和�
 - 相机或触觉来源失效、质量拒绝、队列满都会结束本段。先停止设备，再排空已经接收的完整行；写入和关闭正常时保存有效前缀，保留结束原因。所有已启动的必需 Worker（包括仅用于录制的 Camera）退出都会终止会话。
 - 文件／编码 I/O 失败结束本段，保留 staging 并报告，不发布失败录制。初始化失败时不开始运动；Writer 实际退出并完成收尾后才能重新按 B。发布与失败以 `EpisodeRecorder.result()` 为准，`poll_finish()` 仅表示收尾完成。停止、录制关闭和迟到预测的失败都会更新本段结果；程序错误、停止失败和无法回收的资源继续退出会话。
 - RGB／Depth／状态逐行对应，MP4 PTS 相对首行控制时间。调度跳槽后，在下一条已保存行记录 `/timing/segment_starts`；非空录制从 0 开始、严格递增，`recording_truncated_reason` 仅作诊断。质量拒绝与队列满之后不再接收新行。
-- Raw 保留 `termination_reason` 和可用的 `recording_truncated_reason`；详细错误仍由运行日志及已有 Policy 会话结果报告，不再复制到 Raw 的 `/meta/termination_details`。历史 Raw 无需改写。
+- Raw 保留 `termination_reason` 和可用的 `recording_truncated_reason`；详细错误由运行日志及 Policy 会话结果报告。
 - Raw 保留相机参数、深度与触觉尺度、坐标变换、关节顺序及来源时间。遥操作按当前控制行保存 `vr_wrist_pos`（float64，N×3）、`vr_wrist_quat_wxyz`（float64，N×4，wxyz 顺序）、`vr_landmarks`（float64，N×21×3）、`vr_recv_ts_ns` 和 `vr_sequence_id`（uint64，N）；保留 `vr_to_robot_rotation`，启用手部重定向时还保存 `hand_retargeting_calibration_json` 中的 `bone_lengths` 与 `palm_width`。采样频率与行对应不变，不另建高频 VR 流；`collection_source=policy_rollout` 仍不含 VR 字段。部署完整配置保存在已有 run_config.yaml；遥操作完整配置由研究者自行管理。
 - 导出与回放必须有合法 `segment_starts`，不从时间间隔猜测断点。导出保留有效行，每个连续区间形成一个 Zarr `meta/episode_ends` 边界，训练窗口不跨断点；`raw_episode_count` 统计文件，`episode_count` 统计区间。区间按标称频率使用，周期抖动只告警、不重采样；控制时间倒退、非法数组和所选字段非有限值仍拒绝。
 
@@ -167,7 +173,7 @@ SDK 接受停止请求不等于物理停稳；Arm 准备检查实测停稳，Han
 
 - Direct 为当前实测 Arm 姿态到 HOME；只有明确几何／路径越限拒绝才尝试固定 Via。`arm.homing.via_qpos` 默认 None，不提供假定安全的姿态。
 - 初始实测速度超过 HOME 限速、或候选总时长超过 HOME 预算时直接报错／超时，不进入几何备选。
-- Via 两段都通过才执行，中间点速度和加速度均为零。模型／配置／程序错误不触发 Via，执行开始后也绝不改走 Via。
+- Via 两段都通过才执行，中间点速度和加速度均为零。Ruckig 求解错误、模型／配置／程序错误不触发 Via，执行开始后也绝不改走 Via。
 - Ruckig 离线生成 100 Hz 默认伺服周期下的参考点（实际取 `arm.servo_hz`），完整极值检查复用在线轨迹校验。父进程经 Pipe 一次传递样本，Owner 在 Mode 1 原样发送。
 - 碰撞模型包含 Arm 自碰撞、已启用 Arm–Hand 对及静态环境；手部内部碰撞对仍未验证。XHand 固定为规划时实测姿态。
 - HPP-FCL 使用统一安全余量。检查覆盖所有发送点，并按模型几何半径、关节运动界和余量沿 Ruckig 曲线细分。相邻检查区间的相对几何位移估计控制在余量的一半以内；这不是连续无碰撞证明，也不覆盖真实跟踪误差或异常制动。
@@ -194,7 +200,7 @@ Arm 规划前必须确认 Hand 停止接口实际接受了位置保持；因反�
 Hand 每次只基于提交后的新反馈生成小步目标，禁止旧缓存累积目标，连续三个提交后样本在容差内才成功。
 CRC 写失败立即停止，无运动补发；停止接口保留既有有界重试。停止保持不提高 HOME 输出上限，普通命令恢复原逐关节配置。
 
-`HomePathRejected` 表示未发送 HOME 运动目标，停止准备仍会发生。VR／Policy 保留停止的空闲会话；Jog 规划／配置拒绝后仅等待 R、Q、Esc，成功才重新准备 Jog。
+`HomePathRejected` 表示未发送 HOME 运动目标，停止准备仍会发生。VR／Policy 保留停止的空闲会话；Keyboard 在停止成功、无取消／急停／退出请求时重新准备 Jog 并保持当前位置，操作者可手动调整后再次按 R。配置错误不恢复 Jog。
 取消和超时按原生命周期停止；设备、Owner 或停止错误继续传播，不能显示 HOME 成功。
 
 离线测试不能验收 Mode 1 跟踪与调度、停止距离、URDF/SRDF 碰撞几何、环境标定、Via 姿态、手部保持／步长／输出和超时。

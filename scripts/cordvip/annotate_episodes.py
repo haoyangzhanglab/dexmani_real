@@ -6,14 +6,16 @@ import argparse
 import sys
 from contextlib import ExitStack
 from pathlib import Path
+
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 from cordvip_geometry.raw import iter_raw_rows
-from cordvip_geometry.tracking import TrackingFailure, SceneTracker
-from dexmani_real.data.raw import RawReader, require_published_raw
+from cordvip_geometry.tracking import SceneTracker, TrackingFailure
+
 from dexmani_real.data.hoi import write_hoi
+from dexmani_real.data.raw import RawReader, require_published_raw
 from dexmani_real.geometry.hoi import load_task_template, task_objects
 
 
@@ -30,9 +32,8 @@ def annotate_episodes(episodes, task):
             require_published_raw(episode)
             with RawReader(episode) as reader:
                 if "hoi" in reader.data_file:
-                    reader.require_fields("object_pointcloud", "object_pointcloud_valid")
+                    reader.require_fields("object_pointcloud")
                     reader["object_pointcloud"]
-                    reader["object_pointcloud_valid"]
                     print(f"跳过已发布 HOI：{episode}")
                     continue
                 camera = reader.read_camera()
@@ -75,7 +76,7 @@ def annotate_episodes(episodes, task):
                 print(f"{episode}: 首次失败行 {index}: {failure}；不发布 HOI")
                 continue
             write_hoi(episode / "data.h5", template, poses, camera.T_xarm_base_from_color)
-            print(f"{episode}: {frames}/{frames} 帧有效")
+            print(f"{episode}: 已发布 HOI，{frames} 帧")
 
 
 def main(argv=None):

@@ -5,7 +5,7 @@ import threading
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace as NS
-from unittest.mock import Mock, patch
+from unittest.mock import DEFAULT, Mock, patch
 
 import numpy as np
 
@@ -17,6 +17,7 @@ from dexmani_real.robot.commands import (
     FeedbackUnavailable,
     HomeTimeout,
     OperationCancelled,
+    RobotError,
 )
 from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE, HomeRequest
 from dexmani_real.robot.xarm7.trajectory import (
@@ -174,6 +175,84 @@ class HomeContracts(unittest.TestCase):
         Ruckig(1, 0.01).calculate(inp, tr)
         with self.assertRaises(PositionLimitError):
             validate_extrema(tr, [0.2], [0.0], [1.0])
+
+    def test_direct_extrema_rejection_checks_both_via_segments(self):
+        via = tuple(self.q + 0.05)
+        cfg = replace(self.cfg.arm, homing=replace(self.cfg.arm.homing, via_qpos=via))
+        model = Mock(arm_radii=np.zeros(7))
+        model.rejection.return_value = None
+        with patch(
+            "dexmani_real.runtime.home.validate_extrema", wraps=validate_extrema,
+            side_effect=[PositionLimitError("direct extremum"), DEFAULT, DEFAULT],
+        ) as extrema:
+            samples = plan_home(cfg, self.q, np.zeros(7), self.hand_q, model, lambda: None)
+        self.assertEqual(extrema.call_count, 3)
+        self.assertTrue(any(np.array_equal(q, via) for q in samples))
+        checked = [call.args[0] for call in model.rejection.call_args_list]
+        self.assertTrue(all(any(np.array_equal(q, c) for c in checked) for q in samples))
+
+    def test_ruckig_errors_do_not_try_via(self):
+        from ruckig import Result, RuckigError
+
+        via = tuple(self.q + 0.05)
+        cfg = replace(self.cfg.arm, homing=replace(self.cfg.arm.homing, via_qpos=via))
+        model = Mock(arm_radii=np.zeros(7))
+        model.rejection.return_value = None
+        for result in (
+            Result.ErrorPositionalLimits, Result.Error, Result.ErrorInvalidInput,
+            Result.ErrorExecutionTimeCalculation, Result.ErrorSynchronizationCalculation,
+            RuckigError("calculation failed"), RuntimeError("program error"),
+        ):
+            with self.subTest(result=result):
+                calculator = Mock()
+                calculator.calculate.side_effect = [result]
+                with patch("dexmani_real.robot.xarm7.trajectory.Ruckig", return_value=calculator):
+                    error = type(result) if isinstance(result, Exception) else RuntimeError
+                    with self.assertRaises(error):
+                        plan_home(cfg, self.q, np.zeros(7), self.hand_q, model, lambda: None)
+                    self.assertEqual(calculator.calculate.call_count, 1)
+
+    def test_shared_home_inputs_rejected_before_candidates(self):
+        cfg = replace(self.cfg.arm, homing=replace(self.cfg.arm.homing, via_qpos=tuple(self.q + 0.05)))
+        bad_configs = (
+            replace(cfg, home_qpos=(float("nan"),) * 7),
+            replace(cfg, home_qpos=(100.0,) * 7),
+            replace(cfg, homing=replace(cfg.homing, via_qpos=(float("nan"),) * 7)),
+            replace(cfg, joint_limit_lower=cfg.joint_limit_upper),
+            replace(cfg, joint_limit_upper=(float("nan"),) * 7),
+            replace(cfg, servo_hz=0),
+            replace(cfg, homing=replace(cfg.homing, max_speed_deg_s=0)),
+            replace(cfg, homing=replace(cfg.homing, max_acceleration_deg_per_s2=0)),
+            replace(cfg, homing=replace(cfg.homing, max_jerk_deg_per_s3=0)),
+        )
+        inputs = [(bad, self.q, np.zeros(7), HomeConfigurationError) for bad in bad_configs]
+        inputs += [
+            (cfg, q, v, ValueError) for q, v in (
+                (np.full(7, np.nan), np.zeros(7)), (np.zeros(6), np.zeros(7)),
+                (np.full(7, 100.0), np.zeros(7)), (self.q, np.full(7, np.nan)),
+                (self.q, np.zeros(6)), (self.q, np.full(7, cfg.homing.max_speed_rad_per_s + 0.01)),
+            )
+        ]
+        for bad, q, v, error in inputs:
+            with self.subTest(cfg=bad, q=q, v=v):
+                model = Mock()
+                with patch("dexmani_real.runtime.home.calculate_home_segment") as calculate:
+                    with self.assertRaises(error):
+                        plan_home(bad, q, v, self.hand_q, model, lambda: None)
+                    calculate.assert_not_called()
+                model.rejection.assert_not_called()
+
+    def test_planning_cancel_and_timeout_do_not_try_via(self):
+        cfg = replace(self.cfg.arm, homing=replace(self.cfg.arm.homing, via_qpos=tuple(self.q + 0.05)))
+        for error in (OperationCancelled("cancelled"), HomeTimeout("budget exhausted")):
+            with self.subTest(error=error):
+                check = Mock(side_effect=[None, None, error])
+                with patch(
+                    "dexmani_real.runtime.home.calculate_home_segment", wraps=calculate_home_segment
+                ) as calculate:
+                    with self.assertRaises(type(error)):
+                        plan_home(cfg, self.q, np.zeros(7), self.hand_q, Mock(), check)
+                    self.assertEqual(calculate.call_count, 1)
 
     def test_geometry_margin_and_environment(self):
         model = CollisionModel(margin_m=0.005)
@@ -336,28 +415,77 @@ class HomeContracts(unittest.TestCase):
                 if failure in ("start", "tracking", "hand"):
                     driver.servo.assert_not_called()
 
+    def test_tracking_at_feedback_boundary_uses_last_successful_submission(self):
+        cfg = replace(self.cfg.arm, homing=replace(self.cfg.arm.homing, tracking_error_rad=0.01))
+        samples = np.tile(cfg.home_qpos, (6, 1))
+        samples[:, 0] += np.arange(-5, 1) * 0.02
+        for sdk_failure in (False, True):
+            with self.subTest(sdk_failure=sdk_failure):
+                clock = Clock()
+                start = clock.ns
+                io = NS(stop=Mock(), home_hand_stamp=mp.get_context("spawn").Value("q", start))
+                io.stop.wait.side_effect = clock.sleep
+                driver = Mock()
+                owner = ArmController(cfg, io, None, driver)
+                owner.status["qpos"] = samples[0]
+                owner.wait_settled = Mock()
+                sent = []
+
+                def servo(point, sdk_failure=sdk_failure, clock=clock, start=start, sent=sent):
+                    if sdk_failure and clock.ns == start + 40_000_000:
+                        raise RobotError("servo failed")
+                    sent.append(point.copy())
+
+                def feedback(owner=owner, clock=clock, sent=sent):
+                    # 100 Hz 发送、25 Hz 查询：40 ms 反馈仍对应 samples[3]。
+                    owner.status["timestamp_ns"] = clock.ns
+                    owner.status["qpos"] = sent[-1] if sent else samples[0]
+
+                driver.servo.side_effect = servo
+                owner.read_feedback = Mock(side_effect=feedback)
+                message = HomeRequest(start + 10**9, samples, 0.2)
+                with patch("dexmani_real.robot.xarm7.worker.time.monotonic_ns", clock.now):
+                    if sdk_failure:
+                        with self.assertRaisesRegex(RobotError, "servo failed"):
+                            owner.home(message, check_abort=lambda: None, deadline_ns=message.deadline_ns)
+                        # 失败不推进已提交序列，也不再检查后续参考或执行终点停稳。
+                        np.testing.assert_array_equal(sent, samples[:4])
+                        self.assertEqual(driver.servo.call_count, 5)
+                        owner.wait_settled.assert_called_once()
+                    else:
+                        owner.home(message, check_abort=lambda: None, deadline_ns=message.deadline_ns)
+                        np.testing.assert_array_equal(sent, samples)
+                    self.assertEqual(owner.read_feedback.call_count, 2)
+
     def test_configuration_rejection_stops_without_motion(self):
-        robot = Mock(arm_config=RealConfig().arm, hand_config=self.cfg.hand)
-        state = SessionState(
-            stop_signal=threading.Event(), emergency_signal=threading.Event()
-        )
-        with self.assertRaises(HomeConfigurationError):
-            home_robot(
-                state,
-                robot,
-                environment=self.cfg.environment,
-                cancel_epoch=state.cancel_epoch,
-                cancel_requested=lambda: False,
+        for cfg in (
+            RealConfig().arm,
+            replace(self.cfg.arm, servo_hz=0),
+            replace(self.cfg.arm, joint_limit_upper=(float("nan"),) * 7),
+        ):
+            robot = Mock(arm_config=cfg, hand_config=self.cfg.hand)
+            state = SessionState(
+                stop_signal=threading.Event(), emergency_signal=threading.Event()
             )
-        robot.arm.home.assert_not_called()
-        robot.send_hand_home.assert_not_called()
-        self.assertEqual(robot.stop.call_count, 2)
+            with self.subTest(cfg=cfg), self.assertRaises(HomeConfigurationError):
+                home_robot(
+                    state,
+                    robot,
+                    environment=self.cfg.environment,
+                    cancel_epoch=state.cancel_epoch,
+                    cancel_requested=lambda: False,
+                )
+            robot.arm.settle.assert_not_called()
+            robot.arm.home.assert_not_called()
+            robot.send_hand_home.assert_not_called()
+            self.assertEqual(robot.stop.call_count, 2)
 
     def test_combined_order_rejection_skip_and_execution_failure(self):
         for scenario in (
             "success",
             "rejected",
             "execution_error",
+            "stop_error",
             "already_home",
             "cancel",
         ):
@@ -366,7 +494,10 @@ class HomeContracts(unittest.TestCase):
                 state = SessionState(
                     stop_signal=threading.Event(), emergency_signal=threading.Event()
                 )
-                robot = Mock(arm_config=self.cfg.arm, hand_config=self.cfg.hand)
+                cfg = replace(self.cfg.arm, homing=replace(self.cfg.arm.homing, via_qpos=tuple(self.q + 0.05)))
+                robot = Mock(arm_config=cfg, hand_config=self.cfg.hand)
+                if scenario == "stop_error":
+                    robot.stop.side_effect = [None, RobotError("stop failed")]
                 arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
                 hand = np.zeros(1, dtype=HAND_STATE_DTYPE)
                 arm["qpos"] = (
@@ -391,7 +522,7 @@ class HomeContracts(unittest.TestCase):
                 robot.arm.home.side_effect = execute
                 model = Mock(arm_radii=np.ones(7))
                 model.rejection.return_value = None
-                error = HomePathRejected("blocked") if scenario == "rejected" else None
+                error = HomePathRejected("blocked") if scenario in ("rejected", "stop_error") else None
                 with (
                     patch("dexmani_real.runtime.home.time.monotonic_ns", clock.now),
                     patch("dexmani_real.runtime.home.time.sleep", clock.sleep),
@@ -425,7 +556,8 @@ class HomeContracts(unittest.TestCase):
                             ["hand"] if scenario == "already_home" else ["arm", "hand"],
                         )
                     else:
-                        with self.assertRaises((HomePathRejected, RuntimeError)):
+                        error_type = RobotError if scenario == "stop_error" else (HomePathRejected, RuntimeError)
+                        with self.assertRaises(error_type):
                             run()
                         self.assertNotIn("hand", calls)
                     self.assertLessEqual(plan.call_count, 1)
@@ -481,7 +613,7 @@ class HomeContracts(unittest.TestCase):
                 self.cfg.arm, self.q, np.zeros(7), self.hand_q, model, lambda: None
             )
 
-    def test_policy_and_keyboard_share_home_and_do_not_resume_on_rejection(self):
+    def test_policy_stays_idle_and_keyboard_prepares_hold_after_path_rejection(self):
         from dexmani_real.deployment.session import PolicySession
         from dexmani_real.teleop.keyboard import KeyboardTeleop
 
@@ -489,25 +621,95 @@ class HomeContracts(unittest.TestCase):
             (PolicySession, "dexmani_real.deployment.session"),
             (KeyboardTeleop, "dexmani_real.teleop.keyboard"),
         ):
-            session = cls.__new__(cls)
-            session.runtime = self.cfg
-            session.runtime_state = SessionState(
-                stop_signal=threading.Event(), emergency_signal=threading.Event()
-            )
-            session.robot = Mock()
-            session.episode = None
-            session.prepare_jog = Mock()
-            session.period_ns = 10_000_000
-            for rejected in (False, True):
-                session.prepare_jog.reset_mock()
-                with patch(
-                    module + ".home_robot",
-                    side_effect=HomePathRejected("blocked") if rejected else None,
-                ) as home:
+            for error in (None, HomePathRejected("blocked"), HomeConfigurationError("config")):
+                with self.subTest(cls=cls, error=error):
+                    session = cls.__new__(cls)
+                    session.runtime = self.cfg
+                    state = session.runtime_state = SessionState(
+                        stop_signal=threading.Event(), emergency_signal=threading.Event()
+                    )
+                    session.robot = Mock()
+                    session.robot.prepare_streaming.side_effect = lambda epoch, state=state: state.stop_signal.clear()
+                    session.episode = None
+                    session.jog = Mock()
+                    session.jog_config = self.cfg.keyboard_teleop
+                    session.period_ns = 10_000_000
+                    session.tick_due_ns = 0
+                    session.prepare_jog = Mock(
+                        wraps=session.prepare_jog if cls is KeyboardTeleop else None
+                    )
+
+                    def home_result(*args, state=state, error=error, **kwargs):
+                        state.stop_signal.set()  # 模拟 home_robot 的停止收尾。
+                        if error is not None:
+                            raise error
+
+                    with (
+                        patch(module + ".home_robot", side_effect=home_result) as home,
+                        patch(module + ".time.monotonic_ns", return_value=10**10),
+                    ):
+                        session.run_home(state.cancel_epoch)
+                    home.assert_called_once()
+                    session.jog.step.assert_not_called()
+                    self.assertIsNone(session.episode)
+                    if cls is KeyboardTeleop and not isinstance(error, HomeConfigurationError):
+                        session.prepare_jog.assert_called_once_with(state.cancel_epoch)
+                        session.jog.clear_reference.assert_called_once()
+                        session.robot.prepare_streaming.assert_called_once_with(state.cancel_epoch)
+                        session.robot.send_action.assert_called_once()
+                        command = session.robot.send_action.call_args.args[0]
+                        self.assertTrue(command.arm_hold)
+                        self.assertIsNone(command.arm_qpos)
+                        self.assertIsNone(command.hand_qpos)
+                        self.assertFalse(state.stop_signal.is_set())
+                        self.assertEqual(session.tick_due_ns, 10**10 + session.period_ns)
+                    else:
+                        session.prepare_jog.assert_not_called()
+                        session.robot.prepare_streaming.assert_not_called()
+                        session.robot.send_action.assert_not_called()
+                        self.assertTrue(state.stop_signal.is_set())
+
+    def test_keyboard_rejection_does_not_override_cancel_estop_or_quit(self):
+        from dexmani_real.teleop.keyboard import KeyboardTeleop
+
+        for request in ("request_stop", "request_emergency_stop", "request_quit"):
+            with self.subTest(request=request):
+                session = KeyboardTeleop(self.cfg)
+                state = session.runtime_state = SessionState(
+                    stop_signal=threading.Event(), emergency_signal=threading.Event()
+                )
+                session.robot = Mock()
+                session.prepare_jog = Mock()
+
+                def rejected(*args, state=state, request=request, **kwargs):
+                    getattr(state, request)()
+                    raise HomePathRejected("blocked")
+
+                with patch("dexmani_real.teleop.keyboard.home_robot", side_effect=rejected):
+                    session.run_home(state.cancel_epoch)
+                session.prepare_jog.assert_not_called()
+                self.assertTrue(state.stop_signal.is_set())
+
+    def test_keyboard_execution_errors_do_not_prepare_jog(self):
+        from dexmani_real.teleop.keyboard import KeyboardTeleop
+
+        for error in (
+            OperationCancelled("cancelled"), HomeTimeout("timed out"),
+            FeedbackUnavailable("stale"), RobotError("SDK failed"), RobotError("stop failed"),
+        ):
+            with self.subTest(error=error):
+                session = KeyboardTeleop(self.cfg)
+                session.runtime_state = SessionState(
+                    stop_signal=threading.Event(), emergency_signal=threading.Event()
+                )
+                session.robot = Mock()
+                session.prepare_jog = Mock()
+                with (
+                    patch("dexmani_real.teleop.keyboard.home_robot", side_effect=error),
+                    self.assertRaises(type(error)),
+                ):
                     session.run_home(session.runtime_state.cancel_epoch)
-                home.assert_called_once()
-                if rejected:
-                    session.prepare_jog.assert_not_called()
+                session.prepare_jog.assert_not_called()
 
     def test_owner_operation_stops_on_execution_cancellation(self):
         from dexmani_real.robot.xarm7.protocol import ArmChannels
@@ -587,14 +789,80 @@ class HomeContracts(unittest.TestCase):
 
     def test_home_velocity_and_duration_rejected_before_sampling(self):
         cfg = replace(
-            self.cfg.arm, homing=replace(self.cfg.arm.homing, max_speed_deg_s=0.01)
+            self.cfg.arm, homing=replace(self.cfg.arm.homing, max_speed_deg_s=0.01,
+                                        via_qpos=tuple(self.q + 0.05))
         )
         with self.assertRaisesRegex(ValueError, "initial velocity"):
-            calculate_home_segment(cfg, self.q, np.ones(7) * 0.02, cfg.home_qpos)
+            plan_home(cfg, self.q, np.ones(7) * 0.02, self.hand_q, Mock(), lambda: None)
         model = Mock()
-        with self.assertRaises(HomeTimeout):
-            plan_home(cfg, self.q, np.zeros(7), self.hand_q, model, lambda: None)
+        with patch("dexmani_real.runtime.home.calculate_home_segment", wraps=calculate_home_segment) as calculate:
+            with self.assertRaises(HomeTimeout):
+                plan_home(cfg, self.q, np.zeros(7), self.hand_q, model, lambda: None)
+            self.assertEqual(calculate.call_count, 1)
         model.rejection.assert_not_called()
+
+    def test_start_and_target_settling_require_continuous_position_stability(self):
+        # 每 40 ms 反馈；0.30 s dwell 最早在 0.32 s 确认。
+        for target in (None, np.asarray(self.cfg.arm.home_qpos)):
+            for name, offsets, speeds, finish_s in (
+                ("stationary", [0], [0], 0.32),
+                ("inside_tolerance", [-0.75], [0], 0.32),
+                ("anchor_drift", [-0.75] * 4 + [0.75], [0], 0.48),
+                ("velocity_reset", [0], [0] * 4 + [2, 0], 0.52),
+                ("oscillation", [-0.75, 0.75] * 8, [0], None),
+            ):
+                with self.subTest(target=target, name=name):
+                    clock = Clock()
+                    start = clock.ns
+                    io = NS(stop=Mock())
+                    io.stop.wait.side_effect = clock.sleep
+                    owner = ArmController(self.cfg.arm, io, None, None)
+
+                    def feedback(clock=clock, start=start, owner=owner, offsets=offsets, speeds=speeds):
+                        index = (clock.ns - start) // 40_000_000
+                        owner.status["timestamp_ns"] = clock.ns
+                        owner.status["qpos"] = self.cfg.arm.home_qpos
+                        owner.status["qpos"][0] += (
+                            offsets[min(index, len(offsets) - 1)]
+                            * self.cfg.arm.standstill_position_tolerance_rad
+                        )
+                        owner.status["qvel"] = (
+                            speeds[min(index, len(speeds) - 1)]
+                            * self.cfg.arm.standstill_velocity_tolerance_rad_s
+                        )
+
+                    owner.read_feedback = feedback
+                    with patch("dexmani_real.robot.xarm7.worker.time.monotonic_ns", clock.now):
+                        if finish_s is None:
+                            with self.assertRaisesRegex(TimeoutError, "dwell not confirmed"):
+                                owner.wait_settled(
+                                    lambda: None, stage="HOME", deadline_ns=start + 600_000_000, target=target
+                                )
+                        else:
+                            owner.wait_settled(
+                                lambda: None, stage="HOME", deadline_ns=start + 600_000_000, target=target
+                            )
+                            self.assertEqual(clock.ns - start, round(finish_s * 1e9))
+
+    def test_target_departure_resets_settling_even_within_anchor_tolerance(self):
+        clock = Clock()
+        start = clock.ns
+        io = NS(stop=Mock())
+        io.stop.wait.side_effect = clock.sleep
+        owner = ArmController(self.cfg.arm, io, None, None)
+
+        def feedback():
+            owner.status["timestamp_ns"] = clock.ns
+            owner.status["qpos"] = self.cfg.arm.home_qpos
+            # 相对 anchor 只变化 0.5 倍容差，但 160 ms 时已离开目标容差。
+            offset = 1.25 if clock.ns - start == 160_000_000 else 0.75
+            owner.status["qpos"][0] += offset * self.cfg.arm.standstill_position_tolerance_rad
+
+        owner.read_feedback = feedback
+        with patch("dexmani_real.robot.xarm7.worker.time.monotonic_ns", clock.now):
+            owner.wait_settled(lambda: None, stage="HOME", deadline_ns=start + 10**9,
+                               target=np.asarray(self.cfg.arm.home_qpos))
+        self.assertEqual(clock.ns - start, 520_000_000)
 
     def test_wait_settled_preserves_home_timeout_and_feedback_category(self):
         clock = Clock()
@@ -602,17 +870,24 @@ class HomeContracts(unittest.TestCase):
         io.stop.wait.side_effect = clock.sleep
         owner = ArmController(self.cfg.arm, io, None, None)
         owner.read_feedback = Mock()
+        owner.status["timestamp_ns"] = clock.ns - round(self.cfg.arm.feedback_max_age_s * 1e9) - 1
 
         def expired():
             raise HomeTimeout("budget exhausted")
 
         with patch("dexmani_real.robot.xarm7.worker.time.monotonic_ns", clock.now):
-            with self.assertRaises(HomeTimeout):
-                owner.wait_settled(expired, stage="HOME", deadline_ns=clock.ns)
-            with self.assertRaises(FeedbackUnavailable):
-                owner.wait_settled(
-                    lambda: None, stage="HOME", deadline_ns=clock.ns + 10**9
-                )
+            for target in (None, np.asarray(self.cfg.arm.home_qpos)):
+                with self.assertRaises(HomeTimeout):
+                    owner.wait_settled(expired, stage="HOME", deadline_ns=clock.ns, target=target)
+                with self.assertRaises(FeedbackUnavailable):
+                    owner.wait_settled(
+                        lambda: None, stage="HOME", deadline_ns=clock.ns + 10**9, target=target
+                    )
+                with self.assertRaisesRegex(OperationCancelled, "operator cancelled"):
+                    owner.wait_settled(
+                        Mock(side_effect=OperationCancelled("operator cancelled")),
+                        stage="HOME", deadline_ns=clock.ns + 10**9, target=target,
+                    )
 
     def test_xhand_stop_reports_hold_or_passive(self):
         hand = XHand(self.cfg.hand)

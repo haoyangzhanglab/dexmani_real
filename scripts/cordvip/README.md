@@ -2,7 +2,7 @@
 
 ## 任务级 HOI 流程
 
-任务资产位于 `assets/pointcloud_template/object/<task_name>/<object_name>/`，每物体需要米制 Mesh 和 asset.json。任务配置、尺度与模板约定见[物体资产](../../docs/object_reconstruction.md)。模板由研究者固定，不自动修复历史资产。
+任务资产位于 `assets/pointcloud_template/object/<task_name>/<object_name>/`，每物体需要米制 Mesh 和 asset.json。任务配置、尺度与模板约定见[物体资产](../../docs/object_reconstruction.md)。模板由研究者固定，运行时只读。
 
 ```bash
 python scripts/cordvip/build_task.py --task pnp_apple_banana
@@ -15,7 +15,7 @@ python scripts/export_zarr.py episodes/pnp_apple_banana \
   --fields joint_state action hand_pointcloud object_pointcloud
 ```
 
-默认无需 --config，execution.hoi_max_skew_s=None 关闭额外来源时间差限制。需要启用时，通过 --config 的 CONFIG.execution.hoi_max_skew_s 设置有限正数秒值；程序调用使用 ExportConfig.hoi_max_skew_s。标注可追加 `--episode` 指定单段。已发布结果不覆盖；首次 pose 失效即结束该段且不发布。导出遇到无效帧、非有限坐标或已启用的来源时间差检查超限时拒绝，不丢行拼接。
+默认无需 --config，execution.hoi_max_skew_s=None 关闭额外来源时间差限制。需要启用时，通过 --config 的 CONFIG.execution.hoi_max_skew_s 设置有限正数秒值；程序调用使用 ExportConfig.hoi_max_skew_s。标注可追加 `--episode` 指定单段。已发布结果不覆盖；首次 pose 失效即结束该段且不发布。导出遇到点云缺失、结构错误、非有限坐标或已启用的来源时间差检查超限时拒绝，不丢行拼接。
 
 新模板直接按面积配额与固定 seed 表面采样；通过正式标注和 visualize_episode 查看结果。
 

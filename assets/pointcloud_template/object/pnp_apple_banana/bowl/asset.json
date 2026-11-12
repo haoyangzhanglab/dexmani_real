@@ -1,16 +1,10 @@
 {
   "mesh_file": "mesh/mesh_m.obj",
-  "points_file": "points.npy",
-  "normals_file": "normals.npy",
   "frame": "object",
   "units": "m",
   "scale_to_meters": 0.08490138174640842,
   "measured_extent": null,
   "origin": "source_mesh_origin_scaled_without_recentering",
-  "num_points": 1024,
-  "seed": 0,
-  "sampling": "area_weighted_triangle_barycentric",
-  "normals_method": "mesh_face",
   "bounds_m": [
     [
       -0.08476468203165853,
@@ -23,7 +17,6 @@
       0.08446164777486016
     ]
   ],
-  "pointcloud_file": "pointcloud_1024.ply",
   "source_image": "reference.jpg",
   "calibration": {
     "source": "user_provided_approximate_dimension",

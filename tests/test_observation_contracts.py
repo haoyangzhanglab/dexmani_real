@@ -7,6 +7,7 @@ import sys
 import threading
 import types
 import unittest
+from collections import deque
 from dataclasses import FrozenInstanceError, asdict, replace
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -37,6 +38,60 @@ class ObservationContracts(unittest.TestCase):
                                execution=replace(runtime.execution, control_dt_s=0.1))
         self.record = ObservationNeeds(camera_fields=('rgb', 'depth'),
                                        required_tactile=('aggregate', 'dense'))
+
+    def test_vr_receive_time_survives_queueing_and_assembly(self):
+        from hand_tracking_sdk import parse_line
+
+        from dexmani_real.sensor.vr import run_vr
+
+        head = 'Head pose:, 0, 0, 0, 0, 0, 0, 1\n'
+        wrist = 'Right wrist:, 0, 0, 0, 0, 0, 0, 1\n'
+        landmarks = 'Right landmarks:, ' + ', '.join('0' for _ in range(63)) + '\n'
+        for mode in ('tcp_server', 'tcp_client', 'udp'):
+            for case in ('fresh', 'queued', 'older_wrist'):
+                with self.subTest(mode=mode, case=case):
+                    received_ns = 10**10
+                    clock = NS(now=received_ns)
+                    chunks = deque([(head + wrist).encode(), landmarks.encode()] if case == 'older_wrist'
+                                   else [(head + wrist + landmarks).encode()])
+                    sock, server = Mock(), Mock()
+                    shared = NS(is_running=NS(value=True), vr_ring=Mock())
+                    shared.vr_ring.write.side_effect = lambda shared=shared, **kw: setattr(shared.is_running, 'value', False)
+
+                    def receive(size, case=case, chunks=chunks, clock=clock):
+                        if case == 'older_wrist' and len(chunks) == 1:
+                            clock.now += 10**9
+                        return chunks.popleft()
+
+                    def parse(line, case=case, clock=clock):
+                        packet = parse_line(line)
+                        if case == 'queued' and line.startswith('Head'):
+                            # 腕部与关键点已经在同次接收中排队，延迟后才轮到它们解析。
+                            clock.now += 10**9
+                        return packet
+
+                    sock.recv.side_effect = receive
+                    sock.recvfrom.side_effect = lambda size, receive=receive: (receive(size), ('fake', 8000))
+                    server.accept.side_effect = [(sock, ('fake', 8000)), BlockingIOError()]
+                    with patch('hand_tracking_sdk.transport.socket.socket',
+                               return_value=server if mode == 'tcp_server' else sock), \
+                            patch('hand_tracking_sdk.transport.select', side_effect=[
+                                ([server], [], []), ([sock], [], []), ([sock], [], []),
+                            ]), \
+                            patch('hand_tracking_sdk.transport.monotonic_ns', side_effect=lambda clock=clock: clock.now), \
+                            patch('hand_tracking_sdk.frame.monotonic_ns', side_effect=lambda clock=clock: clock.now), \
+                            patch('hand_tracking_sdk.parse_line', side_effect=parse), \
+                            patch('dexmani_real.sensor.vr.configure_logging'):
+                        run_vr(shared, replace(self.runtime.vr, transport=mode))
+
+                    shared.vr_ring.write.assert_called_once()
+                    frame = shared.vr_ring.write.call_args.kwargs
+                    self.assertEqual(frame['recv_ts_ns'], received_ns)
+                    self.assertEqual(clock.now - frame['recv_ts_ns'], 0 if case == 'fresh' else 10**9)
+                    row = Observation(np.zeros(1, dtype=ARM_STATE_DTYPE), None, None, frame, None, clock.now)
+                    self.assertEqual(self.runtime.teleop.vr_stale_threshold_s, 0.5)
+                    self.assertEqual(check_observation(row, self.runtime, ObservationNeeds(vr=True),
+                                                      now_ns=clock.now), [] if case == 'fresh' else ['vr_stale'])
 
     def test_joint_hoi_source_skew(self):
         from dexmani_real.runtime.observation import check_device_feedback

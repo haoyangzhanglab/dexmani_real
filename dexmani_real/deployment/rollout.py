@@ -95,7 +95,7 @@ class Rollout:
         self.dt_ns = round(self.execution.control_dt_s * 1e9)
         self.started_ns = self.next_step_ns = 0
         self.has_submitted = False
-        self.ik_reference = None
+        self.ik_reference: IKReference | None = None
         self.first_prediction = True
         self.prev_action: np.ndarray | None = None
         self.discard_requested = False
@@ -148,7 +148,7 @@ class Rollout:
             self.recorder = None
             if recorder.error is not None:
                 self.fail("recording", recorder.error)
-            elif not recorder.finish_request.save:
+            elif result.raw["status"] == "discarded":
                 logger.info("Raw 已丢弃。")
         return True
 
@@ -543,7 +543,6 @@ class Rollout:
         if skipped and self.recorder is not None:
             self.recorder.mark_gap()
         self.last_slot = slot
-        pending = self.model.future
         row, raw = self.sample_observation()
         quality_issue = self.recording_issue(raw) if self.recorder is not None else None
         attempted = None
@@ -565,18 +564,16 @@ class Rollout:
             if command is None:
                 return
             now = time.monotonic_ns()
-            if self.execution.mode == "async":
-                if now >= self.started_ns + (plan.anchor_slot + len(plan.actions)) * self.dt_ns:
-                    # 只收取进入本次操作前已有的任务，不轮询刚提交的新请求。
-                    if pending is not None and self.model.future is pending:
-                        self.poll_model()
-                    current_slot = (now - self.started_ns) // self.dt_ns
-                    replacement = handoff_plan(self.query, slot=current_slot)
-                    if replacement is not None and not plan_exhausted(replacement, current_slot):
-                        self.plan, self.query = replacement, None
-                        return
-                    self.stop("prediction window expired during mapping")
+            if (self.execution.mode == "async"
+                    and now >= self.started_ns + (plan.anchor_slot + len(plan.actions)) * self.dt_ns):
+                self.poll_model()
+                current_slot = (time.monotonic_ns() - self.started_ns) // self.dt_ns
+                replacement = handoff_plan(self.query, slot=current_slot)
+                if replacement is not None and not plan_exhausted(replacement, current_slot):
+                    self.plan, self.query = replacement, None
                     return
+                self.stop("prediction window expired during mapping")
+                return
             attempted = command
             self.robot.send_action(command, expires_ns=now + COMMAND_LEASE_NS)
             if self.policy_info.requires_prev_action:

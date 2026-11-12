@@ -4,9 +4,9 @@
 
 米制 Mesh → 固定任务模板 → Raw 离线标注 → Zarr → CordViP 训练与部署。命令见[实验入口](../scripts/cordvip/README.md)。重建 GUI、模型选择与 `--rgbd` 输入仍可使用。
 
-`build_task.py` 构建或复用米制 Mesh。`asset.json` 只要求 `mesh_file`、`units=m`、`frame=object`，最后写入表示发布完成。加载已发布 Mesh 不重复缩放，不居中；不再生产单物体采样点及法向文件。
+`build_task.py` 构建或复用米制 Mesh。`asset.json` 只要求 `mesh_file`、`units=m`、`frame=object`，最后写入表示发布完成。加载已发布 Mesh 保留其尺度和原点；任务点云由 `allocate_points.py` 直接采样。
 
-`allocate_points.py` 保留面积配额：总计 1024 点，每物体至少 64 点；固定 seed=0，直接在各 Mesh 表面采样最终点集。这与旧的二次 FPS 点集不同，不能用于恢复历史几何。
+`allocate_points.py` 保留面积配额：总计 1024 点，每物体至少 64 点；固定 seed=0，直接在各 Mesh 表面采样最终点集。
 
 ### 任务配置
 
@@ -22,19 +22,19 @@
 
 `objects` 决定对象顺序，省略时按目录名排序；Prompt 缺省为对象名。Prompt 须有实际文本，按 `strip().lower().rstrip(".")` 比较时不得重复，场景首帧中各自须匹配唯一候选。`instance` 仅选择重建参考图候选，不能在在线场景中区分同 Prompt 的多个实例。尺度也可用 `scale_to_meters`，与轴尺寸二选一。
 
-### 资产交付与恢复边界
+### 资产与模板
 
-研究者负责固定实验资产。代码不再比较任务、Prompt 或模板哈希，也不传递身份协议。已有 Raw、Zarr、checkpoint、Mesh 和冻结模板均不自动覆盖或重新生成。
+研究者负责固定实验资产。已有 Raw、Zarr、checkpoint、Mesh 和冻结模板均不自动覆盖或重新生成。
 
-示例任务三个米制 Mesh 在本机存在但未纳入 Git；任务级冻结模板缺失。新 checkout 需要自行提供 Mesh 与实验对应的冻结模板。不能用新采样宣称恢复历史模板。
+示例任务三个米制 Mesh 在本机存在但未纳入 Git；任务级冻结模板缺失。新 checkout 需要自行提供 Mesh 与实验对应的冻结模板。
 
-模板要求显式的 object_names 分段映射，资产文件不由运行时修改。手模板只消费 XYZ 通道。历史单物体采样文件因用途未能确认保留，不参与当前链路。
+模板要求显式的 object_names 分段映射，资产文件不由运行时修改。手模板只消费 XYZ 通道。
 
 ### 模板与数据契约
 
 `hoi/template.npz` 包含 `points_local[1024,3]`、`offsets`、`object_names`。名字关联 Mesh、Prompt 与跟踪结果；拼接顺序始终由模板决定，配置列表可以重新排序。加载边界检查必要形状、有限值、分段及对象对应关系。
 
-Raw `/hoi` 只包含 `object_pointcloud[T,1024,3]` 和 `object_pointcloud_valid[T]`。点云以 xArm base 为坐标系、米为单位。中间结果保留在 `_hoi_staging`，写完并 flush 后发布；分组移动不保证断电事务。损坏 HOI 只阻止 HOI 消费者。
+Raw `/hoi` 只包含 float32 的 `object_pointcloud[T,1024,3]`，点云以 xArm base 为坐标系、米为单位，坐标必须有限。全段跟踪成功后才写入并发布；正式点云存在且满足结构要求即表示该段已完成标注。中间结果保留在 `_hoi_staging`，写完并 flush 后发布；分组移动不保证断电事务。损坏 HOI 只阻止 HOI 消费者。
 
 离线跨 Episode 复用模型并重置场景，按 camera_sequence 去重；同序列的来源时间必须一致。首次初始化或 pose 失效即报告 Episode、行号与原因，不发布该 Episode，继续下一段。文件、模型或程序错误直接传播。在线失效后等待新请求，旧 Episode 在途结果不能被新请求接受。
 

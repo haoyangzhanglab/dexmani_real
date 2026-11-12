@@ -4,8 +4,6 @@ import numpy as np
 
 from dexmani_real.geometry.hoi import transform_task_points
 
-HOI_FIELDS = ("object_pointcloud", "object_pointcloud_valid")
-
 
 def write_hoi(path, template, poses, base_from_camera):
     import h5py
@@ -25,7 +23,6 @@ def write_hoi(path, template, poses, base_from_camera):
                 transform_task_points(template, pose, base_from_camera)
                 for pose in poses[start:start + 128]
             ])
-        group.create_dataset("object_pointcloud_valid", data=np.ones(frames, dtype=bool))
         data.flush()
         data.move("_hoi_staging", "hoi")
         data.flush()

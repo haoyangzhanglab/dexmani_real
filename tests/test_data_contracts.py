@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import logging
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -16,7 +17,7 @@ import zarr
 
 from dexmani_real.config.real import RealConfig
 from dexmani_real.data.export import ExportConfig, export_zarr, select_episodes
-from dexmani_real.data.hoi import HOI_FIELDS, write_hoi
+from dexmani_real.data.hoi import write_hoi
 from dexmani_real.data.raw import (
     RawReader,
     RawWriter,
@@ -171,20 +172,16 @@ class DataContracts(unittest.TestCase):
             data.create_group('hoi')
         with RawReader(path) as reader:
             self.assertEqual(reader.meta['task_label'], 'offline')
-            self.assertTrue(set(HOI_FIELDS).isdisjoint(reader.fields))
+            self.assertNotIn('object_pointcloud', reader.fields)
             reader.require_fields('arm_qpos', 'rgb', 'depth')
             self.assertEqual(reader['arm_qpos'].shape, (4, 7))
             self.assertEqual(reader['depth'].shape, (4, 16, 16))
             reader.read_timing()
             self.assertEqual(len(list(reader.iter_rgb_frames())), 4)
-            with self.assertRaises(ValueError):
-                reader.require_fields(*HOI_FIELDS)
-            for name in HOI_FIELDS:
-                with self.subTest(field=name):
-                    with self.assertRaises(ValueError):
-                        reader.require_fields(name)
-                    with self.assertRaises(KeyError):
-                        reader[name]
+            with self.assertRaisesRegex(ValueError, 'missing fields'):
+                reader.require_fields('object_pointcloud')
+            with self.assertRaises(KeyError):
+                reader['object_pointcloud']
         self.assertEqual(len(load_trajectory(path, self.runtime, segment=0)), 2)
         export_zarr(path, self.root / 'ordinary.zarr', processing=ExportConfig(), fields=('joint_state',))
         with self.assertRaises(ValueError):
@@ -192,22 +189,26 @@ class DataContracts(unittest.TestCase):
         self.assertFalse((self.root / 'hoi.zarr').exists())
 
     def test_malformed_hoi_rejected_before_visualizer_start(self):
-        import sys
         from scripts.visualize_episode import EpisodeVisualizer
         path = self.record('policy_rollout')
-        with h5py.File(path / 'data.h5', 'r+') as data:
-            group = data.create_group('hoi')
-            group.create_dataset('object_pointcloud', data=np.zeros((4, 1, 3), np.float32))
-            group.create_dataset('object_pointcloud_valid', data=np.zeros(4, bool))
-        with RawReader(path) as reader:
-            reader.require_fields(*HOI_FIELDS)
-            self.assertEqual(reader['arm_qpos'].shape, (4, 7))
-            with self.assertRaisesRegex(ValueError, 'shape/dtype'):
-                reader['object_pointcloud']
-        rerun = MagicMock()
-        with patch.dict(sys.modules, {'rerun': rerun}), self.assertRaisesRegex(ValueError, 'shape/dtype'):
-            EpisodeVisualizer(str(path), table_plane_path=None)
-        rerun.init.assert_not_called()
+        for shape, dtype in ((None, None), ((4, 1, 3), 'f4'), ((3, 1024, 3), 'f4'), ((4, 1024, 3), 'f8')):
+            with self.subTest(shape=shape, dtype=dtype):
+                with h5py.File(path / 'data.h5', 'r+') as data:
+                    group = data.create_group('hoi')
+                    if shape is not None:
+                        group.create_dataset('object_pointcloud', shape, dtype=dtype)
+                error = 'missing fields' if shape is None else 'shape/dtype'
+                with RawReader(path) as reader:
+                    self.assertEqual(reader['arm_qpos'].shape, (4, 7))
+                    with self.assertRaisesRegex(ValueError, error):
+                        reader.require_fields('object_pointcloud')
+                        reader['object_pointcloud']
+                rerun = MagicMock()
+                with patch.dict(sys.modules, {'rerun': rerun}), self.assertRaisesRegex(ValueError, error):
+                    EpisodeVisualizer(str(path), table_plane_path=None)
+                rerun.init.assert_not_called()
+                with h5py.File(path / 'data.h5', 'r+') as data:
+                    del data['hoi']
 
     def test_annotation_stops_failed_episode_and_deduplicates(self):
         from scripts.cordvip.annotate_episodes import annotate_episodes
@@ -240,8 +241,11 @@ class DataContracts(unittest.TestCase):
             with h5py.File(failed / 'data.h5') as data:
                 self.assertNotIn('hoi', data)
             with h5py.File(good / 'data.h5') as data:
-                self.assertEqual(set(data['hoi']), set(HOI_FIELDS))
+                self.assertEqual(set(data['hoi']), {'object_pointcloud'})
                 self.assertEqual(data['hoi/object_pointcloud'].shape, (4, 1024, 3))
+            annotate_episodes([good], self.root)
+            opened.assert_called_once()
+            self.assertEqual(tracker.step.call_count, 5)
             for error in (RuntimeError('model failed'), OSError('IO failed')):
                 tracker.step.side_effect = error
                 with self.assertRaises(type(error)):
@@ -291,39 +295,84 @@ class DataContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'skew.*row 0'):
             export_zarr(path, self.root / 'over.zarr', processing=ExportConfig(hoi_max_skew_s=.000999999), fields=fields)
         with h5py.File(path / 'data.h5', 'r+') as data:
-            self.assertEqual(set(data['hoi']), set(HOI_FIELDS))
+            self.assertEqual(set(data['hoi']), {'object_pointcloud'})
             self.assertFalse(dict(data['hoi'].attrs))
             rows = data['timing/rows'][:]
             rows['camera_ns'][0] -= 100_000_000
             data['timing/rows'][:] = rows
         with self.assertRaisesRegex(ValueError, 'skew.*row 0'):
             export_zarr(path, self.root / 'skew.zarr', processing=ExportConfig(hoi_max_skew_s=.01), fields=fields)
-        with h5py.File(path / 'data.h5', 'r+') as data:
-            data['hoi/object_pointcloud_valid'][0] = False
-        with self.assertRaisesRegex(ValueError, 'invalid at row 0'):
-            export_zarr(path, self.root / 'invalid.zarr', processing=ExportConfig(), fields=('object_pointcloud',))
 
-    def test_nonfinite_valid_hoi_rejected(self):
+    def test_hoi_visualization_and_nonfinite_export(self):
+        from scripts.visualize_episode import EpisodeVisualizer
+
         path = self.record('policy_rollout')
         template = {'points_local': np.zeros((1024, 3), np.float32), 'offsets': [0, 1024]}
         write_hoi(path / 'data.h5', template, np.tile(np.eye(4), (4, 1, 1, 1)), np.eye(4))
-        with h5py.File(path / 'data.h5', 'r+') as data:
-            data['hoi/object_pointcloud'][0, 0, 0] = np.nan
-        with self.assertRaisesRegex(ValueError, 'nonfinite.*row 0'):
-            export_zarr(path, self.root / 'nan.zarr', processing=ExportConfig(), fields=('object_pointcloud',))
+        for value in (1., np.nan, np.inf):
+            with self.subTest(value=value):
+                with h5py.File(path / 'data.h5', 'r+') as data:
+                    data['hoi/object_pointcloud'][0, 0, 0] = value
+                with patch.dict(sys.modules, {'rerun': MagicMock(), 'rerun.blueprint': MagicMock()}), \
+                        patch('scripts.visualize_episode.ArmFK'), \
+                        patch('scripts.visualize_episode.HandFK'), \
+                        patch('scripts.visualize_episode.HandPointCloud'), \
+                        patch.object(EpisodeVisualizer, 'log_hand_geometry'), \
+                        patch('scripts.visualize_episode.log_points') as points:
+                    viewer = EpisodeVisualizer(str(path), table_plane_path=None)
+                    try:
+                        rgb = next(viewer.reader.iter_rgb_frames())
+                        if np.isfinite(value):
+                            viewer.log_step(0, rgb)
+                            self.assertEqual(points.call_args.args[0], 'object_pointcloud')
+                            expected = np.zeros((1024, 3), np.float32)
+                            expected[0, 0] = value
+                            np.testing.assert_array_equal(points.call_args.args[1], expected)
+                        else:
+                            with self.assertRaisesRegex(ValueError, 'nonfinite.*row 0'):
+                                viewer.log_step(0, rgb)
+                    finally:
+                        viewer.close()
+                if not np.isfinite(value):
+                    with self.assertRaisesRegex(ValueError, 'nonfinite.*row 0'):
+                        export_zarr(path, self.root / f'{value}.zarr', processing=ExportConfig(),
+                                    fields=('object_pointcloud',))
+
+    def test_hoi_write_failure_remains_unpublished(self):
+        path = self.record('policy_rollout')
+        template = {'points_local': np.zeros((1024, 3), np.float32), 'offsets': [0, 1024]}
+        poses = np.tile(np.eye(4), (4, 1, 1, 1))
+        poses[2, 0, 0, 3] = np.nan
+        with self.assertRaisesRegex(ValueError, '非有限'):
+            write_hoi(path / 'data.h5', template, poses, np.eye(4))
+        with RawReader(path) as reader:
+            self.assertIn('_hoi_staging', reader.data_file)
+            self.assertNotIn('hoi', reader.data_file)
+            self.assertNotIn('object_pointcloud', reader.fields)
+        poses[2, 0, 0, 3] = 0
+        write_hoi(path / 'data.h5', template, poses, np.eye(4))
+        with RawReader(path) as reader:
+            self.assertNotIn('_hoi_staging', reader.data_file)
+            self.assertEqual(set(reader.data_file['hoi']), {'object_pointcloud'})
+            np.testing.assert_array_equal(reader['object_pointcloud'][:], np.zeros((4, 1024, 3), np.float32))
+        with self.assertRaises(FileExistsError):
+            write_hoi(path / 'data.h5', template, poses, np.eye(4))
 
     def test_absent_and_staging_hoi_are_not_published(self):
         path = self.record('policy_rollout')
         for staging in (False, True):
             if staging:
                 with h5py.File(path / 'data.h5', 'r+') as data:
-                    data.create_group('_hoi_staging')
+                    data.create_group('_hoi_staging').create_dataset('object_pointcloud', (4, 1024, 3), dtype='f4')
             with self.subTest(staging=staging), RawReader(path) as reader:
-                self.assertTrue(set(HOI_FIELDS).isdisjoint(reader.fields))
+                self.assertNotIn('object_pointcloud', reader.fields)
                 with self.assertRaisesRegex(ValueError, 'missing fields'):
                     reader.require_fields('object_pointcloud')
                 with self.assertRaises(KeyError):
                     reader['object_pointcloud']
+            with self.assertRaisesRegex(ValueError, 'missing fields'):
+                export_zarr(path, self.root / f'staging_{staging}.zarr', processing=ExportConfig(),
+                            fields=('object_pointcloud',))
 
     def test_no_attempt_nan_rejected_by_export_and_replay(self):
         path = self.record('policy_rollout', command=False)

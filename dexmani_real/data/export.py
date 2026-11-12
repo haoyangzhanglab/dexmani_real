@@ -212,10 +212,6 @@ def iter_canonical_blocks(
         raw = {name: reader[name][start:end] for name in inputs - {"rgb"}}
         block = {}
         if "object_pointcloud" in fields:
-            valid = reader["object_pointcloud_valid"][start:end]
-            if not valid.all():
-                row = start + int(np.flatnonzero(~valid)[0])
-                raise ValueError(f"object_pointcloud invalid at row {row}; use --exclude {reader.path.name}")
             block["object_pointcloud"] = raw["object_pointcloud"]
         if "joint_state" in fields:
             block["joint_state"] = np.concatenate((raw["arm_qpos"], raw["hand_qpos"]), axis=1, dtype=np.float32)

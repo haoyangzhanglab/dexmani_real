@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """真机策略评估；--print-config 仅打印配置，不连接设备。"""
 # Usage: python scripts/run_policy.py CHECKPOINT
 # HOI 需求由 Checkpoint 自动识别，任务与模板信息必须匹配。
@@ -7,6 +6,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -133,4 +135,15 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from dexmani_real.deployment.inference import ModelShutdownTimeout
+
+    try:
+        raise SystemExit(main())
+    except ModelShutdownTimeout:
+        # 设备、录制与结果已收尾；绕过解释器对卡住的模型线程的无限等待。
+        try:
+            logging.shutdown()
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(1)

@@ -20,7 +20,6 @@ class HandGeometryRejected(ValueError):
 
 @dataclass(frozen=True)
 class HandTargets:
-    requested_qpos: np.ndarray  # (12,), SDK order; may exceed operating limits
     positions: np.ndarray  # (5, 3, 3): requested FK base / intermediate / tip
     directions: np.ndarray  # (5, 2, 3): requested FK proximal / terminal
     activation: np.ndarray  # (4,): thumb–index/middle/ring/pinky
@@ -163,6 +162,6 @@ class HandCalibration:
         )
         activation = x * x * (3.0 - 2.0 * x)
         return HandTargets(
-            requested_qpos=requested, positions=targets, directions=directions,
+            positions=targets, directions=directions,
             activation=activation, pinch_distances=distances,
         )

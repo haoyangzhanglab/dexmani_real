@@ -163,10 +163,19 @@ class KeyboardTeleop:
                 cancel_epoch=cancel_epoch,
                 cancel_requested=cancelled,
             )
-        except (HomeConfigurationError, HomePathRejected) as exc:
+        except HomeConfigurationError as exc:
             self.robot.check()
             logger.warning("本次 HOME 未完成：%s", exc)
             return False
+        except HomePathRejected as exc:
+            self.robot.check()
+            logger.warning(
+                "自动 HOME 路径不可行：%s。未执行 HOME 轨迹；可使用 Jog 手动调整姿态后再次按 R。",
+                exc,
+            )
+            if (self.runtime_state.cancel_epoch != cancel_epoch
+                    or not self.runtime_state.requests_allow_motion()):
+                return False
         else:
             logger.info("HOME completed")
         self.prepare_jog(cancel_epoch)

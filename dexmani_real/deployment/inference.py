@@ -8,8 +8,12 @@ from typing import TYPE_CHECKING, cast
 if TYPE_CHECKING:
     from dexmani_policy.deployment import PolicyRuntime
 
-MODEL_SHUTDOWN_TIMEOUT_S = 65.0
+MODEL_SHUTDOWN_TIMEOUT_S = 5.0
 logger = logging.getLogger(__name__)
+
+
+class ModelShutdownTimeout(TimeoutError):
+    """模型关闭仍在进行；Session 完成关键收尾后才向 CLI 传播。"""
 
 
 class PolicyWorker:

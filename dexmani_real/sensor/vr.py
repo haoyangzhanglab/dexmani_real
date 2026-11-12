@@ -109,6 +109,7 @@ def iter_vr_events(config: VRConfig, *, running, include_head_frames=False):
         while running():
             try:
                 line = receiver.recv_line()
+                recv_ts_ns = receiver.last_recv_ts_ns
             except TransportTimeoutError:
                 yield None
                 continue
@@ -128,5 +129,5 @@ def iter_vr_events(config: VRConfig, *, running, include_head_frames=False):
             except ParseError:
                 yield None
                 continue
-            event = assembler.push_packet(packet)
+            event = assembler.push_packet(packet, recv_ts_ns=recv_ts_ns)
             yield event

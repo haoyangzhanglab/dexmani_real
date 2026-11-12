@@ -2,8 +2,12 @@
 
 import contextlib
 import io
+import json
 import logging
+import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
 import unittest
 from concurrent.futures import Future
@@ -21,12 +25,11 @@ from dexmani_real.data.recorder import (
     RecordingError,
     format_recording_result,
 )
-from dexmani_real.deployment.inference import PolicyWorker
+from dexmani_real.deployment.inference import ModelShutdownTimeout, PolicyWorker
 from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.rollout import EpisodeResult, Rollout
 from dexmani_real.deployment.session import PolicySession
 from dexmani_real.robot.commands import (
-    HomeTimeout,
     OperationCancelled,
     RobotCommand,
     RobotError,
@@ -115,8 +118,9 @@ class SafetyContracts(unittest.TestCase):
                            cancel_epoch=self.state.cancel_epoch, cancel_requested=lambda: False)
             self.assertEqual(robot.stop.call_count, 2)
 
-    def make_rollout(self):
-        runtime = replace(self.runtime, execution=replace(self.runtime.execution, control_dt_s=0.1, action_steps=2))
+    def make_rollout(self, *, mode='sync', control_dt_s=0.1):
+        runtime = replace(self.runtime, execution=replace(self.runtime.execution,
+                          mode=mode, control_dt_s=control_dt_s, action_steps=2))
         info = NS(n_obs_steps=2, observation_fields=('rgb',), action_mode='joint', requires_prev_action=False)
         builder = ObservationBuilder(info, runtime)
         robot = Mock()
@@ -131,6 +135,76 @@ class SafetyContracts(unittest.TestCase):
         row = Observation(arm, hand, {'timestamp_ns': self.now, 'rgb': np.ones((2, 2, 3), np.uint8)},
                           None, None, self.now)
         return rollout, row
+
+    def test_async_mapping_expiry_polls_prediction_submitted_in_same_step(self):
+        from dexmani_real.deployment.schedule import ActionChunk
+
+        for outcome in ('ready', 'pending', 'exhausted', 'poll_exhausted', 'failed'):
+            with self.subTest(outcome=outcome):
+                self.state.stop_signal.clear()
+                rollout, row = self.make_rollout(mode='async', control_dt_s=0.01)
+                rollout.plan = ActionChunk(np.zeros((2, 19)), 0)
+                rollout.started_ns = self.now - rollout.dt_ns
+                rollout.next_step_ns = self.now
+                rollout.last_slot = 0
+                rollout.first_prediction = False
+                rollout.sample_observation = Mock(return_value=(row, row))
+                actions = np.arange(4 * 19).reshape(4, 19) / 100
+                future = Future()
+                error = RuntimeError('prediction failed during mapping')
+                rollout.model.predict.side_effect = lambda *a, model=rollout.model, future=future, **kw: setattr(model, 'future', future)
+
+                def poll(model=rollout.model, outcome=outcome, dt_ns=rollout.dt_ns):
+                    completed = PolicyWorker.poll(model)
+                    if completed is not None and outcome == 'poll_exhausted':
+                        self.now += 3 * dt_ns
+                    return completed
+
+                rollout.model.poll.side_effect = poll
+
+                def map_command(action, observation, rollout=rollout, future=future,
+                                outcome=outcome, error=error, actions=actions):
+                    # 旧计划最后一槽才发起预测，映射期间跨过窗口末端。
+                    self.assertIs(rollout.model.future, future)
+                    self.assertFalse(future.done())
+                    self.now += (4 if outcome == 'exhausted' else 1) * rollout.dt_ns + 1
+                    if outcome == 'failed':
+                        future.set_exception(error)
+                    elif outcome != 'pending':
+                        future.set_result(actions)
+                    return RobotCommand(action[:7], action[7:]), None
+
+                rollout.map_command = Mock(side_effect=map_command)
+                with patch('dexmani_real.deployment.rollout.time.monotonic_ns', side_effect=lambda: self.now):
+                    if outcome == 'failed':
+                        with self.assertRaises(RuntimeError) as caught:
+                            rollout.step_control()
+                        self.assertIs(caught.exception, error)
+                    else:
+                        rollout.step_control()
+
+                rollout.model.predict.assert_called_once()
+                rollout.map_command.assert_called_once()
+                rollout.robot.send_action.assert_not_called()
+                self.assertFalse(rollout.has_submitted)
+                if outcome == 'ready':
+                    self.assertFalse(rollout.finished)
+                    self.assertFalse(self.state.stop_signal.is_set())
+                    self.assertEqual(rollout.plan.anchor_slot, 2)
+                    np.testing.assert_array_equal(rollout.plan.actions, actions[1:])
+                    self.assertIsNone(rollout.query)
+                    self.assertIsNone(rollout.model.future)
+                elif outcome in ('pending', 'exhausted', 'poll_exhausted'):
+                    self.assertEqual(rollout.result.termination_reason, 'cancelled')
+                    self.assertEqual(rollout.result.termination_details, 'prediction window expired during mapping')
+                    self.assertTrue(self.state.stop_signal.is_set())
+                    self.assertIsNone(rollout.plan)
+                    self.assertIsNone(rollout.query)
+                    if outcome == 'pending':
+                        self.assertIs(rollout.model.future, future)
+                        self.assertFalse(future.done())
+                    else:
+                        self.assertIsNone(rollout.model.future)
 
     def test_stale_input_discards_plan_and_new_episode_refills_history(self):
         rollout, row = self.make_rollout()
@@ -746,6 +820,158 @@ class SafetyContracts(unittest.TestCase):
         self.assertEqual(calls, ['runtime', 'recording', 'model', 'results'])
         self.assertEqual(session.errors[0]['stage'], 'shutdown')
         self.assertEqual([error['stage'] for error in episode.result.errors], ['recording_finalize', 'model_close'])
+
+    def test_model_shutdown_timeout_requires_completed_cleanup_and_results(self):
+        for case in ('pending', 'run_failed', 'recording_failed_but_closed', 'runtime_failed',
+                     'recording_failed', 'recording_pending', 'results_failed',
+                     'completed_timeout', 'completed_error', 'completed_during_save'):
+            with self.subTest(case=case):
+                self.state.stop_signal.clear()
+                episode, _ = self.make_rollout()
+                episode.recorder, _ = self.make_recorder('failed' if case == 'recording_failed_but_closed'
+                                                        else 'published')
+                session = self.make_policy_session(episode)
+                session.episode, session.episodes = episode, [episode.result]
+                closed = Future()
+                session.model.close.return_value = closed
+                if case == 'completed_timeout':
+                    closed.set_exception(TimeoutError('model internal timeout'))
+                elif case == 'completed_error':
+                    closed.set_exception(RuntimeError('model close failed'))
+                if case == 'recording_failed':
+                    episode.recorder.finish.side_effect = RecordingError('finish failed')
+                elif case == 'recording_pending':
+                    episode.finish_recording = Mock(return_value=False)
+
+                def save(case=case, closed=closed):
+                    if case == 'results_failed':
+                        raise OSError('result write failed')
+                    if case == 'completed_during_save':
+                        closed.set_result(None)
+
+                runtime_error = RobotError('device close failed') if case == 'runtime_failed' else None
+                failure = RuntimeError('run failed') if case == 'run_failed' else None
+                with patch('dexmani_real.deployment.session.close_runtime', side_effect=runtime_error), \
+                        patch('dexmani_real.deployment.session.MODEL_SHUTDOWN_TIMEOUT_S', 0), \
+                        patch.object(session, 'save_results', side_effect=save) as saved, \
+                        self.assertLogs('dexmani_real.deployment.session', level='ERROR'):
+                    if case in ('pending', 'run_failed', 'recording_failed_but_closed'):
+                        with self.assertRaises(ModelShutdownTimeout):
+                            session.close(failure=failure)
+                        self.assertIsNone(episode.recorder)
+                    else:
+                        self.assertEqual(session.close(failure=failure), 1)
+                saved.assert_called_once()
+                errors = session.errors + episode.result.errors
+                expected_stage = {'runtime_failed': 'shutdown', 'recording_failed': 'recording_finalize',
+                                  'results_failed': 'results_write', 'run_failed': 'session',
+                                  'recording_failed_but_closed': 'recording'}.get(case, 'model_close')
+                self.assertIn(expected_stage, [error['stage'] for error in errors])
+                if case == 'completed_timeout':
+                    self.assertEqual(episode.result.errors[-1]['exception_type'], 'TimeoutError')
+                    self.assertEqual(episode.result.errors[-1]['message'], 'model internal timeout')
+
+    def test_cli_model_shutdown_exits_after_cleanup(self):
+        root = Path(__file__).resolve().parents[1]
+        script = textwrap.dedent('''\
+            import atexit
+            import json
+            import runpy
+            import sys
+            import threading
+            import time
+            from pathlib import Path
+            from types import SimpleNamespace as NS
+            from unittest.mock import Mock, patch
+
+            sys.path.insert(0, str(Path.cwd() / 'tests'))
+            from test_safety_contracts import SafetyContracts
+            from dexmani_real.deployment.inference import PolicyWorker
+
+            mode, directory = sys.argv[1:]
+            output = Path(directory)
+            def mark(stage):
+                with (output / 'order.jsonl').open('a') as stream:
+                    stream.write(json.dumps([stage, time.monotonic()]) + '\\n')
+            atexit.register(lambda: mark('interpreter_exit'))
+            case = SafetyContracts()
+            case.setUp()
+            episode, _ = case.make_rollout()
+            episode.recorder = Mock(error=None, finish_request=NS(save=True))
+            episode.recorder.finish.side_effect = lambda **kw: mark('recorder')
+            episode.recorder.result.return_value = {'status': 'published'}
+            session = case.make_policy_session(episode)
+            session.episode, session.episodes = episode, [episode.result]
+            session.output_dir = output
+            session.robot.close.side_effect = lambda: mark('robot')
+            session.keyboard.stop.side_effect = lambda: mark('keyboard')
+            session.sensors = Mock()
+            session.sensors.shutdown.side_effect = lambda state: mark('sensors')
+            session.prepare_resources = Mock()
+            session.start_devices = Mock()
+            session.run_control_loop = Mock()
+
+            started, blocked = threading.Event(), threading.Event()
+            def predict(rows):
+                started.set()
+                if mode == 'predict_pending':
+                    blocked.wait()
+                return []
+            def close_model():
+                mark('model_close')
+                if mode == 'close_pending':
+                    blocked.wait()
+            worker = PolicyWorker(lambda: NS(info=None, predict=predict, close=close_model),
+                                  build_observation=lambda rows: rows)
+            worker.load()
+            worker.future.result(timeout=1)
+            worker.poll()
+            worker.predict(())
+            assert started.wait(timeout=1)
+            session.model = worker
+            close = worker.close
+            def request_close():
+                mark('model_close_requested')
+                return close()
+            worker.close = request_close
+            save = session.save_results
+            def save_results():
+                assert episode.recorder is None
+                save()
+                mark('results_saved')
+                print('buffered stdout', end='')
+                sys.stderr.write('buffered stderr')
+            session.save_results = save_results
+
+            sys.argv = ['scripts/run_policy.py', 'offline.pt']
+            with patch('dexmani_real.deployment.run.PolicySession', return_value=session), \\
+                    patch('dexmani_real.deployment.session.MODEL_SHUTDOWN_TIMEOUT_S', 0.03):
+                runpy.run_path('scripts/run_policy.py', run_name='__main__')
+        ''')
+        for mode in ('normal', 'predict_pending', 'close_pending'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(dir='/tmp') as directory:
+                result = subprocess.run([sys.executable, '-B', '-c', script, mode, directory],
+                                        cwd=root, capture_output=True, text=True, timeout=3, check=False)
+                self.assertEqual(result.returncode, 0 if mode == 'normal' else 1, result.stdout + result.stderr)
+                output = Path(directory)
+                events = [json.loads(line) for line in (output / 'order.jsonl').read_text().splitlines()]
+                stages = [stage for stage, _ in events]
+                self.assertEqual(stages[:5], ['robot', 'keyboard', 'sensors', 'recorder', 'model_close_requested'])
+                saved = json.loads((output / 'session_result.json').read_text())
+                self.assertEqual(saved['episodes'][0]['raw']['status'], 'published')
+                self.assertIn('buffered stdout', result.stdout)
+                self.assertIn('buffered stderr', result.stderr)
+                if mode == 'normal':
+                    self.assertEqual(stages[5:], ['model_close', 'results_saved', 'interpreter_exit'])
+                    self.assertEqual(saved['termination_reason'], 'quit')
+                else:
+                    self.assertNotIn('interpreter_exit', stages)
+                    self.assertEqual(stages[-1], 'results_saved')
+                    self.assertEqual('model_close' in stages, mode == 'close_pending')
+                    times = dict(events)
+                    self.assertGreaterEqual(times['results_saved'] - times['model_close_requested'], 0.02)
+                    self.assertEqual(saved['termination_reason'], 'failed')
+                    self.assertEqual(saved['episodes'][0]['errors'][-1]['exception_type'], 'ModelShutdownTimeout')
 
     def test_hoi_rejection_prevents_submission_at_both_boundaries(self):
         import multiprocessing as mp

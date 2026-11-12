@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """离线查看 Raw episode 的观测与点云，或输出数据概要。"""
 # Usage: python scripts/visualize_episode.py episodes/pnp_apple_banana/episode_20261101_165909
 # 已有 /hoi 时自动叠加物体点云；追加 --info 仅输出数据概要。
@@ -76,7 +75,7 @@ class EpisodeVisualizer:
         table_plane_path: str | Path | None,
         max_frames: int | None = None,
         pointcloud_config: PointCloudConfig | None = None,
-        hand_pointcloud_config: HandCloudConfig = HandCloudConfig(),
+        hand_pointcloud_config: HandCloudConfig = HandCloudConfig(),  # noqa: B008 — 不可变配置可共享。
     ):
         import rerun as rr
 
@@ -86,11 +85,10 @@ class EpisodeVisualizer:
         try:
             self.reader = RawReader(episode_path)
             self.timestamps_s = self.reader.timestamps_s
-            self.has_hoi = "object_pointcloud" in self.reader.fields
+            self.has_hoi = "hoi" in self.reader.data_file
             if self.has_hoi:
-                self.reader.require_fields("object_pointcloud", "object_pointcloud_valid")
+                self.reader.require_fields("object_pointcloud")
                 self.reader["object_pointcloud"]
-                self.reader["object_pointcloud_valid"]
 
             self.reader.require_fields(
                 "rgb",
@@ -205,8 +203,8 @@ class EpisodeVisualizer:
         self.log_pointcloud(rgb, depth)
         self.log_hand_geometry(step_idx)
         if self.has_hoi:
-            points = self.reader["object_pointcloud"][step_idx] if self.reader["object_pointcloud_valid"][step_idx] else None
-            if points is not None and not np.isfinite(points).all():
+            points = self.reader["object_pointcloud"][step_idx]
+            if not np.isfinite(points).all():
                 raise ValueError(f"object_pointcloud contains nonfinite coordinates at row {step_idx}")
             log_points("object_pointcloud", points, colors=[255, 170, 0])
 

@@ -101,8 +101,7 @@ def validate_extrema(trajectory, start, lower, upper):
 
 def calculate_home_segment(cfg, q, v, target):
     """计算一段零加速度起步、零速度／加速度到达的离线轨迹。"""
-    if np.any(np.abs(v) > cfg.homing.max_speed_rad_per_s):
-        raise ValueError("HOME initial velocity exceeds its motion limit")
+    # 共享配置、起点与速度由 plan_home 在尝试候选之前验证。
     inp = InputParameter(7)
     inp.current_position = np.asarray(q).tolist()
     inp.current_velocity = np.where(np.abs(v) < 1e-12, 0., v).tolist()
@@ -115,6 +114,8 @@ def calculate_home_segment(cfg, q, v, target):
     inp.duration_discretization = DurationDiscretization.Discrete
     trajectory = Trajectory(7)
     result = Ruckig(7, 1 / cfg.servo_hz).calculate(inp, trajectory)
+    # 当前 Ruckig 不检查位置限位，路径越限由 validate_extrema 判定。
+    # 求解器错误不能证明路径不可行，不能据此改走 Via。
     if result not in (Result.Working, Result.Finished):
         raise RuntimeError(f"HOME Ruckig failed: {result}")
     return trajectory

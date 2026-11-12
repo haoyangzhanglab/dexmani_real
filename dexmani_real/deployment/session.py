@@ -16,7 +16,11 @@ from dexmani_real.config.deployment import POLICY_RUNTIME_SECTIONS
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.data.raw import camera_metadata
 from dexmani_real.data.recorder import format_recording_result
-from dexmani_real.deployment.inference import MODEL_SHUTDOWN_TIMEOUT_S, PolicyWorker
+from dexmani_real.deployment.inference import (
+    MODEL_SHUTDOWN_TIMEOUT_S,
+    ModelShutdownTimeout,
+    PolicyWorker,
+)
 from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import (
     resolve_deployment_config,
@@ -326,12 +330,15 @@ class PolicySession:
 
     def close(self, *, failure=None):
         exit_signal = failure if isinstance(failure, SystemExit) else None
+        resources_closed = False
+        model_timeout = None
         if failure is not None:
             self.errors.append(error_detail("session", failure))
         try:
             close_runtime(
                 self.runtime_state, self.robot, sensors=self.sensors, keyboard=self.keyboard,
             )
+            resources_closed = True
         except BaseException as exc:
             if isinstance(exc, SystemExit):
                 exit_signal = exit_signal or exc
@@ -341,8 +348,10 @@ class PolicySession:
             self.errors.append(error_detail("shutdown", exc))
         if self.episode is not None:
             try:
-                self.episode.finish_recording()
+                recording_closed = self.episode.finish_recording()
+                resources_closed = resources_closed and recording_closed
             except BaseException as exc:
+                resources_closed = False
                 if isinstance(exc, SystemExit):
                     exit_signal = exit_signal or exc
                 if isinstance(exc, KeyboardInterrupt):
@@ -353,7 +362,10 @@ class PolicySession:
             try:
                 closed = self.model.close()
                 if closed not in wait((closed,), timeout=MODEL_SHUTDOWN_TIMEOUT_S).done:
-                    raise TimeoutError("model close still pending; task handle retained")
+                    model_timeout = ModelShutdownTimeout(
+                        f"model close still pending after {MODEL_SHUTDOWN_TIMEOUT_S:g}s; task handle retained"
+                    )
+                    raise model_timeout
                 closed.result()
             except BaseException as exc:
                 if isinstance(exc, SystemExit):
@@ -374,8 +386,10 @@ class PolicySession:
         elif self.summary["termination_reason"] is None:
             self.summary["termination_reason"] = "quit"
         self.summary["ended_utc"] = utc_now()
+        results_saved = False
         try:
             self.save_results()
+            results_saved = True
         except BaseException as exc:
             if isinstance(exc, SystemExit):
                 exit_signal = exit_signal or exc
@@ -385,6 +399,10 @@ class PolicySession:
             self.summary["termination_reason"] = "estop" if self.runtime_state.estop_request else "failed"
             failed = True
             logger.exception("session result write failed")
+        # 运行或录制失败不等于资源未收尾；保存期间模型也可能已经关闭。
+        if (resources_closed and results_saved and model_timeout is not None
+                and not closed.done()):
+            raise model_timeout
         if exit_signal is not None:
             raise exit_signal
         return int(failed)

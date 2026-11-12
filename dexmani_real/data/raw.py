@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
-from dexmani_real.data.hoi import HOI_FIELDS
 from dexmani_real.geometry.camera import (
     CameraIntrinsics,
     CameraSnapshot,
@@ -459,8 +458,9 @@ class RawReader:
         import h5py
 
         names = {key for key, value in self.data_file.items()
-                 if isinstance(value, h5py.Dataset) and key not in HOI_FIELDS}
-        names.update(name for name in HOI_FIELDS if f"hoi/{name}" in self.data_file)
+                 if isinstance(value, h5py.Dataset) and key != "object_pointcloud"}
+        if "hoi/object_pointcloud" in self.data_file:
+            names.add("object_pointcloud")
         if self.rgb_path.is_file():
             names.add("rgb")
         return frozenset(names)
@@ -484,19 +484,16 @@ class RawReader:
                 and self.meta["arm_action_semantics"] != ARM_ACTION_SEMANTICS
             ):
                 raise ValueError(f"Raw arm_action_semantics: expected {ARM_ACTION_SEMANTICS}")
-            path = f"hoi/{name}" if name in HOI_FIELDS else name
+            path = "hoi/object_pointcloud" if name == "object_pointcloud" else name
             array = self.data_file[path]
             spec = (
                 ((), TIMING_ROW_DTYPE) if name == "timing/rows"
                 else ROBOT_DATASET_SPECS.get(name, VR_DATASET_SPECS.get(name))
             )
-            if name in HOI_FIELDS:
-                hoi_shape, hoi_dtype = (
-                    ((self.num_frames, 1024, 3), np.float32) if name == "object_pointcloud"
-                    else ((self.num_frames,), np.bool_)
-                )
-                if array.shape != hoi_shape or array.dtype != hoi_dtype:
-                    raise ValueError(f"Raw /hoi/{name}: shape/dtype 错误")
+            if name == "object_pointcloud" and (
+                array.shape != (self.num_frames, 1024, 3) or array.dtype != np.float32
+            ):
+                raise ValueError("Raw /hoi/object_pointcloud: shape/dtype 错误")
             if spec is not None:
                 shape, dtype = spec
                 valid_dtype = array.dtype.kind == "f" if dtype.kind == "f" else array.dtype == dtype

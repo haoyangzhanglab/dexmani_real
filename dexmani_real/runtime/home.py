@@ -35,6 +35,17 @@ class HomePathRejected(ValueError):
 
 def plan_home(cfg, q, v, hand_q, collision, check):
     """只在预规划阶段尝试 Direct / Via；返回原样发送的参考点。"""
+    check()
+    try:
+        cfg.validate_home()
+    except (ValueError, TypeError) as exc:
+        raise HomeConfigurationError(str(exc)) from exc
+    q = arm_reference_from_feedback(q, cfg.joint_limit_lower, cfg.joint_limit_upper)
+    v = np.asarray(v, dtype=np.float64)
+    if v.shape != (7,) or not np.isfinite(v).all():
+        raise ValueError("HOME initial velocity must contain seven finite values")
+    if np.any(np.abs(v) > cfg.homing.max_speed_rad_per_s):
+        raise ValueError("HOME initial velocity exceeds its motion limit")
     home = np.asarray(cfg.home_qpos)
     margin = cfg.homing.collision_margin_m
     reasons = []

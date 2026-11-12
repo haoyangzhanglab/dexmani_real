@@ -101,7 +101,7 @@ class ArmController:
             if target is not None:
                 valid = valid and np.max(np.abs(q - target)) <= tolerance
             if valid:
-                if target is None and (anchor is None or np.max(np.abs(q - anchor)) > tolerance):
+                if anchor is None or np.max(np.abs(q - anchor)) > tolerance:
                     stable, anchor = None, q.copy()
                 # SDK 未提供采样时刻；首尾查询的等待时间不能算作已观测到的停稳。
                 stable = completed_ns if stable is None else stable
@@ -145,6 +145,7 @@ class ArmController:
         period = round(1e9 / self.cfg.servo_hz)
         start = time.monotonic_ns()
         feedback_due = start
+        last_sent_index = 0  # samples[0] 已由实测起点确认。
         lateness = int(self.cfg.homing.max_lateness_s * 1e9)
         for index, point in enumerate(samples):
             due = start + index * period
@@ -155,7 +156,7 @@ class ArmController:
                 stamp = int(self.status['timestamp_ns'])
                 if not sample_is_fresh(stamp, self.cfg.feedback_max_age_s, time.monotonic_ns()):
                     raise FeedbackUnavailable("HOME arm feedback stale")
-                reference_index = min(len(samples)-1, max(0, (stamp-start)//period))
+                reference_index = min(last_sent_index, max(0, (stamp-start)//period))
                 if np.max(np.abs(self.status['qpos']-samples[reference_index])) > self.cfg.homing.tracking_error_rad:
                     raise OperationCancelled("HOME tracking error exceeded")
                 feedback_due = stamp + round(1e9/self.cfg.feedback_hz)
@@ -163,6 +164,7 @@ class ArmController:
             if time.monotonic_ns()-due > lateness:
                 raise HomeTimeout("HOME servo schedule late; no catch-up")
             self.driver.servo(point)
+            last_sent_index = index
             guarded()
             if time.monotonic_ns()-due > lateness:
                 raise HomeTimeout("HOME servo call exceeded schedule budget")
@@ -174,7 +176,7 @@ class ArmController:
         self.active = self.reference = None
         try:
             self.driver.stop()
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 — 停止失败必须锁存，不能伪装为确认停止。
             self.fault(exc)
         finally:
             self.io.publish_status(self.status)
@@ -214,7 +216,7 @@ class ArmController:
                 )
                 check_abort()
                 self.reference = ArmTrajectory(self.cfg, self.status["qpos"], self.status["qvel"])
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 — 生命周期请求须停止并向父进程报告中断或故障。
             error = exc
             if not isinstance(exc, OperationCancelled):
                 self.fault(exc)
@@ -325,7 +327,7 @@ class ArmController:
                     self.pipe.poll(delay)
                 else:
                     self.io.stop.wait(delay)
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 — Owner 顶层负责所有退出路径的停止收尾。
             if not isinstance(exc, OperationCancelled):
                 self.fault(exc)
             else:
@@ -337,7 +339,7 @@ class ArmController:
                 self.stop()
             try:
                 self.driver.close()
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001 — 关闭失败仍须经故障通道报告。
                 self.fault(exc)
             self.pipe.close()
 

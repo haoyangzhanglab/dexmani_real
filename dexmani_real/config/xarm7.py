@@ -137,6 +137,9 @@ class ArmConfig:
                 raise ValueError("arm standstill thresholds must be finite and positive")
 
     def validate_home(self) -> None:
+        from dexmani_real.robot.commands import validate_arm_target
+
+        self.validate()
         self.homing.validate()
         if cast(float, self.homing.max_lateness_s) >= 1 / self.servo_hz:
             raise ValueError("HOME lateness must be below one servo period")
@@ -145,11 +148,5 @@ class ArmConfig:
                 or cast(float, self.homing.max_jerk_deg_per_s3) > self.max_joint_jerk_deg_per_s3):
             raise ValueError("HOME motion limits exceed arm limits")
         if self.homing.via_qpos is not None:
-            from dexmani_real.robot.commands import validate_arm_target
             validate_arm_target(self.homing.via_qpos, self.joint_limit_lower, self.joint_limit_upper)
-        self._validate_standstill()
-        home = np.asarray(self.home_qpos, dtype=np.float64)
-        if home.shape != (ARM_DOF,) or not np.isfinite(home).all():
-            raise ValueError("arm home_qpos must contain seven finite values")
-        if np.any(home < self.joint_limit_lower) or np.any(home > self.joint_limit_upper):
-            raise ValueError("home_qpos must be within joint limits")
+        validate_arm_target(self.home_qpos, self.joint_limit_lower, self.joint_limit_upper)
