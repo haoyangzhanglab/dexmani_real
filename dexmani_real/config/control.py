@@ -61,13 +61,16 @@ class EnvironmentConfig:
     workspace: WorkspaceBounds = field(default_factory=WorkspaceBounds)
     # 最终 EEF 验收允许超出名义工作空间的距离，向外放宽边界。
     eef_workspace_tolerance_m: float = 0.005
-    # EEF/jog 使用的静态障碍物。
+    # HOME 使用的已标定静态障碍物。
     static_boxes: tuple[StaticCollisionBox, ...] = ()
+    home_model_confirmed: bool = False
 
     # 点云去桌面所用的标定事实。
     table_plane_path: str | None = TABLE_PLANE_RELATIVE_PATH
 
     def validate(self) -> None:
+        if type(self.home_model_confirmed) is not bool:
+            raise ValueError("home_model_confirmed must be an explicit boolean")
         self.workspace.as_array()
         if not isfinite(self.eef_workspace_tolerance_m) or self.eef_workspace_tolerance_m < 0:
             raise ValueError("eef_workspace_tolerance_m must be finite and non-negative")

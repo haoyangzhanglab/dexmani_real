@@ -5,20 +5,25 @@ import time
 
 import numpy as np
 
-from dexmani_real.robot.commands import OperationCancelled, validate_arm_target
+from dexmani_real.robot.commands import (
+    FeedbackUnavailable,
+    HomeTimeout,
+    OperationCancelled,
+    validate_arm_target,
+)
 from dexmani_real.robot.xarm7.protocol import (
     ARM_STATE_DTYPE,
     READY_TIMEOUT_S,
+    STANDSTILL_DWELL_S,
     HomeRequest,
     PrepareRequest,
+    StandstillRequest,
 )
 from dexmani_real.robot.xarm7.trajectory import ArmTrajectory
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import next_tick_ns, sample_is_fresh, sampling_clock_ns
 
 logger = logging.getLogger(__name__)
-
-STANDSTILL_DWELL_S = 0.30
 
 
 class ArmController:
@@ -91,7 +96,7 @@ class ArmController:
             q, v = self.status["qpos"], self.status["qvel"]
             sample_ns = int(self.status["timestamp_ns"])
             if not sample_is_fresh(sample_ns, self.cfg.feedback_max_age_s, completed_ns):
-                raise TimeoutError(f"{stage}: current arm feedback unavailable/stale")
+                raise FeedbackUnavailable(f"{stage}: current arm feedback unavailable/stale")
             valid = np.max(np.abs(v)) <= self.cfg.standstill_velocity_tolerance_rad_s
             if target is not None:
                 valid = valid and np.max(np.abs(q - target)) <= tolerance
@@ -107,20 +112,62 @@ class ArmController:
             # 按查询开始时刻限频，查询耗时既不拉长采样间隔，也不充作停稳时长。
             remaining_ns = min(sample_ns + interval_ns, deadline_ns) - time.monotonic_ns()
             self.io.stop.wait(max(0, remaining_ns) / 1e9)
+        check_abort()
         raise TimeoutError(f"{stage}: measured position/velocity dwell not confirmed")
 
-    def home(self, *, check_abort, deadline_ns):
-        target = validate_arm_target(self.cfg.home_qpos, self.cfg.joint_limit_lower,
-                                     self.cfg.joint_limit_upper)
-        self.wait_settled(check_abort, stage="HOME standstill", deadline_ns=deadline_ns)
-        if np.max(np.abs(self.status["qpos"] - target)) > self.cfg.standstill_position_tolerance_rad:
-            self.driver.prepare_motion(0, check_abort=check_abort)
-            self.wait_settled(check_abort, stage="HOME mode standstill", deadline_ns=deadline_ns)
+    def home(self, message, *, check_abort, deadline_ns):
+        samples = message.samples
+        if samples.ndim != 2 or samples.shape[1] != 7 or len(samples) < 2:
+            raise ValueError("invalid HOME reference array")
+        for point in samples:
+            validate_arm_target(point, self.cfg.joint_limit_lower, self.cfg.joint_limit_upper)
+        if not np.array_equal(samples[-1], self.cfg.home_qpos):
+            raise ValueError("HOME references must end at home")
+        last_hand_stamp = 0
+
+        def guarded():
+            nonlocal last_hand_stamp
             check_abort()
-            self.driver.move_home(target)
-            check_abort()
-        self.wait_settled(check_abort, stage="arm HOME", deadline_ns=deadline_ns, target=target)
-        check_abort()
+            value = self.io.home_hand_stamp
+            # 竞争时沿用上一份已验证的来源时间，不延长其时效。
+            if value.get_lock().acquire(False):
+                try:
+                    last_hand_stamp = value.get_obj().value
+                finally:
+                    value.get_lock().release()
+            if not sample_is_fresh(last_hand_stamp, message.hand_max_age_s, time.monotonic_ns()):
+                raise FeedbackUnavailable("HOME hand posture verification expired")
+        guarded()
+        self.driver.prepare_motion(check_abort=guarded)
+        self.wait_settled(guarded, stage="HOME start", deadline_ns=deadline_ns)
+        if np.max(np.abs(self.status['qpos']-samples[0])) > self.cfg.standstill_position_tolerance_rad:
+            raise OperationCancelled("HOME start changed after planning")
+        period = round(1e9 / self.cfg.servo_hz)
+        start = time.monotonic_ns()
+        feedback_due = start
+        lateness = int(self.cfg.homing.max_lateness_s * 1e9)
+        for index, point in enumerate(samples):
+            due = start + index * period
+            self.io.stop.wait(max(0, due-time.monotonic_ns()) / 1e9)
+            guarded()
+            if time.monotonic_ns() >= feedback_due:
+                self.read_feedback()
+                stamp = int(self.status['timestamp_ns'])
+                if not sample_is_fresh(stamp, self.cfg.feedback_max_age_s, time.monotonic_ns()):
+                    raise FeedbackUnavailable("HOME arm feedback stale")
+                reference_index = min(len(samples)-1, max(0, (stamp-start)//period))
+                if np.max(np.abs(self.status['qpos']-samples[reference_index])) > self.cfg.homing.tracking_error_rad:
+                    raise OperationCancelled("HOME tracking error exceeded")
+                feedback_due = stamp + round(1e9/self.cfg.feedback_hz)
+            guarded()
+            if time.monotonic_ns()-due > lateness:
+                raise HomeTimeout("HOME servo schedule late; no catch-up")
+            self.driver.servo(point)
+            guarded()
+            if time.monotonic_ns()-due > lateness:
+                raise HomeTimeout("HOME servo call exceeded schedule budget")
+        self.wait_settled(guarded, stage="arm HOME", deadline_ns=deadline_ns,
+                          target=np.asarray(self.cfg.home_qpos))
 
     def stop(self):
         self.io.stop.set()
@@ -133,7 +180,7 @@ class ArmController:
             self.io.publish_status(self.status)
             self.io.stopped.set()  # 处理结束；停止失败仍保存在 fault。
 
-    def operation(self, message: PrepareRequest | HomeRequest):
+    def operation(self, message: PrepareRequest | HomeRequest | StandstillRequest):
         self.io.stop_reason.value = b""
         self.io.stopped.clear()
         kind = "home" if isinstance(message, HomeRequest) else "prepare"
@@ -141,15 +188,20 @@ class ArmController:
         try:
 
             def check_abort():
+                if isinstance(message, (HomeRequest, StandstillRequest)) and time.monotonic_ns() >= message.deadline_ns:
+                    raise HomeTimeout("HOME execution budget exhausted")
                 self.check_lifecycle(deadline_ns=message.deadline_ns, stage=kind)
 
             check_abort()
             # request_operation 已等待本 owner 的停止确认，目标和伺服参考已清除。
             if isinstance(message, HomeRequest):
-                self.home(check_abort=check_abort, deadline_ns=message.deadline_ns)
+                self.home(message, check_abort=check_abort, deadline_ns=message.deadline_ns)
+                self.stop()
+            elif isinstance(message, StandstillRequest):
+                self.wait_settled(check_abort, stage="HOME standstill", deadline_ns=message.deadline_ns)
                 self.stop()
             else:
-                self.driver.prepare_motion(1, check_abort=check_abort)
+                self.driver.prepare_motion(check_abort=check_abort)
                 settled_deadline_ns = min(
                     message.deadline_ns,
                     time.monotonic_ns() + int(READY_TIMEOUT_S * 1e9),

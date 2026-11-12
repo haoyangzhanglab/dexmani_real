@@ -14,7 +14,7 @@ from dexmani_real.robot.model import (
 
 
 class CollisionModel:
-    def __init__(self, *, static_boxes=()):
+    def __init__(self, *, static_boxes=(), margin_m):
         import pinocchio as pin
         from hppfcl.hppfcl import Box
 
@@ -51,7 +51,17 @@ class CollisionModel:
             self.add_obstacle(f"obstacle_{index}", Box(*box.size_xyz_m), placement, robot_count)
 
         self.geometry_data = self.geometry.createData()
-        self.hand_qpos = None
+        for request in self.geometry_data.collisionRequests:
+            request.security_margin = margin_m
+        pin.computeBodyRadius(self.model, self.geometry, self.geometry_data)
+        radii = np.array(self.geometry_data.radius)
+        for joint in range(self.model.njoints - 1, 0, -1):
+            parent = self.model.parents[joint]
+            radii[parent] = max(radii[parent], radii[joint] + np.linalg.norm(
+                self.model.jointPlacements[joint].translation))
+        self.arm_radii = np.array([radii[self.model.getJointId(n)] for n in XARM7_JOINT_NAMES])
+        if not np.isfinite(self.arm_radii).all() or np.any(self.arm_radii <= 0):
+            raise ValueError("collision model has invalid arm geometry radii")
 
     def add_obstacle(self, name, shape, placement, robot_count):
         geometry = self.pin.GeometryObject(f"environment::{name}", 0, 0, shape, placement)
@@ -60,15 +70,9 @@ class CollisionModel:
         for robot_id in range(robot_count):
             self.geometry.addCollisionPair(self.pin.CollisionPair(robot_id, obstacle_id))
 
-    def set_hand_qpos(self, hand_qpos):
-        # 来源为已投影目标、设备反馈或已校验的 HOME 姿态；隔离后续来源更新。
-        self.hand_qpos = np.array(hand_qpos, dtype=np.float64, copy=True)
-
-    def rejection(self, arm_qpos):
-        if self.hand_qpos is None:
-            raise RuntimeError("set the collision hand posture before querying arm poses")
+    def rejection(self, arm_qpos, hand_qpos):
         qpos = np.empty(self.model.nq)
-        qpos[self.sdk_q_indices] = np.concatenate((arm_qpos, self.hand_qpos))
+        qpos[self.sdk_q_indices] = np.concatenate((arm_qpos, hand_qpos))
         # 命令限位由调用方检查；手部实测姿态按原值参与几何计算。
         collided = self.pin.computeCollisions(
             self.model, self.data, self.geometry, self.geometry_data, qpos, True

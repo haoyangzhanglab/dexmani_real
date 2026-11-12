@@ -117,7 +117,7 @@ class IKSolver:
         return residual, jacobian
 
     def solve(
-        self, target: Pose, measured, command, anchor, *, h: float, hand_qpos
+        self, target: Pose, measured, command, anchor, *, h: float
     ) -> IKResult:
         lower, upper = self.bounds(measured, command, h=h)
         seed = np.clip(command, lower, upper)  # 仅初值；最终输出不裁剪。
@@ -161,6 +161,5 @@ class IKSolver:
         if final @ final > initial_cost + OBJECTIVE_ROUNDOFF * max(1.0, initial_cost):
             raise RuntimeError("IK objective increased")
         pose = self.compute_eef_pose_base(q)
-        self.constraints.collision_model.set_hand_qpos(hand_qpos)
-        reason = self.constraints.endpoint_rejection(q, position=pose.p)
+        reason = self.constraints.endpoint_rejection(position=pose.p)
         return IKResult(qpos=q.copy() if reason is None else None, reason=reason or "")

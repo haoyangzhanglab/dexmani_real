@@ -35,7 +35,7 @@ from dexmani_real.robot.system import Robot
 from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
 from dexmani_real.robot.xarm7.worker import ArmController
 from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
-from dexmani_real.runtime.home import home_hand
+from dexmani_real.runtime.home import HomeConfigurationError, home_robot
 from dexmani_real.runtime.observation import (
     Observation,
     ObservationNeeds,
@@ -107,23 +107,13 @@ class SafetyContracts(unittest.TestCase):
         self.assertFalse(self.state.requests_allow_motion())
 
     def test_home_failure_stops_and_stop_failure_propagates(self):
-        feedback = np.zeros(1, dtype=HAND_STATE_DTYPE)
-        feedback['timestamp_ns'] = self.now
         for stop_error in (None, RobotError('stop failed')):
-            with self.subTest(stop_error=stop_error):
-                robot = Mock(hand_config=self.runtime.hand)
-                robot.hand_feedback.snapshot.return_value = feedback
-                robot.send_hand_home.side_effect = HomeTimeout('HOME timed out')
-                robot.stop.side_effect = [None, stop_error]
-                with (
-                    patch('dexmani_real.runtime.home.time.monotonic_ns', return_value=self.now),
-                    self.assertRaisesRegex(type(stop_error) if stop_error else HomeTimeout,
-                                           'stop failed' if stop_error else 'HOME timed out'),
-                ):
-                    home_hand(self.state, robot, cancel_epoch=self.state.cancel_epoch,
-                              cancel_requested=lambda: False)
-                self.assertEqual(robot.stop.call_count, 2)
-                self.assertEqual(robot.method_calls[-1][0], 'stop')
+            robot = Mock(arm_config=self.runtime.arm, hand_config=self.runtime.hand)
+            robot.stop.side_effect = [None, stop_error]
+            with self.assertRaises(type(stop_error) if stop_error else HomeConfigurationError):
+                home_robot(self.state, robot, environment=self.runtime.environment,
+                           cancel_epoch=self.state.cancel_epoch, cancel_requested=lambda: False)
+            self.assertEqual(robot.stop.call_count, 2)
 
     def make_rollout(self):
         runtime = replace(self.runtime, execution=replace(self.runtime.execution, control_dt_s=0.1, action_steps=2))
@@ -697,10 +687,9 @@ class SafetyContracts(unittest.TestCase):
         loop.phase = TeleopPhase.IDLE
         loop.pending_termination_reason = None
         calls = []
-        with patch('dexmani_real.teleop.loop.home_hand', side_effect=lambda *a, **kw: calls.append('hand')), \
-                patch('dexmani_real.teleop.loop.home_arm', side_effect=lambda *a, **kw: calls.append('arm')):
+        with patch('dexmani_real.teleop.loop.home_robot', side_effect=lambda *a, **kw: calls.append('robot')):
             self.assertTrue(loop.handle_operator_command('h'))
-            self.assertEqual(calls, ['hand', 'arm'])
+            self.assertEqual(calls, ['robot'])
             calls.clear()
             for phase in (TeleopPhase.PREPARING, TeleopPhase.ACTIVE):
                 loop.phase = phase
@@ -726,11 +715,10 @@ class SafetyContracts(unittest.TestCase):
         def cancel(*args, **kwargs):
             self.state.request_stop()
             raise OperationCancelled('offline cancellation')
-        with patch('dexmani_real.teleop.loop.home_hand', side_effect=cancel), \
-                patch('dexmani_real.teleop.loop.home_arm') as arm:
+        with patch('dexmani_real.teleop.loop.home_robot', side_effect=cancel):
             loop.handle_operator_command('h')
-        arm.assert_not_called()
-        loop.robot.stop.assert_called_once()
+        loop.robot.send_hand_home.assert_not_called()
+        loop.robot.stop.assert_not_called()
 
     def test_session_shutdown_attempts_all_stages_in_order(self):
         episode, _ = self.make_rollout()

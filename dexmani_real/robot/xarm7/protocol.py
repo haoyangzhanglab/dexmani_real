@@ -10,6 +10,7 @@ from dexmani_real.robot.model import ARM_JOINT_SHAPE
 
 # startup/prepare 的基础等待预算；HOME 使用独立的 homing.timeout_s。
 READY_TIMEOUT_S = 15.0
+STANDSTILL_DWELL_S = 0.30
 
 ARM_STATE_DTYPE = np.dtype(
     [
@@ -35,8 +36,15 @@ class PrepareRequest:
 
 
 @dataclass(frozen=True)
+class StandstillRequest:
+    deadline_ns: int
+
+
+@dataclass(frozen=True)
 class HomeRequest:
     deadline_ns: int
+    samples: np.ndarray
+    hand_max_age_s: float
 
 
 class ArmChannels:
@@ -48,6 +56,7 @@ class ArmChannels:
         self.fault = ctx.Array("c", 1024, lock=False)
         # 仅 Owner 写；先写原因再置 stop，接纳新操作时清除。
         self.stop_reason = ctx.Array("c", 64, lock=False)
+        self.home_hand_stamp = ctx.Value("q", 0)
         self.goal_lock, self.status_lock = ctx.Lock(), ctx.Lock()
         self.goal = ctx.RawArray("b", GOAL_DTYPE.itemsize)
         self.status = ctx.RawArray("b", ARM_STATE_DTYPE.itemsize)

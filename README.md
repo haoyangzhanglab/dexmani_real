@@ -90,7 +90,7 @@ python scripts/visualize_episode.py episodes/task/episode_xxx --info
 | [sensor](dexmani_real/sensor/) / [ipc](dexmani_real/ipc/) | 采集传感器数据，通过共享内存传递快照。 |
 | [robot](dexmani_real/robot/) | 设备连接、反馈读取与命令提交。 |
 | [runtime](dexmani_real/runtime/) | 共享观测、会话状态、资源生命周期、回位与点动。 |
-| [control](dexmani_real/control/) | 动作映射、局部 IK、限位与碰撞检查。 |
+| [control](dexmani_real/control/) | 动作映射、局部 IK、运行限位及仅供 HOME 使用的碰撞检查。 |
 | [teleop](dexmani_real/teleop/) | 腕部映射、手部重定向与示教采集。 |
 | [geometry](dexmani_real/geometry/) / [perception](dexmani_real/perception/) | 相机几何、正运动学、场景／手部／HOI 点云。 |
 | [data](dexmani_real/data/) | Raw 录制与读取、Zarr 导出。 |
@@ -98,6 +98,16 @@ python scripts/visualize_episode.py episodes/task/episode_xxx --info
 | [replay](dexmani_real/replay/) | 校验 Raw 目标与连续区间，进行物理回放。 |
 
 [config](dexmani_real/config/) 保存实验配置，[utils](dexmani_real/utils/) 提供标定与可视化工具，[assets](assets/) 保存机器人模型和几何模板。
+
+## HOME
+
+VR／Policy 的 H 和 Keyboard Jog 的 R 共用 `runtime/home.py` 的 `home_robot()`：
+先停止并确认反馈／停稳，再验证、执行 Arm HOME，最后以实测小步位置控制执行 XHand HOME。
+正常 Teleop、Policy EEF 和 Jog 不计算算法碰撞；关节范围、工作空间、IK 速度／lead、Ruckig 与设备停止机制保留。
+
+自动 HOME 默认不可用：必须在实验配置中确认 `environment.home_model_confirmed`，配置可信的 `static_boxes`，
+并填写经测试的 HOME 参数。空障碍列表只允许用于确认无固定障碍的场景；手部禁用时拒绝组合 HOME。
+详细参数和验证边界见[HOME 约定](docs/policy_deployment.md#home-规划与准入)。
 
 ## 离线验证
 

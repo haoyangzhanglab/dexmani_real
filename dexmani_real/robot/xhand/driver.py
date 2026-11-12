@@ -366,18 +366,20 @@ class XHand:
 
     def _send_action(self, target: np.ndarray) -> None:
         """目标已由 Robot 的组合预检验证；连续写 CRC 仍会失败。"""
-        confirmed = self._send_position(target) != COMMUNICATION_CRC_ERROR_CODE
+        confirmed = self._send_position(target, tor_max=self.cfg.tor_max) != COMMUNICATION_CRC_ERROR_CODE
         if not confirmed and self.consecutive_write_crc >= MAX_CONSECUTIVE_WRITE_CRC:
             raise XHandError(
                 "send", COMMUNICATION_CRC_ERROR_CODE,
                 f"{self.consecutive_write_crc} consecutive position write CRC replies; delivery unconfirmed",
             )
 
-    def _send_position(self, target: np.ndarray) -> int:
+    def _send_position(self, target: np.ndarray, *, tor_max=None) -> int:
         if self.control is None or self.command is None or not self.connected_flag:
             raise RuntimeError("XHand command path is not initialized")
         for index, value in enumerate(target):
             joint = self.command.finger_command[index]
+            if tor_max is not None:
+                joint.tor_max = int(tor_max[index])
             joint.mode = POSITION_MODE
             joint.position = float(value)
         return self.send_command()
@@ -389,10 +391,10 @@ class XHand:
             self.command.finger_command[index].mode = PASSIVE_MODE
         return self.send_command()
 
-    def stop(self, qpos: np.ndarray | None = None, *, timestamp_ns: int = 0) -> None:
-        """SDK 接受停止请求不代表物理停稳。"""
+    def stop(self, qpos: np.ndarray | None = None, *, timestamp_ns: int = 0) -> bool:
+        """返回是否接受位置保持；False 表示 passive，不证明物理停稳。"""
         if self.command is None:
-            return  # 命令初始化前没有可发送的运动；部分启动只需关闭连接。
+            return False  # 命令初始化前没有可发送的运动；部分启动只需关闭连接。
         if not self.is_connected:
             raise RuntimeError("XHand disconnected before stop")
         reference = None
@@ -412,7 +414,7 @@ class XHand:
                 reference = None
             status = self._send_position(reference) if reference is not None else self.set_passive()
             if status != COMMUNICATION_CRC_ERROR_CODE:
-                return
+                return reference is not None
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break

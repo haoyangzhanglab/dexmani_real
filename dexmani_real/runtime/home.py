@@ -1,12 +1,24 @@
-"""机械臂和手部回零，以新鲜实测反馈确认收敛。"""
+"""Arm-first HOME；模型上的离散工程验证不覆盖异常制动或未知障碍。"""
 
 import logging
 import time
-from contextlib import contextmanager
+from itertools import pairwise
 
 import numpy as np
 
-from dexmani_real.robot.commands import HomeTimeout, OperationCancelled
+from dexmani_real.control.collision import CollisionModel
+from dexmani_real.robot.commands import (
+    FeedbackUnavailable,
+    HomeTimeout,
+    OperationCancelled,
+    arm_reference_from_feedback,
+)
+from dexmani_real.robot.xarm7.protocol import STANDSTILL_DWELL_S
+from dexmani_real.robot.xarm7.trajectory import (
+    PositionLimitError,
+    calculate_home_segment,
+    validate_extrema,
+)
 from dexmani_real.utils.timing import sample_is_fresh
 
 logger = logging.getLogger(__name__)
@@ -14,120 +26,276 @@ HOME_CONSECUTIVE_SAMPLES = 3
 
 
 class HomeConfigurationError(ValueError):
-    """HOME 配置无效，本次操作不能执行。"""
+    """HOME 配置尚未具备准入条件。"""
 
 
-@contextmanager
-def _hand_home_motion(state, robot):
-    failure = None
-    try:
-        yield
-    except BaseException as exc:
-        failure = exc
-        if isinstance(exc, KeyboardInterrupt):
-            state.request_emergency_stop()
-        raise
-    finally:
-        try:
-            robot.stop()
-        except BaseException as exc:
-            if isinstance(exc, KeyboardInterrupt):
-                state.request_emergency_stop()
-            if failure is None or isinstance(failure, OperationCancelled):
-                raise
-            logger.exception("HOME cleanup also failed")
+class HomePathRejected(ValueError):
+    """所有配置候选均不可行；没有提交 HOME 运动。"""
 
 
-def home_arm(state, robot, *, cancel_epoch, cancel_requested):
-    """直接回配置关节位；操作者负责确认空间，不改变手部目标。"""
-    try:
-        robot.arm_config.validate_home()
-    except (ValueError, TypeError) as exc:
-        raise HomeConfigurationError(f"arm HOME configuration: {exc}") from exc
-    deadline_ns = time.monotonic_ns() + int(robot.arm_config.homing.timeout_s * 1e9)
+def plan_home(cfg, q, v, hand_q, collision, check):
+    """只在预规划阶段尝试 Direct / Via；返回原样发送的参考点。"""
+    home = np.asarray(cfg.home_qpos)
+    margin = cfg.homing.collision_margin_m
+    reasons = []
+    for name, targets in [("Direct", [home]), ("Via", [cfg.homing.via_qpos, home])]:
+        if name == "Via" and cfg.homing.via_qpos is None:
+            break
+        current, velocity = q, v
+        chunks: list[np.ndarray] = []
+        duration = 0.0
+        reason = None
+        for target in targets:
+            check()
+            target = np.asarray(target)
+            trajectory = calculate_home_segment(cfg, current, velocity, target)
+            check()
+            duration += trajectory.duration
+            if duration > cfg.homing.timeout_s:
+                raise HomeTimeout("HOME trajectory exceeds configured motion budget")
+            try:
+                validate_extrema(
+                    trajectory,
+                    current,
+                    np.asarray(cfg.joint_limit_lower),
+                    np.asarray(cfg.joint_limit_upper),
+                )
+            except PositionLimitError as exc:
+                reason = str(exc)
+                break
+            count = round(trajectory.duration * cfg.servo_hz)
+            times = np.arange(count + 1) / cfg.servo_hz
+            samples = np.array([trajectory.at_time(t)[0] for t in times])
+            samples[-1] = target
+            for point in samples:
+                check()
+                reason = collision.rejection(point, hand_q)
+                if reason:
+                    break
+            if reason:
+                break
+            # 几何半径传播给出位移上界估计；沿 Ruckig 曲线细分，不线性插值。
+            intervals = list(pairwise(times))
+            while intervals:
+                check()
+                a, b = intervals.pop()
+                va = np.abs(trajectory.at_time(a)[1])
+                vb = np.abs(trajectory.at_time(b)[1])
+                speed = np.minimum(
+                    cfg.homing.max_speed_rad_per_s,
+                    np.maximum(va, vb)
+                    + cfg.homing.max_acceleration_rad_per_s2 * (b - a) / 2,
+                )
+                if 2 * np.dot(collision.arm_radii, speed) * (b - a) <= margin / 2:
+                    continue
+                mid = (a + b) / 2
+                reason = collision.rejection(
+                    np.asarray(trajectory.at_time(mid)[0]), hand_q
+                )
+                if reason:
+                    break
+                intervals.extend(((a, mid), (mid, b)))
+            if reason:
+                break
+            chunks.append(samples if not chunks else samples[1:])
+            current, velocity = target, np.zeros(7)
+        if reason is None:
+            references = np.concatenate(chunks)
+            logger.info(
+                "HOME %s: %d references, margin=%g m, interval displacement estimate <= %g m; "
+                "离散模型检查不保证实际跟踪或制动无碰撞",
+                name,
+                len(references),
+                margin,
+                margin / 2,
+            )
+            return references
+        reasons.append(f"{name}: {reason}")
+    raise HomePathRejected("; ".join(reasons))
+
+
+def _hand_sample(robot):
+    frame = robot.hand_feedback.snapshot()
+    if frame is None or not sample_is_fresh(
+        int(frame["timestamp_ns"][0]),
+        robot.hand_config.feedback_max_age_s,
+        time.monotonic_ns(),
+    ):
+        raise FeedbackUnavailable("HOME hand feedback unavailable/stale")
+    return frame[0]
+
+
+def _home_hand(robot, check):
+    cfg = robot.hand_config
+    check()
+    _hand_sample(robot)
+    deadline = time.monotonic_ns() + int(cfg.home_timeout_s * 1e9)
+    target = np.deg2rad(cfg.home_qpos_deg)
+    step = np.deg2rad(cfg.home_max_step_deg)
+    tolerance = np.deg2rad(cfg.home_tolerance_deg)
+    last = 0
+    consecutive = 0
+    submitted = False
+    while True:
+        check()
+        if time.monotonic_ns() >= deadline:
+            raise HomeTimeout("hand HOME convergence timed out")
+        robot.service_feedback()
+        check()
+        if time.monotonic_ns() >= deadline:
+            raise HomeTimeout("hand HOME feedback exceeded deadline")
+        sample = _hand_sample(robot)
+        stamp = int(sample["timestamp_ns"])
+        if stamp > last:
+            q = sample["qpos"]
+            consecutive = (
+                consecutive + 1
+                if submitted and np.max(np.abs(q - target)) <= tolerance
+                else 0
+            )
+            if consecutive >= HOME_CONSECUTIVE_SAMPLES:
+                return
+            command = q + np.clip(target - q, -step, step)
+            robot.send_hand_home(command, deadline_ns=deadline, check_abort=check)
+            submitted = True
+            last = time.monotonic_ns()
+        time.sleep(0.005)
+
+
+def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
+    """所有失败均完成停止收尾；停止失败保留原异常链并优先传播。"""
 
     def cancelled():
-        return cancel_requested() or not (
-            state.cancel_epoch == cancel_epoch and state.requests_allow_motion()
+        return (
+            cancel_requested()
+            or state.cancel_epoch != cancel_epoch
+            or not state.requests_allow_motion()
         )
 
-    robot.home_arm(cancel_epoch, cancelled, deadline_ns=deadline_ns)
+    def check():
+        if cancelled():
+            raise OperationCancelled("HOME cancelled")
+        robot.check()
 
-
-def home_hand(state, robot, *, cancel_epoch, cancel_requested):
-    hand = robot.hand_config
-    if not hand.enabled:
-        return
     try:
-        hand.validate_home()
-    except (ValueError, TypeError) as exc:
-        raise HomeConfigurationError(f"hand HOME configuration: {exc}") from exc
-    target = np.deg2rad(hand.home_qpos_deg)
-    deadline_ns = time.monotonic_ns() + int(hand.home_timeout_s * 1e9)
-    tolerance = np.deg2rad(hand.home_tolerance_deg)
-
-    def cancelled():
-        return cancel_requested() or not (state.cancel_epoch == cancel_epoch and state.requests_allow_motion())
-
-    if cancelled():
-        raise OperationCancelled("home interrupted")
-    with _hand_home_motion(state, robot):
         robot.stop()
-        # 停止态允许等待关节反馈恢复；采样机会不代表获得了有效新帧。
-        while True:
-            if cancelled():
-                raise OperationCancelled("home interrupted")
-            if time.monotonic_ns() >= deadline_ns:
-                raise HomeTimeout("hand HOME initial feedback timed out")
-            robot.service_feedback()
-            if cancelled():
-                raise OperationCancelled("home interrupted")
-            now_ns = time.monotonic_ns()
-            if now_ns >= deadline_ns:
-                raise HomeTimeout("hand HOME initial feedback timed out")
-            feedback = robot.hand_feedback.snapshot()
-            if feedback is not None and sample_is_fresh(
-                int(feedback["timestamp_ns"][0]), hand.feedback_max_age_s, now_ns,
-            ):
-                break
-            time.sleep(min(0.01, (deadline_ns - now_ns) / 1e9))
-        retry_pending = not robot.send_hand_home(target, deadline_ns=deadline_ns, cancel_requested=cancelled)
+        check()
+        try:
+            robot.arm_config.validate_home()
+            robot.hand_config.validate_home()
+            environment.validate()
+            if not environment.home_model_confirmed or not robot.hand_config.enabled:
+                raise ValueError(
+                    "HOME requires confirmed environment and measured XHand posture"
+                )
+        except (ValueError, TypeError) as exc:
+            raise HomeConfigurationError(str(exc)) from exc
+        cfg = robot.arm_config
+        deadline = time.monotonic_ns() + int(cfg.homing.timeout_s * 1e9)
 
-        # 只有提交完成之后的新样本才能确认到达。
-        last_sample_ns = time.monotonic_ns()
-        consecutive = 0
+        def check_arm():
+            check()
+            if time.monotonic_ns() >= deadline:
+                raise HomeTimeout("arm HOME budget exhausted")
+            robot.service_feedback()
+            check()
+            if time.monotonic_ns() >= deadline:
+                raise HomeTimeout("arm HOME feedback exceeded deadline")
+
+        check_arm()
+        _hand_sample(robot)
+        if not robot.stop_hand():
+            raise FeedbackUnavailable("HOME requires confirmed XHand position hold")
+        robot.arm.settle(
+            cancel_epoch,
+            service=robot.service_feedback,
+            abort=cancelled,
+            deadline_ns=deadline,
+        )
+        anchor = _hand_sample(robot)["qpos"].copy()
+        stable = time.monotonic_ns()
         while True:
-            if cancelled():
-                raise OperationCancelled("home interrupted")
-            if time.monotonic_ns() >= deadline_ns:
+            check_arm()
+            sample = _hand_sample(robot)
+            if (
+                np.max(np.abs(sample["qpos"] - anchor))
+                > cfg.homing.hand_hold_tolerance_rad
+            ):
+                anchor = sample["qpos"].copy()
+                stable = time.monotonic_ns()
+            elif int(sample["timestamp_ns"]) - stable >= int(STANDSTILL_DWELL_S * 1e9):
                 break
-            sampled = robot.service_feedback()
-            if cancelled():
-                raise OperationCancelled("home interrupted")
-            if time.monotonic_ns() >= deadline_ns:
-                break
-            feedback = robot.hand_feedback.snapshot()
-            if feedback is not None:
-                sample = feedback[0]
-                stamp = int(sample["timestamp_ns"])
-                fresh = sample_is_fresh(stamp, hand.feedback_max_age_s, time.monotonic_ns())
-                if retry_pending and sampled and fresh:
-                    robot.send_hand_home(target, deadline_ns=deadline_ns, cancel_requested=cancelled)
-                    retry_pending = False
-                    last_sample_ns = time.monotonic_ns()
-                    consecutive = 0
-                    # 本轮 snapshot 来自补发前，不能用于确认最新提交到位。
-                elif stamp > last_sample_ns:
-                    last_sample_ns = stamp
-                    if fresh and np.max(np.abs(sample["qpos"] - target)) <= tolerance:
-                        consecutive += 1
-                    else:
-                        consecutive = 0
-                    if consecutive >= HOME_CONSECUTIVE_SAMPLES:
-                        if cancelled():
-                            raise OperationCancelled("home interrupted")
-                        if time.monotonic_ns() < deadline_ns:
-                            return
-                        break
-            time.sleep(min(0.01, max(0, deadline_ns - time.monotonic_ns()) / 1e9))
-        raise HomeTimeout("hand HOME convergence timed out")
+            time.sleep(0.005)
+        row = robot.arm.snapshot()[0]
+        q = arm_reference_from_feedback(
+            row["qpos"], cfg.joint_limit_lower, cfg.joint_limit_upper
+        )
+        if not sample_is_fresh(
+            int(row["timestamp_ns"]), cfg.feedback_max_age_s, time.monotonic_ns()
+        ):
+            raise FeedbackUnavailable("HOME arm feedback stale")
+        if np.max(np.abs(row["qvel"])) > cfg.standstill_velocity_tolerance_rad_s:
+            raise OperationCancelled("arm moved after standstill")
+
+        def held():
+            check_arm()
+            sample = _hand_sample(robot)
+            if (
+                np.max(np.abs(sample["qpos"] - anchor))
+                > cfg.homing.hand_hold_tolerance_rad
+            ):
+                raise OperationCancelled("XHand moved from HOME planning posture")
+            robot.arm.publish_home_hand_stamp(int(sample["timestamp_ns"]))
+
+        model = CollisionModel(
+            static_boxes=environment.static_boxes,
+            margin_m=cfg.homing.collision_margin_m,
+        )
+        held()
+        if (
+            np.max(np.abs(q - np.asarray(cfg.home_qpos)))
+            <= cfg.standstill_position_tolerance_rad
+        ):
+            reason = model.rejection(q, anchor)
+            if reason:
+                raise HomePathRejected(reason)
+        else:
+            samples = plan_home(cfg, q, row["qvel"], anchor, model, held)
+
+            def execution_service():
+                # 取消收尾时不再检查保持偏差，仍服务设备故障。
+                if state.stop_signal.is_set():
+                    robot.service_feedback()
+                else:
+                    held()
+
+            robot.arm.home(
+                cancel_epoch,
+                samples=samples,
+                hand_max_age_s=robot.hand_config.feedback_max_age_s,
+                service=execution_service,
+                abort=cancelled,
+                deadline_ns=deadline,
+            )
+        check()
+        robot.service_feedback()
+        current = robot.arm.snapshot()[0]
+        if (
+            not sample_is_fresh(
+                int(current["timestamp_ns"]),
+                cfg.feedback_max_age_s,
+                time.monotonic_ns(),
+            )
+            or np.max(np.abs(current["qpos"] - np.asarray(cfg.home_qpos)))
+            > cfg.standstill_position_tolerance_rad
+            or np.max(np.abs(current["qvel"])) > cfg.standstill_velocity_tolerance_rad_s
+        ):
+            raise FeedbackUnavailable(
+                "arm HOME position/standstill lost before hand HOME"
+            )
+        _home_hand(robot, check)
+    except KeyboardInterrupt:
+        state.request_emergency_stop()
+        raise
+    finally:
+        robot.stop()

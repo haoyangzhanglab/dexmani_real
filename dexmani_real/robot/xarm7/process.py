@@ -11,6 +11,7 @@ from dexmani_real.robot.xarm7.protocol import (
     ArmChannels,
     HomeRequest,
     PrepareRequest,
+    StandstillRequest,
 )
 
 if TYPE_CHECKING:
@@ -162,7 +163,7 @@ class ArmProcess:
             # 父进程此时清确认会使 owner 把尚未清除的 stop 当作新停止。
             self.io.stop.clear()
 
-    def request_operation(self, request: PrepareRequest | HomeRequest, *, service, abort, cancel_epoch):
+    def request_operation(self, request: PrepareRequest | HomeRequest | StandstillRequest, *, service, abort, cancel_epoch):
         """普通取消确认停止并消费回复后抛出；其他失败关闭 owner。"""
         deadline_ns = request.deadline_ns
         # 生命周期仅由一个父控制流程顺序调用；局部事实只决定异常收尾。
@@ -248,9 +249,21 @@ class ArmProcess:
             cancel_epoch=cancel_epoch,
         )
 
-    def home(self, cancel_epoch, *, service, abort, deadline_ns):
+    def settle(self, cancel_epoch, *, service, abort, deadline_ns):
+        self.request_operation(StandstillRequest(deadline_ns), service=service, abort=abort, cancel_epoch=cancel_epoch)
+
+    def publish_home_hand_stamp(self, stamp):
+        value = self.io.home_hand_stamp
+        if not value.get_lock().acquire(timeout=self.cfg.feedback_max_age_s):
+            raise TimeoutError("HOME hand timestamp lock unavailable")
+        try:
+            value.get_obj().value = stamp
+        finally:
+            value.get_lock().release()
+
+    def home(self, cancel_epoch, *, samples, hand_max_age_s, service, abort, deadline_ns):
         self.request_operation(
-            HomeRequest(deadline_ns),
+            HomeRequest(deadline_ns, samples, hand_max_age_s),
             service=service,
             abort=abort,
             cancel_epoch=cancel_epoch,

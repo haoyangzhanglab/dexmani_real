@@ -66,12 +66,14 @@ class HandConfig:
 
     # 关节及策略必需触觉共用的主机查询时效预算，不保证物理采样年龄。
     feedback_max_age_s: float = 0.20
-    home_timeout_s: float = 2.0
+    home_timeout_s: float | None = None
+    home_max_step_deg: float | None = None
+    home_tor_max: int | None = None
     home_tolerance_deg: float = 5.0
 
     def __post_init__(self) -> None:
         # 配置保留原生整数表示，SDK 参数及 JSON/YAML 归档无需各自适配 NumPy。
-        for name in ("baudrate", "device_id", "ethercat_slave_position", "ki", "kd"):
+        for name in ("baudrate", "device_id", "ethercat_slave_position", "ki", "kd", "home_tor_max"):
             value = getattr(self, name)
             if isinstance(value, np.integer):
                 object.__setattr__(self, name, int(value))
@@ -134,6 +136,8 @@ class HandConfig:
 
     def validate_home(self) -> None:
         self.validate_home_pose()
-        for value in (self.home_timeout_s, self.home_tolerance_deg):
-            if not isfinite(value) or value <= 0:
-                raise ValueError("hand HOME timeout and tolerance must be finite and positive")
+        if type(self.home_tor_max) is not int or not 0 < self.home_tor_max <= 400:
+            raise ValueError("HOME output limit requires a tested integer in [1, 400]")
+        for value in (self.home_timeout_s, self.home_tolerance_deg, self.home_max_step_deg):
+            if value is None or not isfinite(value) or value <= 0:
+                raise ValueError("hand HOME timeout, tolerance and step must be configured, finite and positive")

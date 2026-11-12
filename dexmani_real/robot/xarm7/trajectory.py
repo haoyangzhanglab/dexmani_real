@@ -3,16 +3,17 @@
 import numpy as np
 from ruckig import (
     ControlInterface,
+    DurationDiscretization,
     InputParameter,
     OutputParameter,
     Result,
     Ruckig,
     Synchronization,
+    Trajectory,
 )
 
 from dexmani_real.config.xarm7 import ArmConfig
 from dexmani_real.robot.commands import arm_reference_from_feedback
-
 
 # 仅容纳轨迹计算的浮点舍入误差（rad），不是运动或到位容差。
 _POSITION_ROUNDOFF_RAD = 1e-12
@@ -50,31 +51,7 @@ class ArmTrajectory:
         if self.otg.update(self.input, self.output) not in (Result.Working, Result.Finished):
             raise ValueError("Ruckig calculation failed")
         if self.output.new_calculation:
-            # 段端点及 v=0 处覆盖完整制动距离；库的 position_extrema 会漏掉恒加速度段内极值。
-            for i, profile in enumerate(self.output.trajectory.profiles[0]):
-                extrema = [self.input.current_position[i], *profile.p]
-                for segment in (profile.brake, profile):
-                    for p, v, a, j, t in zip(segment.p, segment.v, segment.a, segment.j, segment.t):
-                        if t == 0:
-                            continue
-                        extrema.append(p)
-                        roots: tuple[float, ...]
-                        if j == 0:
-                            roots = (-v / a,) if a != 0 else ()
-                        else:
-                            d = a * a - 2 * j * v
-                            roots = ((-a - np.sqrt(d)) / j, (-a + np.sqrt(d)) / j) if d >= 0 else ()
-                        for tau in roots:
-                            if 0 < tau < t:
-                                extrema.append(p + tau * (v + tau * (a / 2 + tau * j / 6)))
-                if (
-                    not np.isfinite(extrema).all()
-                    or min(extrema) < self.lower[i] - _POSITION_ROUNDOFF_RAD
-                    or max(extrema) > self.upper[i] + _POSITION_ROUNDOFF_RAD
-                ):
-                    raise ValueError(
-                        f"reference braking/position extremum outside joint {i + 1} limits"
-                    )
+            validate_extrema(self.output.trajectory, self.input.current_position, self.lower, self.upper)
         q = np.asarray(self.output.new_position)
         if (
             not np.isfinite(q).all()
@@ -87,3 +64,57 @@ class ArmTrajectory:
         self.output.pass_to_input(self.input)
         self.input.current_position = q.tolist()
         return q
+
+
+class PositionLimitError(ValueError):
+    """完整参考轨迹越过操作位置限位。"""
+
+
+def validate_extrema(trajectory, start, lower, upper):
+    # 段端点及 v=0 处覆盖完整制动距离；库的 position_extrema 会漏掉恒加速度段内极值。
+    for i, profile in enumerate(trajectory.profiles[0]):
+        extrema = [start[i], *profile.p]
+        for segment in (profile.brake, profile):
+            for p, v, a, j, t in zip(segment.p, segment.v, segment.a, segment.j, segment.t):
+                if t == 0:
+                    continue
+                extrema.append(p)
+                roots: tuple[float, ...]
+                if j == 0:
+                    roots = (-v / a,) if a != 0 else ()
+                else:
+                    d = a * a - 2 * j * v
+                    roots = ((-a - np.sqrt(d)) / j, (-a + np.sqrt(d)) / j) if d >= 0 else ()
+                for tau in roots:
+                    if 0 < tau < t:
+                        extrema.append(p + tau * (v + tau * (a / 2 + tau * j / 6)))
+        if not np.isfinite(extrema).all():
+            raise RuntimeError("non-finite Ruckig profile")
+        if (
+            min(extrema) < lower[i] - _POSITION_ROUNDOFF_RAD
+            or max(extrema) > upper[i] + _POSITION_ROUNDOFF_RAD
+        ):
+            raise PositionLimitError(
+                f"reference braking/position extremum outside joint {i + 1} limits"
+            )
+
+
+def calculate_home_segment(cfg, q, v, target):
+    """计算一段零加速度起步、零速度／加速度到达的离线轨迹。"""
+    if np.any(np.abs(v) > cfg.homing.max_speed_rad_per_s):
+        raise ValueError("HOME initial velocity exceeds its motion limit")
+    inp = InputParameter(7)
+    inp.current_position = np.asarray(q).tolist()
+    inp.current_velocity = np.where(np.abs(v) < 1e-12, 0., v).tolist()
+    inp.current_acceleration = [0.] * 7
+    inp.target_position = np.asarray(target).tolist()
+    inp.target_velocity = inp.target_acceleration = [0.] * 7
+    inp.max_velocity = [cfg.homing.max_speed_rad_per_s] * 7
+    inp.max_acceleration = [cfg.homing.max_acceleration_rad_per_s2] * 7
+    inp.max_jerk = [np.deg2rad(cfg.homing.max_jerk_deg_per_s3)] * 7
+    inp.duration_discretization = DurationDiscretization.Discrete
+    trajectory = Trajectory(7)
+    result = Ruckig(7, 1 / cfg.servo_hz).calculate(inp, trajectory)
+    if result not in (Result.Working, Result.Finished):
+        raise RuntimeError(f"HOME Ruckig failed: {result}")
+    return trajectory

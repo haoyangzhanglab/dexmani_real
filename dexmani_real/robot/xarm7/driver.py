@@ -104,27 +104,16 @@ class XArm7:
             self.api.set_timeout(SDK_TIMEOUT_S)
         check_sdk_return_code(code, "servo")
 
-    def move_home(self, target: np.ndarray) -> None:
-        code = self.api.set_servo_angle(
-            angle=target,
-            is_radian=True,
-            speed=self.cfg.homing.max_speed_rad_per_s,
-            mvacc=self.cfg.homing.max_acceleration_rad_per_s2,
-            wait=False,
-            radius=None,
-        )
-        check_sdk_return_code(code, "home move")
-
-    def prepare_motion(self, mode, *, check_abort):
+    def prepare_motion(self, *, check_abort):
         check_abort()
         self.check_controller_error()
         check_abort()
         check_sdk_return_code(self.api.motion_enable(True), "motion_enable")
         check_abort()
         # 明确发送模式命令并检查应答；api.mode 不能同步确认模式切换。
-        check_sdk_return_code(self.api.set_mode(mode), f"set_mode({mode})")
+        check_sdk_return_code(self.api.set_mode(1), "set_mode(1)")
         check_abort()
-        check_sdk_return_code(self.api.set_state(0), f"set_state(0) after Mode {mode}")
+        check_sdk_return_code(self.api.set_state(0), "set_state(0) after Mode 1")
         check_abort()
         if not self._motion_configured:
             check_sdk_return_code(
@@ -140,8 +129,7 @@ class XArm7:
                 "set_tcp_load",
             )
         check_abort()
-        acceleration = (self.cfg.homing.max_acceleration_rad_per_s2 if mode == 0
-                        else self.cfg.max_joint_acceleration_rad_per_s2)
+        acceleration = self.cfg.max_joint_acceleration_rad_per_s2
         check_sdk_return_code(self.api.set_joint_maxacc(acceleration, is_radian=True), "set_joint_maxacc")
         check_abort()
         # 静态参数只在本 SDK 会话首次完整准备成功后复用。

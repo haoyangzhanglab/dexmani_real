@@ -145,7 +145,7 @@ class Robot:
         )
 
     def service_feedback(self) -> bool:
-        """服务反馈与故障；返回本次是否到采样机会，供一次性目标有限补发。"""
+        """服务反馈与故障；返回本次是否到采样机会，不代表收到新帧。"""
         try:
             self.check()
             now = time.monotonic_ns()
@@ -243,45 +243,38 @@ class Robot:
                 raise RobotError("hand device unavailable")
             validate_hand_target(command.hand_qpos, self.hand_lower, self.hand_upper)
 
-    def send_hand_home(self, qpos, *, deadline_ns, cancel_requested) -> bool:
-        """一次性绝对目标；arm 保持停止，由 HOME 期限及新反馈确认结果。"""
+    def send_hand_home(self, qpos, *, deadline_ns, check_abort) -> None:
+        """提交 HOME 小步目标；CRC 立即失败，停止仍由组合 HOME 收尾。"""
         if not self.connected or self.hand is None or not self.hand.is_connected:
             raise RobotError("hand device unavailable")
-        # 配置负责实验 HOME 范围；实际发送仍验证目标及硬件额定范围。
-        target = validate_hand_target(qpos, self.hand_lower, self.hand_upper)
-        if cancel_requested():
-            raise OperationCancelled("hand HOME cancelled before submission")
+        # 操作范围已由连接前配置校验限制在额定范围内。
+        target = validate_hand_target(
+            qpos, self.hand_config.qpos_min_rad, self.hand_config.qpos_max_rad,
+        )
+        check_abort()
         self.check()
-        if cancel_requested():
-            raise OperationCancelled("hand HOME cancelled before submission")
+        check_abort()
         self._check_hand_feedback()
         if time.monotonic_ns() >= deadline_ns:
             raise HomeTimeout("hand HOME budget exhausted before submission")
         self.hand_stop_required = True
         from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE
 
-        return self.hand._send_position(target) != COMMUNICATION_CRC_ERROR_CODE
+        code = self.hand._send_position(target, tor_max=np.minimum(
+            self.hand_config.tor_max, self.hand_config.home_tor_max))
+        if code == COMMUNICATION_CRC_ERROR_CODE:
+            from dexmani_real.robot.xhand.driver import XHandError
+            raise XHandError("HOME send", code, "delivery unconfirmed")
 
-    def home_arm(self, cancel_epoch, abort_check, *, deadline_ns):
-        if abort_check():
-            raise OperationCancelled("arm HOME cancelled before submission")
-        cast("ArmProcess", self.arm).home(
-            cancel_epoch,
-            abort=abort_check,
-            service=self.service_feedback,
-            deadline_ns=deadline_ns,
-        )
-        if abort_check():
-            raise OperationCancelled("arm HOME cancelled during execution")
-
-    def stop_hand(self, *, passive=False):
+    def stop_hand(self, *, passive=False) -> bool:
         if self.hand is None:
-            return
+            return False
+        self.hand_stop_required = True
         frame = self.hand_feedback.snapshot()
         if not passive and frame is not None:
-            self.hand.stop(frame["qpos"][0], timestamp_ns=int(frame["timestamp_ns"][0]))
+            return self.hand.stop(frame["qpos"][0], timestamp_ns=int(frame["timestamp_ns"][0]))
         else:
-            self.hand.stop()
+            return self.hand.stop()
 
     def stop(self):
         """arm 停止结果由 Owner 持有；仅未完成的手部停止需要再次发送。"""

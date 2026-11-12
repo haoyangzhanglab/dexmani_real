@@ -2,8 +2,6 @@
 
 import numpy as np
 
-from dexmani_real.control.collision import CollisionModel
-
 
 def workspace_start_rejection(position, lower, upper):
     """检查调用方的起点接纳范围，不修改实测位置。"""
@@ -16,16 +14,12 @@ class MotionConstraints:
     """EEF/jog 目标端点的几何检查。"""
 
     def __init__(self, arm, environment):
-        self.collision_model = CollisionModel(static_boxes=environment.static_boxes)
         self.limits = np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper))
         self.workspace = environment.workspace.as_array()
         tolerance = environment.eef_workspace_tolerance_m
         self.workspace_with_tolerance = self.workspace + (-tolerance, tolerance)
 
-    def endpoint_rejection(self, target, *, position):
-        reason = self.collision_model.rejection(target)
-        if reason is not None:
-            return reason
+    def endpoint_rejection(self, *, position):
         if np.any(position < self.workspace_with_tolerance[:, 0]) or np.any(
             position > self.workspace_with_tolerance[:, 1]
         ):

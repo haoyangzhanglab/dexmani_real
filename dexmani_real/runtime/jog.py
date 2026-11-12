@@ -63,11 +63,7 @@ class CartesianJog:
                     pressed_keys,
                     row.arm["qpos"][0],
                     control_ns=time.monotonic_ns(),
-                    hand_qpos=(
-                        row.hand["qpos"][0]
-                        if row.hand is not None
-                        else np.deg2rad(runtime.hand.home_qpos_deg)
-                    ),
+
                 )
             except IKReferenceError as exc:
                 raise OperationCancelled(str(exc)) from exc
@@ -105,7 +101,7 @@ class CartesianJog:
             self.clear_reference()
 
     def propose(
-        self, pressed_keys, measured_qpos, *, hand_qpos, control_ns
+        self, pressed_keys, measured_qpos, *, control_ns
     ) -> IKResult:
         measured, command, anchor, h = prepare_reference(
             self.solver,
@@ -135,7 +131,7 @@ class CartesianJog:
             self.position_upper,
         )
         return self.solver.solve(
-            pose, measured, command, anchor, h=h, hand_qpos=hand_qpos
+            pose, measured, command, anchor, h=h
         )
 
 

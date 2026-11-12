@@ -31,7 +31,11 @@ from dexmani_real.robot.commands import (
     RobotError,
 )
 from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import HomeConfigurationError, home_arm, home_hand
+from dexmani_real.runtime.home import (
+    HomeConfigurationError,
+    HomePathRejected,
+    home_robot,
+)
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
@@ -158,7 +162,7 @@ class PolicySession:
                 self.runtime_state.request_quit()
                 self.summary["termination_reason"] = "startup_cancelled"
             else:
-                print("就绪：B 新段 | S/C 保存结束 | D 丢弃 | Q 保存退出 | Esc 急停退出 | 空闲 H 先手后臂回位、T 复位触觉。", flush=True)
+                print("就绪：B 新段 | S/C 保存结束 | D 丢弃 | Q 保存退出 | Esc 急停退出 | 空闲 H 先臂后手回位、T 复位触觉。", flush=True)
                 self.run_control_loop()
                 cast(Robot, self.robot).check()
         except KeyboardInterrupt as exc:
@@ -497,13 +501,9 @@ class PolicySession:
         robot = cast(Robot, self.robot)
         logger.info("正在回初始位…")
         try:
-            home_hand(
+            home_robot(
                 self.runtime_state, robot,
-                cancel_epoch=cancel_epoch,
-                cancel_requested=self.home_abort_requested,
-            )
-            home_arm(
-                self.runtime_state, robot,
+                environment=self.runtime.environment,
                 cancel_epoch=cancel_epoch,
                 cancel_requested=self.home_abort_requested,
             )
@@ -517,15 +517,14 @@ class PolicySession:
             else:
                 logger.warning("本次 HOME 未完成：%s", exc)
         except OperationCancelled as exc:
-            robot.stop()
             robot.check()
             if (self.runtime_state.cancel_epoch == cancel_epoch
                     and self.runtime_state.requests_allow_motion()):
                 raise
             logger.info("回初始位已中断：%s", exc)
-        except HomeConfigurationError as exc:
+        except (HomeConfigurationError, HomePathRejected) as exc:
             robot.check()
-            logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
+            logger.warning("本次 HOME 未完成：%s", exc)
         else:
             logger.info("已回初始位，按 B 开始。")
         return True

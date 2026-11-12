@@ -30,7 +30,6 @@ class ActionMapper:
         hand_enabled,
         hand_lower_rad,
         hand_upper_rad,
-        fixed_hand_qpos=None,
         solver=None,
     ):
         self.solver = solver
@@ -38,10 +37,6 @@ class ActionMapper:
         self.hand_enabled = hand_enabled
         self.hand_lower = np.array(hand_lower_rad, dtype=np.float64, copy=True) if hand_enabled else None
         self.hand_upper = np.array(hand_upper_rad, dtype=np.float64, copy=True) if hand_enabled else None
-        self.fixed_hand_qpos = (
-            None if fixed_hand_qpos is None
-            else np.array(fixed_hand_qpos, dtype=np.float64, copy=True)
-        )
 
     @classmethod
     def for_mode(cls, mode, *, arm, hand, motion, environment):
@@ -49,11 +44,7 @@ class ActionMapper:
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
         solver = None
-        fixed_hand_qpos = None
         if mode == "eef":
-            if not hand.enabled:
-                hand.validate_home_pose()
-                fixed_hand_qpos = np.deg2rad(hand.home_qpos_deg)
             solver = IKSolver(
                 MotionConstraints(arm, environment),
                 target_speed=np.deg2rad(motion.ik_target_speed_deg_s),
@@ -66,7 +57,6 @@ class ActionMapper:
             hand_enabled=hand.enabled,
             hand_lower_rad=hand.qpos_min_rad,
             hand_upper_rad=hand.qpos_max_rad,
-            fixed_hand_qpos=fixed_hand_qpos,
         )
 
     def prepare_hand(self, hand):
@@ -102,7 +92,6 @@ class ActionMapper:
             pose,
             measured,
             command, anchor, h=h,
-            hand_qpos=hand if hand is not None else self.fixed_hand_qpos,
         )
         reason = None if result.qpos is not None else result.reason
         return ActionResult(

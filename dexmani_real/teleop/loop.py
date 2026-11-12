@@ -23,7 +23,11 @@ from dexmani_real.robot.commands import (
     OperationCancelled,
     RobotCommand,
 )
-from dexmani_real.runtime.home import HomeConfigurationError, home_arm, home_hand
+from dexmani_real.runtime.home import (
+    HomeConfigurationError,
+    HomePathRejected,
+    home_robot,
+)
 from dexmani_real.runtime.observation import (
     RAW_RECORDING_NEEDS,
     ObservationNeeds,
@@ -384,18 +388,14 @@ class TeleopLoop:
             logger.info("正在回初始位…")
             self.audio.play("home")
             try:
-                home_hand(
+                home_robot(
                     self.runtime_state, self.robot,
-                    cancel_epoch=expected_cancel_epoch,
-                    cancel_requested=self.poll_blocking_commands,
-                )
-                home_arm(
-                    self.runtime_state, self.robot,
+                    environment=self.runtime.environment,
                     cancel_epoch=expected_cancel_epoch,
                     cancel_requested=self.poll_blocking_commands,
                 )
             except (FeedbackUnavailable, HomeTimeout) as exc:
-                # hand HOME 的 finally、arm 生命周期协议已完成停止收尾。
+                # 组合 HOME 已完成停止收尾。
                 interrupted = self.poll_blocking_commands()
                 if (interrupted or self.runtime_state.cancel_epoch != expected_cancel_epoch
                         or not self.runtime_state.requests_allow_motion()):
@@ -403,15 +403,14 @@ class TeleopLoop:
                 else:
                     logger.warning("本次 HOME 未完成：%s", exc)
             except OperationCancelled as exc:
-                self.robot.stop()
                 self.robot.check()
                 if (self.runtime_state.cancel_epoch == expected_cancel_epoch
                         and self.runtime_state.requests_allow_motion()):
                     raise
                 logger.info("HOME cancelled: %s", exc)
-            except HomeConfigurationError as exc:
+            except (HomeConfigurationError, HomePathRejected) as exc:
                 self.robot.check()
-                logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
+                logger.warning("本次 HOME 未完成：%s", exc)
             else:
                 logger.info("已回初始位。")
                 self.audio.play("home_done")

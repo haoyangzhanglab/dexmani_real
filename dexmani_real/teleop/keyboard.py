@@ -9,7 +9,11 @@ from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.ik import IKSolver
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.robot.system import Robot
-from dexmani_real.runtime.home import HomeConfigurationError, home_arm, home_hand
+from dexmani_real.runtime.home import (
+    HomeConfigurationError,
+    HomePathRejected,
+    home_robot,
+)
 from dexmani_real.runtime.jog import CartesianJog
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime
@@ -32,8 +36,6 @@ class KeyboardTeleop:
         configure_logging()
         validate_robot_config(self.runtime)
         self.runtime.environment.validate()
-        if not self.runtime.hand.enabled:
-            self.runtime.hand.validate_home_pose()
         self.bounds = jog_bounds(self.runtime)
         self.runtime_state = SessionState()
         self.robot = Robot(
@@ -93,10 +95,10 @@ class KeyboardTeleop:
         if not (self.runtime_state.cancel_epoch == startup_epoch and self.runtime_state.requests_allow_motion()):
             raise OperationCancelled("startup cancelled")
         self.prepare_jog(startup_epoch)
-        print("WASD/arrows and IJKL: jog; R: hand then direct arm HOME; Q: exit; ESC: emergency stop")
+        print("WASD/arrows and IJKL: jog; R: validated arm then hand HOME; Q: exit; ESC: emergency stop")
         print(
             "Jog is ready. Release jog keys to brake and hold. "
-            "Geometry rejection brakes and holds; invalid references end the session."
+            "Workspace rejection brakes and holds; invalid references end the session."
         )
         self.period_ns = sampling_clock_ns(self.jog_config.control_hz)
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
@@ -134,6 +136,8 @@ class KeyboardTeleop:
                 if epoch is not None:
                     self.run_home(epoch)
                 continue
+            if self.runtime_state.stop_signal.is_set():
+                continue
             self.jog.step(
                 self.robot, self.keys, self.runtime_state, self.runtime,
             )
@@ -141,7 +145,7 @@ class KeyboardTeleop:
 
     def run_home(self, expected_cancel_epoch):
         with self.runtime_state.motion_lock:
-            if not (self.runtime_state.cancel_epoch == expected_cancel_epoch and self.runtime_state.requests_allow_motion() and not self.runtime_state.stop_signal.is_set()):
+            if not (self.runtime_state.cancel_epoch == expected_cancel_epoch and self.runtime_state.requests_allow_motion()):
                 logger.info("Ignored revoked HOME intent")
                 return
             self.runtime_state.stop_signal.set()
@@ -153,19 +157,16 @@ class KeyboardTeleop:
             return not self.runtime_state.requests_allow_motion()
 
         try:
-            home_hand(
+            home_robot(
                 self.runtime_state, self.robot,
+                environment=self.runtime.environment,
                 cancel_epoch=cancel_epoch,
                 cancel_requested=cancelled,
             )
-            home_arm(
-                self.runtime_state, self.robot,
-                cancel_epoch=cancel_epoch,
-                cancel_requested=cancelled,
-            )
-        except HomeConfigurationError as exc:
+        except (HomeConfigurationError, HomePathRejected) as exc:
             self.robot.check()
-            logger.warning("本次 HOME 未完成（手部可能已回位）：%s", exc)
+            logger.warning("本次 HOME 未完成：%s", exc)
+            return False
         else:
             logger.info("HOME completed")
         self.prepare_jog(cancel_epoch)

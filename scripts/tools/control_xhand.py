@@ -34,6 +34,7 @@ logger = logging.getLogger("dexmani_real.tools.control_xhand")
 HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
 FEEDBACK_POLL_INTERVAL_S = 0.01
 CONVERGENCE_SAMPLES = 3
+ACTION_TIMEOUT_S = 2.0  # 独立诊断动作预算，不使用组合 HOME 的运动参数。
 ACTION_DWELL_S = 1.0
 
 # SDK 关节顺序，单位为度；HOME/palm 沿用当前配置，不裁剪超限姿态。
@@ -143,7 +144,7 @@ class XHandDiagnostic(XHand):
 
     def execute_action(self, target: np.ndarray) -> None:
         """执行 action_sequence 已校验的内部目标，提交后以实测反馈确认到位。"""
-        deadline_ns = time.monotonic_ns() + int(self.cfg.home_timeout_s * 1e9)
+        deadline_ns = time.monotonic_ns() + int(ACTION_TIMEOUT_S * 1e9)
         self.read_fresh_state(action_deadline_ns=deadline_ns)
         self.check_active(deadline_ns)
         self.motion_pending = True  # SDK 抛错也不能证明目标未送达，仍须停止收尾。
@@ -208,8 +209,10 @@ def run_hardware_session(config: HandConfig, *, finger_id: int, read_only: bool)
     config.validate()
     if not config.enabled:
         raise ValueError("hand.enabled=False; enable the hand in CONFIG.hand first")
-    if not read_only:
-        config.validate_home()
+    if not read_only and (
+        not np.isfinite(config.home_tolerance_deg) or config.home_tolerance_deg <= 0
+    ):
+        raise ValueError("diagnostic position tolerance must be finite and positive")
     # 连接前验证全部姿态，避免执行到中途才发现实验范围不允许后续目标。
     actions = [] if read_only else action_sequence(config)
     configure_logging()
