@@ -26,7 +26,7 @@ flowchart LR
 在已配置设备与模型依赖的 `real_robot` 环境中，从仓库根目录运行脚本；完整参数通过对应入口的 `--help` 查看。
 
 VR 接收依赖包含 DR-004 接收时间修复的 `hand-tracking-sdk 1.1.0` 源码（基于上游
-`6ca05d1d5b00dfd89535aef74f698d6765bf1229`）。将修复后的 checkout 放在相邻的
+`6ca05d1d5b00dfd89535aef74f698d6765bf1229`）。将[修复后的 SDK](https://github.com/haoyangzhanglab/hand-tracking-sdk) checkout 放在相邻的
 `../hand-tracking-sdk`，在 `real_robot` 环境执行 `python -m pip install --no-deps -e ../hand-tracking-sdk`。
 接收器须提供 `last_recv_ts_ns`，保留行在主机完整接收时的单调时间，供组帧与现有 TTL 检查使用。
 
