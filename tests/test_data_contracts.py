@@ -251,6 +251,72 @@ class DataContracts(unittest.TestCase):
                 with self.assertRaises(type(error)):
                     annotate_episodes([failed], self.root)
 
+    def test_annotation_deduplicates_before_depth_read_but_consumes_rgb(self):
+        from scripts.cordvip.annotate_episodes import annotate_episodes
+        module = 'scripts.cordvip.annotate_episodes.'
+        camera = CameraSnapshot('offline', CameraIntrinsics(16, 16, 10., 10., 8., 8.,
+                                'none', (0, 0, 0, 0, 0)), 0.001, np.eye(4))
+        template = {'object_names': np.array(['object'])}
+        for scenario, error in (('success', None), ('time_conflict', '来源时间冲突'),
+                                ('short_rgb', 'ended before row 2'),
+                                ('extra_rgb', 'more frames'), ('bad_repeat_rgb', 'grid invalid at row 1'),
+                                ('bad_depth', 'Raw depth')):
+            with self.subTest(scenario=scenario):
+                timing = np.array([(10, 100), (10, 100), (11, 200)],
+                                  dtype=[('camera_sequence', 'i8'), ('camera_ns', 'i8')])
+                if scenario == 'time_conflict':
+                    timing['camera_ns'][1] += 1
+                depth = MagicMock(shape=(3, 16, 16), dtype=np.dtype('uint16'))
+                if scenario == 'bad_depth':
+                    depth.dtype = np.dtype('float32')
+                depth.__getitem__.side_effect = lambda index: np.full((16, 16), 100 + index, np.uint16)
+                consumed = []
+                def images():
+                    count = 2 if scenario == 'short_rgb' else 4 if scenario == 'extra_rgb' else 3
+                    for index in range(count):
+                        consumed.append(index)
+                        dtype = np.float32 if scenario == 'bad_repeat_rgb' and index == 1 else np.uint8
+                        yield np.full((16, 16, 3), index, dtype)
+                reader = MagicMock(num_frames=3, data_file={})
+                reader.__enter__.return_value = reader
+                reader.read_camera.return_value = camera
+                reader.__getitem__.side_effect = {'depth': depth, 'timing/rows': timing}.__getitem__
+                reader.iter_rgb_frames.return_value = images()
+                tracker = MagicMock()
+                first, second = np.eye(4), np.eye(4)
+                second[0, 3] = 1
+                tracker.step.side_effect = [{'object': first}, {'object': second}]
+                with (patch(module + 'RawReader', return_value=reader),
+                      patch(module + 'require_published_raw'),
+                      patch(module + 'load_task_template', return_value=template),
+                      patch(module + 'task_objects', return_value=[{'name': 'object', 'prompt': 'object'}]),
+                      patch(module + 'SceneTracker.open') as opened,
+                      patch(module + 'write_hoi') as publish,
+                      contextlib.redirect_stdout(io.StringIO())):
+                    opened.return_value.__enter__.return_value = tracker
+                    if error:
+                        with self.assertRaisesRegex(ValueError, error):
+                            annotate_episodes([self.root / 'episode'], self.root)
+                        publish.assert_not_called()
+                        if scenario == 'bad_depth':
+                            opened.assert_not_called()
+                    else:
+                        annotate_episodes([self.root / 'episode'], self.root)
+                        self.assertEqual(consumed, [0, 1, 2])
+                        self.assertEqual([c.args[0] for c in depth.__getitem__.call_args_list], [0, 2])
+                        self.assertEqual(tracker.step.call_count, 2)
+                        tracker.detect_masks.assert_called_once()
+                        publish.assert_called_once()
+                        poses = publish.call_args.args[2]
+                        self.assertEqual(poses.shape, (3, 1, 4, 4))
+                        np.testing.assert_array_equal(poses[:, 0], [first, first, second])
+                        for call, index in zip(tracker.step.call_args_list, (0, 2)):
+                            frame = call.args[0]
+                            np.testing.assert_array_equal(frame.rgb, np.full((16, 16, 3), index, np.uint8))
+                            self.assertEqual(frame.depth_m.dtype, np.float32)
+                            np.testing.assert_array_equal(frame.depth_m,
+                                np.full((16, 16), 100 + index, np.float32) * np.float32(camera.depth_scale_m))
+
     def test_joint_hoi_export_preserves_rows_across_chunks_and_episodes(self):
         template = {'points_local': np.zeros((1024, 3), np.float32), 'offsets': [0, 1024]}
         for episode_index, (source, frames) in enumerate((('policy_rollout', 131), ('teleop', 3))):

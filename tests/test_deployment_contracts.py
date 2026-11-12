@@ -11,7 +11,7 @@ import unittest
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 
@@ -129,6 +129,51 @@ class DeploymentContracts(unittest.TestCase):
             with self.assertRaises(type(error)) as raised:
                 tracker.register(None, None, None, None)
             self.assertIs(raised.exception, error)
+
+    def test_tracking_refiner_receives_guided_numpy_before_state_update(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party/cordvip_geometry/src'))
+        from cordvip_geometry.foundationpose import PoseTracker, guide_centered_pose
+
+        for dtype in (np.float32, np.float64):
+            with self.subTest(dtype=dtype):
+                initial = np.eye(4, dtype=dtype)[None]
+                initial[0, 2, 3] = 1.5
+                K = np.array([[100., 0, 2], [0, 100., 2], [0, 0, 1]])
+                mask = np.ones((6, 8), bool)
+                expected = guide_centered_pose(initial.reshape(4, 4), K, mask)[None]
+                previous, refined = MagicMock(), MagicMock()
+                previous.detach.return_value.cpu.return_value.numpy.return_value = initial
+                result = expected.copy()
+                result[0, 2, 3] += 0.1
+                transform = np.eye(4, dtype=dtype)
+                transform[0, 3] = 0.2
+                converted = refined.__matmul__.return_value
+                converted.detach.return_value.cpu.return_value.numpy.return_value = result @ transform
+                estimator = Mock(pose_last=previous)
+                estimator.get_tf_to_centered_mesh.return_value = transform
+                tracker = PoseTracker.__new__(PoseTracker)
+                tracker.estimator = estimator
+
+                def predict(**kwargs):
+                    self.assertIs(estimator.pose_last, previous)
+                    self.assertIsInstance(kwargs['ob_in_cams'], np.ndarray)
+                    self.assertEqual(kwargs['ob_in_cams'].dtype, dtype)
+                    np.testing.assert_array_equal(kwargs['ob_in_cams'], expected)
+                    return refined, None
+
+                estimator.refiner.predict.side_effect = predict
+                actual = tracker.track(K, mask, prepared_frame={})
+                self.assertIs(estimator.pose_last, refined)
+                previous.detach.return_value.cpu.assert_called_once()
+                converted.detach.return_value.cpu.assert_called_once()
+                np.testing.assert_array_equal(actual, (result @ transform).reshape(4, 4))
+                refined.detach.return_value.cpu.return_value.numpy.return_value = result
+                failure = RuntimeError('refiner failed')
+                estimator.refiner.predict.side_effect = failure
+                with self.assertRaises(RuntimeError) as caught:
+                    tracker.track(K, mask, prepared_frame={})
+                self.assertIs(caught.exception, failure)
+                self.assertIs(estimator.pose_last, refined)
 
     def test_hand_xyz_and_joint_mapping(self):
         from dexmani_real.deployment.observation import ObservationBuilder

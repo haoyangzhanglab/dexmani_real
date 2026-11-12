@@ -19,10 +19,16 @@ from dexmani_real.robot.xarm7.trajectory import (
     calculate_home_segment,
     validate_extrema,
 )
+from dexmani_real.robot.xhand.driver import (
+    OVERCURRENT_BOARD_CODE,
+    OVERCURRENT_WARNING_CODE,
+    XHandError,
+)
 from dexmani_real.utils.timing import sample_is_fresh
 
 logger = logging.getLogger(__name__)
 HOME_CONSECUTIVE_SAMPLES = 3
+HOME_OVERCURRENT_CONSECUTIVE_CYCLES = 3
 
 
 class HomeConfigurationError(ValueError):
@@ -146,6 +152,7 @@ def _home_hand(robot, check):
     tolerance = np.deg2rad(cfg.home_tolerance_deg)
     last = 0
     consecutive = 0
+    overcurrent_consecutive = 0
     submitted = False
     while True:
         check()
@@ -158,16 +165,39 @@ def _home_hand(robot, check):
         sample = _hand_sample(robot)
         stamp = int(sample["timestamp_ns"])
         if stamp > last:
+            warning_stamp, read_warning, joints = robot.hand.feedback_overcurrent
+            if warning_stamp != stamp:
+                raise FeedbackUnavailable("HOME hand overcurrent status does not match feedback")
+            write_warning = False
+            # 第三次读取告警不再发送；其余周期合并读写结果后只计一次。
+            abort_before_send = (
+                read_warning
+                and overcurrent_consecutive + 1 >= HOME_OVERCURRENT_CONSECUTIVE_CYCLES
+            )
             q = sample["qpos"]
             consecutive = (
                 consecutive + 1
-                if submitted and np.max(np.abs(q - target)) <= tolerance
+                if submitted and not read_warning and np.max(np.abs(q - target)) <= tolerance
                 else 0
             )
             if consecutive >= HOME_CONSECUTIVE_SAMPLES:
                 return
-            command = q + np.clip(target - q, -step, step)
-            robot.send_hand_home(command, deadline_ns=deadline, check_abort=check)
+            if not abort_before_send:
+                command = q + np.clip(target - q, -step, step)
+                write_warning = robot.send_hand_home(command, deadline_ns=deadline, check_abort=check)
+            warned = read_warning or write_warning
+            overcurrent_consecutive = overcurrent_consecutive + 1 if warned else 0
+            if warned:
+                consecutive = 0
+            if overcurrent_consecutive >= HOME_OVERCURRENT_CONSECUTIVE_CYCLES:
+                source = "read" if read_warning else "send"
+                error = XHandError(
+                    "HOME", OVERCURRENT_WARNING_CODE,
+                    f"persistent overcurrent: source={source}, joints={list(joints)}, "
+                    f"board_code={OVERCURRENT_BOARD_CODE if joints else 'unknown'}, consecutive={overcurrent_consecutive}",
+                )
+                logger.error("%s", error)
+                raise error
             submitted = True
             last = time.monotonic_ns()
         time.sleep(0.005)
@@ -258,10 +288,12 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
                 raise OperationCancelled("XHand moved from HOME planning posture")
             robot.arm.publish_home_hand_stamp(int(sample["timestamp_ns"]))
 
-        model = CollisionModel(
-            static_boxes=environment.static_boxes,
-            margin_m=cfg.homing.collision_margin_m,
-        )
+        if robot.home_collision_model is None:
+            robot.home_collision_model = CollisionModel(
+                static_boxes=environment.static_boxes,
+                margin_m=cfg.homing.collision_margin_m,
+            )
+        model = robot.home_collision_model
         held()
         if (
             np.max(np.abs(q - np.asarray(cfg.home_qpos)))

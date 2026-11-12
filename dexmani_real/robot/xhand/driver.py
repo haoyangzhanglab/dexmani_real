@@ -1,4 +1,4 @@
-"""XHand SDK 边界；过流仅告警，CRC 不代表发送成功，触觉有效性单独判断。"""
+"""XHand SDK 边界；普通控制过流仅告警，CRC 不代表发送成功，触觉有效性单独判断。"""
 
 from __future__ import annotations
 
@@ -153,6 +153,12 @@ class XHand:
         self.control: Any = None
         self.command: Any = None
         self.tactile_reset_metadata: dict[str, object] = {}
+        self._feedback_overcurrent: tuple[int, bool, tuple[int, ...]] = (0, False, ())
+
+    @property
+    def feedback_overcurrent(self) -> tuple[int, bool, tuple[int, ...]]:
+        """最近有效关节反馈的来源时间、过流状态及已知关节编号。"""
+        return self._feedback_overcurrent
 
     @property
     def is_connected(self) -> bool:
@@ -321,7 +327,9 @@ class XHand:
             index for index, joint in joints.items()
             if int(joint.jonitboard_err) == OVERCURRENT_BOARD_CODE
         ]
-        if code == OVERCURRENT_WARNING_CODE or overcurrent_joints:
+        warned = code == OVERCURRENT_WARNING_CODE or bool(overcurrent_joints)
+        self._feedback_overcurrent = (query_started_ns, warned, tuple(overcurrent_joints))
+        if warned:
             self.warn_overcurrent("read", f"{error.error_message}; joints={overcurrent_joints}")
 
         channels = ("aggregate", "dense")
@@ -443,7 +451,7 @@ class XHand:
             self.next_warning_ns[key] = now_ns + 1_000_000_000
 
     def warn_overcurrent(self, operation: str, message: str) -> None:
-        self.warn_limited("overcurrent", "XHand 过流告警（继续运行）：%s code=%d msg=%s",
+        self.warn_limited("overcurrent", "XHand 过流告警：%s code=%d msg=%s",
                           operation, OVERCURRENT_WARNING_CODE, message)
 
     def make_command(self, qpos: np.ndarray) -> Any:

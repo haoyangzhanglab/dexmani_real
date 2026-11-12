@@ -141,11 +141,13 @@ class ArmController:
         guarded()
         self.driver.prepare_motion(check_abort=guarded)
         self.wait_settled(guarded, stage="HOME start", deadline_ns=deadline_ns)
-        if np.max(np.abs(self.status['qpos']-samples[0])) > self.cfg.standstill_position_tolerance_rad:
-            raise OperationCancelled("HOME start changed after planning")
+        start_tolerance = min(self.cfg.standstill_position_tolerance_rad, self.cfg.homing.tracking_error_rad)
+        if np.max(np.abs(self.status['qpos']-samples[0])) > start_tolerance:
+            raise OperationCancelled("HOME start differs from collision-checked trajectory")
         period = round(1e9 / self.cfg.servo_hz)
         start = time.monotonic_ns()
-        feedback_due = start
+        feedback_interval_ns = round(1e9 / self.cfg.feedback_hz)
+        feedback_due = start + feedback_interval_ns
         last_sent_index = 0  # samples[0] 已由实测起点确认。
         lateness = int(self.cfg.homing.max_lateness_s * 1e9)
         for index, point in enumerate(samples):
@@ -160,7 +162,7 @@ class ArmController:
                 reference_index = min(last_sent_index, max(0, (stamp-start)//period))
                 if np.max(np.abs(self.status['qpos']-samples[reference_index])) > self.cfg.homing.tracking_error_rad:
                     raise OperationCancelled("HOME tracking error exceeded")
-                feedback_due = stamp + round(1e9/self.cfg.feedback_hz)
+                feedback_due = stamp + feedback_interval_ns
             guarded()
             if time.monotonic_ns()-due > lateness:
                 raise HomeTimeout("HOME servo schedule late; no catch-up")

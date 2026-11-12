@@ -36,7 +36,7 @@
 
 Raw `/hoi` 只包含 float32 的 `object_pointcloud[T,1024,3]`，点云以 xArm base 为坐标系、米为单位，坐标必须有限。全段跟踪成功后才写入并发布；正式点云存在且满足结构要求即表示该段已完成标注。中间结果保留在 `_hoi_staging`，写完并 flush 后发布；分组移动不保证断电事务。损坏 HOI 只阻止 HOI 消费者。
 
-离线跨 Episode 复用模型并重置场景，按 camera_sequence 去重；同序列的来源时间必须一致。首次初始化或 pose 失效即报告 Episode、行号与原因，不发布该 Episode，继续下一段。文件、模型或程序错误直接传播。在线失效后等待新请求，旧 Episode 在途结果不能被新请求接受。
+离线跨 Episode 复用模型并重置场景，先检查每行相机时钟；重复 camera_sequence 的来源时间必须一致，直接复用上一行位姿，仅新序列读取深度并跟踪。RGB 仍逐行消费和校验，完整成功后核对视频总帧数，输出行数与 Raw 一致。首次初始化或 pose 失效即报告 Episode、行号与原因，不发布该 Episode，继续下一段。文件、模型或程序错误直接传播。在线失效后等待新请求，旧 Episode 在途结果不能被新请求接受。
 
 手点云使用唯一的冻结手模板与 FK，运行时及导出为 XYZ。部署从 info.task_name 定位任务；手点数由 RealConfig.hand_pointcloud 决定，不从 checkpoint 覆盖。
 

@@ -2,7 +2,7 @@
 
 `prepare_asset(mesh_path, output, scale_to_meters=...)` 或实测轴尺寸参数将源 Mesh 转为米制，保留原点。`load_asset(path)` 返回 `(mesh, metadata)`，不加载单物体采样文件。Mesh 顶点法向仍用于跟踪。
 
-`RGBDFrame` 接收 color 网格 RGB、米制深度、内参与畸变参数；`from_camera()` 使用实测相机标定转换。`iter_raw_rows()` 保持逐行 RGB-D 读取，Reader 由调用者关闭。
+`RGBDFrame` 接收 color 网格 RGB、米制深度、内参与畸变参数；`from_camera()` 使用实测相机标定转换。离线标注逐行读取 Raw 时间和 RGB，仅在相机序列更新时读取深度并跟踪；重复序列复用上一行位姿。
 
 `RGBDFrame`、`SceneTracker` 和 `TrackingFailure` 均可从 `cordvip_geometry` 导入。
 

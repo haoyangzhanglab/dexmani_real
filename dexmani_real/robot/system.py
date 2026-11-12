@@ -62,6 +62,7 @@ class Robot:
         self.hand_stop_required = False
         self.hand_feedback = XHandFeedback()
         self.feedback_next_ns = 0
+        self.home_collision_model = None  # 配置在会话内固定；仅 HOME 按需构造。
 
     def check(self) -> None:
         if self.arm is not None:
@@ -243,8 +244,8 @@ class Robot:
                 raise RobotError("hand device unavailable")
             validate_hand_target(command.hand_qpos, self.hand_lower, self.hand_upper)
 
-    def send_hand_home(self, qpos, *, deadline_ns, check_abort) -> None:
-        """提交 HOME 小步目标；CRC 立即失败，停止仍由组合 HOME 收尾。"""
+    def send_hand_home(self, qpos, *, deadline_ns, check_abort) -> bool:
+        """提交 HOME 小步目标并返回过流告警；CRC 立即失败。"""
         if not self.connected or self.hand is None or not self.hand.is_connected:
             raise RobotError("hand device unavailable")
         # 操作范围已由连接前配置校验限制在额定范围内。
@@ -258,13 +259,17 @@ class Robot:
         if time.monotonic_ns() >= deadline_ns:
             raise HomeTimeout("hand HOME budget exhausted before submission")
         self.hand_stop_required = True
-        from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE
+        from dexmani_real.robot.xhand.driver import (
+            COMMUNICATION_CRC_ERROR_CODE,
+            OVERCURRENT_WARNING_CODE,
+            XHandError,
+        )
 
         code = self.hand._send_position(target, tor_max=np.minimum(
             self.hand_config.tor_max, self.hand_config.home_tor_max))
         if code == COMMUNICATION_CRC_ERROR_CODE:
-            from dexmani_real.robot.xhand.driver import XHandError
             raise XHandError("HOME send", code, "delivery unconfirmed")
+        return code == OVERCURRENT_WARNING_CODE
 
     def stop_hand(self, *, passive=False) -> bool:
         if self.hand is None:

@@ -11,7 +11,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
-from cordvip_geometry.raw import iter_raw_rows
+from cordvip_geometry.rgbd import RGBDFrame
 from cordvip_geometry.tracking import SceneTracker, TrackingFailure
 
 from dexmani_real.data.hoi import write_hoi
@@ -44,6 +44,16 @@ def annotate_episodes(episodes, task):
                     raise ValueError("空 Episode")
                 poses = np.empty((frames, count, 4, 4), np.float32)
                 failure = None
+                reader.require_fields("rgb", "depth")
+                intrinsics = camera.color
+                K = intrinsics.matrix()
+                expected_shape = (intrinsics.height, intrinsics.width)
+                depth_scale = np.float32(camera.depth_scale_m)
+                depth = reader["depth"]
+                if depth.shape != (frames, *expected_shape) or depth.dtype != np.uint16:
+                    raise ValueError("Raw depth must be uint16 [rows,H,W] matching color intrinsics")
+                timing = reader["timing/rows"][:]
+                images = iter(reader.iter_rgb_frames())
                 if tracker is None:
                     tracker = stack.enter_context(
                         SceneTracker.open(assets, workspace=ROOT)
@@ -51,8 +61,9 @@ def annotate_episodes(episodes, task):
                 else:
                     tracker.reset()
                 previous_sequence = previous_stamp = -1
-                for index, (frame, timing) in enumerate(iter_raw_rows(reader, camera)):
-                    sequence, stamp = int(timing["camera_sequence"]), int(timing["camera_ns"])
+                for index in range(frames):
+                    sequence = int(timing[index]["camera_sequence"])
+                    stamp = int(timing[index]["camera_ns"])
                     if (
                         sequence <= 0
                         or stamp <= 0
@@ -60,18 +71,34 @@ def annotate_episodes(episodes, task):
                         or stamp < previous_stamp
                     ):
                         raise ValueError(f"非法相机时钟，行 {index}")
+                    if sequence == previous_sequence and stamp != previous_stamp:
+                        raise ValueError("相同相机序列的来源时间冲突")
+                    rgb = next(images, None)
+                    if rgb is None:
+                        raise ValueError(f"Raw RGB ended before row {index}")
+                    if rgb.dtype != np.uint8 or rgb.shape != (*expected_shape, 3):
+                        raise ValueError(f"Raw RGB grid invalid at row {index}")
                     if sequence == previous_sequence:
-                        if stamp != previous_stamp:
-                            raise ValueError("相同相机序列的来源时间冲突")
-                    else:
-                        try:
-                            masks = tracker.detect_masks(frame, prompts) if index == 0 else None
-                            result = tracker.step(frame, initial_masks=masks)
-                        except TrackingFailure as error:
-                            failure = str(error)
-                            break
+                        poses[index] = poses[index - 1]
+                        continue
+                    frame = RGBDFrame(
+                        rgb=rgb,
+                        depth_m=np.multiply(depth[index], depth_scale, dtype=np.float32),
+                        K=K,
+                        distortion_model=intrinsics.distortion_model,
+                        distortion_coeffs=intrinsics.distortion_coeffs,
+                    )
+                    try:
+                        masks = tracker.detect_masks(frame, prompts) if index == 0 else None
+                        result = tracker.step(frame, initial_masks=masks)
+                    except TrackingFailure as error:
+                        failure = str(error)
+                        break
                     poses[index] = np.stack([result[name] for name in template["object_names"]])
                     previous_sequence, previous_stamp = sequence, stamp
+                else:
+                    if next(images, None) is not None:
+                        raise ValueError("Raw RGB contains more frames than the HDF5 rows")
             if failure is not None:
                 print(f"{episode}: 首次失败行 {index}: {failure}；不发布 HOI")
                 continue

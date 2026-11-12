@@ -115,21 +115,15 @@ class PoseTracker:
             raise TrackingFailure(f"invalid FoundationPose output: {exc}") from exc
 
     def track(self, intrinsics, mask, *, prepared_frame):
-        import torch
-
-        previous = self.estimator.pose_last
-        guided = guide_centered_pose(
-            previous.detach().cpu().numpy().reshape(4, 4), intrinsics, mask
-        )
-        self.estimator.pose_last = torch.as_tensor(
-            guided, dtype=previous.dtype, device=previous.device
-        ).reshape(previous.shape)
         estimator = self.estimator
+        guided = guide_centered_pose(
+            estimator.pose_last.detach().cpu().numpy().reshape(4, 4), intrinsics, mask
+        )
         pose, _ = estimator.refiner.predict(
             **prepared_frame,
             K=intrinsics,
             iteration=2,
-            ob_in_cams=estimator.pose_last.reshape(1, 4, 4).detach().cpu().numpy(),
+            ob_in_cams=guided.reshape(1, 4, 4),
             normal_map=None,
             mesh=estimator.mesh,
             mesh_tensors=estimator.mesh_tensors,
