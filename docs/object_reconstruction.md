@@ -1,84 +1,49 @@
-# 物体重建与点云资产
+# 物体重建与 HOI
+
+HOI（Hand–Object Interaction，手物交互）观测用手部与物体点云描述操作场景，供 CordViP 等策略训练与部署使用。物体几何由重建资产提供，在线位姿由 RGB-D 跟踪获得。
+
+## 点云表示
+
+**物体点云**来自固定 Mesh 表面模板：每帧只根据物体位姿变换模板点，保持对象分段和点的顺序。**手点云**来自固定手部模板，根据机械臂与手部关节状态，通过正运动学（FK）变换生成。两者都使用 xArm base 坐标系，以米为单位。
+
+离线标注与在线部署共用物体模板、跟踪器和坐标变换；手部几何也共用同一条 FK 路径，使训练数据与运行时观测采用一致的表示。
 
 ## HOI 五阶段流程
 
-米制 Mesh → 固定任务模板 → Raw 离线标注 → Zarr → CordViP 训练与部署。命令见[实验入口](../scripts/cordvip/README.md)。重建 GUI、模型选择与 `--rgbd` 输入仍可使用。
-
-`build_task.py` 构建或复用米制 Mesh。`asset.json` 只要求 `mesh_file`、`units=m`、`frame=object`，最后写入表示发布完成。加载已发布 Mesh 保留其尺度和原点；任务点云由 `allocate_points.py` 直接采样。
-
-`allocate_points.py` 保留面积配额：总计 1024 点，每物体至少 64 点；固定 seed=0，直接在各 Mesh 表面采样最终点集。
-
-### 任务配置
-
-任务目录为 `assets/pointcloud_template/object/<task_name>/`，各物体占一个子目录。新资产默认读取 `reference.jpg`；已有合法资产直接复用，无需原图或模型权重，只需带齐 `asset.json` 指向的米制 Mesh。更改照片或参数不会替换已发布资产，重建应使用新的资产目录。
-
-`task.json` 示例，尺寸需替换为实测值：
-
-```json
-{"objects": [
-  {"name": "apple", "prompt": "apple", "size_axis": "x", "size_meters": 0.08}
-]}
+```mermaid
+flowchart LR
+    mesh[米制物体 Mesh] --> template[固定任务模板]
+    template --> annotation[Raw 离线标注]
+    raw[示教 Raw] --> annotation
+    annotation --> zarr[Zarr 训练数据]
+    zarr --> policy[策略训练与部署]
+    template --> policy
 ```
 
-`objects` 决定对象顺序，省略时按目录名排序；Prompt 缺省为对象名。Prompt 须有实际文本，按 `strip().lower().rstrip(".")` 比较时不得重复，场景首帧中各自须匹配唯一候选。`instance` 仅选择重建参考图候选，不能在在线场景中区分同 Prompt 的多个实例。尺度也可用 `scale_to_meters`，与轴尺寸二选一。
+1. **准备物体资产**：从参考图分割物体，通过 Hunyuan3D 重建 Mesh，再根据实测尺寸确定米制尺度；已有米制资产可直接复用。任务由对象名称、识别提示词和各自的 Mesh 组成，入口为 [build_task.py](../scripts/cordvip/build_task.py)。
+2. **固定任务模板**：[allocate_points.py](../scripts/cordvip/allocate_points.py) 按物体表面积分配采样点，生成任务级 1024 点模板，固定对象分段与点序。实验期间复用这份模板。
+3. **标注示教 Raw**：[annotate_episodes.py](../scripts/cordvip/annotate_episodes.py) 从录制的 RGB-D 逐帧估计物体位姿，将模板变换到机器人基座系。整段跟踪成功后，物体点云才写入对应 Raw。
+4. **导出训练数据**：[export_zarr.py](../scripts/export_zarr.py) 读取物体标注，并由关节状态生成手点云，与所选状态、动作一同导出为 Zarr。
+5. **训练与部署**：在 dexmani_policy 中训练策略；部署时加载同一任务的资产与模板，从实时 RGB-D 生成物体点云，与手部几何和其他观测共同送入模型。
 
-### 资产与模板
+任务资产统一放在 [assets/pointcloud_template/object](../assets/pointcloud_template/object/) 下，按任务和物体组织。米制 Mesh 确定尺度与局部坐标，任务模板确定点云表示；两者由研究者固定，运行时只读复用。已有数据和模型应使用实验对应的资产与模板。
 
-研究者负责固定实验资产。已有 Raw、Zarr、checkpoint、Mesh 和冻结模板均不自动覆盖或重新生成。
+## 核心模块
 
-示例任务三个米制 Mesh 在本机存在但未纳入 Git；任务级冻结模板缺失。新 checkout 需要自行提供 Mesh 与实验对应的冻结模板。
+| 模块 | 职责 |
+| --- | --- |
+| [cordvip_geometry](../third_party/cordvip_geometry/) | 共用的物体分割、网格重建、尺度校准与 RGB-D 位姿跟踪后端。 |
+| [geometry/hoi.py](../dexmani_real/geometry/hoi.py) | 读取任务与模板，将物体局部点变换到机器人基座系。 |
+| [perception/hoi_worker.py](../dexmani_real/perception/hoi_worker.py) | 在线处理相机帧，为当前策略 Episode 生成物体点云。 |
+| [perception/hand_cloud.py](../dexmani_real/perception/hand_cloud.py) | 通过固定手模板与 FK 生成手点云。 |
+| [data/hoi.py](../dexmani_real/data/hoi.py) / [data/export.py](../dexmani_real/data/export.py) | 将离线物体点云写入 Raw，并组织训练数据导出。 |
 
-模板要求显式的 object_names 分段映射，资产文件不由运行时修改。手模板只消费 XYZ 通道。
+## 在线观测流程
 
-### 模板与数据契约
+策略部署根据 Checkpoint 的观测需求启用 HOI，并按任务名加载资产与模板。每段开始时重置跟踪场景，首帧用 Grounding DINO 与 SAM2 定位、分割目标，由 FoundationPose 初始化位姿；后续通过 SAM2 和 FoundationPose 持续跟踪，再结合相机外参生成基座系点云。
 
-`hoi/template.npz` 包含 `points_local[1024,3]`、`offsets`、`object_names`。名字关联 Mesh、Prompt 与跟踪结果；拼接顺序始终由模板决定，配置列表可以重新排序。加载边界检查必要形状、有限值、分段及对象对应关系。
+跟踪器通过分割与深度一致性判断位姿是否有效；部署端继续检查观测时效。跟踪失效或必需观测过期会结束当前段，下一段重新初始化。手部反馈与物体点云分别更新，组合输入仍是时间近似，并不代表硬件同步。
 
-Raw `/hoi` 只包含 float32 的 `object_pointcloud[T,1024,3]`，点云以 xArm base 为坐标系、米为单位，坐标必须有限。全段跟踪成功后才写入并发布；正式点云存在且满足结构要求即表示该段已完成标注。中间结果保留在 `_hoi_staging`，写完并 flush 后发布；分组移动不保证断电事务。损坏 HOI 只阻止 HOI 消费者。
-
-离线标注在每个待处理 Episode 打开或重置 tracker、解码 RGB、逐行读取深度之前，一次检查全部相机时钟：camera_sequence 与 camera_ns 必须为正且不能倒退，相同序列的来源时间必须一致。坏时钟以 ValueError 报告最早错误行（从 0 开始）和原因，区分普通时钟错误与同序列时间冲突，直接终止本次调用，不发布该段 HOI。
-
-预检通过后跨 Episode 复用模型并重置场景；重复 camera_sequence 仍消费并校验 RGB，再复用上一行位姿，仅新序列读取深度并跟踪。完整成功后核对视频总帧数，输出行数与 Raw 一致。首次初始化或 pose 失效即报告 Episode、行号与原因，不发布该 Episode，继续下一段。文件、模型或程序错误直接传播。在线失效后等待新请求，旧 Episode 在途结果不能被新请求接受。
-
-手点云使用唯一的冻结手模板与 FK，运行时及导出为 XYZ。部署从 info.task_name 定位任务；手点数由 RealConfig.hand_pointcloud 决定，不从 checkpoint 覆盖。
-
-### 可选来源时间差预算
-
-最新关节与滞后物体点云的组合仍是实验近似；时间差预算只限制这种近似，不代表物理同步，关闭它也不会关闭年龄或跟踪有效性检查。
-
-CONFIG.execution.hoi_max_skew_s 默认 None，关闭额外来源时间差限制；物体点云与手几何或 joint_state 联合消费时，可显式填写有限正数秒值启用。导出使用同一个 `--config`，程序调用可直接设置 ExportConfig.hoi_max_skew_s。
-
-在线使用 HOI 原始相机来源时间与臂、手反馈时间；离线使用 camera_ns、arm_ns、hand_ns。启用检查时三者 max−min 不得超过预算（等于预算允许），超限拒绝整次导出或停止本轮。在线各来源年龄检查继续保留，不以年龄预算替代时间差预算。主机记录时间差不证明物理同步，不进行插值、补洞或重采样。
-
-## 当前实现与性能结论
-
-以下为历史性能测量，不能视为本次精简后 GPU 或真机验证。
-
-正式后端为 Grounded-SAM-2／SAM2.1 Small、Mask 引导 FoundationPose 两次跟踪细化及语义深度门控；DINO 只用于首帧。模型跨轮复用，场景逐轮重置，单姿态跟踪使用缓存补丁。完整 VOS 编译分支已移除，EdgeTAM、EfficientTAM 与 TensorRT FP 均未接入正式后端。
-
-2026-11-09 本机对照：RTX 4090、三物体、上述两段各 403 帧，排除前 15 帧计时。耗时包含分割、位姿、通信和门控，排除文件解码与策略推理：
-
-| 方案 | 第一段 P50/P95 | 两段全物体同时有效帧数 | 状态 |
-| --- | --- | --- | --- |
-| 当前 SAM2 + 当前 FP | 79.04/81.86 ms | 403 / 146 | 正式实现 |
-| 完整 VOS + 当前 FP | 73.18/76.67 ms | 403 / 146 | 已移除 |
-| 当前 SAM2 + TensorRT FP | 53.79/55.35 ms | 403 / 147 | 对照实验 |
-| 完整 VOS + TensorRT FP | 47.20/49.12 ms | 403 / 146 | 对照实验 |
-| EdgeTAM + TensorRT FP | 32.96/34.62 ms | 403 / 143 | 对照实验 |
-
-VOS 约节省 6 ms，但需额外环境、约 223 s 冷编译及 CUDA Graph 处理，原速回放仍失效。EfficientTAM-S 512 在第二段苹果出现 252 帧空 Mask，未采用；失效后跳过物体的低耗时不能作为加速收益。
-
-第一段按原始时间间隔回放 Camera Ring：403 帧约 25.2 s、Raw 约 16 Hz，包含自动初始化、HOI Worker 与固定点变换，每约 5 ms 采样最新结果：
-
-| 跟踪实现 | 有效输出 | 新点云更新率 | 年龄 P50/P95 | 超过 133 ms 的采样比例 |
-| --- | --- | --- | --- | --- |
-| 当前 FP | 322/322 | 12.8 Hz | 150/200 ms | 69.5% |
-| TensorRT FP 实验适配器 | 403/403 | 15.98 Hz | 91/120 ms | 0.46% |
-
-HOI 默认 250 ms 基于回放 P95 约 200 ms 留余量，仍是暂定研究参数。回放没有真实设备、策略 GPU 并发或原相机 30 Hz 中未记录的中间帧；关节反馈仍取最新值，未做历史对齐或动力学补偿，不能据此认定连续真机执行可用。
-
-TensorRT 对照使用 [NVIDIA 固定源码](https://github.com/nvidia-isaac/foundation-pose-inference-library/tree/89dd4cfec75f944b9fca52d9cb282725f1666c12) 与[固定 ONNX 权重](https://huggingface.co/nvidia/foundationpose/tree/18d8309afc9790cddc03a1d50bc69954dc058693)：CUDA 12.4、TensorRT 10.16.0.72、FP16、252 个候选、5 次注册／2 次跟踪细化、micro-batch 42、关闭 CUDA Graph。原生实现无 bbox XY 引导，tracking score 固定 1.0；对照沿用语义／深度门控，不以 score 判断可信度。
-
-一次性对照脚本、结果副本、实验环境和临时日志已清理，仅保留结论及可复用源码／权重缓存。后续先完成真实相机与已训练策略的并发验收，再决定是否继续评估 TensorRT。
+任务操作命令见 [CordViP 实验入口](../scripts/cordvip/README.md)，后端安装见 [cordvip_geometry](../third_party/cordvip_geometry/README.md#安装与命令)，策略执行链路见[策略部署](policy_deployment.md)。
 
 返回[项目架构](../README.md)。

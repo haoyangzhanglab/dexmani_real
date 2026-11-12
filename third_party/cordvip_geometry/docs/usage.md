@@ -1,19 +1,31 @@
-# CordViP 几何核心
+# 几何核心接口与流程
 
-`prepare_asset(mesh_path, output, scale_to_meters=...)` 或实测轴尺寸参数将源 Mesh 转为米制，保留原点。`load_asset(path)` 返回 `(mesh, metadata)`，不加载单物体采样文件。Mesh 顶点法向仍用于跟踪。
+`cordvip_geometry` 提供米制物体资产与 RGB-D 位姿跟踪接口。主项目使用这些结果生成任务点云，并组织 Raw 标注与在线策略观测。
 
-`RGBDFrame` 接收 color 网格 RGB、米制深度、内参与畸变参数；`from_camera()` 使用实测相机标定转换。离线标注逐行读取 Raw 时间和 RGB，仅在相机序列更新时读取深度并跟踪；重复序列复用上一行位姿。
+## 核心接口
 
-`RGBDFrame`、`SceneTracker` 和 `TrackingFailure` 均可从 `cordvip_geometry` 导入。
+以下接口均可从 `cordvip_geometry` 导入。
 
-`SceneTracker.open(assets, *, workspace)` 要求每个名字对应一个 Mesh 资产。首帧由 `detect_masks(frame, prompts)` 获取 initial_masks，调用 `step(frame, initial_masks=masks)`；后续直接 `step(frame)`。新 Episode 调用 reset()，模型权重和资产继续复用。
+| 接口 | 职责 |
+| --- | --- |
+| [prepare_asset()](../src/cordvip_geometry/assets.py) | 根据实测尺度将源 Mesh 转为米制资产，保留物体局部原点。 |
+| [load_asset()](../src/cordvip_geometry/assets.py) | 读取米制 Mesh 及其元数据。 |
+| [RGBDFrame](../src/cordvip_geometry/rgbd.py) | 携带同一彩色相机网格上的 RGB、米制深度、内参与畸变信息。 |
+| [SceneTracker](../src/cordvip_geometry/tracking.py) | 管理多物体分割、位姿估计与跟踪有效性判断。 |
+| [TrackingFailure](../src/cordvip_geometry/foundationpose.py) | 表示当前场景无法继续可靠跟踪。 |
 
-step 成功返回 `{object_name: pose_camera}`，位姿将原物体坐标系变换到相机系。任一物体预期跟踪失败立即抛出 TrackingFailure（含物体及原因），不返回部分结果。调用方结束当前 Episode，下一段先 reset；在线 Worker 保留整轮失败锁存。模型、IPC、文件和程序错误保持原异常传播。
+## 跟踪流程
 
-跟踪使用 workspace 下默认模型目录、默认 SAM 配对、当前解释器和临时调试目录。语义支持与模型深度一致性阈值为 tracking 模块常量：pixel_stride=2、depth_tolerance_m=0.015、min_matched_pixels=30、min_matched_fraction=0.15，同时保留 FoundationPose 最小有效深度要求。内部只保留判定所需深度和像素，不输出展示 mask、颜色或三维诊断载荷。
+1. **组织输入**：用 `RGBDFrame` 表示当前相机帧；主项目可通过 `RGBDFrame.from_camera()` 结合相机标定转换原始 RGB-D。
+2. **加载场景**：通过 `with SceneTracker.open(assets, workspace=...) as tracker` 加载物体资产与模型，`assets` 将对象名称对应到各自的米制资产目录。
+3. **初始化首帧**：调用 `detect_masks(frame, prompts)` 定位、分割各对象，再将结果传给 `step(frame, initial_masks=masks)` 初始化位姿。
+4. **持续跟踪**：后续帧调用 `step(frame)`，结合分割、深度与 Mesh 更新各对象位姿，并检查观测与模型的一致性。
+5. **切换 Episode**：新段先调用 `reset()` 清除场景状态，再从首帧初始化；模型与资产继续复用，退出上下文时释放资源。
 
-正式离线入口为 annotate_episodes.py；它按 camera_sequence 去重并在首次失效停止该 Episode。结果通过主项目 visualize_episode.py 查看。重建选择支持图片或含 rgb 的 NPZ，选择结果使用固定的 mask.png、foreground_rgba.png、overlay.png 文件名。
+## 输出与主项目衔接
 
-FoundationPose 权重与同帧预处理复用、SAM 子进程隔离及有界时序状态继续保留。参见[实验命令](../../../scripts/cordvip/README.md)和[资产约定](../../../docs/object_reconstruction.md)。
+`step()` 成功返回 `{object_name: pose_camera}`，每个位姿是物体局部坐标到相机坐标的变换。任一物体跟踪失效会抛出 `TrackingFailure`，调用方结束当前段，下一段重置场景后重新初始化。
 
-输出使用尚不存在的新目标，可位于候选、资产或 Raw 目录内部，由研究者选择位置；已有输出仍拒绝覆盖。模型下载目录允许复用。
+主项目将这些位姿与相机外参组合，把固定物体模板变换到 xArm base 坐标系。离线标注与在线 HOI Worker 共用这条几何路径；手点云由主项目根据机器人关节状态和 FK 单独生成。
+
+任务操作入口见 [CordViP 实验流程](../../../scripts/cordvip/README.md)，整体数据链路见[物体重建与 HOI](../../../docs/object_reconstruction.md)，后端模块与安装见[模块概览](../README.md)。

@@ -1,35 +1,25 @@
 # CordViP 实验入口
 
+这些脚本连接物体几何后端与 DexMani Real 的实验数据，完成任务资产准备、固定模板生成、Raw 标注与训练数据导出。整体表示与架构见[物体重建与 HOI](../../docs/object_reconstruction.md)。
+
 ## 任务级 HOI 流程
 
-任务资产位于 `assets/pointcloud_template/object/<task_name>/<object_name>/`，每物体需要米制 Mesh 和 asset.json。任务配置、尺度与模板约定见[物体资产](../../docs/object_reconstruction.md)。模板由研究者固定，运行时只读。
+**米制物体资产 → 固定任务模板 → Raw 离线标注 → 检查结果 → Zarr 训练数据**。
 
-```bash
-python scripts/cordvip/build_task.py --task pnp_apple_banana
-# 仅用于新实验首次冻结；已有模板只读取复用。
-python scripts/cordvip/allocate_points.py assets/pointcloud_template/object/pnp_apple_banana
-python scripts/cordvip/annotate_episodes.py --task pnp_apple_banana
-python scripts/visualize_episode.py episodes/pnp_apple_banana/episode_20261101_165909
-python scripts/export_zarr.py episodes/pnp_apple_banana \
-  --output datasets/pnp_apple_banana.cordvip.zarr \
-  --fields joint_state action hand_pointcloud object_pointcloud
-```
+| 阶段 | 入口 | 作用与产物 |
+| --- | --- | --- |
+| 准备物体资产 | [build_task.py](build_task.py) | 按任务配置重建物体并确定实测尺度，或复用已有米制 Mesh。 |
+| 固定任务模板 | [allocate_points.py](allocate_points.py) | 从各物体 Mesh 采样，固定任务点云的对象分段与点序。 |
+| 标注示教 | [annotate_episodes.py](annotate_episodes.py) | 从已采集的 Raw RGB-D 跟踪物体，将整段成功的物体点云写回 Raw。 |
+| 检查结果 | [visualize_episode.py](../visualize_episode.py) | 查看录制数据与标注点云。 |
+| 导出训练数据 | [export_zarr.py](../export_zarr.py) | 将物体点云、由关节状态生成的手点云及所选状态、动作导出为 Zarr。 |
 
-默认无需 --config，execution.hoi_max_skew_s=None 关闭额外来源时间差限制。需要启用时，通过 --config 的 CONFIG.execution.hoi_max_skew_s 设置有限正数秒值；程序调用使用 ExportConfig.hoi_max_skew_s。标注可追加 `--episode` 指定单段。已发布结果不覆盖；首次 pose 失效即结束该段且不发布。导出遇到点云缺失、结构错误、非有限坐标或已启用的来源时间差检查超限时拒绝，不丢行拼接。
+任务资产位于 `assets/pointcloud_template/object/<task_name>/`，按物体组织 Mesh，并保存任务级模板。实验期间固定资产与模板，训练数据导出和在线部署使用同一套几何表示。
 
-新模板直接按面积配额与固定 seed 表面采样；通过正式标注和 visualize_episode 查看结果。
-
-手点云导出为 XYZ，普通 RGB-D point_cloud 仍为 XYZRGB。Zarr 可以直接用于 CordViP 训练，接触预训练为可选步骤。相机标定、动作语义和 Raw 连续段边界保持不变。
+Zarr 交给 dexmani_policy 训练；部署时使用同一任务的资产，从实时 RGB-D 跟踪生成物体点云。
 
 ## 单物体重建
 
-独立重建可直接指定图片和尺度。将图片路径、网格轴及尺寸替换为实际值，以下 `0.08` 仅为米制尺寸示例：
+[reconstruct_object.py](reconstruct_object.py) 提供独立的参考图分割与 Mesh 重建入口。提供实测尺寸后可生成米制资产，供任务模板采样与位姿跟踪使用。
 
-```bash
-python scripts/cordvip/reconstruct_object.py \
-  --image path/to/object.jpg --prompt apple \
-  --size-axis x --size-meters 0.08 \
-  --headless --output logs/cordvip/apple_build
-```
-
-提供尺度时，米制资产写入 `<output>/asset/`；省略尺度时保留未定尺度网格，后续需完成尺度校准。`--headless` 下多候选需要查看候选结果并明确指定零起始的 `--instance`；任务构建时对应 `task.json` 中的 `instance`。
+脚本从仓库根目录运行，具体参数见各入口的 `--help`。后端准备见 [cordvip_geometry 安装与命令](../../third_party/cordvip_geometry/README.md#安装与命令)，接口流程见[几何核心接口](../../third_party/cordvip_geometry/docs/usage.md)。
