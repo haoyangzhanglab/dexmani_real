@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -37,12 +38,19 @@ def annotate_episodes(episodes, task):
             if tracker is None:
                 tracker = SceneTracker(mesh_paths, workspace=ROOT)
             try:
-                poses, base_from_camera = track_episode(reader, tracker, names, prompts)
+                poses, base_from_camera, quality = track_episode(reader, tracker, names, prompts)
             except TrackingFailure as error:
                 print(f"{episode}: {error}；不写入 HOI")
                 continue
 
-        write_hoi(episode / "data.h5", template, poses, base_from_camera)
+        write_hoi(
+            episode / "data.h5",
+            template,
+            poses,
+            base_from_camera,
+            quality=quality,
+            tracking_config=asdict(tracker.config),
+        )
         print(f"{episode}: 已写入 HOI，{len(poses)} 帧")
 
 
@@ -82,6 +90,7 @@ def track_episode(reader, tracker, names, prompts):
         raise ValueError(f"{reason}，行 {index}")
 
     poses = np.empty((frames, len(names), 4, 4), np.float32)
+    quality = []
     images = iter(reader.iter_rgb_frames())
     for index in range(frames):
         rgb = next(images, None)
@@ -91,6 +100,7 @@ def track_episode(reader, tracker, names, prompts):
             raise ValueError(f"Raw RGB grid invalid at row {index}")
         if not new_sequence[index]:
             poses[index] = poses[index - 1]
+            quality.append(quality[-1])
             continue
         frame = RGBDFrame(
             rgb=rgb,
@@ -106,12 +116,13 @@ def track_episode(reader, tracker, names, prompts):
                 else tracker.track(frame)
             )
         except TrackingFailure as error:
-            raise TrackingFailure(f"行 {index}: {error}") from error
-        poses[index] = np.stack([result[name] for name in names])
+            raise TrackingFailure(f"行 {index}，相机序列 {sequences[index]}: {error}") from error
+        poses[index] = np.stack([result.poses[name] for name in names])
+        quality.append([result.quality[name] for name in names])
 
     if next(images, None) is not None:
         raise ValueError("Raw RGB contains more frames than the HDF5 rows")
-    return poses, camera.T_xarm_base_from_color
+    return poses, camera.T_xarm_base_from_color, quality
 
 
 def main(argv=None):

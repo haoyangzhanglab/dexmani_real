@@ -83,3 +83,34 @@ def test_depth_is_recording_input_only(info):
     with pytest.raises(ValueError, match='no live producer.*depth'):
         ObservationBuilder(replace(info, observation_fields=('depth',)), RealConfig())
     assert 'depth' in RAW_RECORDING_NEEDS.camera_fields
+
+
+def test_hoi_projection_uses_aligned_joints_without_changing_feedback():
+    info = SimpleNamespace(observation_fields=("joint_state", "object_pointcloud"))
+    builder = ObservationBuilder(info, RealConfig())
+    arm = np.zeros(1, dtype=[("qpos", "f8", (7,))])
+    hand = np.zeros(1, dtype=[("qpos", "f8", (12,))])
+    row = SimpleNamespace(
+        arm=arm,
+        hand=hand,
+        hoi={"object_pointcloud": np.zeros((1024, 3), np.float32)},
+        aligned_joints={"arm_qpos": np.full(7, 0.25), "hand_qpos": np.full(12, 0.5)},
+    )
+    result = builder.build([builder.project(row)])
+    np.testing.assert_allclose(result["joint_state"][0], np.r_[np.full(7, 0.25), np.full(12, 0.5)])
+    assert not arm["qpos"].any() and not hand["qpos"].any()
+
+
+def test_hoi_eef_projection_requires_only_arm_history(info):
+    builder = ObservationBuilder(
+        replace(info, observation_fields=("eef_pose", "object_pointcloud")), RealConfig()
+    )
+    assert builder.needs.hoi_joint_devices == ("arm",)
+    assert builder.needs.union(RAW_RECORDING_NEEDS).hoi_joint_devices == ("arm",)
+    row = SimpleNamespace(
+        hoi={"object_pointcloud": np.zeros((1024, 3), np.float32)},
+        aligned_joints={"arm_qpos": np.zeros(7)},
+    )
+    arrays = builder.build([builder.project(row)])
+    assert arrays["eef_pose"].shape == (1, 9)
+    assert np.isfinite(arrays["eef_pose"]).all()

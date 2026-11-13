@@ -11,6 +11,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from dexmani_real.config.perception import HandCloudConfig
+from dexmani_real.geometry.hoi import sample_surface_points
 from dexmani_real.perception.hand_cloud import HAND_TEMPLATE_DIR
 from dexmani_real.robot.model import XARM7_XHAND_RIGHT_URDF_PATH
 from dexmani_real.utils.io import publish
@@ -70,13 +71,7 @@ def generate_hand_template(
 
     clouds = []
     for index, (mesh, count) in enumerate(zip(meshes, counts)):
-        rng = np.random.default_rng(index)
-        selected = rng.choice(len(mesh.faces), count, p=mesh.area_faces / mesh.area)
-        uv = rng.random((count, 2))
-        root_u = np.sqrt(uv[:, 0])
-        weights = np.column_stack((1 - root_u, root_u * (1 - uv[:, 1]), root_u * uv[:, 1]))
-        xyz = np.sum(mesh.triangles[selected] * weights[:, :, None], axis=1)
-        clouds.append(xyz)
+        clouds.append(sample_surface_points(mesh, int(count), seed=index))
 
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)

@@ -46,23 +46,6 @@ def load_mesh(path):
     return mesh
 
 
-def sample_mesh_surface(mesh, num_points=1024, seed=0):
-    """按面积采样固定表面 XYZ。"""
-    areas = mesh.area_faces
-    total = areas.sum()
-    if not np.isfinite(total) or total <= 0:
-        raise ValueError("Mesh has no finite, nonzero surface area")
-    rng = np.random.default_rng(seed)
-    indices = rng.choice(len(mesh.faces), num_points, p=areas / total)
-    triangles = mesh.vertices[mesh.faces[indices]]
-    # sqrt(u) 保证三角面内均匀采样。
-    uv = rng.random((num_points, 2))
-    root_u = np.sqrt(uv[:, 0])
-    weights = np.column_stack((1 - root_u, root_u * (1 - uv[:, 1]), root_u * uv[:, 1]))
-    points = np.sum(triangles * weights[:, :, None], axis=1)
-    return points.astype(np.float32)
-
-
 def scale_mesh(mesh, *, scale_to_meters=None, size_axis=None, size_meters=None):
     """按实测尺度缩放副本，保留物体原点和朝向。"""
     if (size_axis is None) != (size_meters is None):

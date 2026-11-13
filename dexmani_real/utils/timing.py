@@ -1,4 +1,4 @@
-"""绝对时钟调度与来源时效判断。"""
+"""绝对时钟调度、来源时效判断与关节时间插值。"""
 
 from __future__ import annotations
 
@@ -28,10 +28,43 @@ def sample_is_fresh(timestamp_ns, max_age_s, now_ns):
     return 0 < stamp <= now_ns and now_ns - stamp < int(max_age_s * 1e9)
 
 
-def validate_hoi_skew_budget(value):
-    if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value <= 0):
-        raise ValueError("hoi_max_skew_s 必须为 None 或有限正数")
+def validate_joint_gap(value):
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise ValueError("hoi_max_joint_gap_s 必须为有限正数")
 
 
-def hoi_sources_within_skew(stamps, budget_s):
-    return min(stamps) > 0 and max(stamps) - min(stamps) <= budget_s * 1e9
+def interpolate_joints(stamps, positions, targets, max_gap_s):
+    """返回关节和有效标志；无法插值的位置为 NaN。
+
+    调用方按连续区间提供历史；精确命中直接取样，否则要求前后样本间隔不超预算。
+    """
+    import numpy as np
+
+    stamps = np.asarray(stamps, dtype=np.int64)
+    positions = np.asarray(positions, dtype=np.float64)
+    targets = np.atleast_1d(np.asarray(targets, dtype=np.int64))
+    if (
+        stamps.ndim != 1
+        or not len(stamps)
+        or positions.ndim != 2
+        or len(positions) != len(stamps)
+        or np.any(stamps <= 0)
+        or np.any(np.diff(stamps) < 0)
+        or not np.isfinite(positions).all()
+    ):
+        raise ValueError("Invalid joint history")
+    duplicate = np.diff(stamps) == 0
+    if np.any(np.any(positions[1:] != positions[:-1], axis=1) & duplicate):
+        raise ValueError("Conflicting joint states at the same timestamp")
+    keep = np.r_[True, ~duplicate]
+    stamps, positions = stamps[keep], positions[keep]
+    right = np.searchsorted(stamps, targets).clip(0, len(stamps) - 1)
+    exact = stamps[right] == targets
+    left = np.where(exact, right, np.maximum(0, right - 1))
+    lo, hi = stamps[left], stamps[right]
+    span_ns = hi - lo
+    valid = (lo <= targets) & (targets <= hi) & (span_ns <= max_gap_s * 1e9)
+    fraction = np.divide(targets - lo, span_ns, out=np.zeros(len(targets)), where=span_ns != 0)
+    values = positions[left] + fraction[:, None] * (positions[right] - positions[left])
+    values[~valid] = np.nan
+    return values, valid

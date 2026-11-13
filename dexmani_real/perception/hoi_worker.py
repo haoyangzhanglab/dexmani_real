@@ -68,7 +68,7 @@ def run_hoi_worker(shared, camera, task, template):
             failure = str(error)
             points = np.zeros((1024, 3), np.float32)
         else:
-            poses = np.stack([scene[name] for name in template["object_names"]])
+            poses = np.stack([scene.poses[name] for name in template["object_names"]])
             points = transform_task_points(
                 template, poses, camera.T_xarm_base_from_color
             )

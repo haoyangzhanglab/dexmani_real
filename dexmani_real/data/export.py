@@ -14,6 +14,7 @@ import numpy as np
 import zarr
 
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
+from dexmani_real.data.hoi import align_hoi_episode
 from dexmani_real.data.raw import RawReader, require_published_raw
 from dexmani_real.geometry.camera import (
     camera_extrinsic_cv,
@@ -29,7 +30,6 @@ from dexmani_real.robot.model import (
     XHAND_TACTILE_SCALE_DIVISOR,
 )
 from dexmani_real.utils.io import publish
-from dexmani_real.utils.timing import hoi_sources_within_skew, validate_hoi_skew_budget
 
 CANONICAL_FORMAT = "dexmani.real.canonical"
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ class ExportConfig:
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
-    hoi_max_skew_s: float | None = None
+    hoi_max_joint_gap_s: float = 0.10
 
 
 # 输出字段直接对应 Raw 输入；FK 和相机计算由下方普通条件启用。
@@ -142,8 +142,8 @@ def canonical_array_specs(fields, processing, camera):
             for name in fields}
 
 
-def validate_export_episode(reader: RawReader, fields, *, hoi_max_skew_s=None):
-    """校验输入及控制时间；显式启用预算时检查 HOI 来源时间差。"""
+def validate_export_episode(reader: RawReader, fields):
+    """校验所选输入、相机和控制时间；HOI 插值单独按连续区间处理。"""
     frames = reader.num_frames
     if frames <= 0:
         raise ValueError("episode contains no rows")
@@ -152,14 +152,7 @@ def validate_export_episode(reader: RawReader, fields, *, hoi_max_skew_s=None):
     for name in inputs - {"rgb"}:
         reader[name]
     camera = export_camera(reader, fields)
-    rows = reader.read_timing()
-    if hoi_max_skew_s is not None:
-        for row_index, row in enumerate(rows):
-            stamps = tuple(int(row[key]) for key in ("camera_ns", "arm_ns", "hand_ns"))
-            if (not hoi_sources_within_skew(stamps, hoi_max_skew_s)
-                    or max(stamps) > int(row["observation_ns"])):
-                raise ValueError(f"HOI source time invalid/skew exceeds hoi_max_skew_s at row {row_index}")
-
+    reader.read_timing()
     return camera
 
 
@@ -185,8 +178,15 @@ def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
 
 
 def iter_canonical_blocks(
-    reader: RawReader, config: ExportConfig, *, fields, arm_fk, hand_fk,
-    hand_cloud, camera,
+    reader: RawReader,
+    config: ExportConfig,
+    *,
+    fields,
+    arm_fk,
+    hand_fk,
+    hand_cloud,
+    camera,
+    alignment=None,
 ):
     frames = reader.num_frames
     inputs = {name for field in fields for name in FIELD_INPUTS[field]}
@@ -208,9 +208,47 @@ def iter_canonical_blocks(
     images = reader.iter_rgb_frames() if "rgb" in inputs else None
     for start in range(0, frames, chunk_frames):
         end = min(frames, start + chunk_frames)
-        count = end - start
-        raw = {name: reader[name][start:end] for name in inputs - {"rgb"}}
+        if alignment is None:
+            selected = slice(None)
+            count = end - start
+        else:
+            selected = alignment["keep"][start:end]
+            count = int(alignment["keep"][start:end].sum())
+        raw = {name: reader[name][start:end][selected] for name in inputs - {"rgb"}}
+        if alignment is not None:
+            for name in ("arm_qpos", "hand_qpos"):
+                if name in raw:
+                    raw[name] = alignment[name][start:end][selected]
         block = {}
+        if images is not None:
+            height, width = camera["shape"]
+            if "rgb" in fields:
+                block["rgb"] = np.empty((count, height, width, 3), dtype=np.uint8)
+            if processor is not None:
+                block["point_cloud"] = np.empty(
+                    (count, config.pointcloud.num_points, 6), dtype=np.float32
+                )
+            offset = 0
+            for index in range(start, end):
+                image = next(images, None)
+                if image is None or image.shape != (height, width, 3) or image.dtype != np.uint8:
+                    raise ValueError(
+                        f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
+                    )
+                if alignment is not None and not alignment["keep"][index]:
+                    continue
+                if "rgb" in fields:
+                    block["rgb"][offset] = image
+                if processor is not None:
+                    cloud = processor.process(raw["depth"][offset], image)
+                    if not len(cloud):
+                        raise ValueError(f"point_cloud unavailable at row {index}")
+                    block["point_cloud"][offset] = cloud
+                    del cloud
+                offset += 1
+                del image
+        if count == 0:
+            continue
         if "object_pointcloud" in fields:
             block["object_pointcloud"] = raw["object_pointcloud"]
         if "joint_state" in fields:
@@ -237,25 +275,6 @@ def iter_canonical_blocks(
             block[name] = np.broadcast_to(values, (count, values.size))
         if "depth" in fields:
             block["depth"] = raw["depth"]
-        if images is not None:
-            height, width = camera["shape"]
-            if "rgb" in fields:
-                block["rgb"] = np.empty((count, height, width, 3), dtype=np.uint8)
-            if processor is not None:
-                block["point_cloud"] = np.empty((count, config.pointcloud.num_points, 6), dtype=np.float32)
-            for offset, index in enumerate(range(start, end)):
-                image = next(images, None)
-                if image is None or image.shape != (height, width, 3) or image.dtype != np.uint8:
-                    raise ValueError(f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}")
-                if "rgb" in fields:
-                    block["rgb"][offset] = image
-                if processor is not None:
-                    cloud = processor.process(raw["depth"][offset], image)
-                    if not len(cloud):
-                        raise ValueError(f"point_cloud unavailable at row {index}")
-                    block["point_cloud"][offset] = cloud
-                    del cloud
-                del image
         yield block
         del raw, block
     if images is not None and next(images, None) is not None:
@@ -272,11 +291,12 @@ def export_zarr(
     progress_callback=None,
 ) -> dict:
     fields = resolve_fields(fields)
-    joint_hoi = "object_pointcloud" in fields and bool(
-        HAND_FK_FIELDS.union({"joint_state"}).intersection(fields)
+    inputs = {name for field in fields for name in FIELD_INPUTS[field]}
+    joint_devices = tuple(
+        device
+        for device in ("arm", "hand")
+        if "object_pointcloud" in fields and f"{device}_qpos" in inputs
     )
-    if joint_hoi:
-        validate_hoi_skew_budget(processing.hoi_max_skew_s)
     if "point_cloud" in fields:
         processing.pointcloud.validate()
     if "hand_pointcloud" in fields:
@@ -298,13 +318,19 @@ def export_zarr(
                 require_published_raw(episode)
                 with RawReader(episode) as reader:
                     task_name = reader.meta["task_label"]
-                    camera = validate_export_episode(
-                        reader,
-                        fields,
-                        hoi_max_skew_s=processing.hoi_max_skew_s if joint_hoi else None,
-                    )
+                    camera = validate_export_episode(reader, fields)
                     starts = reader.segment_starts
                     frames = reader.num_frames
+                    alignment = (
+                        align_hoi_episode(
+                            reader, processing.hoi_max_joint_gap_s, devices=joint_devices
+                        )
+                        if joint_devices
+                        else None
+                    )
+                    if alignment is not None:
+                        starts = alignment["starts"]
+                        frames = int(alignment["keep"].sum())
                     logger.info(
                         "%s: exporting %d rows in %d segments",
                         episode.name, frames, len(starts),
@@ -359,7 +385,32 @@ def export_zarr(
                         hand_fk=hand_fk,
                         hand_cloud=hand_cloud,
                         camera=camera,
+                        alignment=alignment,
                     )
+                    if alignment is not None:
+                        records = list(root.attrs.get("hoi_alignment", []))
+                        records.append(
+                            dict(
+                                episode=episode.name,
+                                kept_ranges=alignment["ranges"],
+                                max_gap_s=processing.hoi_max_joint_gap_s,
+                            )
+                        )
+                        root.attrs["hoi_alignment"] = records
+                    if "object_pointcloud" in fields:
+                        saved = reader.data_file["hoi/template"]
+                        template = {
+                            "points_local": saved["points_local"][:],
+                            "offsets": saved["offsets"][:],
+                            "object_names": saved["object_names"].asstr()[:],
+                        }
+                        if index == 0:
+                            task_template = template
+                        elif any(
+                            not np.array_equal(template[key], task_template[key])
+                            for key in template
+                        ):
+                            raise ValueError("HOI templates differ between episodes")
                     append_rows(arrays, offset, blocks, frames)
                     ends.extend(offset + int(start) for start in starts[1:])
                     ends.append(offset + frames)

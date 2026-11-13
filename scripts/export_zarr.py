@@ -24,7 +24,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Export selected fields from published Raw episodes of one task to canonical Zarr. "
-            "Preserve recorded continuous segments as separate episodes without resampling. "
+            "Preserve continuous segments as separate episodes. HOI joint observations are aligned "
+            "to camera timestamps, with unalignable segment boundaries trimmed. "
             "Reject missing/nonfinite selected data and publish only after all episodes succeed."
         )
     )
@@ -49,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help="Trusted Python experiment file exporting CONFIG: RealConfig; execution.hoi_max_skew_s optionally limits joint HOI source skew (default None/off)",
+        help="Trusted Python experiment file exporting CONFIG: RealConfig; execution.hoi_max_joint_gap_s bounds joint interpolation intervals (default 0.10 s)",
     )
     parser.add_argument(
         "--fields", nargs="+", choices=tuple(FIELD_INPUTS),
@@ -87,7 +88,7 @@ def load_processing_config(path: Path | None, fields) -> ExportConfig:
         pointcloud=runtime.pointcloud,
         hand_pointcloud=runtime.hand_pointcloud,
         table_plane_abcd=plane,
-        hoi_max_skew_s=runtime.execution.hoi_max_skew_s,
+        hoi_max_joint_gap_s=runtime.execution.hoi_max_joint_gap_s,
     )
 
 

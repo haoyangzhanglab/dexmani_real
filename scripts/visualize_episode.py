@@ -74,6 +74,7 @@ class EpisodeVisualizer:
         *,
         table_plane_path: str | Path | None,
         max_frames: int | None = None,
+        hoi_max_joint_gap_s: float = 0.10,
         pointcloud_config: PointCloudConfig | None = None,
         hand_pointcloud_config: HandCloudConfig = HandCloudConfig(),  # noqa: B008 — 不可变配置可共享。
     ):
@@ -133,6 +134,14 @@ class EpisodeVisualizer:
             self.arm_fk = ArmFK()
             self.hand_fk = HandFK()
             self.hand_cloud = HandPointCloud(self.hand_fk, hand_pointcloud_config.num_points)
+            self.hoi_alignment = None
+            if self.has_hoi:
+                from dexmani_real.data.hoi import align_hoi_episode
+
+                self.hoi_alignment = align_hoi_episode(self.reader, hoi_max_joint_gap_s)
+                logger.info(
+                    "HOI 对齐保留区间：%s；边界帧不显示插值手几何", self.hoi_alignment["ranges"]
+                )
             self.state = self.preload_state()
 
             app_id = f"DexMani - {episode_name}"
@@ -211,6 +220,10 @@ class EpisodeVisualizer:
     def log_hand_geometry(self, step_idx: int) -> None:
         arm = self.state["arm_qpos"][step_idx]
         hand = self.state["hand_qpos"][step_idx]
+        if self.hoi_alignment is not None:
+            arm = self.hoi_alignment["arm_qpos"][step_idx]
+            hand = self.hoi_alignment["hand_qpos"][step_idx]
+            self.log_hoi_diagnostics(step_idx)
         pose = self.arm_fk.forward(arm) if np.isfinite(arm).all() else None
         fingertips, cloud = None, None
         if pose is not None and np.isfinite(hand).all():
@@ -230,6 +243,17 @@ class EpisodeVisualizer:
             "eef", pose[None, :3, 3] if pose is not None else None,
             colors=[EEF_COLOR], radii=0.020,
         )
+
+    def log_hoi_diagnostics(self, step_idx: int) -> None:
+        available = int(self.hoi_alignment["keep"][step_idx])
+        self.rr.log("hoi/alignment_available", self.rr.Scalar(available))
+        timing = self.reader["timing/rows"][step_idx]
+        for device in ("arm", "hand"):
+            offset_ms = (int(timing[f"{device}_ns"]) - int(timing["camera_ns"])) / 1e6
+            self.rr.log(f"hoi/{device}_source_offset_ms", self.rr.Scalar(offset_ms))
+        for name, values in self.reader.data_file["hoi/quality"].items():
+            for index, value in enumerate(values[step_idx]):
+                self.rr.log(f"hoi/object_{index}/{name}", self.rr.Scalar(float(value)))
 
     def log_camera(self, step_idx: int, rgb: np.ndarray) -> np.ndarray:
         color = self.camera_model.color
@@ -337,6 +361,7 @@ def main(argv: list[str] | None = None) -> int:
         max_frames=args.max_frames,
         pointcloud_config=pointcloud_config,
         hand_pointcloud_config=runtime.hand_pointcloud,
+        hoi_max_joint_gap_s=runtime.execution.hoi_max_joint_gap_s,
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.frame_count)

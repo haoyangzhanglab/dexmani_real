@@ -113,3 +113,146 @@ def test_invalid_tasks_leave_no_output(
         export_zarr(source, output, processing=ExportConfig(), fields=("joint_state",))
     assert not output.exists()
     assert not list(tmp_path.glob(".invalid.zarr.tmp-*"))
+
+
+@pytest.fixture
+def hoi_episodes(raw_episodes):
+    from dexmani_real.data.hoi import write_hoi
+
+    source, states, actions = raw_episodes
+    template = dict(
+        points_local=np.zeros((1024, 3), np.float32),
+        offsets=np.array([0, 1024]),
+        object_names=np.array(["object"]),
+    )
+    for episode in sorted(source.iterdir()):
+        with h5py.File(episode / "data.h5", "r+") as f:
+            count = len(f["timing/rows"])
+        write_hoi(
+            episode / "data.h5",
+            template,
+            np.tile(np.eye(4), (count, 1, 1, 1)),
+            np.eye(4),
+            quality=[[{"iou": 1.0}]] * count,
+            tracking_config={},
+        )
+    return source, states, actions
+
+
+def test_hoi_export_trims_all_fields_and_preserves_segments(tmp_path, hoi_episodes):
+    source, states, actions = hoi_episodes
+    for episode in source.iterdir():
+        with h5py.File(episode / "data.h5", "r+") as f:
+            rows = f["timing/rows"][:]
+            rows["camera_ns"] -= 10_000_000
+            f["timing/rows"][:] = rows
+    output = tmp_path / "aligned.zarr"
+    export_zarr(
+        source,
+        output,
+        processing=ExportConfig(),
+        fields=("joint_state", "action", "object_pointcloud"),
+    )
+    root = zarr.open_group(str(output), mode="r")
+    np.testing.assert_array_equal(root["meta/episode_ends"][:], [1, 2, 4])
+    kept = np.array([1, 3, 5, 6])
+    np.testing.assert_allclose(root["data/action"][:], actions[kept], atol=1e-6)
+    np.testing.assert_allclose(
+        root["data/joint_state"][:], 0.2 * states[kept - 1] + 0.8 * states[kept], atol=1e-6
+    )
+    assert root.attrs["hoi_alignment"][0]["kept_ranges"] == [[1, 2], [3, 4]]
+    root.store.close()
+
+
+def test_hoi_eef_export_does_not_require_hand_history(tmp_path, hoi_episodes):
+    source, states, _ = hoi_episodes
+    for episode in source.iterdir():
+        with h5py.File(episode / "data.h5", "r+") as data:
+            del data["hand_qpos"]
+            del data["meta"].attrs["hand_joint_names"]
+            rows = data["timing/rows"][:]
+            rows["hand_ns"] = 0
+            data["timing/rows"][:] = rows
+    output = tmp_path / "arm_only.zarr"
+    export_zarr(source, output, processing=ExportConfig(), fields=("eef_pose", "object_pointcloud"))
+    root = zarr.open_group(str(output), mode="r")
+    expected = encode_eef_pose(eef_poses(states[:, :7], arm_fk=ArmFK()))
+    np.testing.assert_allclose(root["data/eef_pose"][:], expected, atol=1e-6)
+    root.store.close()
+
+
+@pytest.mark.parametrize("key", ["points_local", "offsets", "object_names"])
+def test_hoi_export_rejects_different_templates(tmp_path, hoi_episodes, key):
+    source, _, _ = hoi_episodes
+    with h5py.File(source / "episode_1" / "data.h5", "r+") as data:
+        array = data[f"hoi/template/{key}"]
+        array[0] = "another_object" if key == "object_names" else 1
+    output = tmp_path / "different_templates.zarr"
+    with pytest.raises(ValueError, match="HOI templates differ"):
+        export_zarr(source, output, processing=ExportConfig(), fields=("object_pointcloud",))
+    assert not output.exists()
+    assert not list(tmp_path.glob(".different_templates.zarr.tmp-*"))
+
+
+def test_hoi_trim_precedes_fk_and_keeps_images_in_step(tmp_path, hoi_episodes, monkeypatch):
+    from dexmani_real.data.raw import RawReader
+
+    source, states, actions = hoi_episodes
+    for episode in source.iterdir():
+        (episode / "rgb.mp4").touch()
+        with h5py.File(episode / "data.h5", "r+") as data:
+            data["meta"].attrs.update(camera_color_width=2, camera_color_height=2)
+            rows = data["timing/rows"][:]
+            rows["camera_ns"] -= 10_000_000
+            data["timing/rows"][:] = rows
+            # 裁掉的首帧仍提供插值历史，但其动作不应送入 FK。
+            for index in data["timing/segment_starts"][:]:
+                data["action_arm_joint_target"][index] = np.nan
+
+    def images(reader):
+        for index in range(reader.num_frames):
+            yield np.full((2, 2, 3), index, np.uint8)
+
+    forward = ArmFK.forward
+
+    def checked_forward(self, joints):
+        assert np.isfinite(joints).all()
+        return forward(self, joints)
+
+    monkeypatch.setattr(RawReader, "iter_rgb_frames", images)
+    monkeypatch.setattr(ArmFK, "forward", checked_forward)
+    monkeypatch.setattr("dexmani_real.data.export.MAX_BATCH_FRAMES", 1)
+    output = tmp_path / "trimmed_images.zarr"
+    export_zarr(
+        source,
+        output,
+        processing=ExportConfig(),
+        fields=("eef_pose", "action_ee", "rgb", "object_pointcloud"),
+    )
+    root = zarr.open_group(str(output), mode="r")
+    kept = np.array([1, 3, 5, 6])
+    expected_joints = 0.2 * states[kept - 1, :7] + 0.8 * states[kept, :7]
+    expected_poses = encode_eef_pose(eef_poses(expected_joints, arm_fk=ArmFK()))
+    expected_actions = np.concatenate(
+        (encode_eef_pose(eef_poses(actions[kept, :7], arm_fk=ArmFK())), actions[kept, 7:]), axis=1
+    )
+    np.testing.assert_allclose(root["data/eef_pose"][:], expected_poses, atol=1e-6)
+    np.testing.assert_allclose(root["data/action_ee"][:], expected_actions, atol=1e-6)
+    np.testing.assert_array_equal(root["data/rgb"][:, 0, 0, 0], [1, 3, 1, 2])
+    np.testing.assert_array_equal(root["meta/episode_ends"][:], [1, 2, 4])
+    root.store.close()
+
+
+def test_hoi_internal_gap_is_not_trimmed(raw_episodes):
+    from dexmani_real.data.hoi import align_hoi_episode
+    from dexmani_real.data.raw import RawReader
+
+    source, _, _ = raw_episodes
+    episode = source / "episode_1"
+    with h5py.File(episode / "data.h5", "r+") as f:
+        rows = f["timing/rows"][:]
+        rows["camera_ns"][1] -= 10_000_000
+        f["timing/rows"][:] = rows
+    with RawReader(episode) as reader:
+        with pytest.raises(ValueError, match="internal joint gap"):
+            align_hoi_episode(reader, 0.01)

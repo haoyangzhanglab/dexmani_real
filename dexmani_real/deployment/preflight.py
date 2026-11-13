@@ -20,10 +20,14 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
         raise NotImplementedError("Policy does not support RTC")
 
     if "object_pointcloud" in info.observation_fields and set(info.observation_fields) & {
-        "hand_pointcloud", "joint_state", "fingertip_xyz"
+        "hand_pointcloud",
+        "joint_state",
+        "fingertip_xyz",
+        "eef_pose",
     }:
-        from dexmani_real.utils.timing import validate_hoi_skew_budget
-        validate_hoi_skew_budget(execution.hoi_max_skew_s)
+        from dexmani_real.utils.timing import validate_joint_gap
+
+        validate_joint_gap(execution.hoi_max_joint_gap_s)
     if "object_pointcloud" in info.observation_fields:
         age = execution.hoi_max_age_s
         if type(age) not in (int, float) or not math.isfinite(age) or age <= 0:

@@ -48,11 +48,12 @@ tracker = SceneTracker(
     workspace=".",
 )
 frame = RGBDFrame.from_camera(camera, camera_row)
-poses = tracker.initialize(frame, {"apple": "apple"})
-poses = tracker.track(next_frame)
+result = tracker.initialize(frame, {"apple": "apple"})
+poses, quality = result.poses, result.quality
+result = tracker.track(next_frame)
 ```
 
-位姿表示物体局部坐标到相机坐标的变换，平移单位为米。
+`initialize()` 和 `track()` 均返回 `SceneResult(poses, quality)`，两份字典均以对象名为键。位姿表示物体局部坐标到相机坐标的变换，平移单位为米。
 
 - 每段调用 `initialize()`，复用模型并重置位姿、视频状态及场景缓存。
 - 同一段内相机参数和图像尺寸须保持固定。
@@ -69,13 +70,28 @@ poses = tracker.track(next_frame)
 
 `reconstruction.load_shape_model()` 加载可复用的 Hunyuan3D 模型；`reconstruct_mesh(model, rgba, ...)` 清理退化面并返回简化网格；`scale_mesh()` 返回保留原点和朝向的缩放副本，由调用方保存。
 
+## 质量检查
+
+`TrackingConfig` 集中定义质量阈值，通过 `SceneTracker(..., config=...)` 传入：
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `depth_tolerance_m` | 0.015 m | 实测与模型深度的匹配容差 |
+| `min_depth_pixels` | 30 | stride=2 网格上的最少深度支持像素 |
+| `min_depth_fraction` | 0.5 | mask 内有效深度的最低匹配比例 |
+| `min_precision`、`min_recall` | 0.5 | 可见轮廓的最低 precision、recall |
+
+每帧渲染完整模型投影。只有 mask 外的有效实测深度比模型近、且差值超过深度容差时，才将对应投影视为前景遮挡；缺失深度不作为遮挡证据。`quality` 同时返回轮廓 IoU、深度误差中位数及遮挡比例等诊断值。
+
+阈值是工程初值，需用实际 RGB-D 回放验证。分割深度不足或质量检查失败均抛出 `TrackingFailure`；相机参数变化属于输入错误，直接报错。
+
 ## 推理实现
 
 `SceneTracker` 在构造时加载 Grounding DINO 并预热固定尺寸网络。每段首帧先对 RGB-D 去畸变，再检测目标并用框初始化 SAM2，所有物体共享一次图像编码。每个描述须匹配唯一候选；缺失或多个匹配均终止初始化。首帧与后续帧均由 SAM2 按最高 mask 分数分配重叠像素。
 
 SAM2 流式前处理使用 1024 输入和 LANCZOS 缩放，上传 uint8 图像后查表获得 float32 输入，保持 float64 归一化后转 float32 的数值结果。[SAM2 补丁](scripts/sam2_inference.patch) 保留多尺度图像特征，仅计算 memory attention 所需的最终层位置编码。
 
-FoundationPose 后续帧复用图像缓冲、相机投影矩阵及采样网格常量，共享深度预处理。位姿保留在 GPU，以掩码中心射线更新 XY；各物体独立渲染，观测裁剪与归一化合批执行。两轮 refinement 后，逐物体检查分割与模型的深度一致性。
+FoundationPose 后续帧复用图像缓冲、相机投影矩阵及采样网格常量，共享深度预处理。位姿保留在 GPU，从上一帧位姿开始更新；各物体独立渲染，观测裁剪与归一化合批执行。两轮 refinement 后，逐物体渲染完整投影，检查遮挡感知的双向轮廓与实测深度一致性。
 
 RGB 与几何输入共用采样网格：refine 直接裁剪 XYZ，score 从裁剪深度重建 XYZ。跟踪使用 PyTorch 原生 CUDA 卷积；注册和跟踪的 cuDNN 设置仅在调用内生效。批量大小会影响浮点结果，近对称物体的旋转可能不稳定。
 
@@ -89,7 +105,9 @@ Hunyuan3D 重建使用分层体积解码、完整 attention 和 Marching Cubes�
 | --- | --- |
 | `camera.py`、`mesh.py` | 相机去畸变、网格处理与射线深度 |
 | `segmentation.py`、`reconstruction.py`、`foundationpose.py` | 模型加载与推理 |
-| `tracking.py` | 多物体跟踪与深度一致性检查 |
+| `tracking.py` | 多物体跟踪与轮廓/深度质量检查 |
 | `cli.py`、`visualization.py`、`weights.py` | 命令行、结果预览与模型下载 |
+
+表面模板采样由主项目 `geometry/hoi.py` 负责，后端不依赖主项目或 fpsample。
 
 任务流程见 [实验入口](../../scripts/cordvip/README.md)，主项目表示见 [物体重建与 HOI](../../docs/object_reconstruction.md)。

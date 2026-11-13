@@ -1,4 +1,4 @@
-"""按表面积配额直接采样并冻结任务级 1024 点模板。"""
+"""按表面积分配配额，用 FPS 生成固定的任务级 1024 点模板。"""
 
 import argparse
 import sys
@@ -9,9 +9,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 
-from cordvip_geometry.mesh import load_mesh, sample_mesh_surface
-
-from dexmani_real.geometry.hoi import load_task_template, task_objects
+from cordvip_geometry.mesh import load_mesh
+from dexmani_real.geometry.hoi import (
+    load_task_template,
+    sample_surface_points,
+    task_objects,
+)
 
 
 def allocate_counts(areas):
@@ -44,8 +47,7 @@ def sample_template(task):
     meshes = [load_mesh(task / name / "mesh/mesh_m.obj") for name in names]
     counts = allocate_counts([mesh.area for mesh in meshes])
     points = [
-        sample_mesh_surface(mesh, int(count), seed=0)
-        for mesh, count in zip(meshes, counts)
+        sample_surface_points(mesh, int(count), seed=0) for mesh, count in zip(meshes, counts)
     ]
     output.mkdir(parents=True, exist_ok=True)
     np.savez(

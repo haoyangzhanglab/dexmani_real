@@ -12,9 +12,9 @@ import trimesh
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "third_party/cordvip_geometry/src")]
 from cordvip_geometry.camera import RGBDFrame, RGBDRectifier, camera_rays
-from cordvip_geometry.mesh import MeshRaycaster, sample_mesh_surface, scale_mesh
-from cordvip_geometry.tracking import TrackingFailure
-
+from cordvip_geometry.mesh import MeshRaycaster, scale_mesh
+from dexmani_real.geometry.hoi import sample_mesh_surface
+from cordvip_geometry.tracking import TrackingFailure, SceneResult, TrackingConfig
 
 def script(name):
     spec = importlib.util.spec_from_file_location(
@@ -141,19 +141,20 @@ def test_duplicate_camera_frame_and_tracking_failure():
         def initialize(self, frame, prompts):
             assert isinstance(frame, RGBDFrame)
             self.count += 1
-            return {"apple": np.eye(4)}
+            return SceneResult({"apple": np.eye(4)}, {"apple": {"iou": 1.0}})
 
         def track(self, frame):
             self.count += 1
             pose = np.eye(4)
             pose[0, 3] = 1
-            return {"apple": pose}
+            return SceneResult({"apple": pose}, {"apple": {"iou": 1.0}})
 
     tracker = Tracker()
-    poses, _ = module.track_episode(
+    poses, _, quality = module.track_episode(
         FakeRawReader(), tracker, ["apple"], {"apple": "apple"}
     )
     assert tracker.count == 2
+    assert quality[0] == quality[1]
     np.testing.assert_array_equal(poses[0], poses[1])
     assert poses[2, 0, 0, 3] == 1
 
@@ -234,7 +235,9 @@ def test_template_and_raw_roundtrip(tmp_path):
     poses = np.tile(np.eye(4), (129, 1, 1, 1))
     poses[1, 0, 0, 3] = 1
     poses[128, 0, 1, 3] = 2
-    write_hoi(path, template, poses, np.eye(4))
+    write_hoi(
+        path, template, poses, np.eye(4), quality=[[{"iou": 1.0}]] * len(poses), tracking_config={}
+    )
     with h5py.File(path, "r") as data:
         assert "_hoi_staging" not in data
         points = data["hoi/object_pointcloud"][:]
@@ -287,6 +290,8 @@ def test_scene_batch_keeps_per_object_depth_gate(monkeypatch):
     scene.directions = camera_rays(shape, np.eye(3), tracking.PIXEL_STRIDE)
     scene.segmenter = SimpleNamespace(track=lambda rgb: {"apple": mask, "banana": mask})
     scene.trackers = {"apple": object(), "banana": object()}
+    scene.config = TrackingConfig()
+    scene.frame_signature = (shape, np.eye(3), "none", np.zeros(5))
     scene.frame_cache = {}
     scene.renderers = {
         "apple": SimpleNamespace(render=lambda rays, pose: np.ones(len(rays))),
@@ -294,7 +299,7 @@ def test_scene_batch_keeps_per_object_depth_gate(monkeypatch):
     }
     calls = []
 
-    def batch(trackers, rgb, depth, K, masks, frame_cache):
+    def batch(trackers, rgb, depth, K, frame_cache):
         assert frame_cache is scene.frame_cache
         calls.append(list(trackers))
         return {name: np.eye(4) for name in trackers}
@@ -432,15 +437,15 @@ def test_offline_uses_template_order(monkeypatch, tmp_path):
 
     def tracker(paths, **kwargs):
         assert list(paths) == ["banana", "apple"]
-        return object()
+        return SimpleNamespace(config=TrackingConfig())
 
     def track(reader, tracker, names, prompts):
         assert list(names) == list(prompts) == ["banana", "apple"]
-        return np.zeros((3, 2, 4, 4)), np.eye(4)
+        return np.zeros((3, 2, 4, 4)), np.eye(4), []
 
     monkeypatch.setattr(module, "SceneTracker", tracker)
     monkeypatch.setattr(module, "track_episode", track)
-    monkeypatch.setattr(module, "write_hoi", lambda *args: None)
+    monkeypatch.setattr(module, "write_hoi", lambda *args, **kwargs: None)
     module.annotate_episodes([tmp_path / "episode"], str(tmp_path))
 
 
@@ -648,6 +653,7 @@ def test_scene_initialization_rectifies_before_detection_and_resets_state():
     boxes = {"fruit": np.array([0, 0, 16, 32]), "dish": np.array([16, 0, 32, 32])}
     masks = {"fruit": np.indices(shape)[1] < 16, "dish": np.indices(shape)[1] >= 16}
     scene = SceneTracker.__new__(SceneTracker)
+    scene.config = TrackingConfig()
     scene.trackers = {
         name: SimpleNamespace(estimator=SimpleNamespace(pose_last=np.eye(4)))
         for name in boxes
@@ -695,7 +701,7 @@ def test_scene_initialization_rectifies_before_detection_and_resets_state():
         scene.frame_cache = {"K": K, "rgb": rgb}
         frame = RGBDFrame(rgb, depth, K, "brown_conrady", distortion)
         result = scene.initialize(frame, {"fruit": " Apple. ", "dish": "bowl"})
-        assert list(result) == ["fruit", "dish"]
+        assert list(result.poses) == ["fruit", "dish"]
         assert received[-2] is masks["fruit"] and received[-1] is masks["dish"]
     assert scene.rectifier.maps is None
 
@@ -705,6 +711,7 @@ def test_scene_rejects_missing_or_ambiguous_detection(count):
     from cordvip_geometry.tracking import SceneTracker
 
     scene = SceneTracker.__new__(SceneTracker)
+    scene.config = TrackingConfig()
     scene.trackers = {
         "fruit": SimpleNamespace(estimator=SimpleNamespace(pose_last=None))
     }
@@ -716,3 +723,76 @@ def test_scene_rejects_missing_or_ambiguous_detection(count):
         TrackingFailure, match=f"fruit: expected one first-frame detection, got {count}"
     ):
         scene.initialize(frame, {"fruit": "apple"})
+
+
+def test_pose_quality_requires_two_sided_evidence():
+    from cordvip_geometry.tracking import pose_quality
+
+    config = TrackingConfig()
+    target = np.zeros((40, 40), bool)
+    target[10:30, 10:30] = True
+    rendered = target.astype(float)
+    observed = np.where(target, 1.0, 2.0)
+    assert pose_quality(target, observed, rendered, config)[1]
+    # mask 内完全匹配仍不能接受轮廓过大的模型。
+    assert not pose_quality(target, observed, np.ones_like(rendered), config)[1]
+    visible = target.copy()
+    visible[:, 20:] = False
+    occluded_depth = observed.copy()
+    occluded_depth[target & ~visible] = 0.8
+    metrics, valid = pose_quality(visible, occluded_depth, rendered, config)
+    assert valid and metrics["occluded_fraction"] == 0.5
+    occluded_depth[target & ~visible] = 0
+    # 缺失深度不能被计为遮挡。
+    assert pose_quality(visible, occluded_depth, rendered, config)[0]["occluded_fraction"] == 0
+    assert not pose_quality(target, observed, rendered * 1.1, config)[1]
+
+
+def test_joint_interpolation_boundaries_and_conflicts():
+    from dexmani_real.utils.timing import interpolate_joints
+
+    stamps = np.array([100, 150, 150, 200]) * 1_000_000
+    q = np.array([[0.0], [1.0], [1.0], [2.0]])
+    target = np.array([90, 100, 125, 200, 210]) * 1_000_000
+    values, valid = interpolate_joints(stamps, q, target, 0.1)
+    np.testing.assert_array_equal(valid, [False, True, True, True, False])
+    np.testing.assert_allclose(values[valid, 0], [0, 0.5, 2])
+    assert not interpolate_joints(stamps, q, [125_000_000], 0.01)[1][0]
+    q[2] = 3
+    with pytest.raises(ValueError, match="Conflicting"):
+        interpolate_joints(stamps, q, target, 0.1)
+
+
+def test_fps_surface_is_fixed_and_improves_coverage():
+    from dexmani_real.geometry.hoi import sample_surface_points
+    from scipy.spatial import cKDTree
+
+    mesh = trimesh.creation.box(extents=(0.1, 0.1, 0.1))
+    points = sample_surface_points(mesh, 256)
+    np.testing.assert_array_equal(points, sample_surface_points(mesh, 256))
+    np.testing.assert_allclose(np.max(np.abs(points), axis=1), 0.05)
+    reference = sample_mesh_surface(mesh, 20000, seed=19)
+    old = cKDTree(sample_mesh_surface(mesh, 256)).query(reference)[0]
+    new = cKDTree(points).query(reference)[0]
+    assert np.percentile(new, 95) < 0.8 * np.percentile(old, 95)
+
+
+@pytest.mark.parametrize("devices", [("arm",), ("arm", "hand")])
+def test_live_joint_history_matches_offline_interpolation(devices):
+    from collections import deque
+    from dexmani_real.robot.system import Robot
+
+    robot = Robot.__new__(Robot)
+    robot.enable_joint_history(0.35, devices=devices)
+    for name in devices:
+        n = 7 if name == "arm" else 12
+        robot.joint_history[name] = deque(
+            [(1_000_000_000, np.zeros(n)), (1_080_000_000, np.ones(n))]
+        )
+    aligned = robot.aligned_joints(1_020_000_000, 0.1)
+    assert set(aligned) == {name + "_qpos" for name in devices}
+    for positions in aligned.values():
+        np.testing.assert_allclose(positions, 0.25)
+    assert robot.aligned_joints(1_090_000_000, 0.1) is None
+    robot.enable_joint_history(0.35, devices=devices)
+    assert robot.aligned_joints(1_020_000_000, 0.1) is None

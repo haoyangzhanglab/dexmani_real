@@ -38,7 +38,11 @@ class ObservationBuilder:
         )
         self.needs = ObservationNeeds(
             hoi="hoi" in self.dependencies,
-            hoi_joint_input={"hoi", "hand"} <= self.dependencies,
+            hoi_joint_devices=tuple(
+                name
+                for name in ("arm", "hand")
+                if "hoi" in self.dependencies and name in self.dependencies
+            ),
             camera_fields=("rgb",) if "rgb" in self.dependencies else (),
             point_cloud="cloud" in self.dependencies,
             required_tactile=tuple(c for c in ("aggregate", "dense") if c in self.dependencies),
@@ -55,10 +59,15 @@ class ObservationBuilder:
     def project(self, row):
         fields, dependencies = self.fields, self.dependencies
         values = {}
-        if "arm" in dependencies:
-            values["arm_qpos"] = row.arm["qpos"][0].copy()
-        if "hand" in dependencies:
-            values["hand_qpos"] = row.hand["qpos"][0].copy()
+        for device in ("arm", "hand"):
+            if device in dependencies:
+                name = f"{device}_qpos"
+                qpos = (
+                    row.aligned_joints[name]
+                    if self.needs.hoi_joint_devices
+                    else getattr(row, device)["qpos"][0]
+                )
+                values[name] = qpos.copy()
         # 大数组已由 ring 独立复制；交给录制和模型历史后，快照数组只读。
         for name in fields:
             if name == "finger_tactile_force":

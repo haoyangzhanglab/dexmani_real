@@ -2,6 +2,7 @@
 
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -22,7 +23,7 @@ from dexmani_real.robot.model import (
 )
 from dexmani_real.robot.xhand.feedback import XHandFeedback
 from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S
-from dexmani_real.utils.timing import next_tick_ns, sample_is_fresh
+from dexmani_real.utils.timing import interpolate_joints, next_tick_ns, sample_is_fresh
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,29 @@ class Robot:
         self.hand_stop_required = False
         self.hand_feedback = XHandFeedback()
         self.feedback_next_ns = 0
+        self.joint_history: dict[str, deque[tuple[int, np.ndarray]]] = {}
+        self.joint_history_ns = 0
         self.home_collision_model = None  # 配置在会话内固定；仅 HOME 按需构造。
+
+    def enable_joint_history(self, duration_s, *, devices):
+        """每段重新建立历史，保留点云来源时间附近的反馈。"""
+        self.joint_history = {name: deque() for name in devices}
+        self.joint_history_ns = int(duration_s * 1e9)
+
+    def aligned_joints(self, timestamp_ns, max_gap_s):
+        """仅提供模型输入，不改变真实反馈及其来源时间。"""
+        if not self.joint_history:
+            return None
+        result = {}
+        for name, history in self.joint_history.items():
+            if not history:
+                return None
+            stamps, positions = zip(*history)
+            q, valid = interpolate_joints(stamps, positions, [timestamp_ns], max_gap_s)
+            if not valid[0]:
+                return None
+            result[name + "_qpos"] = q[0]
+        return result
 
     def check(self) -> None:
         if self.arm is not None:
@@ -153,6 +176,18 @@ class Robot:
             sampled = now >= self.feedback_next_ns
             if sampled:
                 self.read_hand()
+                if self.joint_history:
+                    state = self.read_state()
+                    for name, history in self.joint_history.items():
+                        frame = getattr(state, name)
+                        if frame is None:
+                            continue
+                        stamp = int(frame["timestamp_ns"][0])
+                        if not history or stamp != history[-1][0]:
+                            history.append((stamp, frame["qpos"][0].copy()))
+                        # 留下窗口左侧的一个样本，供边界时刻插值。
+                        while len(history) > 2 and history[1][0] < stamp - self.joint_history_ns:
+                            history.popleft()
                 self.feedback_next_ns = next_tick_ns(
                     self.feedback_next_ns or now, FEEDBACK_PERIOD_NS, time.monotonic_ns(),
                 )

@@ -1,4 +1,4 @@
-"""共享模型权重、由分割掩码引导的 FoundationPose 位姿跟踪。"""
+"""共享模型权重的 FoundationPose 注册与位姿 refinement。"""
 
 import importlib
 import sys
@@ -102,7 +102,7 @@ class FoundationPoseTracker:
         return pose
 
 
-def track_objects(trackers, rgb, depth_m, intrinsics, masks, frame_cache):
+def track_objects(trackers, rgb, depth_m, intrinsics, frame_cache):
     """各物体独立渲染，观测裁剪及两轮 refinement 合批执行。"""
     import torch
     from learning.training.predict_pose_refine import (
@@ -122,22 +122,9 @@ def track_objects(trackers, rgb, depth_m, intrinsics, masks, frame_cache):
         raise TrackingFailure(
             f"{name}: Previous centered pose must be in front of the camera"
         )
-    rays = []
-    for name in names:
-        rows, cols = np.nonzero(masks[name])
-        center = [
-            (cols.min() + cols.max()) / 2.0,
-            (rows.min() + rows.max()) / 2.0,
-            1.0,
-        ]
-        rays.append(np.linalg.solve(intrinsics, center))
-
     with torch.inference_mode():
-        # 使用 float64 引导 XY，赋值时才舍入到 float32，保持与 NumPy 计算一致。
+        # 遮挡改变可见 mask 中心，不能将其当作刚体中心。
         poses = previous.clone()
-        directions = torch.as_tensor(np.stack(rays), device="cuda")
-        scale = poses[:, 2, 3].double() / directions[:, 2]
-        poses[:, :2, 3] = (directions * scale[:, None])[:, :2]
         rgb_tensor, xyz_map = prepare_tracking_frame(
             rgb, depth_m, intrinsics, refiner.cfg.input_resize, frame_cache
         )

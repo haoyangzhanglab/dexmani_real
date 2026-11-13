@@ -1,4 +1,4 @@
-"""任务配置、固定模板与物体点云变换。"""
+"""HOI 任务资产、固定表面采样与坐标变换。"""
 
 import json
 import unicodedata
@@ -44,9 +44,7 @@ def task_objects(task):
 def load_task_template(task):
     task = Path(task)
     with np.load(task / "hoi/template.npz", allow_pickle=False) as saved:
-        template = {
-            key: saved[key] for key in ("points_local", "offsets", "object_names")
-        }
+        template = {key: saved[key] for key in ("points_local", "offsets", "object_names")}
     names = template["object_names"]
     if (
         names.ndim != 1
@@ -91,3 +89,36 @@ def transform_task_points(template, poses_camera, base_from_camera):
     if not np.isfinite(points).all():
         raise ValueError("HOI 变换产生非有限坐标")
     return points
+
+
+def sample_mesh_surface(mesh, num_points=1024, seed=0):
+    """按面积采样固定表面 XYZ。"""
+    areas = mesh.area_faces
+    total = areas.sum()
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("Mesh has no finite, nonzero surface area")
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(len(mesh.faces), num_points, p=areas / total)
+    triangles = mesh.vertices[mesh.faces[indices]]
+    # sqrt(u) 保证三角面内均匀采样。
+    uv = rng.random((num_points, 2))
+    root_u = np.sqrt(uv[:, 0])
+    weights = np.column_stack((1 - root_u, root_u * (1 - uv[:, 1]), root_u * uv[:, 1]))
+    points = np.sum(triangles * weights[:, :, None], axis=1)
+    return points.astype(np.float32)
+
+
+def sample_surface_points(mesh, num_points, seed=0):
+    """固定面积候选与 FPS；只在生成新资产时调用。"""
+    from fpsample import bucket_fps_kdline_sampling
+
+    if type(num_points) is not int or num_points < 1:
+        raise ValueError("num_points must be a positive integer")
+    dense = sample_mesh_surface(mesh, 8 * num_points, seed)
+    ids = bucket_fps_kdline_sampling(
+        dense,
+        num_points,
+        h=min(5, len(dense).bit_length() - 1),
+        start_idx=0,
+    )
+    return dense[ids]

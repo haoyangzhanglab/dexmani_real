@@ -2,6 +2,14 @@
 
 from .camera import RGBDFrame
 from .mesh import load_mesh, scale_mesh
-from .tracking import SceneTracker, TrackingFailure
+from .tracking import SceneResult, SceneTracker, TrackingConfig, TrackingFailure
 
-__all__ = ["RGBDFrame", "SceneTracker", "TrackingFailure", "load_mesh", "scale_mesh"]
+__all__ = [
+    "RGBDFrame",
+    "SceneResult",
+    "SceneTracker",
+    "TrackingConfig",
+    "TrackingFailure",
+    "load_mesh",
+    "scale_mesh",
+]

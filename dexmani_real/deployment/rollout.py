@@ -75,6 +75,11 @@ class Rollout:
         self.policy_info = policy_info
         self.execution = runtime.execution
         self.robot, self.sensors = robot, sensors
+        if observations.needs.hoi_joint_devices:
+            robot.enable_joint_history(
+                self.execution.hoi_max_age_s + self.execution.hoi_max_joint_gap_s,
+                devices=observations.needs.hoi_joint_devices,
+            )
         self.observations = observations
         self.read_needs = read_needs
         self.record_needs = record_needs
@@ -211,7 +216,12 @@ class Rollout:
 
     def read_observations(self) -> tuple[Observation, Observation]:
         """共享关节采样；派生模型图像同源，Raw 独立取最新相机帧。"""
-        row = read_observation(self.sensors.channels, self.robot, needs=self.read_needs)
+        row = read_observation(
+            self.sensors.channels,
+            self.robot,
+            needs=self.read_needs,
+            joint_gap_s=self.execution.hoi_max_joint_gap_s,
+        )
         raw = row
         if self.record_raw and (self.observations.needs.hoi or self.observations.needs.point_cloud):
             camera = read_camera_frame(self.sensors.channels, fields=self.record_needs.camera_fields)

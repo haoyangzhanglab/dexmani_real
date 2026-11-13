@@ -6,15 +6,16 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.ipc.sensors import read_camera_frame
-from dexmani_real.utils.timing import sample_is_fresh, hoi_sources_within_skew
+from dexmani_real.utils.timing import sample_is_fresh
 
 _HOI_METADATA_FIELDS = ("episode_id", "timestamp_ns", "source_camera_sequence", "valid")
+
 
 @dataclass(frozen=True)
 class ObservationNeeds:
     camera_fields: tuple[str, ...] = ()
     hoi: bool = False
-    hoi_joint_input: bool = False
+    hoi_joint_devices: tuple[str, ...] = ()
     point_cloud: bool = False
     vr: bool = False
     required_tactile: tuple[str, ...] = ()
@@ -26,15 +27,21 @@ class ObservationNeeds:
     def union(self, other):
         return ObservationNeeds(
             camera_fields=tuple(
-                name for name in ("rgb", "depth")
+                name
+                for name in ("rgb", "depth")
                 if name in self.camera_fields or name in other.camera_fields
             ),
             hoi=self.hoi or other.hoi,
-            hoi_joint_input=self.hoi_joint_input or other.hoi_joint_input,
+            hoi_joint_devices=tuple(
+                name
+                for name in ("arm", "hand")
+                if name in self.hoi_joint_devices or name in other.hoi_joint_devices
+            ),
             point_cloud=self.point_cloud or other.point_cloud,
             vr=self.vr or other.vr,
             required_tactile=tuple(
-                channel for channel in ("aggregate", "dense")
+                channel
+                for channel in ("aggregate", "dense")
                 if channel in self.required_tactile or channel in other.required_tactile
             ),
         )
@@ -57,9 +64,10 @@ class Observation:
     pointcloud_timestamp_ns: int = 0
     control_timestamp_ns: int = -1
     hoi: dict | None = None
+    aligned_joints: dict | None = None
 
 
-def read_observation(channels, robot, *, needs: ObservationNeeds) -> Observation:
+def read_observation(channels, robot, *, needs: ObservationNeeds, joint_gap_s=0.10) -> Observation:
     control_ns = time.monotonic_ns()
     state = robot.read_state()
     cloud_result = None
@@ -83,11 +91,19 @@ def read_observation(channels, robot, *, needs: ObservationNeeds) -> Observation
         else:
             camera = read_camera_frame(channels, fields=needs.camera_fields)
     vr_result = channels.vr_ring.read() if needs.vr else None
+    aligned_joints = None
+    if needs.hoi_joint_devices and hoi is not None:
+        aligned_joints = robot.aligned_joints(int(hoi["timestamp_ns"]), joint_gap_s)
     return Observation(
-        arm=state.arm, hand=state.hand, hoi=hoi,
-        camera=camera, vr=vr_result[0] if vr_result is not None else None,
+        arm=state.arm,
+        hand=state.hand,
+        hoi=hoi,
+        aligned_joints=aligned_joints,
+        camera=camera,
+        vr=vr_result[0] if vr_result is not None else None,
         point_cloud=cloud["point_cloud"] if cloud is not None else None,
-        observation_timestamp_ns=time.monotonic_ns(), control_timestamp_ns=control_ns,
+        observation_timestamp_ns=time.monotonic_ns(),
+        control_timestamp_ns=control_ns,
         pointcloud_timestamp_ns=int(cloud["timestamp_ns"]) if cloud is not None else 0,
     )
 
@@ -131,11 +147,8 @@ def check_observation(row, runtime, needs, *, now_ns=None):
                 issues.append("pointcloud_stale")
     if needs.hoi:
         issues.extend(_hoi_issues(row.hoi, runtime, now))
-        if needs.hoi_joint_input and row.hoi is not None and runtime.execution.hoi_max_skew_s is not None:
-            stamps = (int(row.hoi["timestamp_ns"]), int(row.arm["timestamp_ns"][0]),
-                      int(row.hand["timestamp_ns"][0]) if row.hand is not None else 0)
-            if not hoi_sources_within_skew(stamps, runtime.execution.hoi_max_skew_s):
-                issues.append("hoi_source_skew")
+        if needs.hoi_joint_devices and row.aligned_joints is None:
+            issues.append("hoi_joint_alignment_unavailable")
     if needs.vr:
         if row.vr is None:
             issues.append("vr_unavailable")
@@ -145,7 +158,6 @@ def check_observation(row, runtime, needs, *, now_ns=None):
             if not sample_is_fresh(stamp, age, now):
                 issues.append("vr_stale")
     return issues
-
 
 
 def _read_hoi(channels, *, fields=()):
