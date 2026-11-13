@@ -44,6 +44,8 @@ flowchart LR
 
 跟踪器检查分割与模型的深度一致性，部署端检查观测时效。跟踪失效或必需观测过期会结束当前段，下一段重新初始化。手部反馈与物体点云异步更新，组合观测采用近似时间对齐。
 
+查看已保存的点云和机器人状态使用 `scripts/visualize_episode.py`。
+
 任务命令见 [CordViP 实验入口](../scripts/cordvip/README.md)，后端安装见 [cordvip_geometry](../third_party/cordvip_geometry/README.md#安装与命令)，执行链路见[策略部署](policy_deployment.md)。
 
 返回[项目首页](../README.md)。

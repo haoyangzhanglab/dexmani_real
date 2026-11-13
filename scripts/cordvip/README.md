@@ -22,8 +22,10 @@ python scripts/cordvip/annotate_episodes.py --task pnp_apple_banana
 
 米制网格保留源物体原点和朝向。模板固定对象顺序、点分段和点序，在线与离线共用。已有模板直接复用；需要重新采样时先移除旧模板，实验期间保持网格和模板不变。
 
-标注支持 `--episode <episode目录>`，已有 HOI 的 Raw 会跳过。相同相机序列复用位姿；RGB 使用 4 个解码线程，物体点云按 128 帧分块变换、写入。在线与离线共用 `transform_task_points()`，输出为基座坐标系下的米制 float32 点云。
+## 离线标注
 
-跟踪时，每个 `prompt` 须在去畸变后的首帧匹配唯一候选；缺失或歧义会终止当前段。`instance` 仅用于参考图选择，不用于跟踪初始化。检测去重、SAM2 初始化和深度门控见后端说明。
+`annotate_episodes.py` 默认处理任务下所有已发布 Raw，也可用 `--episode <目录>` 指定单段。标注需要任务模板及 Raw 中的相机外参，跳过已有 HOI 的 Raw，整段成功后写入基座坐标系下的米制 float32 点云；相同相机序列复用位姿。
 
-检查结果使用 `scripts/visualize_episode.py`，训练数据使用 `scripts/export_zarr.py` 导出。后端安装与单物体操作见 [cordvip_geometry](../../third_party/cordvip_geometry/README.md)。
+每个 `prompt` 须在去畸变后的首帧匹配唯一候选，缺失或歧义会终止当前段。`instance` 仅用于参考图选择，不用于跟踪初始化。
+
+查看已保存的点云使用 `scripts/visualize_episode.py`，导出训练数据使用 `scripts/export_zarr.py`。安装、跟踪原理与单物体操作见 [cordvip_geometry](../../third_party/cordvip_geometry/README.md)。

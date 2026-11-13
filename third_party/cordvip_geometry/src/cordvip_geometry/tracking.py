@@ -72,7 +72,7 @@ class SceneTracker:
             ]
             if len(matches) != 1:
                 raise TrackingFailure(
-                    f"{name}: 首帧候选数 {len(matches)}，无法无歧义初始化"
+                    f"{name}: expected one first-frame detection, got {len(matches)}"
                 )
             boxes[name] = matches[0]["box_xyxy"]
 
@@ -95,7 +95,8 @@ class SceneTracker:
             depth_count = np.count_nonzero(mask & (depth_m >= 0.001))
             if sampled_count < MIN_MATCHED_PIXELS or depth_count < MIN_DEPTH_PIXELS:
                 raise TrackingFailure(
-                    f"{name}: insufficient segmented depth: {sampled_count} independent points, "
+                    f"{name}: insufficient segmented depth: "
+                    f"{sampled_count} independent points, "
                     f"{depth_count} FoundationPose pixels; requires "
                     f"{MIN_MATCHED_PIXELS} and {MIN_DEPTH_PIXELS}"
                 )

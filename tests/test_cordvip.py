@@ -165,17 +165,37 @@ def test_duplicate_camera_frame_and_tracking_failure():
         module.track_episode(FakeRawReader(), tracker, ["apple"], {"apple": "apple"})
 
 
-def test_failed_episode_never_writes(monkeypatch, tmp_path):
-    module = script("annotate_episodes")
+def test_offline_requires_camera_extrinsics(monkeypatch):
+    reader = FakeRawReader()
+    camera = reader.read_camera()
+    camera.T_xarm_base_from_color = None
+    monkeypatch.setattr(reader, "read_camera", lambda: camera)
 
-    monkeypatch.setattr(module, "RawReader", FakeRawReader)
+    with pytest.raises(ValueError, match="相机外参"):
+        script("annotate_episodes").track_episode(
+            reader, None, ["apple"], {"apple": "apple"}
+        )
+
+
+@pytest.mark.parametrize("has_hoi", [False, True])
+def test_existing_or_failed_episode_never_writes(monkeypatch, tmp_path, has_hoi):
+    module = script("annotate_episodes")
+    reader = FakeRawReader()
+    if has_hoi:
+        reader.data_file["hoi"] = object()
+
+    monkeypatch.setattr(module, "RawReader", lambda path: reader)
     monkeypatch.setattr(
         module, "load_task_template", lambda task: {"object_names": ["apple"]}
     )
     monkeypatch.setattr(
         module, "task_objects", lambda task: [{"name": "apple", "prompt": "apple"}]
     )
-    monkeypatch.setattr(module, "SceneTracker", lambda *args, **kwargs: None)
+
+    def load_tracker(*args, **kwargs):
+        assert not has_hoi, "existing HOI loaded tracking models"
+
+    monkeypatch.setattr(module, "SceneTracker", load_tracker)
 
     def fail(*args):
         raise TrackingFailure("lost")
@@ -183,7 +203,7 @@ def test_failed_episode_never_writes(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "track_episode", fail)
 
     def write(*args):
-        pytest.fail("failed episode wrote HOI")
+        pytest.fail("existing or failed episode wrote HOI")
 
     monkeypatch.setattr(module, "write_hoi", write)
     module.annotate_episodes([tmp_path / "episode"], tmp_path)
@@ -431,7 +451,8 @@ def test_shape_loader_preserves_environment(monkeypatch, tmp_path):
     weights = tmp_path / "hunyuan3d-dit-v2-1"
     weights.mkdir()
     (weights / "config.yaml").write_text(
-        "conditioner:\n  params:\n    main_image_encoder:\n      kwargs:\n        config: {}\n"
+        "conditioner:\n  params:\n    main_image_encoder:\n"
+        "      kwargs:\n        config: {}\n"
     )
 
     class Component:
@@ -687,5 +708,7 @@ def test_scene_rejects_missing_or_ambiguous_detection(count):
     frame = RGBDFrame(
         np.zeros((8, 8, 3), np.uint8), np.ones((8, 8)), np.eye(3), "none", (0,) * 5
     )
-    with pytest.raises(TrackingFailure, match=f"fruit: 首帧候选数 {count}"):
+    with pytest.raises(
+        TrackingFailure, match=f"fruit: expected one first-frame detection, got {count}"
+    ):
         scene.initialize(frame, {"fruit": "apple"})

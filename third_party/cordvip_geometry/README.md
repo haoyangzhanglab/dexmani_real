@@ -56,6 +56,8 @@ poses = tracker.track(next_frame)
 
 首帧先对 RGB-D 去畸变，再检测并用框初始化 SAM2 视频状态，所有物体共享一次图像编码。每个描述须匹配唯一候选；缺失或多个匹配均终止初始化。首帧与后续帧统一由 SAM2 按最高 mask 分数分配重叠像素。
 
+SAM2 [推理补丁](scripts/sam2_inference.patch) 保留多尺度图像特征，仅计算 memory attention 所需的最终层位置编码。
+
 `SAM2Segmenter.detect()` 返回检测框、分数和标签；`predict()` 在候选中加入单图分割 mask 并过滤空 mask。视频接口 `initialize(rgb, boxes)` 接收 `{对象名: XYXY 检测框}`，与 `track(rgb)` 一样返回 `{对象名: mask}`。
 
 FoundationPose 后续帧共享深度预处理，各物体独立裁剪、归一化，合批执行两轮 refinement，再分别检查分割与模型的深度一致性。RGB 与几何输入共用采样网格；refine 直接裁剪 XYZ，score 从裁剪深度重建 XYZ。

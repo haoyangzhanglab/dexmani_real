@@ -94,14 +94,18 @@ checkout_source() {
     fi
 }
 
+apply_source_patch() {
+    local cordvip_source="third_party/$1"
+    local cordvip_patch="$cordvip_library/scripts/$2"
+    if ! git apply --directory="$cordvip_source" --reverse --check "$cordvip_patch" 2>/dev/null; then
+        git apply --directory="$cordvip_source" "$cordvip_patch"
+    fi
+}
+
 mkdir -p third_party
 if [[ "$cordvip_operation" == reconstruction ]]; then
     checkout_source Hunyuan3D-2.1 https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git 82920d643c0dc2f7bfd7255f45f62d386edfe60c
-    cordvip_shape_patch="$cordvip_library/scripts/hunyuan_hierarchical_decode.patch"
-    if ! git apply --directory=third_party/Hunyuan3D-2.1 --reverse --check "$cordvip_shape_patch" 2>/dev/null; then
-        git apply --directory=third_party/Hunyuan3D-2.1 --check "$cordvip_shape_patch"
-        git apply --directory=third_party/Hunyuan3D-2.1 "$cordvip_shape_patch"
-    fi
+    apply_source_patch Hunyuan3D-2.1 hunyuan_hierarchical_decode.patch
     python -m pip install \
         --constraint "$cordvip_constraints" \
         --requirement "$cordvip_library/requirements-reconstruction.txt"
@@ -110,11 +114,8 @@ else
     checkout_source FoundationPose https://github.com/NVlabs/FoundationPose.git a1b694b83e633c2cb6115b9063d940a687759392
     checkout_source nvdiffrast https://github.com/NVlabs/nvdiffrast.git 253ac4fcea7de5f396371124af597e6cc957bfae
 
-    cordvip_fp_patch="$cordvip_library/scripts/foundationpose_inference.patch"
-    if ! git apply --directory=third_party/FoundationPose --reverse --check "$cordvip_fp_patch" 2>/dev/null; then
-        git apply --directory=third_party/FoundationPose --check "$cordvip_fp_patch"
-        git apply --directory=third_party/FoundationPose "$cordvip_fp_patch"
-    fi
+    apply_source_patch Grounded-SAM-2 sam2_inference.patch
+    apply_source_patch FoundationPose foundationpose_inference.patch
 
     python -m pip install \
         --constraint "$cordvip_constraints" \

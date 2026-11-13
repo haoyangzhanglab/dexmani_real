@@ -1,4 +1,4 @@
-"""将已发布 Raw 的离线 HOI 结果写入原 data.h5。"""
+"""离线跟踪已发布 Raw，整段成功后写入 HOI。"""
 
 import argparse
 import sys
@@ -25,6 +25,7 @@ def annotate_episodes(episodes, task):
     mesh_paths = {name: task / name / "mesh/mesh_m.obj" for name in names}
     prompts = {name: by_name[name]["prompt"] for name in names}
     tracker = None
+
     for episode in episodes:
         episode = Path(episode)
         require_published_raw(episode)
@@ -40,6 +41,7 @@ def annotate_episodes(episodes, task):
             except TrackingFailure as error:
                 print(f"{episode}: {error}；不写入 HOI")
                 continue
+
         write_hoi(episode / "data.h5", template, poses, base_from_camera)
         print(f"{episode}: 已写入 HOI，{len(poses)} 帧")
 
@@ -48,6 +50,7 @@ def track_episode(reader, tracker, names, prompts):
     camera = reader.read_camera()
     if camera.T_xarm_base_from_color is None:
         raise ValueError("HOI 必须有 Raw 中记录的相机外参")
+
     frames = reader.num_frames
     if frames == 0:
         raise ValueError("空 Episode")
@@ -105,6 +108,7 @@ def track_episode(reader, tracker, names, prompts):
         except TrackingFailure as error:
             raise TrackingFailure(f"行 {index}: {error}") from error
         poses[index] = np.stack([result[name] for name in names])
+
     if next(images, None) is not None:
         raise ValueError("Raw RGB contains more frames than the HDF5 rows")
     return poses, camera.T_xarm_base_from_color

@@ -1,0 +1,100 @@
+diff --git a/sam2/modeling/backbones/image_encoder.py b/sam2/modeling/backbones/image_encoder.py
+index 37e9266..00fab21 100644
+--- a/sam2/modeling/backbones/image_encoder.py
++++ b/sam2/modeling/backbones/image_encoder.py
+@@ -27,27 +27,22 @@ class ImageEncoder(nn.Module):
+         ), f"Channel dims of trunk and neck do not match. Trunk: {self.trunk.channel_list}, neck: {self.neck.backbone_channel_list}"
+
+     def forward(self, sample: torch.Tensor):
+-        # Forward through backbone
+-        features, pos = self.neck(self.trunk(sample))
++        features = self.neck(self.trunk(sample))
+         if self.scalp > 0:
+-            # Discard the lowest resolution features
+-            features, pos = features[: -self.scalp], pos[: -self.scalp]
++            features = features[: -self.scalp]
+
+         src = features[-1]
+-        output = {
++        # Only the final level supplies positional encoding to memory attention.
++        pos = self.neck.position_encoding(src).to(src.dtype)
++        return {
+             "vision_features": src,
+-            "vision_pos_enc": pos,
++            "vision_pos_enc": [pos],
+             "backbone_fpn": features,
+         }
+-        return output
+
+
+ class FpnNeck(nn.Module):
+-    """
+-    A modified variant of Feature Pyramid Network (FPN) neck
+-    (we remove output conv and also do bicubic interpolation similar to ViT
+-    pos embed interpolation)
+-    """
++    """Feature pyramid with lateral projections and optional top-down fusion."""
+
+     def __init__(
+         self,
+@@ -61,12 +56,6 @@ class FpnNeck(nn.Module):
+         fuse_type: str = "sum",
+         fpn_top_down_levels: Optional[List[int]] = None,
+     ):
+-        """Initialize the neck
+-        :param trunk: the backbone
+-        :param position_encoding: the positional encoding to use
+-        :param d_model: the dimension of the model
+-        :param neck_norm: the normalization to use
+-        """
+         super().__init__()
+         self.position_encoding = position_encoding
+         self.convs = nn.ModuleList()
+@@ -100,12 +89,8 @@ class FpnNeck(nn.Module):
+         self.fpn_top_down_levels = list(fpn_top_down_levels)
+
+     def forward(self, xs: List[torch.Tensor]):
+-
+         out = [None] * len(self.convs)
+-        pos = [None] * len(self.convs)
+         assert len(xs) == len(self.convs)
+-        # fpn forward pass
+-        # see https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/fpn.py
+         prev_features = None
+         # forward in top-down order (from low to high resolution)
+         n = len(self.convs) - 1
+@@ -127,8 +112,6 @@ class FpnNeck(nn.Module):
+                     prev_features /= 2
+             else:
+                 prev_features = lateral_features
+-            x_out = prev_features
+-            out[i] = x_out
+-            pos[i] = self.position_encoding(x_out).to(x_out.dtype)
++            out[i] = prev_features
+
+-        return out, pos
++        return out
+diff --git a/sam2/modeling/sam2_base.py b/sam2/modeling/sam2_base.py
+index a5d243a..cd22576 100644
+--- a/sam2/modeling/sam2_base.py
++++ b/sam2/modeling/sam2_base.py
+@@ -479,15 +479,15 @@ class SAM2Base(torch.nn.Module):
+         return backbone_out
+
+     def _prepare_backbone_features(self, backbone_out):
+-        """Prepare and flatten visual features."""
++        """Flatten multi-scale features and the final-level positional encoding."""
+         backbone_out = backbone_out.copy()
+-        assert len(backbone_out["backbone_fpn"]) == len(backbone_out["vision_pos_enc"])
++        assert len(backbone_out["vision_pos_enc"]) == 1
+         assert len(backbone_out["backbone_fpn"]) >= self.num_feature_levels
+
+         feature_maps = backbone_out["backbone_fpn"][-self.num_feature_levels :]
+-        vision_pos_embeds = backbone_out["vision_pos_enc"][-self.num_feature_levels :]
++        vision_pos_embeds = backbone_out["vision_pos_enc"]
+
+-        feat_sizes = [(x.shape[-2], x.shape[-1]) for x in vision_pos_embeds]
++        feat_sizes = [(x.shape[-2], x.shape[-1]) for x in feature_maps]
+         # flatten NxCxHxW to HWxNxC
+         vision_feats = [x.flatten(2).permute(2, 0, 1) for x in feature_maps]
+         vision_pos_embeds = [x.flatten(2).permute(2, 0, 1) for x in vision_pos_embeds]
