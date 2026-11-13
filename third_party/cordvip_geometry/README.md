@@ -62,6 +62,8 @@ SAM2 [推理补丁](scripts/sam2_inference.patch) 保留多尺度图像特征，
 
 FoundationPose 后续帧共享深度预处理，各物体独立裁剪、归一化，合批执行两轮 refinement，再分别检查分割与模型的深度一致性。RGB 与几何输入共用采样网格；refine 直接裁剪 XYZ，score 从裁剪深度重建 XYZ。
 
+FoundationPose [推理补丁](scripts/foundationpose_inference.patch) 按上述两份权重的固定格式加载模型，使用局部固定种子采样网格直径。refine 和 score 直接返回位姿与分数；可视化由调用入口负责。
+
 跟踪网络使用 PyTorch 原生 CUDA 卷积；注册和跟踪的 cuDNN 设置仅在调用内生效，调用后恢复。批量大小会影响浮点结果，近对称物体的旋转可能不稳定。
 
 `reconstruction.load_shape_model()` 加载可复用的 Hunyuan3D 模型，使用分层体积解码、完整 attention 和 Marching Cubes。`reconstruct_mesh(model, rgba, ...)` 清理退化面并返回简化网格；`scale_mesh()` 返回保留原点和朝向的缩放副本，由调用方保存。

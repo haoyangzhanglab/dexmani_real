@@ -27,7 +27,6 @@ def prepare_tracking_frame(rgb, depth_m, intrinsics):
     xyz_map = depth2xyzmap_batch(depth[None], K[None], zfar=np.inf)[0]
     return {
         "rgb": torch.as_tensor(rgb, device="cuda", dtype=torch.float),
-        "depth": depth,
         "xyz_map": xyz_map,
     }
 
@@ -67,24 +66,12 @@ class FoundationPoseTracker:
             estimator_type = type(shared_with.estimator)
             context = shared_with.estimator.glctx
 
-        # 固定直径采样，避免物体顺序影响裁剪。
-        random_state = np.random.get_state()
-        try:
-            np.random.seed(0)
-            self.estimator = estimator_type(
-                mesh=self.mesh,
-                glctx=context,
-                scorer=shared_with.estimator.scorer
-                if shared_with is not None
-                else None,
-                refiner=shared_with.estimator.refiner
-                if shared_with is not None
-                else None,
-                debug=0,
-                debug_dir="/tmp",
-            )
-        finally:
-            np.random.set_state(random_state)
+        self.estimator = estimator_type(
+            mesh=self.mesh,
+            glctx=context,
+            scorer=shared_with.estimator.scorer if shared_with is not None else None,
+            refiner=shared_with.estimator.refiner if shared_with is not None else None,
+        )
 
     def register(self, rgb, depth_m, intrinsics, mask):
         import torch
