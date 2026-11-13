@@ -1,6 +1,4 @@
-"""Raw HOI 字段与分块发布。"""
-
-import numpy as np
+"""将物体点云分块写入 Raw。"""
 
 from dexmani_real.geometry.hoi import transform_task_points
 
@@ -17,12 +15,13 @@ def write_hoi(path, template, poses, base_from_camera):
         if "_hoi_staging" in data:
             del data["_hoi_staging"]
         group = data.create_group("_hoi_staging")
-        cloud = group.create_dataset("object_pointcloud", (frames, 1024, 3), dtype="f4", chunks=(1, 1024, 3))
+        cloud = group.create_dataset(
+            "object_pointcloud", (frames, 1024, 3), dtype="f4", chunks=(1, 1024, 3)
+        )
         for start in range(0, frames, 128):
-            cloud[start:start + 128] = np.stack([
-                transform_task_points(template, pose, base_from_camera)
-                for pose in poses[start:start + 128]
-            ])
+            cloud[start : start + 128] = transform_task_points(
+                template, poses[start : start + 128], base_from_camera
+            )
         data.flush()
         data.move("_hoi_staging", "hoi")
         data.flush()

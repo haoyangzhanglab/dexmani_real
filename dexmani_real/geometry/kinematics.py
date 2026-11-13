@@ -78,7 +78,7 @@ class ArmFK:
 class HandFK:
     """从组合 URDF 提取手部子树，输入关节及雅可比列均按 SDK 顺序。"""
 
-    def __init__(self, fingertip_link_names: Sequence[str] = XHAND_FINGERTIP_LINK_NAMES):
+    def __init__(self):
         import pinocchio as pin
 
         self.pin = pin
@@ -91,9 +91,7 @@ class HandFK:
             XHAND_SDK_JOINT_NAMES.index(name) for name in active
         ], dtype=np.intp)
         self.urdf_to_sdk = np.argsort(self.sdk_to_urdf)
-        if len(fingertip_link_names) != 5 or len(set(fingertip_link_names)) != 5:
-            raise ValueError("hand FK requires five distinct fingertip frames")
-        self.fingertip_frame_ids = tuple(self.model.getFrameId(n) for n in fingertip_link_names)
+        self.fingertip_frame_ids = tuple(self.model.getFrameId(n) for n in XHAND_FINGERTIP_LINK_NAMES)
         if any(fid >= self.model.nframes for fid in self.fingertip_frame_ids):
             raise ValueError("fingertip frame is missing from the hand URDF")
 

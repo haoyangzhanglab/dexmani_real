@@ -538,6 +538,9 @@ class RawReader:
         self.require_fields("rgb")
         if self.video_container is None:
             self.video_container = av.open(str(self.rgb_path), "r")
+            stream = self.video_container.streams.video[0]
+            stream.thread_type = "AUTO"
+            stream.thread_count = 4
         self.video_container.seek(0)
         for frame in self.video_container.decode(video=0):
             yield frame.to_ndarray(format="rgb24")

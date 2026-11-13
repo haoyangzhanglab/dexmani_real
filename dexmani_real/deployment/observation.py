@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from dexmani_real.geometry.camera import camera_parameters_cv, depth_scales_match
+from dexmani_real.geometry.camera import camera_parameters_cv
 from dexmani_real.geometry.kinematics import (
     ArmFK,
     HandFK,
@@ -22,7 +22,6 @@ FIELD_DEPENDENCIES = {
     "taxel_tactile_force": ("dense",),
     "point_cloud": ("cloud",),
     "rgb": ("rgb",),
-    "depth": ("depth",),
     "camera_intrinsic": ("camera_static",),
     "camera_extrinsic": ("camera_static",),
 }
@@ -30,7 +29,6 @@ FIELD_DEPENDENCIES = {
 
 class ObservationBuilder:
     def __init__(self, info, runtime):
-        self.info = info
         self.fields = tuple(info.observation_fields)
         unknown = set(self.fields) - FIELD_DEPENDENCIES.keys()
         if unknown:
@@ -41,7 +39,7 @@ class ObservationBuilder:
         self.needs = ObservationNeeds(
             hoi="hoi" in self.dependencies,
             hoi_joint_input={"hoi", "hand"} <= self.dependencies,
-            camera_fields=tuple(name for name in ("rgb", "depth") if name in self.dependencies),
+            camera_fields=("rgb",) if "rgb" in self.dependencies else (),
             point_cloud="cloud" in self.dependencies,
             required_tactile=tuple(c for c in ("aggregate", "dense") if c in self.dependencies),
         )
@@ -50,7 +48,7 @@ class ObservationBuilder:
         self.arm_fk = ArmFK() if "arm_fk" in self.dependencies else None
         self.hand_fk = self.hand_cloud = None
         if "hand_fk" in self.dependencies:
-            self.hand_fk = HandFK(info.fingertip_link_names) if "fingertips" in self.dependencies else HandFK()
+            self.hand_fk = HandFK()
             if "hand_cloud" in self.dependencies:
                 self.hand_cloud = HandPointCloud(self.hand_fk, runtime.hand_pointcloud.num_points)
 
@@ -72,7 +70,7 @@ class ObservationBuilder:
                 values[name] = row.hoi["object_pointcloud"]
             elif name == "point_cloud":
                 values[name] = row.point_cloud
-            elif name in {"rgb", "depth"}:
+            elif name == "rgb":
                 values[name] = row.camera[name]
         for value in values.values():
             value.flags.writeable = False
@@ -80,19 +78,7 @@ class ObservationBuilder:
 
     def configure_camera(self, camera):
         self.camera_parameters = {}
-        requested = set(self.fields) & {"depth", "camera_intrinsic", "camera_extrinsic"}
-        if not requested:
-            return
-        if "depth" in requested:
-            if camera.depth_scale_m is None:
-                raise ValueError("depth observations require a camera depth scale")
-            if not depth_scales_match(camera.depth_scale_m, self.info.depth_config["depth_scale_m"]):
-                raise ValueError(
-                    f"Live camera depth_scale_m={camera.depth_scale_m!r} differs from "
-                    f"Checkpoint depth_config.depth_scale_m={self.info.depth_config['depth_scale_m']!r}; "
-                    "check the camera device/calibration and training recipe; raw depth counts are not rescaled"
-                )
-        requested.discard("depth")
+        requested = set(self.fields) & {"camera_intrinsic", "camera_extrinsic"}
         if not requested:
             return
         parameters = camera_parameters_cv(

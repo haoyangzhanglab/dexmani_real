@@ -1,20 +1,18 @@
 """共享模型权重的 Mask 引导 FoundationPose 位姿跟踪。"""
 
 import importlib
-import logging
 import sys
 from pathlib import Path
 
 import numpy as np
 
-from .geometry import simplify_mesh, validate_pose
+from .mesh import simplify_mesh
+
+MIN_DEPTH_PIXELS = 4
 
 
 class TrackingFailure(RuntimeError):
-    """当前场景的预期跟踪失败；调用方须结束本段，不沿用历史位姿。"""
-
-
-MIN_DEPTH_PIXELS = 4
+    """当前场景丢失位姿，调用方应结束该段。"""
 
 
 def prepare_tracking_frame(rgb, depth_m, intrinsics):
@@ -35,7 +33,7 @@ def prepare_tracking_frame(rgb, depth_m, intrinsics):
 
 
 def guide_centered_pose(pose_camera_centered, intrinsics, mask):
-    """bbox 中心引导 centered mesh 的 XY，保留上帧 Z 和旋转。"""
+    """以掩码边框中心引导 XY，保留上一帧 Z 和旋转。"""
     pose = np.array(pose_camera_centered, copy=True)
     z = pose[2, 3]
     if z <= 0:
@@ -49,8 +47,8 @@ def guide_centered_pose(pose_camera_centered, intrinsics, mask):
     return pose
 
 
-class PoseTracker:
-    def __init__(self, root, mesh, debug_dir, *, shared_with=None):
+class FoundationPoseTracker:
+    def __init__(self, root, mesh, *, shared_with=None):
         root = Path(root).expanduser().resolve()
         self.mesh = simplify_mesh(mesh)
 
@@ -58,32 +56,24 @@ class PoseTracker:
             import torch
 
             if not torch.cuda.is_available():
-                raise RuntimeError(
-                    "FoundationPose requires CUDA; input validation alone does not run tracking"
-                )
+                raise RuntimeError("FoundationPose requires CUDA")
             sys.path.insert(0, str(root))
-            # 上游 Utils 导入会重设 root logging，恢复宿主级别以免逐帧刷屏。
-            log_level = logging.getLogger().level
-            try:
-                estimator_module = importlib.import_module("estimater")
-            finally:
-                logging.getLogger().setLevel(log_level)
+            estimator_module = importlib.import_module("estimater")
             import nvdiffrast.torch as dr
 
             estimator_type = estimator_module.FoundationPose
-            self.context = dr.RasterizeCudaContext()
+            context = dr.RasterizeCudaContext()
         else:
             estimator_type = type(shared_with.estimator)
-            self.context = shared_with.context
-        # 固定直径采样，避免物体顺序影响裁剪与体素化。
+            context = shared_with.estimator.glctx
+
+        # 固定直径采样，避免物体顺序影响裁剪。
         random_state = np.random.get_state()
         try:
             np.random.seed(0)
             self.estimator = estimator_type(
-                model_pts=self.mesh.vertices,
-                model_normals=self.mesh.vertex_normals,
                 mesh=self.mesh,
-                glctx=self.context,
+                glctx=context,
                 scorer=shared_with.estimator.scorer
                 if shared_with is not None
                 else None,
@@ -91,55 +81,90 @@ class PoseTracker:
                 if shared_with is not None
                 else None,
                 debug=0,
-                debug_dir=str(Path(debug_dir).resolve()),
+                debug_dir="/tmp",
             )
         finally:
             np.random.set_state(random_state)
 
     def register(self, rgb, depth_m, intrinsics, mask):
+        import torch
+
         self.estimator.pose_last = None
-        pose = self.estimator.register(
-            K=intrinsics,
-            rgb=rgb,
-            depth=depth_m,
-            ob_mask=mask,
-            iteration=5,
-        )
+        with torch.backends.cudnn.flags(
+            enabled=True, deterministic=True, benchmark=False
+        ):
+            pose = self.estimator.register(
+                K=intrinsics,
+                rgb=rgb,
+                depth=depth_m,
+                ob_mask=mask,
+                iteration=5,
+            )
         if self.estimator.pose_last is None:
             raise TrackingFailure(
                 "FoundationPose registration did not initialize tracking"
             )
-        try:
-            return validate_pose(pose)
-        except ValueError as exc:
-            raise TrackingFailure(f"invalid FoundationPose output: {exc}") from exc
+        if not np.isfinite(pose).all():
+            raise TrackingFailure("FoundationPose returned nonfinite pose")
+        return pose
 
-    def track(self, intrinsics, mask, *, prepared_frame):
-        estimator = self.estimator
-        guided = guide_centered_pose(
-            estimator.pose_last.detach().cpu().numpy().reshape(4, 4), intrinsics, mask
-        )
-        pose, _ = estimator.refiner.predict(
-            **prepared_frame,
-            K=intrinsics,
-            iteration=2,
-            ob_in_cams=guided.reshape(1, 4, 4),
-            normal_map=None,
-            mesh=estimator.mesh,
-            mesh_tensors=estimator.mesh_tensors,
-            mesh_diameter=estimator.diameter,
-            glctx=estimator.glctx,
-            get_vis=False,
-        )
-        estimator.pose_last = pose
-        pose = (
-            (pose @ estimator.get_tf_to_centered_mesh())
-            .detach()
-            .cpu()
-            .numpy()
-            .reshape(4, 4)
-        )
+
+def track_objects(trackers, rgb, depth_m, intrinsics, masks):
+    """各物体独立裁剪，同帧的所有物体合批执行两轮 refinement。"""
+    import torch
+    from learning.datasets.pose_dataset import BatchPoseData
+    from learning.training.predict_pose_refine import make_crop_data_batch
+
+    names = list(trackers)
+    estimators = [tracker.estimator for tracker in trackers.values()]
+    refiner = estimators[0].refiner
+    previous = torch.cat([est.pose_last.reshape(1, 4, 4) for est in estimators])
+    guided = []
+    for name, pose in zip(names, previous.detach().cpu().numpy()):
         try:
-            return validate_pose(pose)
-        except ValueError as exc:
-            raise TrackingFailure(f"invalid FoundationPose output: {exc}") from exc
+            guided.append(guide_centered_pose(pose, intrinsics, masks[name]))
+        except TrackingFailure as error:
+            raise TrackingFailure(f"{name}: {error}") from error
+
+    with torch.inference_mode():
+        poses = torch.as_tensor(np.stack(guided), device="cuda", dtype=torch.float)
+        frame = prepare_tracking_frame(rgb, depth_m, intrinsics)
+        for _ in range(2):
+            crops = [
+                make_crop_data_batch(
+                    refiner.cfg.input_resize,
+                    poses[index : index + 1],
+                    **frame,
+                    K=intrinsics,
+                    crop_ratio=refiner.cfg.crop_ratio,
+                    mesh_diameter=est.diameter,
+                    glctx=est.glctx,
+                    mesh_tensors=est.mesh_tensors,
+                )
+                for index, est in enumerate(estimators)
+            ]
+            batch = BatchPoseData(
+                **{
+                    key: torch.cat([getattr(crop, key) for crop in crops])
+                    for key in (
+                        "rgbAs",
+                        "rgbBs",
+                        "xyz_mapAs",
+                        "xyz_mapBs",
+                        "poseA",
+                        "mesh_diameters",
+                    )
+                }
+            )
+            # 避免 cuDNN 随 batch 大小切换卷积算法。
+            with torch.backends.cudnn.flags(enabled=False):
+                poses = refiner.refine(batch)
+
+        mesh_transforms = torch.stack([est.tf_to_centered_mesh for est in estimators])
+        output = (poses @ mesh_transforms).cpu().numpy()
+
+    for index, (name, est) in enumerate(zip(names, estimators)):
+        if not np.isfinite(output[index]).all():
+            raise TrackingFailure(f"{name}: FoundationPose returned nonfinite pose")
+        est.pose_last = poses[index : index + 1]
+    return dict(zip(names, output))

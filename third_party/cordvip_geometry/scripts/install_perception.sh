@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Usage: conda activate real_robot; bash third_party/cordvip_geometry/scripts/install_perception.sh
-# Incremental setup for the existing real_robot environment; never opens devices.
+# 在现有 real_robot 环境中安装依赖并编译扩展。
 set -euo pipefail
 
 cordvip_root="$PWD"
@@ -17,27 +16,19 @@ fi
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     cat <<'USAGE'
-Usage: conda activate real_robot
-       bash third_party/cordvip_geometry/scripts/install_perception.sh [--workspace PATH] [reconstruction]
+用法：conda activate real_robot
+      bash third_party/cordvip_geometry/scripts/install_perception.sh [--workspace PATH] [reconstruction]
 
-Default: install tracking/shared requirements, fetch Grounded-SAM-2,
-FoundationPose and nvdiffrast, apply the FoundationPose tracking-cache patch,
-and build nvdiffrast and FoundationPose mycpp. Requires conda CUDA compiler/headers,
-CMake, C++, system Boost (system/program_options) and OpenMP development files.
-Next: python -m cordvip_geometry download
-Prepare FoundationPose weights separately, then: python -m cordvip_geometry check
+默认安装跟踪依赖，获取 Grounded-SAM-2、FoundationPose 和 nvdiffrast，
+应用推理补丁并编译扩展。需要 conda CUDA 编译器及头文件、CMake、C++、
+系统 Boost（system/program_options）和 OpenMP 开发文件。
 
-reconstruction: after default installation in the same environment, fetch
-Hunyuan3D and install only reconstruction's additional requirements.
-Does not repeat tracking installation or builds.
-Next: python -m cordvip_geometry download --models shape
+reconstruction：在已完成跟踪安装的同一环境中获取 Hunyuan3D，
+应用分层解码补丁并安装重建依赖。
 
-Both branches preserve the base environment and use recorded source revisions.
-No model downloads or device access.
-Existing source directories and local edits are reused without checkout or reset.
-FoundationPose patch conflicts fail explicitly.
-The workspace defaults to the current directory; --workspace must be the first option.
-Logs and environment snapshots are saved under its reports/cordvip_install/.
+源码按指定 revision 获取；已有目录和本地修改直接复用，补丁冲突会报错。
+工作目录默认为当前目录，--workspace 必须放在首位。
+安装不下载模型或访问设备，后续命令见完成提示。
 USAGE
     exit 0
 fi
@@ -77,12 +68,9 @@ if [[ "$cordvip_operation" == tracking ]]; then
     fi
 fi
 
-mkdir -p reports/cordvip_install
-cordvip_log_dir="$(mktemp -d "$cordvip_root/reports/cordvip_install/install_XXXXXX")"
-exec > >(tee -a "$cordvip_log_dir/install.log") 2>&1
-printf 'Installation log: %s\n' "$cordvip_log_dir"
-python -m pip list --format=json > "$cordvip_log_dir/packages_before.json"
-python - <<'PY' > "$cordvip_log_dir/base_constraints.txt"
+cordvip_constraints="$(mktemp)"
+trap 'rm -f "$cordvip_constraints"' EXIT
+python - <<'PY' > "$cordvip_constraints"
 from importlib.metadata import version
 for package in ('torch', 'torchvision', 'numpy', 'transformers'):
     print(f'{package}=={version(package)}')
@@ -104,35 +92,32 @@ checkout_source() {
         printf 'Source path is not a directory: %s\n' "$cordvip_path" >&2
         return 1
     fi
-    if [[ -e "$cordvip_path/.git" ]]; then
-        cordvip_revision="$(git -C "$cordvip_path" rev-parse HEAD)"
-        git -C "$cordvip_path" status --short > "$cordvip_log_dir/${cordvip_name}_status.txt"
-    else
-        cordvip_revision="local_directory"
-    fi
-    printf '%s %s\n' "$cordvip_name" "$cordvip_revision" >> "$cordvip_log_dir/source_revisions.txt"
 }
 
 mkdir -p third_party
 if [[ "$cordvip_operation" == reconstruction ]]; then
     checkout_source Hunyuan3D-2.1 https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git 82920d643c0dc2f7bfd7255f45f62d386edfe60c
+    cordvip_shape_patch="$cordvip_library/scripts/hunyuan_hierarchical_decode.patch"
+    if ! git apply --directory=third_party/Hunyuan3D-2.1 --reverse --check "$cordvip_shape_patch" 2>/dev/null; then
+        git apply --directory=third_party/Hunyuan3D-2.1 --check "$cordvip_shape_patch"
+        git apply --directory=third_party/Hunyuan3D-2.1 "$cordvip_shape_patch"
+    fi
     python -m pip install \
-        --constraint "$cordvip_log_dir/base_constraints.txt" \
+        --constraint "$cordvip_constraints" \
         --requirement "$cordvip_library/requirements-reconstruction.txt"
 else
     checkout_source Grounded-SAM-2 https://github.com/IDEA-Research/Grounded-SAM-2.git b7a9c29f196edff0eb54dbe14588d7ae5e3dde28
     checkout_source FoundationPose https://github.com/NVlabs/FoundationPose.git a1b694b83e633c2cb6115b9063d940a687759392
     checkout_source nvdiffrast https://github.com/NVlabs/nvdiffrast.git 253ac4fcea7de5f396371124af597e6cc957bfae
 
-    # 幂等应用单姿态跟踪缓存优化；遇到冲突直接失败，不重置已有源码。
-    cordvip_fp_patch="$cordvip_library/scripts/foundationpose_tracking_cache.patch"
+    cordvip_fp_patch="$cordvip_library/scripts/foundationpose_inference.patch"
     if ! git apply --directory=third_party/FoundationPose --reverse --check "$cordvip_fp_patch" 2>/dev/null; then
         git apply --directory=third_party/FoundationPose --check "$cordvip_fp_patch"
         git apply --directory=third_party/FoundationPose "$cordvip_fp_patch"
     fi
 
     python -m pip install \
-        --constraint "$cordvip_log_dir/base_constraints.txt" \
+        --constraint "$cordvip_constraints" \
         --requirement "$cordvip_library/requirements-tracking.txt"
 
     # 使用现有 conda CUDA 编译，保留基础 Torch/CUDA 版本。
@@ -158,12 +143,9 @@ PY
     cmake --build third_party/FoundationPose/mycpp/build -j"$MAX_JOBS"
 fi
 
-python -m pip list --format=json > "$cordvip_log_dir/packages_after.json"
 if [[ "$cordvip_operation" == reconstruction ]]; then
-    printf 'Reconstruction additions installed. No models or devices were opened.\n'
-    printf 'Next, from the workspace root: python -m cordvip_geometry download --models shape\n'
+    printf '重建依赖安装完成。下载模型：python -m cordvip_geometry download --models shape\n'
 else
-    printf 'Tracking dependencies and builds completed. No models or devices were opened.\n'
-    printf 'Next, from the workspace root: python -m cordvip_geometry download\n'
-    printf 'Prepare FoundationPose weights separately under third_party/FoundationPose/weights/, then run python -m cordvip_geometry check; see third_party/cordvip_geometry/README.md.\n'
+    printf '跟踪依赖编译完成。下载模型：python -m cordvip_geometry download\n'
+    printf 'FoundationPose 权重另放于 third_party/FoundationPose/weights/，见后端 README。\n'
 fi

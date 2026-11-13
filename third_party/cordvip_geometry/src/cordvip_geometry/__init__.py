@@ -1,7 +1,7 @@
-"""物体资产与 RGB-D 几何追踪；导入不加载模型或设备。"""
+"""物体重建和 RGB-D 位姿跟踪；导入不加载模型。"""
 
-from .assets import load_asset, prepare_asset
-from .rgbd import RGBDFrame
+from .camera import RGBDFrame
+from .mesh import load_mesh, scale_mesh
 from .tracking import SceneTracker, TrackingFailure
 
-__all__ = ["RGBDFrame", "SceneTracker", "TrackingFailure", "load_asset", "prepare_asset"]
+__all__ = ["RGBDFrame", "SceneTracker", "TrackingFailure", "load_mesh", "scale_mesh"]

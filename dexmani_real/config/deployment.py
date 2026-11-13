@@ -10,7 +10,7 @@ DEFAULT_MAX_RUNNING_S = 60.0
 
 @dataclass(frozen=True)
 class ExecutionConfig:
-    # 未指定时使用 checkpoint 保存的周期；两处均缺失时须明确填写。
+    # 未指定时使用 checkpoint 保存的控制周期。
     control_dt_s: float | None = None
     # async/RTC 可继续旧预测尾部；action_steps 是名义窗口，RTC 按提交进度接续。
     # None 使用 checkpoint n_action_steps；显式值仍须满足模型约束。

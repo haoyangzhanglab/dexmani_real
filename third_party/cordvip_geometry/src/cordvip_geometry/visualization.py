@@ -1,7 +1,40 @@
-"""物体候选预览、显式确认与选择产物；不持有分割模型。"""
+"""网格预览与分割候选选择。"""
 
-from ..io import write_npz
-from ..viewer import display_available
+import os
+import sys
+
+
+def require_display():
+    if sys.platform.startswith("linux") and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    ):
+        raise RuntimeError("没有图形会话；请使用 --headless 或 --list-only")
+
+
+def preview_mesh(mesh_path, *, units="unscaled"):
+    require_display()
+    import open3d as o3d
+
+    mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+    if not mesh.has_triangles():
+        raise ValueError("预览 mesh 为空或没有三角面")
+    mesh.compute_vertex_normals()
+    mesh.paint_uniform_color([0.65, 0.78, 0.87])
+    bounds = mesh.get_axis_aligned_bounding_box()
+    bounds.color = [0.85, 0.65, 0.15]
+    extent = bounds.get_extent()
+    print(
+        f"mesh 轴向尺寸 x/y/z ({units}): {extent.tolist()}；红 x、绿 y、蓝 z。",
+        flush=True,
+    )
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+        size=float(extent.max()) * 0.35
+    )
+    o3d.visualization.draw_geometries(
+        [mesh, bounds, frame],
+        window_name=f"Object mesh ({units}); x=red y=green z=blue",
+        mesh_show_back_face=True,
+    )
 
 
 def overlay(rgb, candidate, index):
@@ -28,14 +61,12 @@ def save_candidates(output, rgb, candidates):
     import numpy as np
     from PIL import Image
 
-    write_npz(
+    np.savez_compressed(
         output / "candidates.npz",
-        {
-            "masks": np.stack([c["mask"] for c in candidates]),
-            "boxes": np.stack([c["box_xyxy"] for c in candidates]),
-            "scores": np.asarray([c["score"] for c in candidates]),
-            "labels": np.asarray([c["label"] for c in candidates], dtype=str),
-        },
+        masks=np.stack([c["mask"] for c in candidates]),
+        boxes=np.stack([c["box_xyxy"] for c in candidates]),
+        scores=np.asarray([c["score"] for c in candidates]),
+        labels=np.asarray([c["label"] for c in candidates], dtype=str),
     )
     width = min(rgb.shape[1], 420)
     height = max(1, round(rgb.shape[0] * width / rgb.shape[1]))
@@ -64,7 +95,7 @@ def choose(rgb, candidates, instance, *, headless):
         if len(candidates) == 1:
             return 0
         raise ValueError(f"多个候选需要明确 --instance（0..{len(candidates) - 1}）")
-    display_available()
+    require_display()
     import cv2
     import numpy as np
 
@@ -111,14 +142,15 @@ def choose(rgb, candidates, instance, *, headless):
 
 
 def save_selection(output, rgb, candidates, index):
+    import numpy as np
+    from PIL import Image
+
     candidate = candidates[index]
     mask = candidate["mask"]
     if not mask.any():
         raise ValueError("没有选中前景；请重新选择或分割")
     overlay(rgb, candidate, index).save(output / "overlay.png")
-    import numpy as np
-    from PIL import Image
-
-    Image.fromarray(mask.astype(np.uint8) * 255).save(output / "mask.png")
-    Image.fromarray(np.dstack((rgb, mask.astype(np.uint8) * 255))).save(output / "foreground_rgba.png")
+    alpha = mask.astype(np.uint8) * 255
+    Image.fromarray(alpha).save(output / "mask.png")
+    Image.fromarray(np.dstack((rgb, alpha))).save(output / "foreground_rgba.png")
     print(f"已确认候选 {index}；全分辨率 mask、RGBA 与 overlay：{output}", flush=True)

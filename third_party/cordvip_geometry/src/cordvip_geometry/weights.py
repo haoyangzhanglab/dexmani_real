@@ -1,4 +1,4 @@
-"""本地感知模型、固定官方 revision 与参数配对。"""
+"""感知模型的下载位置、官方 revision 与 SAM 配置配对。"""
 
 from pathlib import Path
 from typing import Any
@@ -23,19 +23,8 @@ GROUNDING_MODEL: dict[str, Any] = {
     "repo_id": "IDEA-Research/grounding-dino-base",
     "revision": "12bdfa3120f3e7ec7b434d90674b3396eccf88eb",
     "directory": "grounding-dino-base",
-    "weight": "model.safetensors",
     "patterns": ["*.json", "model.safetensors", "vocab.txt", "README.md", "LICENSE*"],
 }
-GROUNDING_FILES = (
-    GROUNDING_MODEL["weight"],
-    "config.json",
-    "preprocessor_config.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "vocab.txt",
-)
-
 SHAPE_MODEL: dict[str, Any] = {
     "repo_id": "tencent/Hunyuan3D-2.1",
     "revision": "0b94677654c57bb9a6b6845cd7b704ccf551d327",
@@ -46,13 +35,11 @@ SHAPE_MODEL: dict[str, Any] = {
         "README.md",
         "LICENSE*",
     ],
-    "weight": "hunyuan3d-dit-v2-1/model.fp16.ckpt",
 }
 
 
 def resolve_sam_model(models_dir, variant=None, checkpoint=None, config=None):
-    custom = checkpoint is not None or config is not None
-    if custom:
+    if checkpoint is not None or config is not None:
         if checkpoint is None or config is None:
             raise ValueError("--sam-checkpoint 与 --sam-config 必须完整配对")
         if variant is not None:
@@ -60,3 +47,21 @@ def resolve_sam_model(models_dir, variant=None, checkpoint=None, config=None):
         return Path(checkpoint).expanduser().resolve(), config
     model = SAM_MODELS[variant or "small"]
     return Path(models_dir) / model["weight"], model["config"]
+
+
+def download_models(models, models_dir, sam_variant="small"):
+    from huggingface_hub import snapshot_download
+
+    for name in models:
+        spec: dict[str, Any]
+        if name == "sam":
+            model = SAM_MODELS[sam_variant]
+            spec = dict(model, directory=".", patterns=[model["weight"]])
+        else:
+            spec = {"grounding": GROUNDING_MODEL, "shape": SHAPE_MODEL}[name]
+        snapshot_download(
+            repo_id=spec["repo_id"],
+            revision=spec["revision"],
+            allow_patterns=spec["patterns"],
+            local_dir=Path(models_dir) / spec["directory"],
+        )

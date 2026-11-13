@@ -7,7 +7,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.deployment import ExecutionConfig
-from dexmani_real.config.perception import PointCloudConfig
 from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
 
 if TYPE_CHECKING:
@@ -31,13 +30,8 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
             raise ValueError("hoi_max_age_s requires a finite positive value")
 
     dt = execution.control_dt_s
-    if dt is None:
-        raise ValueError(
-            "Checkpoint has no control period; set CONFIG.execution.control_dt_s "
-            "in the experiment file passed via --config"
-        )
     if (
-        type(dt) not in (int, float)
+        dt is None or type(dt) not in (int, float)
         or not math.isfinite(dt * 1e9)
         or int(dt * 1e9) <= 0
     ):
@@ -86,37 +80,11 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
                       else runtime.execution.control_dt_s),
     )
     validate_execution_config(info, execution)
-    names = set(info.observation_fields)
     if not runtime.hand.enabled:
         raise ValueError("Dexterous policy deployment requires hand.enabled=true")
-    pointcloud = runtime.pointcloud
-    if "point_cloud" in names:
-        if info.pointcloud_config is None:
-            raise ValueError("point_cloud requires Checkpoint pointcloud_config")
-        pointcloud = PointCloudConfig(**info.pointcloud_config)
-        pointcloud.validate()
-    if "fingertip_xyz" in names and info.fingertip_link_names is None:
-        raise ValueError("fingertip_xyz requires Checkpoint fingertip_link_names in model input order")
-    if "depth" in names:
-        recipe = info.depth_config
-        if not isinstance(recipe, dict) or "shape" not in recipe or "depth_scale_m" not in recipe:
-            raise ValueError("Checkpoint depth_config requires saved shape and depth_scale_m")
-        scale = recipe["depth_scale_m"]
-        if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
-            raise ValueError(f"Checkpoint depth_config.depth_scale_m={scale!r} must be finite and positive")
-        if tuple(recipe["shape"]) != runtime.camera.image_shape:
-            raise ValueError(
-                f"Checkpoint depth_config.shape={tuple(recipe['shape'])} (height, width), "
-                f"but RealConfig camera.image_shape={runtime.camera.image_shape}; "
-                "set camera.height and camera.width in the experiment file passed via --config; "
-                "depth is not resized"
-            )
-
-    runtime = replace(
-        runtime,
-        execution=execution,
-        pointcloud=pointcloud,
-    )
+    if "point_cloud" in info.observation_fields:
+        runtime.pointcloud.validate()
+    runtime = replace(runtime, execution=execution)
     validate_robot_config(runtime)
     if info.action_mode == "eef":
         runtime.environment.validate()

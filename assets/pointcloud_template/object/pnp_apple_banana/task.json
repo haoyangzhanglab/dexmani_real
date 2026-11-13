@@ -1,0 +1,16 @@
+{
+  "objects": [
+    {
+      "name": "apple",
+      "scale_to_meters": 0.04118132621040771
+    },
+    {
+      "name": "banana",
+      "scale_to_meters": 0.08540591497108434
+    },
+    {
+      "name": "bowl",
+      "scale_to_meters": 0.08490138174640842
+    }
+  ]
+}
