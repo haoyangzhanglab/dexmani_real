@@ -47,15 +47,23 @@ def load_task_template(task):
         template = {
             key: saved[key] for key in ("points_local", "offsets", "object_names")
         }
+    validate_template(template)
+    if set(template["object_names"]) != {obj["name"] for obj in task_objects(task)}:
+        raise ValueError("模板对象与任务对象不对应")
+    return template
+
+
+def validate_template(template):
+    """校验任务文件或 Raw 快照中的固定点身份与对象分段。"""
     names = template["object_names"]
     if (
         names.ndim != 1
         or names.dtype.kind != "U"
         or not len(names)
         or len(set(names)) != len(names)
-        or set(names) != {obj["name"] for obj in task_objects(task)}
+        or any(not name.strip() or "\0" in name for name in names)
     ):
-        raise ValueError("模板对象与任务对象不对应")
+        raise ValueError("非法 HOI 模板对象名")
     points, offsets = template["points_local"], template["offsets"]
     if (
         points.shape != (1024, 3)
@@ -72,7 +80,6 @@ def load_task_template(task):
         or np.any(offsets[1:] <= offsets[:-1])
     ):
         raise ValueError("非法 HOI 点分段")
-    return template
 
 
 def transform_task_points(template, poses_camera, base_from_camera):

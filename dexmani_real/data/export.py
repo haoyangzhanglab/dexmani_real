@@ -14,7 +14,7 @@ import numpy as np
 import zarr
 
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
-from dexmani_real.data.raw import RawReader, require_published_raw
+from dexmani_real.data.raw import RawReader, require_published_raw, validate_task_label
 from dexmani_real.geometry.camera import (
     camera_extrinsic_cv,
     depth_scales_match,
@@ -296,13 +296,19 @@ def export_zarr(
             try:
                 require_published_raw(episode)
                 with RawReader(episode) as reader:
+                    task_name = reader.meta["task_label"]
+                    validate_task_label(task_name)
                     camera = validate_export_episode(
                         reader, fields, hoi_max_skew_s=processing.hoi_max_skew_s if joint_hoi else None,
                     )
                     starts = reader.segment_starts
                     frames = reader.num_frames
+                    template = reader.read_hoi_template() if "object_pointcloud" in fields else None
+                    if "object_pointcloud" in fields and template is None:
+                        logger.warning("%s: HOI 缺少模板快照，无法校验对象分段和点身份。", episode)
                     logger.info("%s: exporting %d rows in %d segments", episode.name, frames, len(starts))
                     if index == 0:
+                        first_template = template
                         arm_fk = ArmFK() if ARM_FK_FIELDS.intersection(fields) else None
                         hand_fk = HandFK() if HAND_FK_FIELDS.intersection(fields) else None
                         hand_cloud = (HandPointCloud(cast(HandFK, hand_fk), processing.hand_pointcloud.num_points)
@@ -318,8 +324,18 @@ def export_zarr(
                             camera,
                             fields=fields,
                             control_hz=reader.control_hz,
+                            task_name=task_name,
                         )
                     else:
+                        if task_name != root.attrs["task_name"]:
+                            raise ValueError("one canonical store requires uniform task_label")
+                        if (template is None) != (first_template is None) or (
+                            template is not None and any(
+                                not np.array_equal(template[key], first_template[key])
+                                for key in template
+                            )
+                        ):
+                            raise ValueError("one canonical store requires identical HOI templates")
                         if not np.isclose(reader.dt, root.attrs["dt"], rtol=1e-6, atol=0):
                             raise ValueError("one canonical store requires uniform dt")
                         if "depth" in fields and not depth_scales_match(camera["depth_scale_m"], root.attrs["depth_scale_m_per_unit"]):
@@ -344,9 +360,16 @@ def export_zarr(
                     ends.append(offset + frames)
             except (KeyError, ValueError) as exc:
                 raise ValueError(f"Raw {episode}: {exc}") from exc
-        root.create_group("meta").create_dataset(
+        meta = root.create_group("meta")
+        meta.create_dataset(
             "episode_ends", data=np.asarray(ends, dtype=np.int64)
         )
+        if first_template is not None:
+            root.attrs.update(
+                object_names=first_template["object_names"].tolist(),
+                object_offsets=first_template["offsets"].tolist(),
+            )
+            meta.create_dataset("object_points_local", data=first_template["points_local"])
         root.store.close()
         store = None
         publish(cast(Path, staging), target)
@@ -370,10 +393,15 @@ def export_zarr(
                 logger.exception("export staging cleanup also failed: %s", staging)
 
 
-def create_store(store, processing, camera, *, fields, control_hz):
+def create_store(store, processing, camera, *, fields, control_hz, task_name):
     specs = canonical_array_specs(fields, processing, camera)
     root = zarr.group(store=store, overwrite=True)
-    root.attrs.update(format=CANONICAL_FORMAT, dt=1.0 / control_hz)
+    root.attrs.update(format=CANONICAL_FORMAT, dt=1.0 / control_hz, task_name=task_name)
+    # action 是训练入口约定的主动作；action_ee 可作为同一数据集中的派生字段。
+    if "action" in fields:
+        root.attrs["action_space"] = "joint"
+    elif "action_ee" in fields:
+        root.attrs["action_space"] = "eef"
     if {"finger_tactile_force", "taxel_tactile_force"}.intersection(fields):
         root.attrs["tactile_scale_divisor"] = XHAND_TACTILE_SCALE_DIVISOR
     if {"action", "action_ee"}.intersection(fields):

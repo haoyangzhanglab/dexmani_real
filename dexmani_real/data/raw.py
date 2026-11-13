@@ -15,6 +15,7 @@ from dexmani_real.geometry.camera import (
     CameraSnapshot,
     parse_camera_matrix,
 )
+from dexmani_real.geometry.hoi import validate_template
 from dexmani_real.geometry.pose import validate_rigid_transform
 from dexmani_real.robot.model import (
     XARM7_JOINT_NAMES,
@@ -504,6 +505,19 @@ class RawReader:
 
     def read_camera(self) -> CameraSnapshot:
         return decode_camera_metadata(self.meta)
+
+    def read_hoi_template(self):
+        """旧标注无模板快照；已存在的快照必须完整且有效。"""
+        if "hoi/template" not in self.data_file:
+            return None
+        saved = self.data_file["hoi/template"]
+        template = {
+            "points_local": saved["points_local"][:],
+            "offsets": saved["offsets"][:],
+            "object_names": np.asarray(saved["object_names"].asstr()[:], dtype=str),
+        }
+        validate_template(template)
+        return template
 
     def validate_joint_metadata(self, device, joint_names) -> None:
         if self.meta["joint_units"] != "rad":

@@ -29,3 +29,19 @@ python scripts/cordvip/annotate_episodes.py --task pnp_apple_banana
 每个 `prompt` 须在去畸变后的首帧匹配唯一候选，缺失或歧义会终止当前段。`instance` 仅用于参考图选择，不用于跟踪初始化。
 
 查看已保存的点云使用 `scripts/visualize_episode.py`，导出训练数据使用 `scripts/export_zarr.py`。安装、跟踪原理与单物体操作见 [cordvip_geometry](../../third_party/cordvip_geometry/README.md)。
+
+## 导出训练数据
+
+```bash
+python scripts/export_zarr.py episodes/pnp_apple_banana \
+  --output datasets/pnp_apple_banana.cordvip.zarr \
+  --fields joint_state action hand_pointcloud object_pointcloud
+```
+
+`object_pointcloud` 必须显式选择；省略 `--fields` 时不导出该字段。Zarr 的 `task_name` 来自 Raw 的 `meta.task_label`，不会从可改名的目录推断。一次导出只接受同一任务、相同控制周期的 episode，并保留录制的连续区间边界。
+
+导出 `action` 时，`action_space=joint`，对应 7 个机械臂关节和 12 个手关节的绝对目标；同时导出的 `action_ee` 是派生表示。仅导出 `action_ee` 时标记为 `eef`，这类数据不能直接通过当前 dexmani_policy 要求 `joint` 的训练入口。仅导出观测时不写 `action_space`。
+
+新 HOI 标注在 Raw 的 `/hoi/template/` 保存实际使用的 `points_local`、`offsets` 和 `object_names`。导出物体点云时，将对象名与分段写入 Zarr 根属性 `object_names` / `object_offsets`，局部模板点写入 `meta/object_points_local`；跨 episode 的模板必须完全一致，包括点序。物体点云仍为基座系、米制的 `[T,1024,3]`，模型输入不变。
+
+旧 HOI 没有模板快照时仍可导出，但会警告无法校验分段和点身份，也不允许与含快照的标注混合导出。导出器不会用当前资产补造历史元数据；需要这些信息时应重新生成 HOI 标注。这些元数据为后续接触标签预处理保留依据，本次不改变 dexmani_policy 的法向量或接触标签计算。
