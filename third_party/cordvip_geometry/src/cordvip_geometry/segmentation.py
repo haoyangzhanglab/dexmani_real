@@ -33,6 +33,18 @@ def normalize_prompt(text):
     return text if text.endswith(".") else text + "."
 
 
+def normalized_rgb_table(device):
+    """预计算 uint8 RGB 的归一化结果，避免逐帧搬运 float64 图像。"""
+    import torch
+
+    # float64 运算配合 float32 均值和标准差，保持 SAM2 输入的舍入结果。
+    values = torch.from_numpy(np.arange(256, dtype=np.float64) / 255.0)
+    values = values.to(device)[:, None].expand(256, 3).clone()
+    mean = torch.tensor((0.485, 0.456, 0.406), device=device, dtype=torch.float32)
+    std = torch.tensor((0.229, 0.224, 0.225), device=device, dtype=torch.float32)
+    return values.sub_(mean).div_(std).float()
+
+
 class SAM2Segmenter:
     def __init__(self, root, checkpoint, config, dino_weights):
         root = Path(root).expanduser().resolve()
@@ -41,7 +53,6 @@ class SAM2Segmenter:
         import torch
         from sam2.build_sam import build_sam2_video_predictor
         from sam2.sam2_image_predictor import SAM2ImagePredictor
-        from sam2.utils.misc import process_stream_frame
 
         if not torch.cuda.is_available():
             raise RuntimeError("Grounded-SAM2 requires CUDA")
@@ -60,7 +71,8 @@ class SAM2Segmenter:
         self.image_predictor = SAM2ImagePredictor(
             self.tracker, max_hole_area=0, max_sprinkle_area=0
         )
-        self.preprocess = process_stream_frame
+        self.normalization_table = normalized_rgb_table(self.device)
+        self.color_channels = torch.arange(3, device=self.device)
         stride = int(self.tracker.memory_temporal_stride_for_eval)
         self.history_frames = max(
             1,
@@ -192,11 +204,18 @@ class SAM2Segmenter:
             return masks
 
     def _append_frame(self, rgb):
-        tensor, _, _ = self.preprocess(
-            img_array=rgb,
-            image_size=self.tracker.image_size,
-            offload_to_cpu=False,
-            compute_device=self.device,
+        import torch
+        from PIL import Image
+
+        size = self.tracker.image_size
+        pixels = np.array(
+            Image.fromarray(rgb)
+            .convert("RGB")
+            .resize((size, size), Image.Resampling.LANCZOS)
+        )
+        pixels = torch.from_numpy(pixels).to(self.device)
+        tensor = self.normalization_table[pixels.long(), self.color_channels].permute(
+            2, 0, 1
         )
         index = self.state["num_frames"]
         # 保留绝对帧号，仅保存当前图像。

@@ -52,21 +52,38 @@ poses = tracker.initialize(frame, {"apple": "apple"})
 poses = tracker.track(next_frame)
 ```
 
-位姿表示物体局部坐标到相机坐标的变换，平移单位为米。每段调用 `initialize()` 重置场景并复用模型；跟踪失败抛出 `TrackingFailure`，调用方结束当前段，下一段重新初始化。
+位姿表示物体局部坐标到相机坐标的变换，平移单位为米。
 
-首帧先对 RGB-D 去畸变，再检测并用框初始化 SAM2 视频状态，所有物体共享一次图像编码。每个描述须匹配唯一候选；缺失或多个匹配均终止初始化。首帧与后续帧统一由 SAM2 按最高 mask 分数分配重叠像素。
+- 每段调用 `initialize()`，复用模型并重置位姿、视频状态及场景缓存。
+- 同一段内相机参数和图像尺寸须保持固定。
+- 跟踪失败抛出 `TrackingFailure`，调用方结束当前段，下一段重新初始化。
 
-SAM2 [推理补丁](scripts/sam2_inference.patch) 保留多尺度图像特征，仅计算 memory attention 所需的最终层位置编码。
+`SAM2Segmenter` 提供单图和视频接口：
 
-`SAM2Segmenter.detect()` 返回检测框、分数和标签；`predict()` 在候选中加入单图分割 mask 并过滤空 mask。视频接口 `initialize(rgb, boxes)` 接收 `{对象名: XYXY 检测框}`，与 `track(rgb)` 一样返回 `{对象名: mask}`。
+| 方法 | 输入与输出 |
+| --- | --- |
+| `detect(rgb, text)` | 返回检测框、分数和标签。 |
+| `predict(rgb, text)` | 在检测候选中加入单图分割 mask，并过滤空 mask。 |
+| `initialize(rgb, boxes)` | 接收 `{对象名: XYXY 检测框}`，初始化视频并返回 `{对象名: mask}`。 |
+| `track(rgb)` | 返回当前帧的 `{对象名: mask}`。 |
 
-FoundationPose 后续帧共享深度预处理，各物体独立裁剪、归一化，合批执行两轮 refinement，再分别检查分割与模型的深度一致性。RGB 与几何输入共用采样网格；refine 直接裁剪 XYZ，score 从裁剪深度重建 XYZ。
+`reconstruction.load_shape_model()` 加载可复用的 Hunyuan3D 模型；`reconstruct_mesh(model, rgba, ...)` 清理退化面并返回简化网格；`scale_mesh()` 返回保留原点和朝向的缩放副本，由调用方保存。
+
+## 推理实现
+
+`SceneTracker` 在构造时加载 Grounding DINO 并预热固定尺寸网络。每段首帧先对 RGB-D 去畸变，再检测目标并用框初始化 SAM2，所有物体共享一次图像编码。每个描述须匹配唯一候选；缺失或多个匹配均终止初始化。首帧与后续帧均由 SAM2 按最高 mask 分数分配重叠像素。
+
+SAM2 流式前处理使用 1024 输入和 LANCZOS 缩放，上传 uint8 图像后查表获得 float32 输入，保持 float64 归一化后转 float32 的数值结果。[SAM2 补丁](scripts/sam2_inference.patch) 保留多尺度图像特征，仅计算 memory attention 所需的最终层位置编码。
+
+FoundationPose 后续帧复用图像缓冲、相机投影矩阵及采样网格常量，共享深度预处理。位姿保留在 GPU，以掩码中心射线更新 XY；各物体独立渲染，观测裁剪与归一化合批执行。两轮 refinement 后，逐物体检查分割与模型的深度一致性。
+
+RGB 与几何输入共用采样网格：refine 直接裁剪 XYZ，score 从裁剪深度重建 XYZ。跟踪使用 PyTorch 原生 CUDA 卷积；注册和跟踪的 cuDNN 设置仅在调用内生效。批量大小会影响浮点结果，近对称物体的旋转可能不稳定。
 
 FoundationPose [推理补丁](scripts/foundationpose_inference.patch) 按上述两份权重的固定格式加载模型，使用局部固定种子采样网格直径。refine 和 score 直接返回位姿与分数；可视化由调用入口负责。
 
-跟踪网络使用 PyTorch 原生 CUDA 卷积；注册和跟踪的 cuDNN 设置仅在调用内生效，调用后恢复。批量大小会影响浮点结果，近对称物体的旋转可能不稳定。
+Hunyuan3D 重建使用分层体积解码、完整 attention 和 Marching Cubes。
 
-`reconstruction.load_shape_model()` 加载可复用的 Hunyuan3D 模型，使用分层体积解码、完整 attention 和 Marching Cubes。`reconstruct_mesh(model, rgba, ...)` 清理退化面并返回简化网格；`scale_mesh()` 返回保留原点和朝向的缩放副本，由调用方保存。
+## 模块职责
 
 | 模块 | 职责 |
 | --- | --- |

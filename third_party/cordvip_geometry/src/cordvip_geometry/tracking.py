@@ -21,6 +21,8 @@ MIN_MATCHED_FRACTION = 0.15
 
 class SceneTracker:
     def __init__(self, mesh_paths, *, workspace):
+        import torch
+
         from .segmentation import SAM2Segmenter
         from .weights import DEFAULT_MODELS_DIR, resolve_sam_model
 
@@ -33,6 +35,7 @@ class SceneTracker:
             config,
             models_dir / "grounding-dino-base",
         )
+        self.segmenter.load_grounding()
         self.trackers = {}
         self.renderers = {}
         shared = None
@@ -46,7 +49,27 @@ class SceneTracker:
             self.trackers[name] = tracker
             self.renderers[name] = MeshRaycaster(tracker.mesh)
 
+        # 在 worker 宣告就绪前预热固定尺寸网络；不创建视频历史或物体位姿。
+        with torch.inference_mode():
+            image_size = self.segmenter.tracker.image_size
+            image = torch.zeros((1, 3, image_size, image_size), device="cuda").to(
+                memory_format=torch.channels_last
+            )
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                self.segmenter.tracker.forward_image(image)
+            refiner = next(iter(self.trackers.values())).estimator.refiner
+            inputs = torch.zeros(
+                (len(self.trackers), 6, *refiner.cfg.input_resize), device="cuda"
+            )
+            with (
+                torch.backends.cudnn.flags(enabled=False),
+                torch.autocast("cuda", dtype=torch.float16),
+            ):
+                refiner.model(inputs, inputs)
+            torch.cuda.synchronize()
+
     def initialize(self, frame, prompts):
+        self.frame_cache = {}
         for tracker in self.trackers.values():
             tracker.estimator.pose_last = None
 
@@ -102,7 +125,11 @@ class SceneTracker:
                 )
             depth_masks[name] = selected
 
-        poses = {} if first else track_objects(self.trackers, rgb, depth_m, K, masks)
+        poses = {}
+        if not first:
+            poses = track_objects(
+                self.trackers, rgb, depth_m, K, masks, self.frame_cache
+            )
         for name, tracker in self.trackers.items():
             if first:
                 try:

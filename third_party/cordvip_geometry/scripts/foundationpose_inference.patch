@@ -1,5 +1,5 @@
 diff --git a/Utils.py b/Utils.py
-index 283028f..9ec5b7f 100644
+index 283028f..df6b29a 100644
 --- a/Utils.py
 +++ b/Utils.py
 @@ -94,12 +94,9 @@ COLOR_MAP=np.array([[0, 0, 0], #Ignore
@@ -73,7 +73,7 @@ index 283028f..9ec5b7f 100644
 
 
  def rle_to_mask(rle: dict) -> np.ndarray:
-@@ -558,75 +554,91 @@ def random_direction():
+@@ -558,75 +554,96 @@ def random_direction():
 
 
 
@@ -202,23 +202,28 @@ index 283028f..9ec5b7f 100644
 +    return scale @ translation
 +
 +
-+def make_crop_grid(tf_to_crops, image_size, crop_size):
-+    """Build the Kornia sampling grid once for RGB and geometry crops."""
++def make_crop_grid_constants(image_size, crop_size, device, dtype):
++    """Camera/crop-size constants reused by the tracking loop."""
 +    from kornia.geometry.conversions import normal_transform_pixel
-+    from kornia.geometry.linalg import transform_points
 +    from kornia.utils import create_meshgrid
 +
-+    src_norm = normal_transform_pixel(
-+        *image_size, device=tf_to_crops.device, dtype=tf_to_crops.dtype
-+    )
-+    dst_norm = normal_transform_pixel(
-+        *crop_size, device=tf_to_crops.device, dtype=tf_to_crops.dtype
-+    )
-+    normalized = dst_norm @ (tf_to_crops @ src_norm.inverse())
-+    grid = create_meshgrid(
-+        *crop_size, normalized_coordinates=True, device=tf_to_crops.device
-+    )
-+    grid = grid.to(tf_to_crops.dtype).expand(len(tf_to_crops), *crop_size, 2)
++    src_norm = normal_transform_pixel(*image_size, device=device, dtype=dtype)
++    dst_norm = normal_transform_pixel(*crop_size, device=device, dtype=dtype)
++    grid = create_meshgrid(*crop_size, normalized_coordinates=True, device=device).to(dtype)
++    return src_norm.inverse(), dst_norm, grid
++
++
++def make_crop_grid(tf_to_crops, image_size, crop_size, constants=None):
++    """Build the Kornia sampling grid once for RGB and geometry crops."""
++    from kornia.geometry.linalg import transform_points
++
++    if constants is None:
++        constants = make_crop_grid_constants(
++            image_size, crop_size, tf_to_crops.device, tf_to_crops.dtype
++        )
++    src_inverse, dst_norm, grid = constants
++    normalized = dst_norm @ (tf_to_crops @ src_inverse)
++    grid = grid.expand(len(tf_to_crops), *crop_size, 2)
 +    return transform_points(normalized.inverse()[:, None, None], grid)
 +
 +
@@ -1632,10 +1637,10 @@ index fbf362e..d18314b 100644
 +
 +        return output
 diff --git a/learning/training/predict_pose_refine.py b/learning/training/predict_pose_refine.py
-index fabb888..0d8443c 100644
+index fabb888..35fd052 100644
 --- a/learning/training/predict_pose_refine.py
 +++ b/learning/training/predict_pose_refine.py
-@@ -7,290 +7,164 @@
+@@ -7,290 +7,206 @@
  # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 
@@ -1648,15 +1653,15 @@ index fabb888..0d8443c 100644
 +from pathlib import Path
 +
  import torch
+-from omegaconf import OmegaConf
 +import torch.nn.functional as F
- from omegaconf import OmegaConf
--from learning.models.refine_network import RefineNet
++from learning.datasets.pose_dataset import BatchPoseData
+ from learning.models.refine_network import RefineNet
 -from learning.datasets.h5_dataset import *
 -from Utils import *
 -from datareader import *
-
-+from learning.datasets.pose_dataset import BatchPoseData
-+from learning.models.refine_network import RefineNet
+-
++from omegaconf import OmegaConf
 +from Utils import (
 +    compute_crop_window_tf_batch,
 +    egocentric_delta_pose_to_pose,
@@ -1680,17 +1685,6 @@ index fabb888..0d8443c 100644
 -
 -  B = len(ob_in_cams)
 -  poseA = torch.as_tensor(ob_in_cams, dtype=torch.float, device='cuda')
--
--  bs = 512
--  rgb_rs = []
--  depth_rs = []
--  normal_rs = []
--  xyz_map_rs = []
--
--  bbox2d_crop = torch.as_tensor(np.array([0, 0, cfg['input_resize'][0]-1, cfg['input_resize'][1]-1]).reshape(2,2), device='cuda', dtype=torch.float)
--  bbox2d_ori = transform_pts(bbox2d_crop, tf_to_crops.inverse()).reshape(-1,4)
--
--  for b in range(0,len(poseA),bs):
 +def make_crop_data_batch(
 +    render_size,
 +    ob_in_cams,
@@ -1702,8 +1696,43 @@ index fabb888..0d8443c 100644
 +    glctx,
 +    mesh_tensors,
 +):
-+    height, width = rgb.shape[:2]
 +    poses = torch.as_tensor(ob_in_cams, dtype=torch.float32, device="cuda")
++    crops = render_crops(
++        render_size,
++        poses,
++        rgb.shape[:2],
++        K,
++        crop_ratio,
++        mesh_diameter,
++        glctx,
++        mesh_tensors,
++    )
++    return sample_observed_crops(poses, rgb, xyz_map, *crops, render_size)
+
+-  bs = 512
+-  rgb_rs = []
+-  depth_rs = []
+-  normal_rs = []
+-  xyz_map_rs = []
+
+-  bbox2d_crop = torch.as_tensor(np.array([0, 0, cfg['input_resize'][0]-1, cfg['input_resize'][1]-1]).reshape(2,2), device='cuda', dtype=torch.float)
+-  bbox2d_ori = transform_pts(bbox2d_crop, tf_to_crops.inverse()).reshape(-1,4)
+-
+-  for b in range(0,len(poseA),bs):
++@torch.inference_mode()
++def render_crops(
++    render_size,
++    poses,
++    image_size,
++    K,
++    crop_ratio,
++    mesh_diameter,
++    glctx,
++    mesh_tensors,
++    projection_mat=None,
++):
++    """Return crop transforms, NCHW RGB (0–255), camera XYZ and diameters."""
++    height, width = image_size
 +    tf_to_crops = compute_crop_window_tf_batch(
 +        poses=poses,
 +        K=K,
@@ -1749,19 +1778,9 @@ index fabb888..0d8443c 100644
 -  else:
 -    normalAs = None
 -    normalBs = None
--
--  logging.info("warp done")
--
--  mesh_diameters = torch.ones((len(rgbAs)), dtype=torch.float, device='cuda')*mesh_diameter
--  pose_data = BatchPoseData(rgbAs=rgbAs, rgbBs=rgbBs, depthAs=None, depthBs=None, normalAs=normalAs, normalBs=normalBs, poseA=poseA, poseB=None, xyz_mapAs=xyz_mapAs, xyz_mapBs=xyz_mapBs, tf_to_crops=tf_to_crops, Ks=Ks, mesh_diameters=mesh_diameters)
--  pose_data = dataset.transform_batch(batch=pose_data, H_ori=H, W_ori=W, bound=1)
--
--  logging.info("pose batch data done")
--
--  return pose_data
--
 +    rendered_rgb, _, _ = nvdiffrast_render(
 +        K=K,
++        projection_mat=projection_mat,
 +        H=height,
 +        W=width,
 +        ob_in_cams=poses,
@@ -1775,7 +1794,33 @@ index fabb888..0d8443c 100644
 +    # Keep the multiply/divide order used by the pretrained model.
 +    rendered_rgb = rendered_rgb.permute(0, 3, 1, 2) * 255
 +    rendered_xyz = extra["xyz_map"].permute(0, 3, 1, 2)
-+    grid = make_crop_grid(tf_to_crops, (height, width), render_size)
++    diameters = torch.ones(len(poses), device=poses.device) * mesh_diameter
++    return tf_to_crops, rendered_rgb, rendered_xyz, diameters
+
+-  logging.info("warp done")
+-
+-  mesh_diameters = torch.ones((len(rgbAs)), dtype=torch.float, device='cuda')*mesh_diameter
+-  pose_data = BatchPoseData(rgbAs=rgbAs, rgbBs=rgbBs, depthAs=None, depthBs=None, normalAs=normalAs, normalBs=normalBs, poseA=poseA, poseB=None, xyz_mapAs=xyz_mapAs, xyz_mapBs=xyz_mapBs, tf_to_crops=tf_to_crops, Ks=Ks, mesh_diameters=mesh_diameters)
+-  pose_data = dataset.transform_batch(batch=pose_data, H_ori=H, W_ori=W, bound=1)
+-
+-  logging.info("pose batch data done")
+-
+-  return pose_data
+
++@torch.inference_mode()
++def sample_observed_crops(
++    poses,
++    rgb,
++    xyz_map,
++    tf_to_crops,
++    rendered_rgb,
++    rendered_xyz,
++    diameters,
++    render_size,
++    grid_constants=None,
++):
++    """Sample observed RGB/XYZ and normalize both inputs for refinement."""
++    grid = make_crop_grid(tf_to_crops, rgb.shape[:2], render_size, grid_constants)
 +    observed_rgb = F.grid_sample(
 +        torch.as_tensor(rgb, device=poses.device, dtype=torch.float32)
 +        .permute(2, 0, 1)[None]
@@ -1792,7 +1837,6 @@ index fabb888..0d8443c 100644
 +        mode="nearest",
 +        align_corners=False,
 +    )
-+    diameters = torch.ones(len(poses), device=poses.device) * mesh_diameter
 +    return BatchPoseData(
 +        rgbAs=rendered_rgb / 255.0,
 +        rgbBs=observed_rgb / 255.0,

@@ -287,13 +287,15 @@ def test_scene_batch_keeps_per_object_depth_gate(monkeypatch):
     scene.directions = camera_rays(shape, np.eye(3), tracking.PIXEL_STRIDE)
     scene.segmenter = SimpleNamespace(track=lambda rgb: {"apple": mask, "banana": mask})
     scene.trackers = {"apple": object(), "banana": object()}
+    scene.frame_cache = {}
     scene.renderers = {
         "apple": SimpleNamespace(render=lambda rays, pose: np.ones(len(rays))),
         "banana": SimpleNamespace(render=lambda rays, pose: np.full(len(rays), 2.0)),
     }
     calls = []
 
-    def batch(trackers, rgb, depth, K, masks):
+    def batch(trackers, rgb, depth, K, masks, frame_cache):
+        assert frame_cache is scene.frame_cache
         calls.append(list(trackers))
         return {name: np.eye(4) for name in trackers}
 
@@ -635,7 +637,7 @@ def test_single_image_segmentation_keeps_candidate_interface(monkeypatch):
     assert segmenter.predict(rgb, "apple") == [] and len(calls) == 1
 
 
-def test_scene_initialization_rectifies_before_detection_and_resets_poses():
+def test_scene_initialization_rectifies_before_detection_and_resets_state():
     import cv2
     from cordvip_geometry.tracking import SceneTracker
 
@@ -658,6 +660,7 @@ def test_scene_initialization_rectifies_before_detection_and_resets_poses():
 
     def detect(image, text):
         assert all(item.estimator.pose_last is None for item in scene.trackers.values())
+        assert scene.frame_cache == {}
         np.testing.assert_array_equal(image, expected_rgb)
         return [
             {"box_xyxy": boxes["dish"], "label": "bowl", "score": 0.9},
@@ -689,6 +692,7 @@ def test_scene_initialization_rectifies_before_detection_and_resets_poses():
         expected_depth = cv2.remap(depth, *maps, cv2.INTER_NEAREST)
         for tracker in scene.trackers.values():
             tracker.estimator.pose_last = np.eye(4)
+        scene.frame_cache = {"K": K, "rgb": rgb}
         frame = RGBDFrame(rgb, depth, K, "brown_conrady", distortion)
         result = scene.initialize(frame, {"fruit": " Apple. ", "dish": "bowl"})
         assert list(result) == ["fruit", "dish"]
