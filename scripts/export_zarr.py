@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """将 Raw episode 的所选字段导出为 Canonical Zarr。"""
-# Usage: python scripts/export_zarr.py episodes/pnp_apple_banana --output datasets/pnp_apple_banana.cordvip.zarr \
-#   --fields joint_state action hand_pointcloud object_pointcloud
 
 from __future__ import annotations
 
@@ -25,25 +23,16 @@ from dexmani_real.utils.table_plane import load_table_plane
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Export published Raw episodes with valid data to a canonical multimodal Zarr. "
-            "Validate structure and timing first, numeric values during chunk conversion. "
-            "Warn on source-clock diagnostics; reject missing/nonfinite selected data. "
-            "Export recorded continuous segments as separate episodes without resampling. "
-            "Recorded segment boundaries are required for every episode. "
-            "Publish only after all episodes succeed; "
-            "use --exclude and retry."
+            "Export selected fields from published Raw episodes of one task to canonical Zarr. "
+            "Preserve recorded continuous segments as separate episodes without resampling. "
+            "Reject missing/nonfinite selected data and publish only after all episodes succeed."
         )
     )
     parser.add_argument(
         "input_root",
         type=Path,
-        metavar="episodes/<task_name>",
-        help=(
-            "One raw task or episode directory. Exports to "
-            "datasets/<task_name>.zarr by default (see --output). "
-            "Every row of the selected fields must be valid. "
-            "The destination must not already exist."
-        ),
+        metavar="INPUT_ROOT",
+        help="One Raw task directory containing episode_* subdirectories, or one episode directory.",
     )
     parser.add_argument(
         "--output",
@@ -51,8 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Alternative canonical Zarr output path for this task "
-            "(default: datasets/<task_name>.zarr). The default name "
-            "comes from the input directory. "
+            "(default: datasets/<input-directory>.zarr, using the parent for a single episode). "
+            "Stored task_name metadata comes from Raw meta.task_label. "
             "The destination must be new; a new target inside the input directory is allowed."
         ),
     )
@@ -77,14 +66,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def default_output_path(input_root: Path) -> Path:
-    task_name = (
+    output_stem = (
         input_root.parent.name
         if (input_root / "data.h5").is_file()
         else input_root.name
     )
-    if not task_name:
+    if not output_stem:
         raise ValueError("input_root must name one task directory, e.g. episodes/pick_place_toy")
-    return Path("datasets") / f"{task_name}.zarr"
+    return Path("datasets") / f"{output_stem}.zarr"
 
 
 def load_processing_config(path: Path | None, fields) -> ExportConfig:

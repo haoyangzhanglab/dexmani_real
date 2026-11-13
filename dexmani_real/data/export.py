@@ -272,19 +272,20 @@ def export_zarr(
     progress_callback=None,
 ) -> dict:
     fields = resolve_fields(fields)
-    joint_hoi = "object_pointcloud" in fields and bool(HAND_FK_FIELDS.union({"joint_state"}).intersection(fields))
+    joint_hoi = "object_pointcloud" in fields and bool(
+        HAND_FK_FIELDS.union({"joint_state"}).intersection(fields)
+    )
     if joint_hoi:
         validate_hoi_skew_budget(processing.hoi_max_skew_s)
     if "point_cloud" in fields:
         processing.pointcloud.validate()
     if "hand_pointcloud" in fields:
         processing.hand_pointcloud.validate()
-    requested_source = Path(input_root).expanduser()
     output = Path(output_path).expanduser()
     target = output.resolve()
     if os.path.lexists(output):
         raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {output}")
-    selected, excluded = select_episodes(requested_source, exclude)
+    selected, excluded = select_episodes(input_root, exclude)
     staging = None
     store = None
     ends: list[int] = []
@@ -296,17 +297,27 @@ def export_zarr(
             try:
                 require_published_raw(episode)
                 with RawReader(episode) as reader:
+                    task_name = reader.meta["task_label"]
                     camera = validate_export_episode(
-                        reader, fields, hoi_max_skew_s=processing.hoi_max_skew_s if joint_hoi else None,
+                        reader,
+                        fields,
+                        hoi_max_skew_s=processing.hoi_max_skew_s if joint_hoi else None,
                     )
                     starts = reader.segment_starts
                     frames = reader.num_frames
-                    logger.info("%s: exporting %d rows in %d segments", episode.name, frames, len(starts))
+                    logger.info(
+                        "%s: exporting %d rows in %d segments",
+                        episode.name, frames, len(starts),
+                    )
                     if index == 0:
                         arm_fk = ArmFK() if ARM_FK_FIELDS.intersection(fields) else None
                         hand_fk = HandFK() if HAND_FK_FIELDS.intersection(fields) else None
-                        hand_cloud = (HandPointCloud(cast(HandFK, hand_fk), processing.hand_pointcloud.num_points)
-                                      if "hand_pointcloud" in fields else None)
+                        hand_cloud = (
+                            HandPointCloud(
+                                cast(HandFK, hand_fk), processing.hand_pointcloud.num_points
+                            )
+                            if "hand_pointcloud" in fields else None
+                        )
                         target.parent.mkdir(parents=True, exist_ok=True)
                         staging = Path(
                             tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
@@ -318,15 +329,25 @@ def export_zarr(
                             camera,
                             fields=fields,
                             control_hz=reader.control_hz,
+                            task_name=task_name,
                         )
                     else:
+                        if task_name != root.attrs["task_name"]:
+                            raise ValueError(
+                                f"task_label mismatch: expected {root.attrs['task_name']!r}, "
+                                f"got {task_name!r}"
+                            )
                         if not np.isclose(reader.dt, root.attrs["dt"], rtol=1e-6, atol=0):
                             raise ValueError("one canonical store requires uniform dt")
-                        if "depth" in fields and not depth_scales_match(camera["depth_scale_m"], root.attrs["depth_scale_m_per_unit"]):
+                        if "depth" in fields and not depth_scales_match(
+                            camera["depth_scale_m"], root.attrs["depth_scale_m_per_unit"]
+                        ):
                             raise ValueError("depth_scale_m_per_unit must be uniform")
                         for name in ("rgb", "depth"):
                             if name in fields:
-                                shape = (*camera["shape"], 3) if name == "rgb" else camera["shape"]
+                                shape = (
+                                    (*camera["shape"], 3) if name == "rgb" else camera["shape"]
+                                )
                                 if shape != arrays[name].shape[1:]:
                                     raise ValueError(f"inconsistent {name} shape")
 
@@ -354,8 +375,10 @@ def export_zarr(
         if progress_callback:
             progress_callback(len(selected), len(selected))
         return {
-            "raw_episode_count": len(selected), "episode_count": len(ends),
-            "total_frames": ends[-1], "excluded_episodes": sorted(excluded),
+            "raw_episode_count": len(selected),
+            "episode_count": len(ends),
+            "total_frames": ends[-1],
+            "excluded_episodes": sorted(excluded),
         }
     finally:
         if staging is not None:
@@ -370,10 +393,15 @@ def export_zarr(
                 logger.exception("export staging cleanup also failed: %s", staging)
 
 
-def create_store(store, processing, camera, *, fields, control_hz):
+def create_store(store, processing, camera, *, fields, control_hz, task_name):
     specs = canonical_array_specs(fields, processing, camera)
     root = zarr.group(store=store, overwrite=True)
-    root.attrs.update(format=CANONICAL_FORMAT, dt=1.0 / control_hz)
+    root.attrs.update(
+        format=CANONICAL_FORMAT,
+        dt=1.0 / control_hz,
+        task_name=task_name,
+        action_space="joint",
+    )
     if {"finger_tactile_force", "taxel_tactile_force"}.intersection(fields):
         root.attrs["tactile_scale_divisor"] = XHAND_TACTILE_SCALE_DIVISOR
     if {"action", "action_ee"}.intersection(fields):
