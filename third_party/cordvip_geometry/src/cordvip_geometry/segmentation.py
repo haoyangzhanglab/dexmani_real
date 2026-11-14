@@ -8,7 +8,8 @@ import numpy as np
 
 
 def prune_state(state, frame_index, history_frames):
-    """保留首帧 conditioning 和下一帧所需历史。"""
+    """保留首帧 conditioning 和近期历史，提示输入与合并输出索引同步裁剪。"""
+
     cutoff = frame_index - history_frames + 1
     for output in [
         state["output_dict"],
@@ -21,6 +22,15 @@ def prune_state(state, frame_index, history_frames):
     for index in list(state["frames_already_tracked"]):
         if index != 0 and index < cutoff:
             del state["frames_already_tracked"][index]
+    for inputs in (state["point_inputs_per_obj"], state["mask_inputs_per_obj"]):
+        for frames in inputs.values():
+            for index in list(frames):
+                if (
+                    index < cutoff
+                    and index
+                    not in state["consolidated_frame_inds"]["cond_frame_outputs"]
+                ):
+                    del frames[index]
     state["consolidated_frame_inds"]["non_cond_frame_outputs"].intersection_update(
         range(max(1, cutoff), frame_index + 1)
     )
@@ -143,7 +153,7 @@ class SAM2Segmenter:
             label for label, keep in zip(detections["labels"], valid.tolist()) if keep
         ]
 
-        normalized = [label.strip().lower().rstrip(".") for label in labels]
+        normalized = [label.strip().lower().rstrip(". ") for label in labels]
         label_ids = {label: i for i, label in enumerate(dict.fromkeys(normalized))}
         class_ids = torch.tensor(
             [label_ids[label] for label in normalized], dtype=torch.int64
@@ -160,25 +170,46 @@ class SAM2Segmenter:
 
     def predict(self, rgb, text, box_threshold=0.3, text_threshold=0.25):
         """单图分割，在检测候选中加入 mask 并过滤空 mask。"""
-        import torch
-
         candidates = self.detect(rgb, text, box_threshold, text_threshold)
         if not candidates:
             return []
-        boxes = np.stack([item["box_xyxy"] for item in candidates])
+        masks = self.segment_boxes(
+            rgb, {i: item["box_xyxy"] for i, item in enumerate(candidates)}
+        )
+        return [
+            {**item, "mask": masks[i]}
+            for i, item in enumerate(candidates)
+            if masks[i].any()
+        ]
+
+    def segment_boxes(self, rgb, boxes):
+        """复用图像 predictor，按对象名返回 mask，不触碰视频状态。"""
+        import torch
+
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             self.image_predictor.set_image(np.ascontiguousarray(rgb))
             masks, _, _ = self.image_predictor.predict(
-                point_coords=None, point_labels=None, box=boxes, multimask_output=False
+                point_coords=None,
+                point_labels=None,
+                box=np.stack(list(boxes.values())),
+                multimask_output=False,
             )
-        masks = np.asarray(masks)
-        if masks.ndim == 4 and masks.shape[1] == 1:
-            masks = masks[:, 0]
-        return [
-            {**item, "mask": mask.astype(bool)}
-            for item, mask in zip(candidates, masks)
-            if mask.any()
-        ]
+        return {
+            name: np.asarray(mask).reshape(rgb.shape[:2]).astype(bool)
+            for name, mask in zip(boxes, masks)
+        }
+
+    def correct_masks(self, masks):
+        """校正当前已跟踪帧的已有对象，合并时保留其他对象的当前输出。"""
+        import torch
+
+        index = self.state["num_frames"] - 1
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            for name, mask in masks.items():
+                self.tracker.add_new_mask(
+                    self.state, frame_idx=index, obj_id=name, mask=mask
+                )
+            return self._masks(self.tracker.infer_single_frame(self.state, index))
 
     def initialize(self, rgb, boxes):
         """以 {对象名: XYXY 检测框} 初始化新视频，共享首帧图像编码。"""

@@ -11,11 +11,11 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def run_hoi_worker(shared, camera, task, template):
+def run_hoi_worker(shared, camera, task, template, *, tracking_config=None):
     root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(root / "third_party/cordvip_geometry/src"))
     from cordvip_geometry.camera import RGBDFrame
-    from cordvip_geometry.tracking import SceneTracker, TrackingFailure
+    from cordvip_geometry.tracking import SceneTracker, TrackingConfig, TrackingFailure
 
     from dexmani_real.geometry.hoi import task_objects, transform_task_points
 
@@ -30,9 +30,10 @@ def run_hoi_worker(shared, camera, task, template):
     )
     epoch = last_sequence = 0
     first = True
-    episode_failed = False
     tracker = SceneTracker(
-        {name: task / name / "mesh/mesh_m.obj" for name in prompts}, workspace=root
+        {name: task / name / "mesh/mesh_m.obj" for name in prompts},
+        workspace=root,
+        config=tracking_config if tracking_config is not None else TrackingConfig(),
     )
     shared.hoi_ready.value = True
     while shared.is_running.value:
@@ -45,11 +46,7 @@ def run_hoi_worker(shared, camera, task, template):
         if epoch != requested_epoch:
             epoch = requested_epoch
             first = True
-            episode_failed = False
             last_sequence = int(command["after_sequence"])
-        if episode_failed:
-            time.sleep(0.005)
-            continue
         result = shared.camera_ring.read()
         if result is None or result[1] <= last_sequence:
             time.sleep(0.001)
@@ -66,20 +63,24 @@ def run_hoi_worker(shared, camera, task, template):
             )
         except TrackingFailure as error:
             failure = str(error)
-            points = np.zeros((1024, 3), np.float32)
         else:
-            poses = np.stack([scene.poses[name] for name in template["object_names"]])
-            points = transform_task_points(
-                template, poses, camera.T_xarm_base_from_color
-            )
-        first = False
+            first = False
+            if not all(scene.valid.values()):
+                failure = str(scene.failures)
+            else:
+                poses = np.stack(
+                    [scene.poses[name] for name in template["object_names"]]
+                )
+                points = transform_task_points(
+                    template, poses, camera.T_xarm_base_from_color
+                )
         # 丢弃已经切换 Episode 的在途结果。
         if int(shared.hoi_request.read()[0]["episode_id"]) != epoch:
             continue
         if failure is not None:
-            episode_failed = True
+            points = np.zeros((1024, 3), np.float32)
             logger.warning(
-                "HOI Episode %d 失败：%s；等待下一轮 B 请求。", epoch, failure
+                "HOI Episode %d 当前帧无效：%s；继续处理后续帧。", epoch, failure
             )
         shared.hoi_ring.write(
             episode_id=epoch,

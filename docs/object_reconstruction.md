@@ -24,7 +24,7 @@ flowchart LR
 
 1. **准备资产**：[prepare_task.py](../scripts/cordvip/prepare_task.py) 按 `task.json` 分割参考图、通过 Hunyuan3D 重建，再用实测尺寸调整为米制尺度；已有米制网格直接复用。
 2. **生成模板**：[sample_template.py](../scripts/cordvip/sample_template.py) 固定对象顺序、点分段与点序，已有模板直接复用。
-3. **标注 Raw**：[annotate_episodes.py](../scripts/cordvip/annotate_episodes.py) 跟踪录制的 RGB-D，整段成功后发布位姿、质量和物体点云。
+3. **标注 Raw**：[annotate_episodes.py](../scripts/cordvip/annotate_episodes.py) 跟踪录制的 RGB-D，完成逐帧标注后发布位姿、质量和物体点云。
 4. **导出数据**：[export_zarr.py](../scripts/export_zarr.py) 读取物体标注，对齐关节并生成手部几何，与所选状态和动作一同导出。
 5. **训练与部署**：在 dexmani_policy 中训练；部署共用任务模板、跟踪器、坐标变换和 FK。
 
@@ -32,7 +32,11 @@ flowchart LR
 
 在线 worker 加载模型、完成预热后宣告就绪。每段首帧先对 RGB-D 去畸变，由 Grounding DINO 检测目标、SAM2 分割，再由 FoundationPose 注册位姿。后续从上一帧位姿开始合批 refinement，并检查遮挡感知的轮廓与实测深度一致性。质量指标和阈值见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)。
 
-模型跨段复用；初始化重置视频历史、位姿及相机缓存，段内相机参数和图像尺寸固定。离线标注使用相同跟踪流程，相同相机序列复用位姿与质量。跟踪失败或必需观测过期会结束当前段，下一段重新初始化。
+模型跨段复用；初始化重置视频历史、位姿及相机缓存，段内相机参数和图像尺寸固定。离线标注使用相同跟踪流程，相同相机序列复用位姿、质量和有效性，不重复推理。
+
+跟踪按对象维护 `TRACKING / LOST`。对象丢失后，健康对象继续跟踪；丢失对象通过检测、分割和重新注册恢复，位姿仍须通过原有质量检查。初始化失败时在后续新帧重试初始化。恢复参数和 SAM2 状态处理见[后端说明](../third_party/cordvip_geometry/README.md#遮挡恢复)。
+
+在线任一必需对象无效时发布零点云和 `valid=False`，全部恢复后重新发布有效点云。感知 worker 只在请求有效期间持续处理；部署控制层仍会在必需观测无效或过期时结束当前段。
 
 HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来源时间的关节。插值要求前后反馈间隔不超过 `execution.hoi_max_joint_gap_s`，默认 0.10 秒；精确命中直接取样，禁止外推和跨连续区间插值。
 
@@ -40,20 +44,26 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 
 ## 标注、导出与回放
 
-Raw 的 `/hoi` 整段成功后才发布，不覆盖已有标注。
+Raw 的 `/hoi` 完成逐帧标注后统一发布，不覆盖已有标注。临时跟踪失败保留原始行、时间戳和有效性，不丢弃整个 episode。
 
 | 内容 | 路径或位置 |
 | --- | --- |
 | 策略使用的基座系物体点云 | `/hoi/object_pointcloud` |
 | 物体局部到相机的位姿 | `/hoi/object_pose_camera` |
+| 逐对象有效性，形状 `[T,O]` | `/hoi/object_valid` |
+| 全部对象有效时为真，形状 `[T]` | `/hoi/valid` |
 | 逐帧、逐对象质量指标 | `/hoi/quality/` |
 | 固定模板、对象顺序及点分段 | `/hoi/template/` |
 | 相机到基座的变换 | `/hoi/base_from_camera` |
 | 实际跟踪配置 | `/hoi` 属性 |
 
+无效对象的位姿为 NaN，无法计算的质量指标为 NaN；任一对象无效时，该帧物体点云全零。只有全部对象有效的帧才生成模板点云。读取和写入都要求显式有效性，两份字段须成对存在且一致。缺少字段的标注直接报错，不推断为全有效，也不自动迁移或覆盖。
+
+导出包含物体点云时，先按原规则对齐所需关节，再过滤感知无效行。所有观测与动作同步选择，每个有效连续区间分别写入 `episode_ends`，训练窗口不会跨越遮挡缺口。仅导出物体点云也执行过滤；没有有效行时明确报错。
+
 Zarr 保持策略数组字段、点数、类型和坐标系不变，元数据记录插值间隔上限及原始保留区间。合并导出时直接比较模板点、对象名和分段数组，拒绝混用不同模板。训练与部署须固定使用相同的物体模板、手模板及机器人模型。
 
-[visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则，显示手物几何、逐物体质量及原始来源时差；不可对齐的边界帧不显示手几何。
+[visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则，显示手物几何、有效性、逐物体质量及原始来源时差；隐藏无效物体点云，不可对齐的边界帧不显示手几何。
 
 ## 代码入口与参考
 

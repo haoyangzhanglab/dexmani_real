@@ -135,6 +135,7 @@ def hoi_episodes(raw_episodes):
             np.eye(4),
             quality=[[{"iou": 1.0}]] * count,
             tracking_config={},
+            object_valid=np.ones((count, 1), bool),
         )
     return source, states, actions
 
@@ -256,3 +257,49 @@ def test_hoi_internal_gap_is_not_trimmed(raw_episodes):
     with RawReader(episode) as reader:
         with pytest.raises(ValueError, match="internal joint gap"):
             align_hoi_episode(reader, 0.01)
+
+
+@pytest.mark.parametrize(
+    "fields", [("object_pointcloud",), ("object_pointcloud", "joint_state", "action")]
+)
+def test_hoi_loss_splits_training_windows(tmp_path, hoi_episodes, fields):
+    source, _, _ = hoi_episodes
+    with h5py.File(source / "episode_1/data.h5", "r+") as data:
+        data["hoi/object_valid"][1, 0] = False
+        data["hoi/valid"][1] = False
+        data["hoi/object_pointcloud"][
+            1
+        ] = np.nan  # 该行必须在写入 canonical 数组前被过滤。
+    output = tmp_path / "filtered.zarr"
+    export_zarr(source, output, processing=ExportConfig(), fields=fields)
+    root = zarr.open_group(str(output), mode="r")
+    np.testing.assert_array_equal(root["meta/episode_ends"][:], [2, 4, 5, 6])
+    assert np.isfinite(root["data/object_pointcloud"][:]).all()
+    assert root.attrs["hoi_alignment"][1]["kept_ranges"] == [[0, 1], [2, 3]]
+    root.store.close()
+
+
+@pytest.mark.parametrize("missing", ["valid", "object_valid"])
+def test_export_rejects_missing_hoi_validity(tmp_path, hoi_episodes, missing):
+    source, _, _ = hoi_episodes
+    with h5py.File(source / "episode_0/data.h5", "r+") as data:
+        del data[f"hoi/{missing}"]
+    output = tmp_path / "invalid.zarr"
+    with pytest.raises(ValueError, match=missing):
+        export_zarr(
+            source, output, processing=ExportConfig(), fields=("object_pointcloud",)
+        )
+    assert not output.exists()
+
+
+def test_export_rejects_episode_with_no_valid_hoi_rows(tmp_path, hoi_episodes):
+    source, _, _ = hoi_episodes
+    with h5py.File(source / "episode_0/data.h5", "r+") as data:
+        data["hoi/valid"][:] = False
+        data["hoi/object_valid"][:] = False
+    output = tmp_path / "empty.zarr"
+    with pytest.raises(ValueError, match="No valid HOI rows"):
+        export_zarr(
+            source, output, processing=ExportConfig(), fields=("object_pointcloud",)
+        )
+    assert not output.exists()

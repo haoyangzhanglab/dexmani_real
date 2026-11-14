@@ -19,6 +19,7 @@ import numpy as np
 
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.config.real import load_config
+from dexmani_real.data.hoi import align_hoi_episode, read_hoi_validity
 from dexmani_real.data.raw import TACTILE_FINGER_ORDER, RawReader, read_episode_outcome
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
@@ -90,6 +91,7 @@ class EpisodeVisualizer:
             if self.has_hoi:
                 self.reader.require_fields("object_pointcloud")
                 self.reader["object_pointcloud"]
+                self.hoi_valid = read_hoi_validity(self.reader)
 
             self.reader.require_fields(
                 "rgb",
@@ -136,11 +138,10 @@ class EpisodeVisualizer:
             self.hand_cloud = HandPointCloud(self.hand_fk, hand_pointcloud_config.num_points)
             self.hoi_alignment = None
             if self.has_hoi:
-                from dexmani_real.data.hoi import align_hoi_episode
-
                 self.hoi_alignment = align_hoi_episode(self.reader, hoi_max_joint_gap_s)
                 logger.info(
-                    "HOI 对齐保留区间：%s；边界帧不显示插值手几何", self.hoi_alignment["ranges"]
+                    "HOI 可导出区间（关节对齐且感知有效）：%s",
+                    self.hoi_alignment["ranges"],
                 )
             self.state = self.preload_state()
 
@@ -212,10 +213,15 @@ class EpisodeVisualizer:
         self.log_pointcloud(rgb, depth)
         self.log_hand_geometry(step_idx)
         if self.has_hoi:
-            points = self.reader["object_pointcloud"][step_idx]
-            if not np.isfinite(points).all():
-                raise ValueError(f"object_pointcloud contains nonfinite coordinates at row {step_idx}")
+            points = None
+            if self.hoi_valid[step_idx]:
+                points = self.reader["object_pointcloud"][step_idx]
+                if not np.isfinite(points).all():
+                    raise ValueError(
+                        f"object_pointcloud contains nonfinite coordinates at row {step_idx}"
+                    )
             log_points("object_pointcloud", points, colors=[255, 170, 0])
+            self.rr.log("hoi/valid", self.rr.Scalar(int(self.hoi_valid[step_idx])))
 
     def log_hand_geometry(self, step_idx: int) -> None:
         arm = self.state["arm_qpos"][step_idx]
@@ -223,7 +229,7 @@ class EpisodeVisualizer:
         if self.hoi_alignment is not None:
             arm = self.hoi_alignment["arm_qpos"][step_idx]
             hand = self.hoi_alignment["hand_qpos"][step_idx]
-            self.log_hoi_diagnostics(step_idx)
+            self.log_hoi_diagnostics(step_idx, self.hoi_alignment)
         pose = self.arm_fk.forward(arm) if np.isfinite(arm).all() else None
         fingertips, cloud = None, None
         if pose is not None and np.isfinite(hand).all():
@@ -244,8 +250,13 @@ class EpisodeVisualizer:
             colors=[EEF_COLOR], radii=0.020,
         )
 
-    def log_hoi_diagnostics(self, step_idx: int) -> None:
-        available = int(self.hoi_alignment["keep"][step_idx])
+    def log_hoi_diagnostics(self, step_idx: int, alignment: dict) -> None:
+        available = int(
+            all(
+                np.isfinite(alignment[f"{device}_qpos"][step_idx]).all()
+                for device in ("arm", "hand")
+            )
+        )
         self.rr.log("hoi/alignment_available", self.rr.Scalar(available))
         timing = self.reader["timing/rows"][step_idx]
         for device in ("arm", "hand"):

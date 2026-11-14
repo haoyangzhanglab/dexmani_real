@@ -325,12 +325,14 @@ def export_zarr(
                         align_hoi_episode(
                             reader, processing.hoi_max_joint_gap_s, devices=joint_devices
                         )
-                        if joint_devices
+                        if "object_pointcloud" in fields
                         else None
                     )
                     if alignment is not None:
                         starts = alignment["starts"]
                         frames = int(alignment["keep"].sum())
+                        if frames == 0:
+                            raise ValueError("No valid HOI rows to export")
                     logger.info(
                         "%s: exporting %d rows in %d segments",
                         episode.name, frames, len(starts),

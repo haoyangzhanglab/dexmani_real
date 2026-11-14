@@ -32,7 +32,7 @@ def task_objects(task):
         ):
             raise ValueError(f"{name}: Prompt 必须是非空字符串，且不能仅含空白或标点")
         # 与跟踪器的标签匹配规则一致。
-        normalized = prompt.strip().lower().rstrip(".")
+        normalized = prompt.strip().lower().rstrip(". ")
         if normalized in names_by_prompt:
             raise ValueError(
                 f"对象 {names_by_prompt[normalized]!r} 与 {name!r} 的 Prompt 冲突：{prompt!r}"

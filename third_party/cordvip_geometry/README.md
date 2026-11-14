@@ -49,15 +49,25 @@ tracker = SceneTracker(
 )
 frame = RGBDFrame.from_camera(camera, camera_row)
 result = tracker.initialize(frame, {"apple": "apple"})
-poses, quality = result.poses, result.quality
 result = tracker.track(next_frame)
+if result.valid["apple"]:
+    pose_camera_from_object = result.poses["apple"]
 ```
 
-`initialize()` 和 `track()` 均返回 `SceneResult(poses, quality)`，两份字典均以对象名为键。位姿表示物体局部坐标到相机坐标的变换，平移单位为米。
+`initialize()` 和 `track()` 返回 `SceneResult`。位姿表示物体局部到相机的变换 `T_camera_from_object`，平移单位为米。
+
+| 字段 | 含义 |
+| --- | --- |
+| `poses` | 仅包含当前有效对象的位姿，键为原始对象名。 |
+| `quality` | 每个对象的当前质量指标；未计算时为空字典。 |
+| `valid` | 覆盖全部对象，表示当前帧位姿是否有效。 |
+| `failures` | 无效对象的失败原因或等待重试状态。 |
+| `timings_ms` | 本帧已完成阶段的墙钟耗时，单位 ms。 |
 
 - 每段调用 `initialize()`，复用模型并重置位姿、视频状态及场景缓存。
 - 同一段内相机参数和图像尺寸须保持固定。
-- 跟踪失败抛出 `TrackingFailure`，调用方结束当前段，下一段重新初始化。
+- 初始化失败抛出 `TrackingFailure`，后续新帧重试初始化；全部对象注册成功后才进入正常跟踪。
+- 跟踪期逐对象返回有效性。单对象推理的运行时失败和质量不通过进入 LOST；输入、接口及程序错误直接报错。共享 SAM2 视频推理或校正失败可能留下部分状态，不作为可恢复遮挡吞掉，调用方停止使用该实例。
 
 `SAM2Segmenter` 提供单图和视频接口：
 
@@ -67,6 +77,8 @@ result = tracker.track(next_frame)
 | `predict(rgb, text)` | 在检测候选中加入单图分割 mask，并过滤空 mask。 |
 | `initialize(rgb, boxes)` | 接收 `{对象名: XYXY 检测框}`，初始化视频并返回 `{对象名: mask}`。 |
 | `track(rgb)` | 返回当前帧的 `{对象名: mask}`。 |
+| `segment_boxes(rgb, boxes)` | 对非空检测框字典做单图分割，不修改视频状态。 |
+| `correct_masks(masks)` | 校正当前已跟踪帧的已有对象 ID，返回合并后的全部 mask。 |
 
 `reconstruction.load_shape_model()` 加载可复用的 Hunyuan3D 模型；`reconstruct_mesh(model, rgba, ...)` 清理退化面并返回简化网格；`scale_mesh()` 返回保留原点和朝向的缩放副本，由调用方保存。
 
@@ -83,7 +95,26 @@ result = tracker.track(next_frame)
 
 每帧渲染完整模型投影。只有 mask 外的有效实测深度比模型近、且差值超过深度容差时，才将对应投影视为前景遮挡；缺失深度不作为遮挡证据。`quality` 同时返回轮廓 IoU、深度误差中位数及遮挡比例等诊断值。
 
-阈值是工程初值，需用实际 RGB-D 回放验证。分割深度不足或质量检查失败均抛出 `TrackingFailure`；相机参数变化属于输入错误，直接报错。
+阈值是工程初值，需用实际 RGB-D 回放验证。跟踪期分割深度不足或质量检查失败仅将对应对象置为 LOST；相机参数变化属于输入错误，直接报错。
+
+## 遮挡恢复
+
+对象处于 `TRACKING` 时先检查 mask 和深度，再合批执行 FoundationPose refinement，并逐对象检查质量。失败对象恢复最后接受的内部 `pose_last`，进入 `LOST`；历史位姿只用于内部回滚，不作为当前观测发布。批量推理发生运行时异常时先回滚，再逐对象调用以隔离失败。非有限候选直接逐对象拒绝，不触发整批重算。后端只替换内部位姿张量，回滚保留原张量引用，无需深拷贝。
+
+`LOST` 对象不再执行正常 refinement。到期对象共享一次 Grounding DINO 检测，按规范化 prompt 唯一匹配候选，随后重新分割并调用现有 `register()`。缺失、歧义或几何校验失败时继续保持 LOST；恢复使用与正常跟踪相同的质量阈值。
+
+| `TrackingConfig` 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `recovery_enabled` | `True` | 是否尝试恢复 LOST 对象。 |
+| `recovery_retry_interval_frames` | `15` | 恢复失败后的重试间隔，按处理帧计数。 |
+| `recovery_box_threshold` | `0.3` | 恢复检测框阈值。 |
+| `recovery_text_threshold` | `0.25` | 恢复检测文本阈值。 |
+
+首次恢复在丢失后的下一处理帧尝试。在线 worker 和离线标注负责跳过重复相机序列，可通过 `tracking_config` 参数传入相同配置。
+
+通过注册校验的 mask 使用 SAM2 已有 ID 的当前帧 `add_new_mask()` 校正，不重置健康对象。合并后重新校验各对象，全部检查完成后才提交各对象的 TRACKING/LOST 状态；候选在合并后被拒绝时保留原定重试间隔。过期提示输入、输出和合并索引共同裁剪，保留首帧 conditioning。
+
+`timings_ms` 和 DEBUG 日志记录注册、正常 SAM2 / FoundationPose 跟踪、恢复检测、恢复分割、恢复注册及总恢复耗时。模型返回 CPU 结果时完成同步；FoundationPose 阶段包含几何质量检查。在线发布、离线有效性和训练数据过滤契约见[主项目说明](../../docs/object_reconstruction.md#标注导出与回放)。
 
 ## 推理实现
 
@@ -111,3 +142,18 @@ Hunyuan3D 重建使用分层体积解码、完整 attention 和 Marching Cubes�
 表面模板采样由主项目 `geometry/hoi.py` 负责，后端不依赖主项目或 fpsample。
 
 任务流程见 [实验入口](../../scripts/cordvip/README.md)，主项目表示见 [物体重建与 HOI](../../docs/object_reconstruction.md)。
+
+## 回归测量（2026-11-14）
+
+
+RTX 4090、Torch 2.4.1+cu124，使用已有 `episode_20261101_174250` 的前 40 行、640×480 RGB-D 和 apple/banana/bowl 三个 CAD，只读回放，无机器人操作。第 10 帧在测试内将 Apple mask 清空，Banana/Bowl 保持有效，第 11 帧真实检测/注册恢复，持续到第 39 帧未再丢失。此注入验证错误路径，不等价于完整自然遮挡实验。
+
+| 恢复阶段 | 耗时 |
+| --- | --- |
+| 检测 | 114.2 ms |
+| 分割 | 36.7 ms |
+| 注册及质量检查 | 734.3 ms |
+| 总恢复 | 901.4 ms |
+| 该帧端到端 | 960.6 ms |
+
+取零起始行号 16–39 的 24 个正常跟踪样本，平均 66.06 ms（15.14 FPS），p50/p95 为 65.96/67.84 ms。计时排除视频读取，端到端边界同步 CUDA。样本较短，不代表所有场景或 RTX 5090 的性能保证。

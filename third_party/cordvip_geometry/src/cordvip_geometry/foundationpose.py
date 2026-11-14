@@ -12,7 +12,7 @@ MIN_DEPTH_PIXELS = 4
 
 
 class TrackingFailure(RuntimeError):
-    """当前场景丢失位姿，调用方应结束该段。"""
+    """当前观测无法通过跟踪或注册，允许后续帧重试。"""
 
 
 def prepare_tracking_frame(rgb, depth_m, intrinsics, render_size, cache):
@@ -103,7 +103,7 @@ class FoundationPoseTracker:
 
 
 def track_objects(trackers, rgb, depth_m, intrinsics, frame_cache):
-    """各物体独立渲染，观测裁剪及两轮 refinement 合批执行。"""
+    """合批生成候选位姿；调用方逐对象校验，拒绝时恢复原 pose_last。"""
     import torch
     from learning.training.predict_pose_refine import (
         render_crops,
@@ -166,8 +166,6 @@ def track_objects(trackers, rgb, depth_m, intrinsics, frame_cache):
         )
         output = (poses @ mesh_transforms).cpu().numpy()
 
-    for index, (name, estimator) in enumerate(zip(names, estimators)):
-        if not np.isfinite(output[index]).all():
-            raise TrackingFailure(f"{name}: FoundationPose returned nonfinite pose")
+    for index, estimator in enumerate(estimators):
         estimator.pose_last = poses[index : index + 1]
     return dict(zip(names, output))

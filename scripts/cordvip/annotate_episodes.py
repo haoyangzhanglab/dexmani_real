@@ -1,4 +1,4 @@
-"""离线跟踪已发布 Raw，整段成功后写入 HOI。"""
+"""离线跟踪已发布 Raw，保留暂时丢失帧的有效性并继续恢复。"""
 
 import argparse
 import sys
@@ -11,14 +11,14 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 
 from cordvip_geometry.camera import RGBDFrame
-from cordvip_geometry.tracking import SceneTracker, TrackingFailure
+from cordvip_geometry.tracking import SceneTracker, TrackingConfig, TrackingFailure
 
-from dexmani_real.data.hoi import write_hoi
+from dexmani_real.data.hoi import read_hoi_validity, write_hoi
 from dexmani_real.data.raw import RawReader, require_published_raw
 from dexmani_real.geometry.hoi import load_task_template, task_objects
 
 
-def annotate_episodes(episodes, task):
+def annotate_episodes(episodes, task, *, tracking_config=TrackingConfig()):
     task = Path(task)
     template = load_task_template(task)
     names = template["object_names"]
@@ -33,15 +33,16 @@ def annotate_episodes(episodes, task):
         with RawReader(episode) as reader:
             if "hoi" in reader.data_file:
                 reader["object_pointcloud"]
+                read_hoi_validity(reader)
                 print(f"跳过已有 HOI：{episode}")
                 continue
             if tracker is None:
-                tracker = SceneTracker(mesh_paths, workspace=ROOT)
-            try:
-                poses, base_from_camera, quality = track_episode(reader, tracker, names, prompts)
-            except TrackingFailure as error:
-                print(f"{episode}: {error}；不写入 HOI")
-                continue
+                tracker = SceneTracker(
+                    mesh_paths, workspace=ROOT, config=tracking_config
+                )
+            poses, base_from_camera, quality, valid = track_episode(
+                reader, tracker, names, prompts
+            )
 
         write_hoi(
             episode / "data.h5",
@@ -49,6 +50,7 @@ def annotate_episodes(episodes, task):
             poses,
             base_from_camera,
             quality=quality,
+            object_valid=valid,
             tracking_config=asdict(tracker.config),
         )
         print(f"{episode}: 已写入 HOI，{len(poses)} 帧")
@@ -89,8 +91,10 @@ def track_episode(reader, tracker, names, prompts):
         )
         raise ValueError(f"{reason}，行 {index}")
 
-    poses = np.empty((frames, len(names), 4, 4), np.float32)
-    quality = []
+    poses = np.full((frames, len(names), 4, 4), np.nan, np.float32)
+    valid = np.zeros((frames, len(names)), bool)
+    first = True
+    quality: list[list[dict[str, float | int | None]]] = []
     images = iter(reader.iter_rgb_frames())
     for index in range(frames):
         rgb = next(images, None)
@@ -101,6 +105,7 @@ def track_episode(reader, tracker, names, prompts):
         if not new_sequence[index]:
             poses[index] = poses[index - 1]
             quality.append(quality[-1])
+            valid[index] = valid[index - 1]
             continue
         frame = RGBDFrame(
             rgb=rgb,
@@ -111,18 +116,22 @@ def track_episode(reader, tracker, names, prompts):
         )
         try:
             result = (
-                tracker.initialize(frame, prompts)
-                if index == 0
-                else tracker.track(frame)
+                tracker.initialize(frame, prompts) if first else tracker.track(frame)
             )
         except TrackingFailure as error:
-            raise TrackingFailure(f"行 {index}，相机序列 {sequences[index]}: {error}") from error
-        poses[index] = np.stack([result.poses[name] for name in names])
+            print(f"行 {index}，相机序列 {sequences[index]}: {error}；继续重试")
+            quality.append([{} for name in names])
+            continue
+        first = False
+        for obj, name in enumerate(names):
+            valid[index, obj] = result.valid[name]
+            if result.valid[name]:
+                poses[index, obj] = result.poses[name]
         quality.append([result.quality[name] for name in names])
 
     if next(images, None) is not None:
         raise ValueError("Raw RGB contains more frames than the HDF5 rows")
-    return poses, camera.T_xarm_base_from_color, quality
+    return poses, camera.T_xarm_base_from_color, quality, valid
 
 
 def main(argv=None):

@@ -1,7 +1,9 @@
 """结合可见轮廓与实测深度的多物体位姿跟踪。"""
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 
@@ -14,6 +16,7 @@ from .foundationpose import (
 )
 from .mesh import MeshRaycaster, load_mesh
 
+logger = logging.getLogger(__name__)
 PIXEL_STRIDE = 2
 
 
@@ -25,7 +28,22 @@ class TrackingConfig:
     min_precision: float = 0.5
     min_recall: float = 0.5
 
+    recovery_enabled: bool = True
+    recovery_retry_interval_frames: int = 15
+    recovery_box_threshold: float = 0.3
+    recovery_text_threshold: float = 0.25
+
     def __post_init__(self):
+        if type(self.recovery_enabled) is not bool:
+            raise ValueError("recovery_enabled must be bool")
+        if (
+            type(self.recovery_retry_interval_frames) is not int
+            or self.recovery_retry_interval_frames < 1
+        ):
+            raise ValueError("recovery_retry_interval_frames must be positive integer")
+        for value in (self.recovery_box_threshold, self.recovery_text_threshold):
+            if not np.isfinite(value) or not 0 < value <= 1:
+                raise ValueError("recovery thresholds must lie in (0, 1]")
         if not np.isfinite(self.depth_tolerance_m) or self.depth_tolerance_m <= 0:
             raise ValueError("depth_tolerance_m must be finite and positive")
         if type(self.min_depth_pixels) is not int or self.min_depth_pixels < 1:
@@ -37,8 +55,13 @@ class TrackingConfig:
 
 @dataclass
 class SceneResult:
+    """仅 poses 中的对象具有当前有效位姿；其余对象由 valid/failures 标记。"""
+
     poses: dict[str, np.ndarray]
     quality: dict[str, dict[str, float | int | None]]
+    valid: dict[str, bool]
+    failures: dict[str, str] = field(default_factory=dict)
+    timings_ms: dict[str, float] = field(default_factory=dict)
 
 
 def pose_quality(mask, observed, rendered, config):
@@ -127,6 +150,20 @@ class SceneTracker:
             torch.cuda.synchronize()
 
     def initialize(self, frame, prompts):
+        self.prompts = {
+            name: prompt.strip().lower().rstrip(". ")
+            for name, prompt in prompts.items()
+        }
+        normalized = list(self.prompts.values())
+        if (
+            set(prompts) != set(self.trackers)
+            or not all(normalized)
+            or len(set(normalized)) != len(normalized)
+        ):
+            raise ValueError("Prompts must uniquely identify every object")
+        self.states = dict.fromkeys(self.trackers, "TRACKING")
+        self.next_retry = dict.fromkeys(self.trackers, 0)
+        self.frame_index = 0
         self.frame_signature = (
             frame.depth_m.shape,
             frame.K.copy(),
@@ -148,23 +185,28 @@ class SceneTracker:
         rgb, depth_m = self.rectifier.apply(frame.rgb, frame.depth_m)
         self.directions = camera_rays(depth_m.shape, frame.K, PIXEL_STRIDE)
 
-        candidates = self.segmenter.detect(rgb, ". ".join(prompts.values()) + ".")
+        try:
+            candidates = self.segmenter.detect(
+                rgb, ". ".join(self.prompts.values()) + "."
+            )
+        except RuntimeError as error:
+            raise TrackingFailure(f"Initial detection: {error}") from error
         boxes = {}
-        for name, prompt in prompts.items():
-            matches = [
-                item
-                for item in candidates
-                if item["label"].strip().lower().rstrip(".")
-                == prompt.strip().lower().rstrip(".")
-            ]
-            if len(matches) != 1:
-                raise TrackingFailure(
-                    f"{name}: expected one first-frame detection, got {len(matches)}"
-                )
-            boxes[name] = matches[0]["box_xyxy"]
+        for name in self.trackers:
+            try:
+                boxes[name] = self._match_box(candidates, self.prompts[name])
+            except TrackingFailure as error:
+                raise TrackingFailure(f"{name}: {error}") from error
 
-        masks = self.segmenter.initialize(rgb, boxes)
-        return self._estimate(rgb, depth_m, frame.K, masks, first=True)
+        try:
+            masks = self.segmenter.initialize(rgb, boxes)
+        except RuntimeError as error:
+            raise TrackingFailure(f"Initial segmentation: {error}") from error
+        result = self._estimate(rgb, depth_m, frame.K, masks, first=True)
+        logger.debug("HOI initialization timings_ms=%s", result.timings_ms)
+        if not all(result.valid.values()):
+            raise TrackingFailure(str(result.failures))
+        return result
 
     def track(self, frame):
         shape, K, model, coeffs = self.frame_signature
@@ -178,49 +220,214 @@ class SceneTracker:
         if frame.rgb.shape != (*shape, 3):
             raise ValueError("RGB grid changed within episode")
         rgb, depth_m = self.rectifier.apply(frame.rgb, frame.depth_m)
+        self.frame_index += 1
+        started = perf_counter()
+        # 共享视频状态推理失败可能留下部分写入；不能当作单对象丢失继续使用。
         masks = self.segmenter.track(rgb)
-        return self._estimate(rgb, depth_m, frame.K, masks, first=False)
+        sam_ms = (perf_counter() - started) * 1000
+        result = self._estimate(rgb, depth_m, frame.K, masks, first=False)
+        result.timings_ms["sam2_tracking"] = sam_ms
+        logger.debug("HOI frame=%d timings_ms=%s", self.frame_index, result.timings_ms)
+        return result
 
-    def _estimate(self, rgb, depth_m, K, masks, *, first) -> SceneResult:
-        """返回物体局部到相机的位姿及质量；任一物体失效则终止本帧。"""
-        sampled_depth = depth_m[::PIXEL_STRIDE, ::PIXEL_STRIDE]
-        for name in self.trackers:
-            mask = masks[name]
-            selected = mask[::PIXEL_STRIDE, ::PIXEL_STRIDE] & (sampled_depth > 0)
-            sampled_count = np.count_nonzero(selected)
-            depth_count = np.count_nonzero(mask & (depth_m >= 0.001))
-            if sampled_count < self.config.min_depth_pixels or depth_count < MIN_DEPTH_PIXELS:
-                raise TrackingFailure(
-                    f"{name}: insufficient segmented depth: "
-                    f"{sampled_count} independent points, "
-                    f"{depth_count} FoundationPose pixels; requires "
-                    f"{self.config.min_depth_pixels} and {MIN_DEPTH_PIXELS}"
-                )
+    @staticmethod
+    def _match_box(candidates, prompt):
+        matches = [
+            candidate
+            for candidate in candidates
+            if candidate["label"].strip().lower().rstrip(". ") == prompt
+        ]
+        if len(matches) != 1:
+            raise TrackingFailure(
+                f"expected one detection for {prompt!r}, got {len(matches)}"
+            )
+        return matches[0]["box_xyxy"]
 
-        quality = {}
-        poses = {}
-        if not first:
-            poses = track_objects(
-                self.trackers, rgb, depth_m, K, self.frame_cache
-            )
-        for name, tracker in self.trackers.items():
-            if first:
-                try:
-                    poses[name] = tracker.register(rgb, depth_m, K, masks[name])
-                except TrackingFailure as error:
-                    raise TrackingFailure(f"{name}: {error}") from error
+    def _check_depth(self, mask, depth):
+        valid = np.isfinite(depth) & (depth >= 0.001)
+        if (
+            mask is None
+            or np.count_nonzero((mask & valid)[::PIXEL_STRIDE, ::PIXEL_STRIDE])
+            < self.config.min_depth_pixels
+            or np.count_nonzero(mask & valid) < MIN_DEPTH_PIXELS
+        ):
+            raise TrackingFailure("insufficient segmented depth")
 
-            rendered = (
-                self.renderers[name]
-                .render(self.directions.reshape(-1, 3), poses[name])
-                .reshape(sampled_depth.shape)
-            )
-            metrics, accepted = pose_quality(
-                masks[name][::PIXEL_STRIDE, ::PIXEL_STRIDE], sampled_depth, rendered, self.config
-            )
-            quality[name] = metrics
+    def _quality(self, name, pose, mask, depth):
+        if np.shape(pose) != (4, 4) or not np.isfinite(pose).all():
+            raise TrackingFailure("FoundationPose returned nonfinite/invalid pose")
+        sampled = depth[::PIXEL_STRIDE, ::PIXEL_STRIDE]
+        rendered = (
+            self.renderers[name]
+            .render(self.directions.reshape(-1, 3), pose)
+            .reshape(sampled.shape)
+        )
+        return pose_quality(
+            mask[::PIXEL_STRIDE, ::PIXEL_STRIDE], sampled, rendered, self.config
+        )
+
+    def _estimate(self, rgb, depth_m, K, masks, *, first):
+        # 后端只替换 pose_last，不原地修改旧张量；保留引用即可回滚居中网格位姿。
+        previous = {
+            name: tracker.estimator.pose_last for name, tracker in self.trackers.items()
+        }
+        result = SceneResult(
+            poses={},
+            quality={name: {} for name in self.trackers},
+            valid=dict.fromkeys(self.trackers, False),
+        )
+        # 只恢复进入本帧前已丢失的对象，新丢失对象从下一帧开始尝试。
+        due = [
+            name
+            for name in self.trackers
+            if self.states[name] == "LOST" and self.frame_index >= self.next_retry[name]
+        ]
+
+        def reject(name, error):
+            self.trackers[name].estimator.pose_last = previous[name]
+            result.poses.pop(name, None)
+            result.valid[name] = False
+            result.failures[name] = str(error)
+            logger.warning("%s: %s", name, error)
+
+        def accept(name, pose, mask):
+            metrics, accepted = self._quality(name, pose, mask, depth_m)
+            result.quality[name] = metrics
             if not accepted:
                 raise TrackingFailure(
-                    f"{name}: Semantic depth/model disagreement; quality={metrics}"
+                    f"Semantic depth/model disagreement; quality={metrics}"
                 )
-        return SceneResult(poses, quality)
+            result.poses[name] = pose
+            result.valid[name] = True
+
+        def register(name, mask):
+            try:
+                pose = self.trackers[name].register(rgb, depth_m, K, mask)
+            except RuntimeError as error:
+                reject(name, error)
+                return False
+            try:
+                accept(name, pose, mask)
+            except TrackingFailure as error:
+                reject(name, error)
+                return False
+            return True
+
+        active = {}
+        for name, tracker in self.trackers.items():
+            if self.states[name] == "LOST":
+                continue
+            try:
+                self._check_depth(masks.get(name), depth_m)
+                active[name] = tracker
+            except TrackingFailure as error:
+                reject(name, error)
+        started = perf_counter()
+        if first:
+            for name in active:
+                register(name, masks[name])
+        elif active:
+            try:
+                candidates = track_objects(active, rgb, depth_m, K, self.frame_cache)
+            except RuntimeError:
+                logger.warning(
+                    "FoundationPose batch failed; isolating objects", exc_info=True
+                )
+                # 批量失败后回滚，再隔离实际失败对象；健康路径仍只推理一次。
+                candidates = {}
+                for name, tracker in active.items():
+                    tracker.estimator.pose_last = previous[name]
+                for name, tracker in active.items():
+                    try:
+                        candidates.update(
+                            track_objects(
+                                {name: tracker}, rgb, depth_m, K, self.frame_cache
+                            )
+                        )
+                    except RuntimeError as error:
+                        reject(name, error)
+            for name, pose in candidates.items():
+                try:
+                    accept(name, pose, masks[name])
+                except TrackingFailure as error:
+                    reject(name, error)
+        result.timings_ms["registration" if first else "foundationpose_tracking"] = (
+            perf_counter() - started
+        ) * 1000
+
+        if due and self.config.recovery_enabled and not first:
+            recovery_start = perf_counter()
+            for name in due:
+                self.next_retry[name] = (
+                    self.frame_index + self.config.recovery_retry_interval_frames
+                )
+            try:
+                started = perf_counter()
+                candidates = self.segmenter.detect(
+                    rgb,
+                    ". ".join(self.prompts[n] for n in due) + ".",
+                    self.config.recovery_box_threshold,
+                    self.config.recovery_text_threshold,
+                )
+                result.timings_ms["recovery_detection"] = (
+                    perf_counter() - started
+                ) * 1000
+                boxes = {}
+                for name in due:
+                    try:
+                        boxes[name] = self._match_box(candidates, self.prompts[name])
+                    except TrackingFailure as error:
+                        reject(name, error)
+                started = perf_counter()
+                recovered_masks = (
+                    self.segmenter.segment_boxes(rgb, boxes) if boxes else {}
+                )
+                result.timings_ms["recovery_segmentation"] = (
+                    perf_counter() - started
+                ) * 1000
+            except RuntimeError as error:
+                for name in due:
+                    reject(name, error)
+                recovered_masks = {}
+            corrections = {}
+            started = perf_counter()
+            for name, mask in recovered_masks.items():
+                try:
+                    self._check_depth(mask, depth_m)
+                except TrackingFailure as error:
+                    reject(name, error)
+                    continue
+                if register(name, mask):
+                    corrections[name] = mask
+            result.timings_ms["recovery_registration"] = (
+                perf_counter() - started
+            ) * 1000
+            if corrections:
+                try:
+                    masks = self.segmenter.correct_masks(corrections)
+                except RuntimeError:
+                    for name, tracker in self.trackers.items():
+                        tracker.estimator.pose_last = previous[name]
+                    raise
+                for name, pose in list(result.poses.items()):
+                    try:
+                        self._check_depth(masks.get(name), depth_m)
+                        accept(name, pose, masks[name])
+                    except TrackingFailure as error:
+                        reject(name, error)
+            result.timings_ms["recovery_total"] = (
+                perf_counter() - recovery_start
+            ) * 1000
+        # 只在最终 mask 校验后提交状态，失败的恢复尝试保留既定重试时间。
+        for name in self.trackers:
+            if result.valid[name]:
+                self.states[name] = "TRACKING"
+            else:
+                if self.states[name] == "TRACKING":
+                    self.next_retry[name] = self.frame_index + 1
+                self.states[name] = "LOST"
+                result.failures.setdefault(name, "LOST; awaiting recovery retry")
+        result.poses = {
+            name: result.poses[name] for name in self.trackers if result.valid[name]
+        }
+        return result
