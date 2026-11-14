@@ -1,8 +1,10 @@
 """手部点云 FK 变换的批量实现回归。"""
 
+from itertools import pairwise
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 
 class FakeHandFK:
@@ -36,15 +38,22 @@ class FakeHandFK:
         return np.stack([self._placement(qpos, frame_id) for frame_id in frame_ids])
 
 
-def test_hand_geometry_batch_transform_preserves_link_segments(tmp_path, monkeypatch):
+@pytest.mark.parametrize("offset_dtype", [np.int64, np.uint64])
+@pytest.mark.parametrize("extra_columns", [0, 3])
+def test_hand_geometry_batch_transform_preserves_link_segments(
+    tmp_path, monkeypatch, offset_dtype, extra_columns,
+):
     from dexmani_real.perception import hand_cloud as module
 
     rng = np.random.default_rng(42)
     local_points = rng.normal(0, 0.02, (6, 3)).astype(np.float32)
-    offsets = np.array([0, 2, 6], dtype=np.int64)
+    offsets = np.array([0, 2, 6], dtype=offset_dtype)
+    template_points = np.column_stack((
+        local_points, np.ones((len(local_points), extra_columns), dtype=np.float32),
+    ))
     np.savez(
         tmp_path / "hand_6.npz",
-        points=local_points,
+        points=template_points,
         part_names=np.array(["link_a", "link_b"], dtype="U"),
         part_offsets=offsets,
     )
@@ -84,7 +93,7 @@ def test_hand_geometry_batch_transform_preserves_link_segments(tmp_path, monkeyp
             + base_from_hand[:3, 3]
         )
         expected_cloud[frame] = local_points
-        for link_index, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        for link_index, (start, end) in enumerate(pairwise(offsets)):
             transform = base_from_hand @ placements[5 + link_index]
             expected_cloud[frame, start:end] = (
                 local_points[start:end] @ transform[:3, :3].T + transform[:3, 3]
@@ -94,11 +103,6 @@ def test_hand_geometry_batch_transform_preserves_link_segments(tmp_path, monkeyp
     np.testing.assert_allclose(actual["hand_pointcloud"], expected_cloud, atol=1e-7)
     assert actual["hand_pointcloud"].dtype == np.float32
     np.testing.assert_array_equal(hand_cloud.local_points, local_points)
-
-    frame_ids = [*hand_fk.fingertip_frame_ids, *hand_cloud.frame_ids]
-    placements = hand_fk.forward(hand_qpos[0], frame_ids)
-    single = hand_cloud.transform(placements[5:], eef_transforms[0] @ arm_from_eef)
-    np.testing.assert_allclose(single, expected_cloud[0], atol=1e-7)
 
 
 def test_hand_cloud_batch_transform_without_fingertips(tmp_path, monkeypatch):

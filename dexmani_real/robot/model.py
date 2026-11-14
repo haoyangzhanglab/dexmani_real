@@ -31,8 +31,6 @@ HAND_TACTILE_FORCE_SHAPE = (
     TACTILE_POINTS_PER_FINGER,
     TACTILE_AXIS_COUNT,
 )
-HAND_FINGERTIP_SHAPE = (HAND_FINGER_COUNT, 3)
-
 
 XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
     "right_hand_thumb_bend_joint",

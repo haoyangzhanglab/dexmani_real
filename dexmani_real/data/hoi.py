@@ -1,6 +1,7 @@
 """发布 HOI 标注，并按 Raw 连续区间对齐关节。"""
 
 import json
+from itertools import pairwise
 
 import numpy as np
 
@@ -95,7 +96,7 @@ def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand")):
         f"{device}_qpos": np.full(reader[f"{device}_qpos"].shape, np.nan) for device in devices
     }
     boundaries = np.r_[reader.segment_starts, count]
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
+    for start, end in pairwise(boundaries):
         valid = np.ones(end - start, bool)
         for device in devices:
             qpos_key = f"{device}_qpos"
@@ -117,7 +118,7 @@ def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand")):
     keep &= read_hoi_validity(reader)
     ranges, starts = [], []
     offset = 0
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
+    for start, end in pairwise(boundaries):
         transitions = np.diff(np.r_[False, keep[start:end], False].astype(int))
         for lo, hi in zip(
             np.flatnonzero(transitions == 1), np.flatnonzero(transitions == -1)

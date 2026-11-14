@@ -28,39 +28,11 @@ python scripts/cordvip/annotate_episodes.py --task pnp_apple_banana
 
 每个 `prompt` 须在去畸变后的首帧匹配唯一候选，缺失或歧义会使初始化失败，后续新帧重试。`instance` 仅用于参考图选择，不用于跟踪初始化。
 
-标注在 `/hoi` 中记录位姿、质量、有效性、模板和坐标变换，命令不会覆盖已有标注。已有标注缺少有效性字段或结构不符时直接报错。Python 调用 `annotate_episodes(..., tracking_config=...)` 可调整分割间隔与恢复参数，默认值见[后端说明](../../third_party/cordvip_geometry/README.md#遮挡恢复)。
+标注在 `/hoi` 中记录位姿、质量、有效性、模板和坐标变换，命令不会覆盖已有标注。已有标注缺少有效性字段或结构不符时直接报错。Python 调用 `annotate_episodes(..., tracking_config=...)` 可调整跟踪配置，参数见后端的[质量检查](../../third_party/cordvip_geometry/README.md#质量检查)和[遮挡恢复](../../third_party/cordvip_geometry/README.md#遮挡恢复)。
 
-## 分割间隔与只读 A/B
+## 分割间隔
 
-离线标注可传 `--segmentation-interval-frames 1` 使用逐帧基线，默认 2；在线 worker 的 Python 参数 `tracking_config` 接收同一配置。两者均仅对新的相机序列推进调度。
-
-在现有 `real_robot` CUDA 环境、仓库根目录运行，选择尚不存在的输出目录：
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 python scripts/cordvip/benchmark_tracking.py --output logs/sam2_ab_new
-```
-
-默认回放 pnp_apple_banana 全部已发布 Episode，对 interval=1/2/3 分别完整预热后各测量三次；可重复传 `--episode` 选择固定数据，`--repeats` 改重复次数。入口不写 Raw，不需要点云模板，不操作设备。所选 Episode 名称必须唯一，避免同名结果覆盖。
-
-报告记录同步 CUDA 的阶段耗时、逐对象质量与有效性、LOST/恢复转换及 SAM2 调用数。总跟踪耗时排除读盘、初始化和独立参考复核，包含恢复帧。逐帧基线 mask 在计时外复核候选位姿；参考拒绝表示需调查的分歧，不等同于有真值支持的位姿误差。参考帧缺失或汇总帧数不一致会直接报错。
-
-| 输出 | 内容 |
-| --- | --- |
-| 每段每轮 JSON | 逐帧结果，以及刷新前的纯深度检查 `depth_checks` |
-| `summary.json` | 各 Episode、间隔和重复轮次的统计 |
-| `comparison.json` | 跨轮汇总，包含按 `mask_source` 分组的深度指标 p50/p95 |
-| `environment.json` | 运行环境、输入路径与对象列表 |
-
-`depth_quality_by_mask_source` 保留匹配点数、匹配比例与覆盖率。两条路径的覆盖率定义相同，匹配比例分母不同。
-
-覆盖率事件按共享处理帧去重：
-
-- `coverage_rejected_frames`：匹配点数和匹配比例通过、仅覆盖率失败。
-- `coverage_triggered_sam_frames`：实际刷新 SAM2，且至少一个候选覆盖不足；可能同时存在其他质量异常。
-
-这些事件不等同于最终 LOST；最终新增无效帧需对照历史逐对象有效性。诊断仅在评估入口收集，不改变跟踪状态机。
-
-初版与覆盖率修复记录分别位于 `logs/sam2_ab`、`logs/sam2_depth_coverage_ab`，复跑时须另选新目录。测量口径与结果见[后端实测](../../third_party/cordvip_geometry/README.md#p2-事件触发-sam2-实测)。
+离线标注通过 `--segmentation-interval-frames` 调整 SAM2 的最大处理帧间隔，默认 2；设为 1 时逐帧分割。在线 worker 的 `tracking_config` 参数接收相同配置。两者均仅对新的相机序列推进调度，深度质量不通过或对象恢复到期时提前刷新。具体规则见[事件触发分割](../../third_party/cordvip_geometry/README.md#事件触发分割)。
 
 ## 导出与查看
 

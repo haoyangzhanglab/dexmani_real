@@ -4,12 +4,13 @@ import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
-from dexmani_real.robot.model import HAND_FINGERTIP_SHAPE
 
 HAND_TEMPLATE_DIR = ASSET_DIR / "pointcloud_template" / "hand"
 
 
 class HandPointCloud:
+    """读取模板前三列的 link 局部 XYZ，保留分段及点序。"""
+
     def __init__(self, hand_fk: HandFK, num_points: int):
         path = HAND_TEMPLATE_DIR / f"hand_{num_points}.npz"
         with np.load(path, allow_pickle=False) as template:
@@ -37,7 +38,7 @@ class HandPointCloud:
         self.local_points = points
         self.point_frame_indices = np.repeat(
             np.arange(len(self.frame_ids), dtype=np.intp),
-            np.diff(offsets),
+            np.diff(offsets).astype(np.intp, copy=False),
         )
 
     def transform_batch(self, base_from_links: np.ndarray) -> np.ndarray:
@@ -50,13 +51,6 @@ class HandPointCloud:
         xyz += point_transforms[..., :3, 3]
         return xyz.astype(np.float32, copy=False)
 
-    def transform(
-        self, handbase_from_links: np.ndarray, base_from_handbase: np.ndarray,
-    ) -> np.ndarray:
-        """单帧接口；与批量路径共用同一变换实现。"""
-        transforms = base_from_handbase @ handbase_from_links
-        return self.transform_batch(transforms[None])[0]
-
 
 def hand_geometry(
     eef_transforms: np.ndarray,
@@ -67,7 +61,10 @@ def hand_geometry(
     hand_cloud: HandPointCloud | None = None,
     include_fingertips: bool = True,
 ) -> dict[str, np.ndarray]:
-    """一次收集批次 FK，再批量变换指尖与手部表面点。"""
+    """由 [T,4,4] EEF 与 [T,12] SDK 关节批量生成基座系几何。
+
+    按请求返回 float32 指尖 [T,5,3] 和手部表面点 [T,N,3]。
+    """
     base_from_hand = eef_transforms @ arm_fk.eef_from_handbase
 
     frame_ids = list(hand_fk.fingertip_frame_ids) if include_fingertips else []

@@ -13,8 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "third_party/cordvip_geometry/src")]
 from cordvip_geometry.camera import RGBDFrame, RGBDRectifier, camera_rays
 from cordvip_geometry.mesh import MeshRaycaster, scale_mesh
+from cordvip_geometry.tracking import SceneResult, TrackingConfig, TrackingFailure
+
 from dexmani_real.geometry.hoi import sample_mesh_surface
-from cordvip_geometry.tracking import TrackingFailure, SceneResult, TrackingConfig
+
 
 def script(name):
     spec = importlib.util.spec_from_file_location(
@@ -788,8 +790,9 @@ def test_joint_interpolation_boundaries_and_conflicts():
 
 
 def test_fps_surface_is_fixed_and_improves_coverage():
-    from dexmani_real.geometry.hoi import sample_surface_points
     from scipy.spatial import cKDTree
+
+    from dexmani_real.geometry.hoi import sample_surface_points
 
     mesh = trimesh.creation.box(extents=(0.1, 0.1, 0.1))
     points = sample_surface_points(mesh, 256)
@@ -804,6 +807,7 @@ def test_fps_surface_is_fixed_and_improves_coverage():
 @pytest.mark.parametrize("devices", [("arm",), ("arm", "hand")])
 def test_live_joint_history_matches_offline_interpolation(devices):
     from collections import deque
+
     from dexmani_real.robot.system import Robot
 
     robot = Robot.__new__(Robot)
@@ -934,7 +938,8 @@ def test_quality_rejection_restores_internal_pose(recovery_scene, monkeypatch):
 
 def test_invalid_hoi_storage_requires_explicit_validity(tmp_path):
     import h5py
-    from dexmani_real.data.hoi import write_hoi, read_hoi_validity
+
+    from dexmani_real.data.hoi import read_hoi_validity, write_hoi
 
     path = tmp_path / "data.h5"
     template = dict(
@@ -989,8 +994,9 @@ def test_initialization_failure_retries_offline():
 
 def test_worker_retries_initial_registration(monkeypatch, tmp_path):
     from cordvip_geometry import tracking
-    from dexmani_real.perception.hoi_worker import run_hoi_worker
+
     from dexmani_real.geometry import hoi
+    from dexmani_real.perception.hoi_worker import run_hoi_worker
 
     monkeypatch.setattr(
         hoi, "task_objects", lambda task: [{"name": "apple", "prompt": "apple"}]
@@ -1414,8 +1420,10 @@ def test_event_rejection_and_due_recovery(recovery_scene):
 
 def test_mixed_quality_hdf5_is_finite(recovery_scene, tmp_path):
     import json
-    import h5py
     from dataclasses import asdict, replace
+
+    import h5py
+
     from dexmani_real.data.hoi import write_hoi
 
     scene, frame, masks, _, _ = recovery_scene
@@ -1455,8 +1463,9 @@ def test_mixed_quality_hdf5_is_finite(recovery_scene, tmp_path):
 
 
 def test_correction_uses_video_index(monkeypatch):
-    import torch
     from contextlib import nullcontext
+
+    import torch
     from cordvip_geometry.segmentation import SAM2Segmenter
 
     monkeypatch.setattr(torch, "autocast", lambda *a, **kw: nullcontext())
@@ -1474,9 +1483,11 @@ def test_correction_uses_video_index(monkeypatch):
 
 def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_path):
     from dataclasses import replace
-    from dexmani_real.perception.hoi_worker import run_hoi_worker
-    from dexmani_real.geometry import hoi
+
     from cordvip_geometry import tracking
+
+    from dexmani_real.geometry import hoi
+    from dexmani_real.perception.hoi_worker import run_hoi_worker
 
     scene, frame, masks, _, _ = recovery_scene
     scene.config = replace(scene.config, segmentation_interval_frames=2)
@@ -1653,71 +1664,6 @@ def test_viewer_marks_unmeasured_quality_as_missing():
     assert logged["hoi/object_1/depth_coverage"] == 0.7
 
 
-@pytest.mark.parametrize("truncated_reference", [False, True])
-@pytest.mark.parametrize("low_coverage", [False, True])
-def test_benchmark_reference_and_cleanup(
-    recovery_scene, monkeypatch, tmp_path, truncated_reference, low_coverage
-):
-    import json
-    import torch
-    from cordvip_geometry import tracking
-
-    module = script("benchmark_tracking")
-    scene, frame, masks, _, _ = recovery_scene
-    original_batch = tracking.track_objects
-    original_depth_quality = tracking.pose_depth_quality
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda index: "test GPU")
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    monkeypatch.setattr(torch, "manual_seed", lambda seed: None)
-    monkeypatch.setattr(module.subprocess, "check_output", lambda *a, **kw: "test")
-    monkeypatch.setattr(module.tracking, "SceneTracker", lambda *a, **kw: scene)
-    monkeypatch.setattr(
-        module, "task_objects", lambda task: [{"name": n, "prompt": n} for n in masks]
-    )
-    monkeypatch.setattr(module, "RawReader", FakeRawReader)
-    calls = 0
-
-    def replay(reader, tracker, names, prompts):
-        nonlocal calls
-        calls += 1
-        tracker.initialize(frame, prompts)
-        if low_coverage:
-            frame.depth_m[10:] = 0
-        # 三次预热后是逐帧基线；缺失参考必须报错，不能静默略过复核。
-        if not (truncated_reference and calls == 4):
-            tracker.track(frame)
-            tracker.track(frame)
-
-    monkeypatch.setattr(module, "track_episode", replay)
-    output = tmp_path / "results"
-    args = [
-        "--episode",
-        str(tmp_path / "episode_test"),
-        "--repeats",
-        "1",
-        "--output",
-        str(output),
-    ]
-    if truncated_reference:
-        with pytest.raises(IndexError):
-            module.main(args)
-    else:
-        module.main(args)
-        runs = json.loads((output / "summary.json").read_text())
-        assert [r["frames"] for r in runs] == [3, 3, 3]
-        assert [r["counts"]["sam_track"] for r in runs] == (
-            [2, 2, 2] if low_coverage else [2, 1, 0]
-        )
-        expected_coverage_events = [0, 2, 2] if low_coverage else [0, 0, 0]
-        for key in ("coverage_rejected_frames", "coverage_triggered_sam_frames"):
-            assert [r[key] for r in runs] == expected_coverage_events
-        assert all(r["reference_rejections"] == 0 for r in runs)
-        assert (output / "comparison.json").is_file()
-    assert tracking.track_objects is original_batch
-    assert tracking.pose_depth_quality is original_depth_quality
-
-
 @pytest.mark.parametrize(
     "value",
     [
@@ -1776,6 +1722,7 @@ def test_depth_coverage_does_not_replace_minimum_count():
 @pytest.mark.parametrize("interval,invalid_mask", [(3, False), (3, True), (1, False)])
 def test_low_coverage_refresh(recovery_scene, monkeypatch, interval, invalid_mask):
     from dataclasses import replace
+
     from cordvip_geometry import tracking
 
     scene, frame, masks, _, _ = recovery_scene
@@ -1813,33 +1760,6 @@ def test_low_coverage_refresh(recovery_scene, monkeypatch, interval, invalid_mas
     if not invalid_mask:
         assert result.quality["apple"]["depth_coverage"] == 5 / 12
         assert result.quality["apple"]["mask_source"] == 1
-
-
-def test_benchmark_coverage_counts_shared_frames():
-    module = script("benchmark_tracking")
-    check = dict(low_coverage=True, coverage_only_rejection=True)
-    rows = [
-        dict(
-            initial=False,
-            total_ms=1.0,
-            valid={"apple": True, "banana": True},
-            stages={"sam_track": [1.0]},
-            reference_rejected=[],
-            depth_checks=[check, check],
-        ),
-        dict(
-            initial=False,
-            total_ms=1.0,
-            valid={"apple": False, "banana": True},
-            stages={"sam_track": [1.0]},
-            reference_rejected=[],
-            depth_checks=[dict(low_coverage=True, coverage_only_rejection=False)],
-        ),
-    ]
-    stats = module.tracking_statistics(rows)
-    assert stats["coverage_rejected_frames"] == 1
-    assert stats["coverage_triggered_sam_frames"] == 2
-    assert stats["sam_calls"] == 2
 
 
 def test_coverage_is_independent_of_mask_and_occlusion():

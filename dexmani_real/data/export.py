@@ -392,11 +392,11 @@ def export_zarr(
                     if alignment is not None:
                         records = list(root.attrs.get("hoi_alignment", []))
                         records.append(
-                            dict(
-                                episode=episode.name,
-                                kept_ranges=alignment["ranges"],
-                                max_gap_s=processing.hoi_max_joint_gap_s,
-                            )
+                            {
+                                "episode": episode.name,
+                                "kept_ranges": alignment["ranges"],
+                                "max_gap_s": processing.hoi_max_joint_gap_s,
+                            }
                         )
                         root.attrs["hoi_alignment"] = records
                     if "object_pointcloud" in fields:

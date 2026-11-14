@@ -113,18 +113,17 @@ def track_objects(trackers, rgb, depth_m, intrinsics, frame_cache):
     names = list(trackers)
     estimators = [tracker.estimator for tracker in trackers.values()]
     refiner = estimators[0].refiner
-    previous = torch.cat(
+    # 遮挡改变可见 mask 中心，不能将其当作刚体中心。
+    poses = torch.cat(
         [estimator.pose_last.reshape(1, 4, 4) for estimator in estimators]
     )
-    invalid = (previous[:, 2, 3] <= 0).cpu().numpy()
+    invalid = (poses[:, 2, 3] <= 0).cpu().numpy()
     if invalid.any():
         name = names[np.flatnonzero(invalid)[0]]
         raise TrackingFailure(
             f"{name}: Previous centered pose must be in front of the camera"
         )
     with torch.inference_mode():
-        # 遮挡改变可见 mask 中心，不能将其当作刚体中心。
-        poses = previous.clone()
         rgb_tensor, xyz_map = prepare_tracking_frame(
             rgb, depth_m, intrinsics, refiner.cfg.input_resize, frame_cache
         )

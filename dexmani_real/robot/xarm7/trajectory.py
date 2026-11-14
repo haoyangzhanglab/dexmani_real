@@ -101,7 +101,7 @@ def validate_extrema(trajectory, start, lower, upper):
 
 def calculate_home_segment(cfg, q, v, target):
     """计算一段零加速度起步、零速度／加速度到达的离线轨迹。"""
-    # 共享配置、起点与速度由 plan_home 在尝试候选之前验证。
+    # 配置与反馈由 HOME 入口校验，初速还需满足规划器的 HOME 限速。
     inp = InputParameter(7)
     inp.current_position = np.asarray(q).tolist()
     inp.current_velocity = np.where(np.abs(v) < 1e-12, 0., v).tolist()

@@ -54,7 +54,7 @@ class RGBDRectifier:
             self.maps = cv2.initUndistortRectifyMap(
                 intrinsics,
                 np.asarray(distortion),
-                None,
+                np.eye(3),
                 intrinsics,
                 (width, height),
                 cv2.CV_32FC1,

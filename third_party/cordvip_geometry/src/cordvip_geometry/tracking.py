@@ -4,7 +4,6 @@ import logging
 from dataclasses import dataclass, field
 from numbers import Real
 from pathlib import Path
-from time import perf_counter
 
 import numpy as np
 
@@ -76,7 +75,6 @@ class SceneResult:
     quality: dict[str, dict[str, float | int | None]]
     valid: dict[str, bool]
     failures: dict[str, str] = field(default_factory=dict)
-    timings_ms: dict[str, float] = field(default_factory=dict)
 
 
 def pose_quality(mask, observed, rendered, config):
@@ -97,18 +95,18 @@ def pose_quality(mask, observed, rendered, config):
     mask_pixels = int(mask.sum())
     visible_pixels = int(visible.sum())
     intersection_pixels = int(intersection.sum())
-    metrics = dict(
-        mask_pixels=mask_pixels,
-        visible_pixels=visible_pixels,
-        precision=intersection_pixels / max(1, visible_pixels),
-        recall=intersection_pixels / max(1, mask_pixels),
-        iou=float(intersection_pixels / max(1, (mask | visible).sum())),
-        depth_pixels=matched_count,
-        depth_fraction=float(matched_count / max(1, depth_target.sum())),
-        depth_coverage=int((projected & valid).sum()) / max(1, projected_count),
-        median_depth_error_m=float(np.median(residual)) if len(residual) else None,
-        occluded_fraction=float(hidden.sum() / max(1, projected_count)),
-    )
+    metrics = {
+        "mask_pixels": mask_pixels,
+        "visible_pixels": visible_pixels,
+        "precision": intersection_pixels / max(1, visible_pixels),
+        "recall": intersection_pixels / max(1, mask_pixels),
+        "iou": float(intersection_pixels / max(1, (mask | visible).sum())),
+        "depth_pixels": matched_count,
+        "depth_fraction": float(matched_count / max(1, depth_target.sum())),
+        "depth_coverage": int((projected & valid).sum()) / max(1, projected_count),
+        "median_depth_error_m": float(np.median(residual)) if len(residual) else None,
+        "occluded_fraction": float(hidden.sum() / max(1, projected_count)),
+    }
     accepted = (
         matched_count >= config.min_depth_pixels
         and metrics["depth_fraction"] >= config.min_depth_fraction
@@ -128,18 +126,18 @@ def pose_depth_quality(observed, rendered, config):
     projected_count = int(projected.sum())
     coverage = support_count / max(1, projected_count)
     fraction = matched_count / max(1, support_count)
-    metrics: dict[str, float | int | None] = dict(
-        mask_pixels=-1,
-        visible_pixels=-1,
-        precision=-1,
-        recall=-1,
-        iou=-1,
-        occluded_fraction=-1,
-        depth_pixels=matched_count,
-        depth_fraction=fraction,
-        depth_coverage=coverage,
-        median_depth_error_m=float(np.median(residual)) if len(residual) else None,
-    )
+    metrics: dict[str, float | int | None] = {
+        "mask_pixels": -1,
+        "visible_pixels": -1,
+        "precision": -1,
+        "recall": -1,
+        "iou": -1,
+        "occluded_fraction": -1,
+        "depth_pixels": matched_count,
+        "depth_fraction": fraction,
+        "depth_coverage": coverage,
+        "median_depth_error_m": float(np.median(residual)) if len(residual) else None,
+    }
     accepted = (
         matched_count >= config.min_depth_pixels
         and coverage >= config.min_depth_coverage
@@ -149,7 +147,13 @@ def pose_depth_quality(observed, rendered, config):
 
 
 class SceneTracker:
-    def __init__(self, mesh_paths, *, workspace, config=TrackingConfig()):
+    def __init__(
+        self,
+        mesh_paths,
+        *,
+        workspace,
+        config: TrackingConfig = TrackingConfig(),  # noqa: B008 — 不可变配置可共享。
+    ):
         import torch
 
         from .segmentation import SAM2Segmenter
@@ -253,7 +257,6 @@ class SceneTracker:
         except RuntimeError as error:
             raise TrackingFailure(f"Initial segmentation: {error}") from error
         result = self._estimate(rgb, depth_m, frame.K, masks, first=True)
-        logger.debug("HOI initialization timings_ms=%s", result.timings_ms)
         if not all(result.valid.values()):
             raise TrackingFailure(str(result.failures))
         return result
@@ -271,9 +274,7 @@ class SceneTracker:
             raise ValueError("RGB grid changed within episode")
         rgb, depth_m = self.rectifier.apply(frame.rgb, frame.depth_m)
         self.frame_index += 1
-        result = self._estimate(rgb, depth_m, frame.K, None, first=False)
-        logger.debug("HOI frame=%d timings_ms=%s", self.frame_index, result.timings_ms)
-        return result
+        return self._estimate(rgb, depth_m, frame.K, None, first=False)
 
     @staticmethod
     def _match_box(candidates, prompt):
@@ -289,17 +290,16 @@ class SceneTracker:
         return matches[0]["box_xyxy"]
 
     def _check_depth(self, mask, depth):
-        valid = np.isfinite(depth) & (depth >= 0.001)
+        valid = None if mask is None else mask & np.isfinite(depth) & (depth >= 0.001)
         if (
-            mask is None
-            or np.count_nonzero((mask & valid)[::PIXEL_STRIDE, ::PIXEL_STRIDE])
+            valid is None
+            or np.count_nonzero(valid[::PIXEL_STRIDE, ::PIXEL_STRIDE])
             < self.config.min_depth_pixels
-            or np.count_nonzero(mask & valid) < MIN_DEPTH_PIXELS
+            or np.count_nonzero(valid) < MIN_DEPTH_PIXELS
         ):
             raise TrackingFailure("insufficient segmented depth")
 
-    def _refresh_masks(self, rgb, result, previous):
-        started = perf_counter()
+    def _refresh_masks(self, rgb, previous):
         try:
             masks = self.segmenter.track(rgb)
         except RuntimeError:
@@ -307,7 +307,6 @@ class SceneTracker:
             for name, tracker in self.trackers.items():
                 tracker.estimator.pose_last = previous[name]
             raise
-        result.timings_ms["sam2_tracking"] = (perf_counter() - started) * 1000
         self.last_sam_frame = self.frame_index
         return masks
 
@@ -328,13 +327,12 @@ class SceneTracker:
             if self.states[name] == "LOST" and self.frame_index >= self.next_retry[name]
         ]
 
-        result.timings_ms["sam2_tracking"] = 0.0
         if not first and (
             self.frame_index - self.last_sam_frame
             >= self.config.segmentation_interval_frames
             or (due and self.config.recovery_enabled)
         ):
-            masks = self._refresh_masks(rgb, result, previous)
+            masks = self._refresh_masks(rgb, previous)
         sampled = depth_m[::PIXEL_STRIDE, ::PIXEL_STRIDE]
         rendered_depths = {}
 
@@ -400,8 +398,6 @@ class SceneTracker:
                 active[name] = tracker
             except TrackingFailure as error:
                 reject(name, error)
-        started = perf_counter()
-        sam_before = result.timings_ms["sam2_tracking"]
         if first:
             for name in active:
                 register(name, masks[name])
@@ -436,7 +432,7 @@ class SceneTracker:
                         reject(name, error)
                         del candidates[name]
                 if refresh:
-                    masks = self._refresh_masks(rgb, result, previous)
+                    masks = self._refresh_masks(rgb, previous)
                     for name in list(candidates):
                         try:
                             self._check_depth(masks.get(name), depth_m)
@@ -453,46 +449,33 @@ class SceneTracker:
                     accept(name, pose, masks[name])
                 except TrackingFailure as error:
                     reject(name, error)
-        result.timings_ms["registration" if first else "foundationpose_tracking"] = (
-            perf_counter() - started
-        ) * 1000 - (result.timings_ms["sam2_tracking"] - sam_before)
 
         if due and self.config.recovery_enabled and not first:
-            recovery_start = perf_counter()
             for name in due:
                 self.next_retry[name] = (
                     self.frame_index + self.config.recovery_retry_interval_frames
                 )
             try:
-                started = perf_counter()
                 candidates = self.segmenter.detect(
                     rgb,
                     ". ".join(self.prompts[n] for n in due) + ".",
                     self.config.recovery_box_threshold,
                     self.config.recovery_text_threshold,
                 )
-                result.timings_ms["recovery_detection"] = (
-                    perf_counter() - started
-                ) * 1000
                 boxes = {}
                 for name in due:
                     try:
                         boxes[name] = self._match_box(candidates, self.prompts[name])
                     except TrackingFailure as error:
                         reject(name, error)
-                started = perf_counter()
                 recovered_masks = (
                     self.segmenter.segment_boxes(rgb, boxes) if boxes else {}
                 )
-                result.timings_ms["recovery_segmentation"] = (
-                    perf_counter() - started
-                ) * 1000
             except RuntimeError as error:
                 for name in due:
                     reject(name, error)
                 recovered_masks = {}
             corrections = {}
-            started = perf_counter()
             for name, mask in recovered_masks.items():
                 try:
                     self._check_depth(mask, depth_m)
@@ -501,9 +484,6 @@ class SceneTracker:
                     continue
                 if register(name, mask):
                     corrections[name] = mask
-            result.timings_ms["recovery_registration"] = (
-                perf_counter() - started
-            ) * 1000
             if corrections:
                 try:
                     masks = self.segmenter.correct_masks(corrections)
@@ -517,9 +497,7 @@ class SceneTracker:
                         accept(name, pose, masks[name])
                     except TrackingFailure as error:
                         reject(name, error)
-            result.timings_ms["recovery_total"] = (
-                perf_counter() - recovery_start
-            ) * 1000
+
         # 只在最终 mask 校验后提交状态，失败的恢复尝试保留既定重试时间。
         for name in self.trackers:
             if result.valid[name]:

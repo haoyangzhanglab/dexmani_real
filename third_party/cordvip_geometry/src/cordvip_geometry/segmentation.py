@@ -244,8 +244,8 @@ class SAM2Segmenter:
             .convert("RGB")
             .resize((size, size), Image.Resampling.LANCZOS)
         )
-        pixels = torch.from_numpy(pixels).to(self.device)
-        tensor = self.normalization_table[pixels.long(), self.color_channels].permute(
+        pixel_tensor = torch.from_numpy(pixels).to(self.device)
+        tensor = self.normalization_table[pixel_tensor.long(), self.color_channels].permute(
             2, 0, 1
         )
         index = self.state["num_frames"]

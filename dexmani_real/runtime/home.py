@@ -39,17 +39,9 @@ class HomePathRejected(ValueError):
     """所有配置候选均不可行；没有提交 HOME 运动。"""
 
 
-def plan_home(cfg, q, v, hand_q, collision, check):
-    """只在预规划阶段尝试 Direct / Via；返回原样发送的参考点。"""
+def _plan_home(cfg, q, v, hand_q, collision, check):
+    """接收 HOME 入口已校验的配置和反馈，尝试 Direct / Via 候选。"""
     check()
-    try:
-        cfg.validate_home()
-    except (ValueError, TypeError) as exc:
-        raise HomeConfigurationError(str(exc)) from exc
-    q = arm_reference_from_feedback(q, cfg.joint_limit_lower, cfg.joint_limit_upper)
-    v = np.asarray(v, dtype=np.float64)
-    if v.shape != (7,) or not np.isfinite(v).all():
-        raise ValueError("HOME initial velocity must contain seven finite values")
     if np.any(np.abs(v) > cfg.homing.max_speed_rad_per_s):
         raise ValueError("HOME initial velocity exceeds its motion limit")
     home = np.asarray(cfg.home_qpos)
@@ -303,7 +295,7 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
             if reason:
                 raise HomePathRejected(reason)
         else:
-            samples = plan_home(cfg, q, row["qvel"], anchor, model, held)
+            samples = _plan_home(cfg, q, row["qvel"], anchor, model, held)
 
             def execution_service():
                 # 取消收尾时不再检查保持偏差，仍服务设备故障。

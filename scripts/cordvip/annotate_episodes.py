@@ -18,7 +18,10 @@ from dexmani_real.data.raw import RawReader, require_published_raw
 from dexmani_real.geometry.hoi import load_task_template, task_objects
 
 
-def annotate_episodes(episodes, task, *, tracking_config=TrackingConfig()):
+def annotate_episodes(
+    episodes, task, *,
+    tracking_config: TrackingConfig = TrackingConfig(),  # noqa: B008 — 不可变配置可共享。
+):
     task = Path(task)
     template = load_task_template(task)
     names = template["object_names"]
