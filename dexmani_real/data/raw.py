@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
+from dexmani_real.config.perception import HOI_NUM_POINTS
 from dexmani_real.geometry.camera import (
     CameraIntrinsics,
     CameraSnapshot,
@@ -490,8 +491,16 @@ class RawReader:
                 ((), TIMING_ROW_DTYPE) if name == "timing/rows"
                 else ROBOT_DATASET_SPECS.get(name, VR_DATASET_SPECS.get(name))
             )
+            if name == "depth":
+                expected = (
+                    self.num_frames,
+                    self.meta["camera_color_height"],
+                    self.meta["camera_color_width"],
+                )
+                if array.shape != expected or array.dtype != np.uint16:
+                    raise ValueError(f"Raw {self.path}: depth must be uint16 {expected}")
             if name == "object_pointcloud" and (
-                array.shape != (self.num_frames, 1024, 3) or array.dtype != np.float32
+                array.shape != (self.num_frames, HOI_NUM_POINTS, 3) or array.dtype != np.float32
             ):
                 raise ValueError("Raw /hoi/object_pointcloud: shape/dtype 错误")
             if spec is not None:
@@ -542,8 +551,14 @@ class RawReader:
             stream.thread_type = "AUTO"
             stream.thread_count = 4
         self.video_container.seek(0)
-        for frame in self.video_container.decode(video=0):
-            yield frame.to_ndarray(format="rgb24")
+        expected = (self.meta["camera_color_height"], self.meta["camera_color_width"], 3)
+        for index, frame in enumerate(self.video_container.decode(video=0)):
+            image = frame.to_ndarray(format="rgb24")
+            if image.shape != expected:
+                raise ValueError(
+                    f"Raw {self.path}: RGB grid invalid at row {index}, expected {expected}"
+                )
+            yield image
 
     def close(self):
         self.dataset_cache.clear()

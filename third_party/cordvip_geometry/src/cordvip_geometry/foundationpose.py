@@ -97,8 +97,6 @@ class FoundationPoseTracker:
             raise TrackingFailure(
                 "FoundationPose registration did not initialize tracking"
             )
-        if not np.isfinite(pose).all():
-            raise TrackingFailure("FoundationPose returned nonfinite pose")
         return pose
 
 

@@ -18,9 +18,18 @@ python scripts/cordvip/annotate_episodes.py --task pnp_apple_banana
 | --- | --- |
 | `prepare_task.py` | 复用已有米制网格；其余对象共用模型完成分割、重建，保存 `mesh/mesh_m.obj` 和 `reconstruction/` 中间结果。 |
 | `sample_template.py` | 按网格表面积分配配额，8 倍候选点经 FPS 选取 1024 个点，每对象至少 64 点，最多 16 个对象，保存到 `hoi/template.npz`。 |
-| `annotate_episodes.py` | 跟踪已发布 Raw 的 RGB-D，完成逐帧标注后写入点云、位姿、质量和模板来源；暂时跟踪丢失记录无效帧并继续恢复，输入或文件错误直接报错。 |
+| `annotate_episodes.py` | 跟踪已发布 Raw 的 RGB-D，完成逐帧标注后写入点云、位姿、质量和固定模板；暂时跟踪丢失记录无效帧并继续恢复，输入或文件错误直接报错。 |
 
-米制网格保留源物体原点和朝向；模板固定对象顺序、点分段和点序，在线与离线共用。已有模板直接复用；重新采样需显式移除旧模板，实验期间固定资产。已有手模板不会自动更换。
+米制网格保留源物体原点和朝向；模板固定对象顺序、点分段和点序，在线与离线共用。已有任务模板直接复用；修改物体 Mesh、手部 URDF 或 Visual Mesh 后，显式重建对应模板：
+
+```bash
+python scripts/cordvip/sample_template.py --task pnp_apple_banana --overwrite
+python scripts/generate_hand_template.py --overwrite
+```
+
+手模板保存 XYZ 和 Link 分段，任务模板保存 XYZ、对象顺序和分段。模板更新后重新生成对应标注和训练数据；写入通过临时文件原子替换，失败时保留原文件。
+
+`prepare_task.py` 也检查复用的米制 Mesh；提供 `size_axis` / `size_meters` 时核对指定轴尺寸，容差为 `rtol=1e-4, atol=1e-6 m`。仅提供缩放因子时无法从米制文件反推实物尺寸。少量退化面会报告数量，整个网格无有限非零面积时拒绝。
 
 ## 离线标注
 
@@ -38,4 +47,4 @@ python scripts/cordvip/annotate_episodes.py --task pnp_apple_banana
 
 使用 `scripts/export_zarr.py` 导出训练数据，使用 `scripts/visualize_episode.py` 查看点云与质量指标。联合导出物体点云和关节/FK 观测时，会按相机来源时间插值所需设备的关节，前后反馈最大间隔由 `execution.hoi_max_joint_gap_s` 指定，默认 0.10 秒。关节对齐只裁去连续区间不可对齐的首尾，内部缺口报错。随后过滤感知无效行，观测与动作同步选择，并将有效连续区间分别导出为训练 episode，避免训练窗口跨越遮挡缺口。
 
-数据表示、对齐和来源记录见[物体重建与 HOI](../../docs/object_reconstruction.md)，后端安装与接口见 [cordvip_geometry](../../third_party/cordvip_geometry/README.md)。
+数据表示与时间对齐见[物体重建与 HOI](../../docs/object_reconstruction.md)，后端安装与接口见 [cordvip_geometry](../../third_party/cordvip_geometry/README.md)。

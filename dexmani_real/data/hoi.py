@@ -5,6 +5,7 @@ from itertools import pairwise
 
 import numpy as np
 
+from dexmani_real.config.perception import HOI_NUM_POINTS
 from dexmani_real.geometry.hoi import transform_task_points
 from dexmani_real.utils.timing import interpolate_joints, validate_joint_gap
 
@@ -68,11 +69,12 @@ def write_hoi(
                 raise ValueError(f"Nonfinite HOI quality: {key}")
             quality_group.create_dataset(key, data=values)
         cloud = group.create_dataset(
-            "object_pointcloud", (frames, 1024, 3), dtype="f4", chunks=(1, 1024, 3)
+            "object_pointcloud", (frames, HOI_NUM_POINTS, 3), dtype="f4",
+            chunks=(1, HOI_NUM_POINTS, 3),
         )
         for start in range(0, frames, 128):
             selected = valid[start : start + 128]
-            points = np.zeros((len(selected), 1024, 3), np.float32)
+            points = np.zeros((len(selected), HOI_NUM_POINTS, 3), np.float32)
             if selected.any():
                 points[selected] = transform_task_points(
                     template, poses[start : start + 128][selected], base_from_camera

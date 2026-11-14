@@ -68,15 +68,7 @@ def track_episode(reader, tracker, names, prompts):
     if frames == 0:
         raise ValueError("空 Episode")
     reader.require_fields("rgb", "depth")
-    intrinsics = camera.color
-    K = intrinsics.matrix()
-    expected_shape = (intrinsics.height, intrinsics.width)
-    depth_scale = np.float32(camera.depth_scale_m)
     depth = reader["depth"]
-    if depth.shape != (frames, *expected_shape) or depth.dtype != np.uint16:
-        raise ValueError(
-            "Raw depth must be uint16 [rows,H,W] matching color intrinsics"
-        )
 
     timing = reader["timing/rows"][:]
     sequences, stamps = timing["camera_sequence"], timing["camera_ns"]
@@ -103,20 +95,12 @@ def track_episode(reader, tracker, names, prompts):
         rgb = next(images, None)
         if rgb is None:
             raise ValueError(f"Raw RGB ended before row {index}")
-        if rgb.dtype != np.uint8 or rgb.shape != (*expected_shape, 3):
-            raise ValueError(f"Raw RGB grid invalid at row {index}")
         if not new_sequence[index]:
             poses[index] = poses[index - 1]
             quality.append(quality[-1])
             valid[index] = valid[index - 1]
             continue
-        frame = RGBDFrame(
-            rgb=rgb,
-            depth_m=np.multiply(depth[index], depth_scale, dtype=np.float32),
-            K=K,
-            distortion_model=intrinsics.distortion_model,
-            distortion_coeffs=intrinsics.distortion_coeffs,
-        )
+        frame = RGBDFrame.from_camera(camera, {"rgb": rgb, "depth": depth[index]})
         try:
             result = (
                 tracker.initialize(frame, prompts) if first else tracker.track(frame)

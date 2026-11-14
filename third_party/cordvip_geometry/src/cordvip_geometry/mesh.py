@@ -1,8 +1,11 @@
-"""网格读取、尺度调整、表面采样与射线深度。"""
+"""网格读取、米制尺度调整与射线深度。"""
+
+import logging
 
 import numpy as np
 
 MAX_MESH_FACES = 20_000
+logger = logging.getLogger(__name__)
 
 
 def simplify_mesh(mesh):
@@ -16,9 +19,7 @@ def simplify_mesh(mesh):
         o3d.utility.Vector3dVector(mesh.vertices),
         o3d.utility.Vector3iVector(mesh.faces),
     )
-    reduced.vertex_colors = o3d.utility.Vector3dVector(
-        visual.vertex_colors[:, :3] / 255.0
-    )
+    reduced.vertex_colors = o3d.utility.Vector3dVector(visual.vertex_colors[:, :3] / 255.0)
     reduced = reduced.simplify_quadric_decimation(MAX_MESH_FACES)
     return trimesh.Trimesh(
         vertices=np.asarray(reduced.vertices),
@@ -43,26 +44,48 @@ def load_mesh(path):
         raise ValueError("Mesh contains nonfinite vertices")
     if np.any(mesh.faces < 0) or np.any(mesh.faces >= len(mesh.vertices)):
         raise ValueError("Mesh has invalid vertex indices")
+    areas = mesh.area_faces
+    total = areas.sum()
+    if not np.isfinite(areas).all() or not np.isfinite(total) or total <= 0:
+        raise ValueError(f"Mesh has no finite, nonzero surface area: {path}")
+    degenerate = int(np.count_nonzero(~mesh.nondegenerate_faces()))
+    if degenerate:
+        # 少量退化面不影响剩余表面；不在加载时改写资产或改变三角面顺序。
+        logger.warning("%s: %d/%d degenerate faces", path, degenerate, len(mesh.faces))
     return mesh
+
+
+def validate_scale(*, scale_to_meters=None, size_axis=None, size_meters=None):
+    """检查缩放参数；任务入口在加载模型前复用此检查。"""
+    if (size_axis is None) != (size_meters is None):
+        raise ValueError("size_axis 与 size_meters 必须同时提供")
+    if (scale_to_meters is None) == (size_axis is None):
+        raise ValueError("必须提供缩放因子或完整实测尺寸，二选一")
+    if size_axis is not None and size_axis not in ("x", "y", "z"):
+        raise ValueError("实测轴必须为 x、y 或 z")
+    if any(
+        value is not None and (not np.isfinite(value) or value <= 0)
+        for value in (scale_to_meters, size_meters)
+    ):
+        raise ValueError("尺度必须为有限正数")
 
 
 def scale_mesh(mesh, *, scale_to_meters=None, size_axis=None, size_meters=None):
     """按实测尺度缩放副本，保留物体原点和朝向。"""
-    if (size_axis is None) != (size_meters is None):
-        raise ValueError("size_axis 与 size_meters 必须同时提供")
-    if (scale_to_meters is None) == (size_axis is None):
-        raise ValueError("提供缩放因子或实测轴尺寸，二选一")
+    validate_scale(
+        scale_to_meters=scale_to_meters,
+        size_axis=size_axis,
+        size_meters=size_meters,
+    )
     if size_axis is not None:
-        if not np.isfinite(size_meters) or size_meters <= 0:
-            raise ValueError("实测尺寸必须为有限正数")
         extent = float(np.ptp(mesh.vertices[:, "xyz".index(size_axis)]))
-        if extent <= 0:
-            raise ValueError("Mesh has zero extent along the selected axis")
+        if not np.isfinite(extent) or extent <= 0:
+            raise ValueError("Mesh has no finite, positive extent along the selected axis")
         scale_to_meters = size_meters / extent
-    if not np.isfinite(scale_to_meters) or scale_to_meters <= 0:
-        raise ValueError("缩放因子必须为有限正数")
     result = mesh.copy()
     result.apply_scale(scale_to_meters)
+    if not np.isfinite(result.vertices).all() or not np.isfinite(result.area) or result.area <= 0:
+        raise ValueError("Scaled mesh has no finite, nonzero surface area")
     return result
 
 

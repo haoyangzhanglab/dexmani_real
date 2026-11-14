@@ -4,6 +4,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
+HOI_NUM_POINTS = 1024
+HOI_MIN_POINTS_PER_OBJECT = 64
+HOI_MAX_OBJECTS = HOI_NUM_POINTS // HOI_MIN_POINTS_PER_OBJECT
+
 
 @dataclass(frozen=True)
 class PointCloudConfig:

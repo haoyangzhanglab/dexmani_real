@@ -2,14 +2,15 @@
 
 import argparse
 import gc
-import math
 import sys
 from pathlib import Path
+
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 
-from cordvip_geometry.mesh import scale_mesh
+from cordvip_geometry.mesh import load_mesh, scale_mesh, validate_scale
 from cordvip_geometry.weights import DEFAULT_MODELS_DIR, resolve_sam_model
 
 from dexmani_real.geometry.hoi import task_objects
@@ -17,29 +18,38 @@ from dexmani_real.geometry.hoi import task_objects
 
 def prepare_task(task):
     task = Path(task)
-    objects = [
-        obj
-        for obj in task_objects(task)
-        if not (task / obj["name"] / "mesh/mesh_m.obj").exists()
-    ]
+    objects = []
+    for obj in task_objects(task):
+        mesh_path = task / obj["name"] / "mesh/mesh_m.obj"
+        existing = mesh_path.exists()
+        scaling = {
+            key: obj[key] for key in ("scale_to_meters", "size_axis", "size_meters") if key in obj
+        }
+        if not existing or any(value is not None for value in scaling.values()):
+            try:
+                validate_scale(**scaling)
+            except ValueError as error:
+                raise ValueError(f"{obj['name']}: {error}") from error
+        if existing:
+            mesh = load_mesh(mesh_path)
+            axis, size = obj.get("size_axis"), obj.get("size_meters")
+            if axis is not None and not np.isclose(
+                mesh.extents["xyz".index(axis)],
+                size,
+                rtol=1e-4,
+                atol=1e-6,
+            ):
+                raise ValueError(
+                    f"{obj['name']}: 米制 Mesh 的 {axis} 尺寸与实测 {size} m 不一致；"
+                    "请核对或重新缩放 Mesh"
+                )
+            del mesh
+        else:
+            objects.append(obj)
     if not objects:
         print(f"复用任务 Mesh：{task}")
         return
-    for obj in objects:
-        scale, axis, size = (
-            obj.get(key) for key in ("scale_to_meters", "size_axis", "size_meters")
-        )
-        if (axis is None) != (size is None) or (scale is None) == (axis is None):
-            raise ValueError(f"{obj['name']}: 必须提供缩放因子或完整实测尺寸，二选一")
-        if axis is not None and axis not in ("x", "y", "z"):
-            raise ValueError(f"{obj['name']}: 实测轴必须为 x、y 或 z")
-        if any(
-            value is not None and (not math.isfinite(value) or value <= 0)
-            for value in (scale, size)
-        ):
-            raise ValueError(f"{obj['name']}: 尺度必须为有限正数")
 
-    import numpy as np
     import torch
     from cordvip_geometry.reconstruction import load_shape_model, reconstruct_mesh
     from cordvip_geometry.segmentation import SAM2Segmenter
@@ -68,9 +78,7 @@ def prepare_task(task):
     gc.collect()
     torch.cuda.empty_cache()
 
-    model = load_shape_model(
-        ROOT / "third_party/Hunyuan3D-2.1", models_dir / "Hunyuan3D-2.1"
-    )
+    model = load_shape_model(ROOT / "third_party/Hunyuan3D-2.1", models_dir / "Hunyuan3D-2.1")
     for obj in objects:
         directory = task / obj["name"]
         output = directory / "reconstruction"

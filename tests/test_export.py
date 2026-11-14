@@ -1,6 +1,7 @@
 """Raw 导出元数据及连续区间的消费者契约。"""
 
 import json
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -8,7 +9,7 @@ import pytest
 import zarr
 
 from dexmani_real.data.export import ExportConfig, export_zarr
-from dexmani_real.data.raw import ARM_ACTION_SEMANTICS, TIMING_ROW_DTYPE
+from dexmani_real.data.raw import ARM_ACTION_SEMANTICS, TIMING_ROW_DTYPE, RawReader
 from dexmani_real.geometry.kinematics import ArmFK, eef_poses
 from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
@@ -50,6 +51,47 @@ def raw_episodes(tmp_path):
             ):
                 data.create_dataset(name, data=values)
     return source, np.concatenate(states), np.concatenate(actions)
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype"),
+    [((4, 2, 3), np.uint16), ((4, 2, 2), np.float32)],
+)
+def test_raw_reader_rejects_invalid_depth_grid(raw_episodes, shape, dtype):
+    source, _, _ = raw_episodes
+    episode = source / "episode_0"
+    with h5py.File(episode / "data.h5", "r+") as data:
+        data["meta"].attrs.update(camera_color_width=2, camera_color_height=2)
+        data.create_dataset("depth", data=np.ones(shape, dtype=dtype))
+    with RawReader(episode) as reader:
+        with pytest.raises(ValueError, match="depth must be uint16"):
+            reader["depth"]
+
+
+@pytest.mark.parametrize("width", [2, 3])
+def test_raw_reader_decodes_rgb_on_recorded_grid(raw_episodes, width):
+    source, _, _ = raw_episodes
+    episode = source / "episode_0"
+    (episode / "rgb.mp4").touch()
+    with h5py.File(episode / "data.h5", "r+") as data:
+        data["meta"].attrs.update(camera_color_width=2, camera_color_height=2)
+    image = np.full((2, width, 3), 128, np.uint8)
+
+    def decode_frame(*, format):
+        assert format == "rgb24"
+        return image
+
+    with RawReader(episode) as reader:
+        reader.video_container = SimpleNamespace(
+            seek=lambda offset: None,
+            decode=lambda **kwargs: [SimpleNamespace(to_ndarray=decode_frame)],
+            close=lambda: None,
+        )
+        if width == 2:
+            np.testing.assert_array_equal(list(reader.iter_rgb_frames()), [image])
+        else:
+            with pytest.raises(ValueError, match="RGB grid invalid at row 0"):
+                list(reader.iter_rgb_frames())
 
 
 @pytest.mark.parametrize("action_key", ["action", "action_ee", None])
@@ -196,8 +238,6 @@ def test_hoi_export_rejects_different_templates(tmp_path, hoi_episodes, key):
 
 
 def test_hoi_trim_precedes_fk_and_keeps_images_in_step(tmp_path, hoi_episodes, monkeypatch):
-    from dexmani_real.data.raw import RawReader
-
     source, states, actions = hoi_episodes
     for episode in source.iterdir():
         (episode / "rgb.mp4").touch()

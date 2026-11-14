@@ -18,6 +18,9 @@ from .mesh import MeshRaycaster, load_mesh
 
 logger = logging.getLogger(__name__)
 PIXEL_STRIDE = 2
+# 容纳 float32 迭代误差，拒绝明显非刚体候选。
+POSE_ROTATION_ATOL = 1e-3
+POSE_HOMOGENEOUS_ATOL = 1e-6
 
 
 @dataclass(frozen=True)
@@ -339,6 +342,14 @@ class SceneTracker:
         def quality(name, pose, mask):
             if np.shape(pose) != (4, 4) or not np.isfinite(pose).all():
                 raise TrackingFailure("FoundationPose returned nonfinite/invalid pose")
+            if not np.allclose(pose[3], (0, 0, 0, 1), atol=POSE_HOMOGENEOUS_ATOL, rtol=0):
+                raise TrackingFailure("FoundationPose returned invalid homogeneous final row")
+            rotation = pose[:3, :3]
+            if (
+                np.max(np.abs(rotation.T @ rotation - np.eye(3))) > POSE_ROTATION_ATOL
+                or abs(np.linalg.det(rotation) - 1) > POSE_ROTATION_ATOL
+            ):
+                raise TrackingFailure("FoundationPose returned invalid SO(3) rotation")
             if name not in rendered_depths:
                 rendered_depths[name] = (
                     self.renderers[name]

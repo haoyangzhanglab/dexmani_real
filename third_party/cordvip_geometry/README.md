@@ -94,7 +94,9 @@ if result.valid["apple"]:
 | `min_depth_coverage` | 0.5 | 纯深度路径的最低有效深度覆盖率，有限实数且在 (0, 1] 内 |
 | `min_precision`、`min_recall` | 0.5 | 可见轮廓的最低 precision、recall |
 
-每个候选位姿渲染一次完整模型投影。有当前 mask 时，使用遮挡感知的轮廓与深度检查：只有 mask 外的有效实测深度比模型近且超过容差，才计为前景遮挡；缺失深度不作为遮挡证据。无当前 mask 时，仅使用深度几何门控。
+每个合法候选位姿渲染一次完整模型投影。有当前 mask 时，使用遮挡感知的轮廓与深度检查：只有 mask 外的有效实测深度比模型近且超过容差，才计为前景遮挡；缺失深度不作为遮挡证据。无当前 mask 时，仅使用深度几何门控。
+
+渲染前检查候选位姿：矩阵须为有限 `[4,4]`，齐次末行绝对误差不超过 `1e-6`，旋转的 `R.T @ R` 与单位阵误差、`det(R)` 与 1 的误差均不超过 `1e-3`。容限允许 float32 迭代误差，非法候选进入 LOST 并回滚。
 
 纯深度检查以有效 CAD 投影与有效传感器深度的交集为 support，统计绝对残差不超过 `depth_tolerance_m` 的匹配点数：
 
@@ -104,9 +106,7 @@ if result.valid["apple"]:
 | `depth_coverage` | `support_count / max(1, projected_count)` | ≥ `min_depth_coverage` |
 | `depth_fraction` | `matched_count / max(1, support_count)` | ≥ `min_depth_fraction` |
 
-`min_depth_coverage` 拒绝布尔值、字符串及范围外数值（包括 NaN/Inf），统一抛出 `ValueError`。
-
-三项条件必须同时满足。覆盖率衡量完整 CAD 投影获得了多少真实深度，匹配比例衡量这些有效深度与位姿的一致性，二者不能互相替代。没有有效投影或深度支持时，三项指标均为零并拒绝。无当前 mask 时，更近和更远的深度偏差都计为不匹配，不推断遮挡。
+三项条件必须同时满足：覆盖率衡量 CAD 投影中的有效深度比例，匹配比例衡量这些深度与位姿的一致性。没有有效投影或深度支持时拒绝；无当前 mask 时，不推断遮挡。
 
 有 mask 的 `pose_quality()` 输出同定义的 `depth_coverage`，仅用于诊断；其 `depth_fraction` 仍以 mask 内有效深度为分母，原有接受条件与遮挡算法不变。
 
@@ -135,7 +135,7 @@ if result.valid["apple"]:
 
 ## 遮挡恢复
 
-有当前 mask 的帧先检查 mask 和深度，再合批执行 FoundationPose refinement；中间帧按上述深度门控流程处理。失败对象恢复最后接受的内部 `pose_last`，进入 `LOST`；历史位姿只用于内部回滚，不作为当前观测发布。批量推理发生运行时异常时先回滚，再逐对象调用以隔离失败。非有限候选直接逐对象拒绝，不触发整批重算。后端只替换内部位姿张量，回滚保留原张量引用，无需深拷贝。
+失败对象恢复最后接受的内部 `pose_last`，进入 `LOST`；历史位姿不作为当前观测发布。批量推理发生运行时异常时先回滚，再逐对象调用以隔离失败；非法候选直接逐对象拒绝，不触发整批重算。
 
 `LOST` 对象不再执行正常 refinement。到期帧先刷新 SAM2 视频状态，再由到期对象共享一次 Grounding DINO 检测，按规范化 prompt 唯一匹配候选，随后重新分割并调用现有 `register()`。缺失、歧义或几何校验失败时继续保持 LOST；恢复使用与正常跟踪相同的质量阈值。
 

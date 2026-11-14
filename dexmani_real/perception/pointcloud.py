@@ -111,6 +111,7 @@ def radius_inliers(points: np.ndarray) -> np.ndarray:
 
 
 def sample_indices(points: np.ndarray, num_points: int) -> np.ndarray:
+    """对非空点集 FPS；稀疏时循环重复已有点以满足形状，不增加几何信息。"""
     if len(points) > num_points:
         from fpsample import bucket_fps_kdline_sampling
 

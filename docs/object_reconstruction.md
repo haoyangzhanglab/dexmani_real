@@ -10,11 +10,15 @@ HOI（Hand–Object Interaction，手物交互）观测用手部与物体点云�
 
 手部 FK 批量收集所需 link placements，再按缓存的点到 link 索引变换表面点，保持模板点序、分段和输出形状。指尖 `fingertip_xyz` 是独立的低维观测，可按策略需要选择。
 
-手模板读取 `points` 的前三列 XYZ，按 `part_names` 和整数 `part_offsets` 对应 URDF link。共享批量接口 `hand_geometry()` 接收 EEF 变换 `[T,4,4]` 与 SDK 顺序的手关节 `[T,12]`，按请求返回 float32 指尖 `[T,5,3]` 和表面点 `[T,N,3]`，供导出、部署和可视化使用。
+手模板保存 float32 `points[N,3]`，按 `part_names` 和整数 `part_offsets` 对应 URDF link。共享批量接口 `hand_geometry()` 接收相同批次长度的 EEF 变换 `[T,4,4]` 与 SDK 顺序的手关节 `[T,12]`，按请求返回 float32 指尖 `[T,5,3]` 和表面点 `[T,N,3]`，供导出、部署和可视化使用；允许空批次。
 
 通用场景 `point_cloud` 由 `PointCloudProcessor` 处理 RGB-D，包含深度滤波、桌面裁剪、体素降采样和离群点过滤；HOI 点云直接使用固定 CAD/URDF 表面模板。
 
 实验期间固定并复用网格和模板，已有模板不会自动重采样。调整采样配额、点数或点序后，须同步重新生成资产、训练数据并重新训练或验证策略；训练与部署始终使用相同资产。
+
+任务模板保存 `points_local`、`object_names` 和 `offsets`，加载时检查数组结构及对象对应关系。修改物体 Mesh、手部 URDF 或 Visual Mesh 后，须显式重建相应模板，再重新生成标注和训练数据；命令见[实验入口](../scripts/cordvip/README.md)。
+
+通用场景点云在过滤后无有效点时返回 float32 `[0,6]`；非空但不足目标点数时循环重复已有 XYZRGB，超过目标点数时执行 FPS。重复填充仅满足输出形状，不增加真实几何信息。
 
 ## 数据流程
 
@@ -29,7 +33,7 @@ flowchart LR
 ```
 
 1. **准备资产**：[prepare_task.py](../scripts/cordvip/prepare_task.py) 按 `task.json` 分割参考图、通过 Hunyuan3D 重建，再用实测尺寸调整为米制尺度；已有米制网格直接复用。
-2. **生成模板**：[sample_template.py](../scripts/cordvip/sample_template.py) 固定对象顺序、点分段与点序，已有模板直接复用。
+2. **生成模板**：[sample_template.py](../scripts/cordvip/sample_template.py) 固定对象顺序、点分段与点序；已有模板直接复用，资产变更后显式重建。
 3. **标注 Raw**：[annotate_episodes.py](../scripts/cordvip/annotate_episodes.py) 跟踪录制的 RGB-D，完成逐帧标注后发布位姿、质量和物体点云。
 4. **导出数据**：[export_zarr.py](../scripts/export_zarr.py) 读取物体标注，对齐关节并生成手部几何，与所选状态和动作一同导出。
 5. **训练与部署**：在 dexmani_policy 中训练；部署共用任务模板、跟踪器、坐标变换和 FK。

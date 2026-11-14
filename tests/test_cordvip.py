@@ -261,6 +261,11 @@ def test_template_and_raw_roundtrip(tmp_path):
     )
     with h5py.File(path, "r") as data:
         assert "_hoi_staging" not in data
+        assert set(data["hoi/template"]) == {"points_local", "offsets", "object_names"}
+        np.testing.assert_array_equal(
+            data["hoi/template/object_names"].asstr()[:], template["object_names"],
+        )
+        np.testing.assert_array_equal(data["hoi/template/offsets"][:], template["offsets"])
         points = data["hoi/object_pointcloud"][:]
         np.testing.assert_allclose(points[0], template["points_local"])
         np.testing.assert_allclose(
@@ -299,6 +304,100 @@ def test_batched_template_transform():
             )
             expected = camera @ base[:3, :3].T + base[:3, 3]
             np.testing.assert_allclose(actual[frame, start:end], expected, atol=2e-7)
+
+
+@pytest.fixture
+def task_template(tmp_path):
+    import json
+
+    objects = [{"name": name} for name in ("banana", "apple")]
+    (tmp_path / "task.json").write_text(json.dumps({"objects": objects}))
+    for obj in objects:
+        directory = tmp_path / obj["name"] / "mesh"
+        directory.mkdir(parents=True)
+        trimesh.creation.box(extents=(0.1, 0.1, 0.1)).export(directory / "mesh_m.obj")
+    script("sample_template").sample_template(tmp_path)
+    return tmp_path
+
+
+def test_template_reuse_and_explicit_overwrite(task_template):
+    import json
+    from dexmani_real.geometry.hoi import load_task_template
+
+    task = task_template
+    template = load_task_template(task)
+    np.testing.assert_array_equal(template["object_names"], ["banana", "apple"])
+    assert set(template) == {"points_local", "offsets", "object_names"}
+    # task.json 重排不改变已有模板的对象顺序和点序。
+    (task / "task.json").write_text(json.dumps({"objects": [{"name": "apple"}, {"name": "banana"}]}))
+    np.testing.assert_array_equal(load_task_template(task)["object_names"], ["banana", "apple"])
+    mesh_path = task / "apple/mesh/mesh_m.obj"
+    trimesh.creation.box(extents=(0.2, 0.1, 0.1)).export(mesh_path)
+    original = (task / "hoi/template.npz").read_bytes()
+    script("sample_template").sample_template(task)
+    assert (task / "hoi/template.npz").read_bytes() == original
+    script("sample_template").sample_template(task, overwrite=True)
+    updated = load_task_template(task)
+    np.testing.assert_array_equal(updated["object_names"], ["apple", "banana"])
+    apple = list(updated["object_names"]).index("apple")
+    segment = slice(updated["offsets"][apple], updated["offsets"][apple + 1])
+    np.testing.assert_allclose(np.max(np.abs(updated["points_local"][segment, 0])), 0.1)
+
+
+def test_template_overwrite_failure_keeps_existing_asset(task_template, monkeypatch):
+    module = script("sample_template")
+    path = task_template / "hoi/template.npz"
+    before = path.read_bytes()
+
+    def fail(stream, **values):
+        stream.write(b"incomplete template")
+        raise OSError("simulated disk write failure")
+
+    monkeypatch.setattr(module.np, "savez", fail)
+    with pytest.raises(OSError, match="disk write"):
+        module.sample_template(task_template, overwrite=True)
+    assert path.read_bytes() == before
+    assert not list(path.parent.glob(".template.npz.*"))
+
+
+def test_mesh_surface_checks_preserve_partial_degenerate_geometry(tmp_path, caplog):
+    from cordvip_geometry.mesh import load_mesh
+
+    box = trimesh.creation.box()
+    mesh = trimesh.Trimesh(vertices=box.vertices, faces=np.vstack((box.faces, [0, 0, 1])), process=False)
+    path = tmp_path / "partial.obj"
+    mesh.export(path)
+    loaded = load_mesh(path)
+    np.testing.assert_array_equal(loaded.vertices, mesh.vertices)
+    np.testing.assert_array_equal(loaded.faces, mesh.faces)
+    assert "1/13 degenerate faces" in caplog.text
+    trimesh.Trimesh(vertices=box.vertices, faces=[[0, 0, 1]], process=False).export(path)
+    with pytest.raises(ValueError, match="surface area"):
+        load_mesh(path)
+
+
+@pytest.mark.parametrize("scale", [1e-200, 1e200])
+def test_scale_rejects_unrepresentable_surface(scale):
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        with pytest.raises(ValueError, match="surface area"):
+            scale_mesh(trimesh.creation.box(), scale_to_meters=scale)
+
+
+def test_prepare_reused_mesh_validates_measurement_without_models(tmp_path):
+    import json
+
+    directory = tmp_path / "apple/mesh"
+    directory.mkdir(parents=True)
+    trimesh.creation.box(extents=(0.1, 0.2, 0.3)).export(directory / "mesh_m.obj")
+    module = script("prepare_task")
+    for measurement in ({}, {"size_axis": "y", "size_meters": 0.2}):
+        (tmp_path / "task.json").write_text(json.dumps({"objects": [{"name": "apple", **measurement}]}))
+        module.prepare_task(tmp_path)
+    (tmp_path / "task.json").write_text(json.dumps({
+        "objects": [{"name": "apple", "size_axis": "y", "size_meters": 0.3}],
+    }))
+    with pytest.raises(ValueError, match="尺寸与实测"):
+        module.prepare_task(tmp_path)
 
 
 def test_scene_batch_keeps_per_object_depth_gate(monkeypatch):
@@ -1249,6 +1348,75 @@ def test_nonfinite_candidate_only_invalidates_its_object(recovery_scene, monkeyp
     assert result.valid == {"apple": False, "banana": True}
     assert scene.trackers["apple"].estimator.pose_last is previous
     assert calls == [["apple", "banana"]] and len(detections) == 1
+
+
+@pytest.mark.parametrize("invalid", ["scale", "reflection", "shear", "last_row"])
+@pytest.mark.parametrize("stage", ["initialize", "track_mask", "track_depth", "recover"])
+def test_nonrigid_pose_is_rejected_before_rendering(recovery_scene, monkeypatch, invalid, stage):
+    from dataclasses import replace
+    from cordvip_geometry import tracking
+
+    scene, frame, _, _, _ = recovery_scene
+    pose = np.eye(4)
+    if invalid == "scale":
+        pose[0, 0] = 2
+    elif invalid == "reflection":
+        pose[0, 0] = -1
+    elif invalid == "shear":
+        pose[0, 1] = 0.2
+    else:
+        pose[3, 0] = 0.1
+
+    def must_not_render(*args):
+        pytest.fail("nonrigid candidate reached the renderer")
+
+    monkeypatch.setattr(scene.renderers["apple"], "render", must_not_render)
+    previous = scene.trackers["apple"].estimator.pose_last
+    if stage in ("initialize", "recover"):
+        def register(*args):
+            scene.trackers["apple"].estimator.pose_last = pose
+            return pose
+        monkeypatch.setattr(scene.trackers["apple"], "register", register)
+        if stage == "initialize":
+            with pytest.raises(TrackingFailure, match="invalid"):
+                scene.initialize(frame, {"apple": "apple", "banana": "banana"})
+            assert scene.trackers["apple"].estimator.pose_last is None
+            assert scene.states == {"apple": "LOST", "banana": "TRACKING"}
+            return
+        scene.states["apple"] = "LOST"
+        scene.next_retry["apple"] = 0
+    else:
+        original = tracking.track_objects
+        def batch(*args):
+            poses = original(*args)
+            poses["apple"] = pose
+            scene.trackers["apple"].estimator.pose_last = pose
+            return poses
+        monkeypatch.setattr(tracking, "track_objects", batch)
+        if stage == "track_depth":
+            scene.config = replace(scene.config, segmentation_interval_frames=2)
+    result = scene.track(frame)
+    assert result.valid == {"apple": False, "banana": True}
+    assert list(result.poses) == ["banana"]
+    assert scene.states["apple"] == "LOST"
+    assert scene.trackers["apple"].estimator.pose_last is previous
+
+
+def test_pose_gate_tolerates_float32_rotation_noise(recovery_scene, monkeypatch):
+    from cordvip_geometry import tracking
+    from scipy.spatial.transform import Rotation
+
+    scene, frame, _, _, _ = recovery_scene
+    original = tracking.track_objects
+    def batch(*args):
+        poses = original(*args)
+        poses["apple"] = poses["apple"].astype(np.float32)
+        poses["apple"][:3, :3] = Rotation.from_euler("z", 0.3).as_matrix().astype(np.float32)
+        poses["apple"][0, 0] += 1e-5
+        scene.trackers["apple"].estimator.pose_last = poses["apple"]
+        return poses
+    monkeypatch.setattr(tracking, "track_objects", batch)
+    assert all(scene.track(frame).valid.values())
 
 
 def test_annotator_rejects_existing_hoi_without_validity(monkeypatch, tmp_path):

@@ -13,7 +13,7 @@ from typing import Any, cast
 import numpy as np
 import zarr
 
-from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
+from dexmani_real.config.perception import HOI_NUM_POINTS, HandCloudConfig, PointCloudConfig
 from dexmani_real.data.hoi import align_hoi_episode
 from dexmani_real.data.raw import RawReader, require_published_raw
 from dexmani_real.geometry.camera import (
@@ -105,10 +105,6 @@ def export_camera(reader, fields):
             if not np.isfinite(scale) or scale <= 0:
                 raise ValueError("depth_scale must be finite and positive")
         camera["depth_scale_m"] = scale
-        expected = (reader.num_frames, *camera["shape"])
-        depth = reader["depth"]
-        if depth.shape != expected or depth.dtype != np.uint16:
-            raise ValueError(f"depth must be uint16 {expected}")
     if "camera_intrinsic" in names:
         if snapshot is not None:
             matrix = snapshot.color.matrix(dtype=np.float32)
@@ -126,7 +122,7 @@ def export_camera(reader, fields):
 
 def canonical_array_specs(fields, processing, camera):
     shapes = {
-        "object_pointcloud": (1024, 3),
+        "object_pointcloud": (HOI_NUM_POINTS, 3),
         "joint_state": (19,), "action": (19,), "action_ee": (21,),
         "finger_tactile_force": (5, 3), "taxel_tactile_force": (5, 120, 3),
         "fingertip_xyz": (5, 3), "eef_pose": (9,),
@@ -231,10 +227,8 @@ def iter_canonical_blocks(
             offset = 0
             for index in range(start, end):
                 image = next(images, None)
-                if image is None or image.shape != (height, width, 3) or image.dtype != np.uint8:
-                    raise ValueError(
-                        f"{reader.path / 'rgb.mp4'}: RGB missing or invalid at row {index}"
-                    )
+                if image is None:
+                    raise ValueError(f"{reader.path / 'rgb.mp4'}: RGB missing at row {index}")
                 if alignment is not None and not alignment["keep"][index]:
                     continue
                 if "rgb" in fields:

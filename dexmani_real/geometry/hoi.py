@@ -6,6 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
+from dexmani_real.config.perception import HOI_NUM_POINTS
+
 
 def task_objects(task):
     """读取有序任务对象，补齐默认 Prompt。"""
@@ -27,8 +29,7 @@ def task_objects(task):
             raise ValueError(f"重复对象名：{name!r}")
         prompt = obj.setdefault("prompt", name)
         if not isinstance(prompt, str) or all(
-            char.isspace() or unicodedata.category(char).startswith("P")
-            for char in prompt
+            char.isspace() or unicodedata.category(char).startswith("P") for char in prompt
         ):
             raise ValueError(f"{name}: Prompt 必须是非空字符串，且不能仅含空白或标点")
         # 与跟踪器的标签匹配规则一致。
@@ -56,7 +57,7 @@ def load_task_template(task):
         raise ValueError("模板对象与任务对象不对应")
     points, offsets = template["points_local"], template["offsets"]
     if (
-        points.shape != (1024, 3)
+        points.shape != (HOI_NUM_POINTS, 3)
         or points.dtype != np.float32
         or not np.isfinite(points).all()
     ):
@@ -66,7 +67,7 @@ def load_task_template(task):
         offsets.dtype.kind not in "iu"
         or offsets.shape != (len(names) + 1,)
         or offsets[0] != 0
-        or offsets[-1] != 1024
+        or offsets[-1] != HOI_NUM_POINTS
         or np.any(offsets[1:] <= offsets[:-1])
     ):
         raise ValueError("非法 HOI 点分段")
@@ -78,7 +79,7 @@ def transform_task_points(template, poses_camera, base_from_camera):
     offsets = template["offsets"]
     # 在线与离线采用相同位姿精度。
     poses_camera = np.asarray(poses_camera, dtype=np.float32)
-    points = np.empty((*poses_camera.shape[:-3], 1024, 3), dtype=np.float32)
+    points = np.empty((*poses_camera.shape[:-3], HOI_NUM_POINTS, 3), dtype=np.float32)
     for index in range(len(offsets) - 1):
         transform = base_from_camera @ poses_camera[..., index, :, :]
         segment = slice(offsets[index], offsets[index + 1])

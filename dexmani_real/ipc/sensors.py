@@ -3,6 +3,7 @@ from typing import cast
 
 import numpy as np
 
+from dexmani_real.config.perception import HOI_NUM_POINTS
 from dexmani_real.config.sensor import CameraConfig
 from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.ipc.ring import SharedRing
@@ -77,10 +78,10 @@ class SensorChannels:
         if hoi:
             fields: list[tuple] = [
                 ("episode_id", "u8"), ("timestamp_ns", "u8"), ("source_camera_sequence", "u8"),
-                ("valid", "?"), ("object_pointcloud", "f4", (1024, 3)),
+                ("valid", "?"), ("object_pointcloud", "f4", (HOI_NUM_POINTS, 3)),
             ]
             if camera_fields:
-                image_dtype = cast(SharedRing, self.camera_ring).dtype
+                image_dtype: np.dtype = cast(SharedRing, self.camera_ring).dtype
                 fields.extend((name, image_dtype[name]) for name in camera_fields)
             self.hoi_ring = SharedRing(ctx, np.dtype(fields), 3)
             self.hoi_request = SharedRing(ctx, np.dtype([

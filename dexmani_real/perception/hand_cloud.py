@@ -9,12 +9,12 @@ HAND_TEMPLATE_DIR = ASSET_DIR / "pointcloud_template" / "hand"
 
 
 class HandPointCloud:
-    """读取模板前三列的 link 局部 XYZ，保留分段及点序。"""
+    """读取 link 局部 XYZ 模板，保留分段及点序。"""
 
     def __init__(self, hand_fk: HandFK, num_points: int):
         path = HAND_TEMPLATE_DIR / f"hand_{num_points}.npz"
         with np.load(path, allow_pickle=False) as template:
-            points = template["points"][:, :3]
+            points = template["points"]
             names = template["part_names"]
             offsets = template["part_offsets"]
         if (
@@ -34,7 +34,9 @@ class HandPointCloud:
             raise ValueError(f"Invalid hand point-cloud template: {path}")
         self.frame_ids = tuple(hand_fk.model.getFrameId(name) for name in names.tolist())
         if any(frame_id >= hand_fk.model.nframes for frame_id in self.frame_ids):
-            raise ValueError(f"Hand point-cloud template names a link missing from the FK model: {path}")
+            raise ValueError(
+                f"Hand point-cloud template names a link missing from the FK model: {path}"
+            )
         self.local_points = points
         self.point_frame_indices = np.repeat(
             np.arange(len(self.frame_ids), dtype=np.intp),
@@ -63,16 +65,26 @@ def hand_geometry(
 ) -> dict[str, np.ndarray]:
     """由 [T,4,4] EEF 与 [T,12] SDK 关节批量生成基座系几何。
 
-    按请求返回 float32 指尖 [T,5,3] 和手部表面点 [T,N,3]。
+    按请求返回 float32 指尖 [T,5,3] 和手部表面点 [T,N,3]；允许 T=0。
     """
-    base_from_hand = eef_transforms @ arm_fk.eef_from_handbase
+    eef_transforms = np.asarray(eef_transforms)
+    hand_qpos = np.asarray(hand_qpos)
+    if eef_transforms.ndim != 3 or eef_transforms.shape[1:] != (4, 4):
+        raise ValueError("eef_transforms must have shape [T,4,4]")
+    if hand_qpos.ndim != 2 or hand_qpos.shape[1] != 12:
+        raise ValueError("hand_qpos must have shape [T,12]")
+    if len(eef_transforms) != len(hand_qpos):
+        raise ValueError("eef_transforms and hand_qpos must have the same batch length")
 
     frame_ids = list(hand_fk.fingertip_frame_ids) if include_fingertips else []
     tip_count = len(frame_ids)
     if hand_cloud is not None:
         frame_ids.extend(hand_cloud.frame_ids)
-    arrays = {}
+    arrays: dict[str, np.ndarray] = {}
+    if not frame_ids:
+        return arrays
 
+    base_from_hand = eef_transforms @ arm_fk.eef_from_handbase
     placements = np.empty((len(base_from_hand), len(frame_ids), 4, 4), dtype=np.float64)
     for index, qpos in enumerate(hand_qpos):
         placements[index] = hand_fk.forward(qpos, frame_ids)

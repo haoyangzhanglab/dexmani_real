@@ -1,9 +1,9 @@
 """物体分割、重建与尺度调整命令；解析不加载模型。"""
 
 import argparse
-import math
 from pathlib import Path
 
+from .mesh import validate_scale
 from .weights import DEFAULT_MODELS_DIR, SAM_MODELS, resolve_sam_model
 
 
@@ -15,29 +15,19 @@ def probability(value):
 
 
 def add_models_directory(parser, workspace):
-    parser.add_argument(
-        "--models-dir", type=Path, default=workspace / DEFAULT_MODELS_DIR
-    )
+    parser.add_argument("--models-dir", type=Path, default=workspace / DEFAULT_MODELS_DIR)
 
 
 def add_segment_arguments(parser, workspace):
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--image", type=Path, help="按 EXIF 纠正朝向的物体照片")
-    source.add_argument(
-        "--rgbd", type=Path, help="含 rgb uint8 [H,W,3] 的 NPZ（仅读取 rgb）"
-    )
+    source.add_argument("--rgbd", type=Path, help="含 rgb uint8 [H,W,3] 的 NPZ（仅读取 rgb）")
     parser.add_argument("--prompt", required=True, help="英文物体描述")
-    parser.add_argument(
-        "--instance", type=int, help="去重后按置信度降序排列的零起始候选索引"
-    )
+    parser.add_argument("--instance", type=int, help="去重后按置信度降序排列的零起始候选索引")
     parser.add_argument("--headless", action="store_true")
     add_models_directory(parser, workspace)
-    parser.add_argument(
-        "--sam-variant", choices=SAM_MODELS, help="官方 SAM2.1 型号，默认 small"
-    )
-    parser.add_argument(
-        "--sam-checkpoint", type=Path, help="自训权重，须与 --sam-config 配对"
-    )
+    parser.add_argument("--sam-variant", choices=SAM_MODELS, help="官方 SAM2.1 型号，默认 small")
+    parser.add_argument("--sam-checkpoint", type=Path, help="自训权重，须与 --sam-config 配对")
     parser.add_argument("--sam-config", help="自训模型在 SAM2 包内的配置")
     parser.add_argument("--box-threshold", type=probability, default=0.3)
     parser.add_argument("--text-threshold", type=probability, default=0.25)
@@ -66,9 +56,7 @@ def parse_args(argv=None, *, workspace=None):
 
     segment = commands.add_parser("segment", help="分割并确认物体")
     add_segment_arguments(segment, workspace)
-    segment.add_argument(
-        "--list-only", action="store_true", help="保存候选，稍后 select"
-    )
+    segment.add_argument("--list-only", action="store_true", help="保存候选，稍后 select")
 
     select = commands.add_parser(
         "select",
@@ -88,15 +76,11 @@ def parse_args(argv=None, *, workspace=None):
     select.add_argument("--headless", action="store_true")
 
     generate = commands.add_parser("generate", help="从 RGBA 生成未定尺度网格")
-    generate.add_argument(
-        "--image", type=Path, required=True, help="透明背景 RGBA 文件"
-    )
+    generate.add_argument("--image", type=Path, required=True, help="透明背景 RGBA 文件")
     add_models_directory(generate, workspace)
     add_generate_arguments(generate)
 
-    reconstruct = commands.add_parser(
-        "reconstruct", help="分割、生成，并按显式尺度准备资产"
-    )
+    reconstruct = commands.add_parser("reconstruct", help="分割、生成，并按显式尺度准备资产")
     add_segment_arguments(reconstruct, workspace)
     add_generate_arguments(reconstruct)
     add_scale_arguments(reconstruct)
@@ -128,14 +112,14 @@ def parse_args(argv=None, *, workspace=None):
     if hasattr(args, "models_dir"):
         args.models_dir = args.models_dir.expanduser().resolve()
     if args.command in {"scale", "reconstruct"}:
-        scale, axis, size = args.scale_to_meters, args.size_axis, args.size_meters
-        if (axis is None) != (size is None):
-            parser.error("--size-axis 与 --size-meters 必须同时提供")
-        if any(
-            value is not None and (not math.isfinite(value) or value <= 0)
-            for value in (scale, size)
-        ):
-            parser.error("尺度必须为有限正数")
+        scaling = {
+            key: getattr(args, key) for key in ("scale_to_meters", "size_axis", "size_meters")
+        }
+        if any(value is not None for value in scaling.values()):
+            try:
+                validate_scale(**scaling)
+            except ValueError as error:
+                parser.error(str(error))
     if args.command in {"segment", "reconstruct"}:
         try:
             args.sam_checkpoint, args.sam_config = resolve_sam_model(
@@ -193,9 +177,7 @@ def main(argv=None):
             args.sam_config,
             args.models_dir / "grounding-dino-base",
         )
-        candidates = segmenter.predict(
-            rgb, args.prompt, args.box_threshold, args.text_threshold
-        )
+        candidates = segmenter.predict(rgb, args.prompt, args.box_threshold, args.text_threshold)
         if not candidates:
             raise ValueError("没有检测到目标，请调整 prompt")
         if command == "segment" and args.list_only:
@@ -216,9 +198,7 @@ def main(argv=None):
     elif command == "select":
         with Image.open(args.segmentation_dir / "rgb.png") as image:
             rgb = np.asarray(image.convert("RGB")).copy()
-        with np.load(
-            args.segmentation_dir / "candidates.npz", allow_pickle=False
-        ) as saved:
+        with np.load(args.segmentation_dir / "candidates.npz", allow_pickle=False) as saved:
             candidates = [
                 {
                     "mask": mask,
@@ -237,9 +217,7 @@ def main(argv=None):
         args.workspace / "third_party/Hunyuan3D-2.1",
         args.models_dir / "Hunyuan3D-2.1",
     )
-    image_path = (
-        output / "foreground_rgba.png" if command == "reconstruct" else args.image
-    )
+    image_path = output / "foreground_rgba.png" if command == "reconstruct" else args.image
     with Image.open(image_path) as image:
         mesh = reconstruct_mesh(
             model,
@@ -250,9 +228,7 @@ def main(argv=None):
             num_chunks=args.num_chunks,
         )
     mesh.export(output / "mesh_unscaled.obj")
-    if command == "generate" or (
-        args.scale_to_meters is None and args.size_axis is None
-    ):
+    if command == "generate" or (args.scale_to_meters is None and args.size_axis is None):
         if args.preview:
             preview_mesh(output / "mesh_unscaled.obj")
         return 0

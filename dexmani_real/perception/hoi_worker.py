@@ -8,6 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
+from dexmani_real.config.perception import HOI_NUM_POINTS
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,7 +80,7 @@ def run_hoi_worker(shared, camera, task, template, *, tracking_config=None):
         if int(shared.hoi_request.read()[0]["episode_id"]) != epoch:
             continue
         if failure is not None:
-            points = np.zeros((1024, 3), np.float32)
+            points = np.zeros((HOI_NUM_POINTS, 3), np.float32)
             logger.warning(
                 "HOI Episode %d 当前帧无效：%s；继续处理后续帧。", epoch, failure
             )
