@@ -41,7 +41,6 @@ class TrackingConfig:
         if (
             isinstance(self.min_depth_coverage, bool)
             or not isinstance(self.min_depth_coverage, Real)
-            or not np.isfinite(self.min_depth_coverage)
             or not 0 < self.min_depth_coverage <= 1
         ):
             raise ValueError("min_depth_coverage must be finite and lie in (0, 1]")

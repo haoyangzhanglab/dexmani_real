@@ -105,6 +105,8 @@ if result.valid["apple"]:
 | `depth_coverage` | `support_count / max(1, projected_count)` | ≥ `min_depth_coverage` |
 | `depth_fraction` | `matched_count / max(1, support_count)` | ≥ `min_depth_fraction` |
 
+`min_depth_coverage` 拒绝布尔值、字符串及范围外数值（包括 NaN/Inf），统一抛出 `ValueError`。
+
 三项条件必须同时满足。覆盖率衡量完整 CAD 投影获得了多少真实深度，匹配比例衡量这些有效深度与位姿的一致性，二者不能互相替代。没有有效投影或深度支持时，三项指标均为零并拒绝。无当前 mask 时，更近和更远的深度偏差都计为不匹配，不推断遮挡。
 
 有 mask 的 `pose_quality()` 输出同定义的 `depth_coverage`，仅用于诊断；其 `depth_fraction` 仍以 mask 内有效深度为分母，原有接受条件与遮挡算法不变。

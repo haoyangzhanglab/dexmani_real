@@ -1413,6 +1413,7 @@ def test_event_rejection_and_due_recovery(recovery_scene):
 
 
 def test_mixed_quality_hdf5_is_finite(recovery_scene, tmp_path):
+    import json
     import h5py
     from dataclasses import asdict, replace
     from dexmani_real.data.hoi import write_hoi
@@ -1443,6 +1444,7 @@ def test_mixed_quality_hdf5_is_finite(recovery_scene, tmp_path):
         object_valid=np.ones((3, 2), bool),
     )
     with h5py.File(path, "r") as data:
+        assert json.loads(data["hoi"].attrs["tracking_config"]) == asdict(scene.config)
         for values in data["hoi/quality"].values():
             assert np.isfinite(values[:]).all()
         np.testing.assert_array_equal(data["hoi/quality/mask_source"][:, 0], [1, 0, 1])
@@ -1717,7 +1719,11 @@ def test_benchmark_reference_and_cleanup(
 
 
 @pytest.mark.parametrize(
-    "value", [True, False, 0, -0.1, 1.1, np.nan, np.inf, "bad", "0.5"]
+    "value",
+    [
+        True, False, np.bool_(True), 0, -0.1, 1.1, 10**100,
+        np.nan, np.inf, -np.inf, None, 1j, "bad", "0.5",
+    ],
 )
 def test_depth_coverage_config(value):
     with pytest.raises(ValueError, match="min_depth_coverage"):
@@ -1847,5 +1853,23 @@ def test_coverage_is_independent_of_mask_and_occlusion():
     mask = observed == 1
     full, _ = pose_quality(mask, observed, rendered, TrackingConfig())
     depth, _ = pose_depth_quality(observed, rendered, TrackingConfig())
+    assert full.keys() == depth.keys()
     assert full["depth_coverage"] == depth["depth_coverage"] == 0.75
     assert full["occluded_fraction"] == 0.25
+
+
+@pytest.mark.parametrize("min_coverage", [0.25, 0.75])
+@pytest.mark.parametrize("min_fraction", [0.4, 0.8])
+def test_depth_thresholds_are_independent(min_coverage, min_fraction):
+    from cordvip_geometry.tracking import pose_depth_quality
+
+    observed = np.zeros((10, 10))
+    observed[:5] = 2
+    observed.flat[:30] = 1
+    config = TrackingConfig(
+        min_depth_coverage=min_coverage, min_depth_fraction=min_fraction
+    )
+    metrics, accepted = pose_depth_quality(observed, np.ones_like(observed), config)
+    assert metrics["depth_coverage"] == 0.5
+    assert metrics["depth_fraction"] == 0.6
+    assert accepted == (min_coverage <= 0.5 and min_fraction <= 0.6)
