@@ -1419,6 +1419,7 @@ def test_mixed_quality_hdf5_is_finite(recovery_scene, tmp_path):
 
     scene, frame, masks, _, _ = recovery_scene
     scene.config = replace(scene.config, segmentation_interval_frames=2)
+    frame.depth_m[18:] = 0
     results = [
         scene.initialize(frame, scene.prompts),
         scene.track(frame),
@@ -1446,6 +1447,9 @@ def test_mixed_quality_hdf5_is_finite(recovery_scene, tmp_path):
             assert np.isfinite(values[:]).all()
         np.testing.assert_array_equal(data["hoi/quality/mask_source"][:, 0], [1, 0, 1])
         assert data["hoi/object_pointcloud"].shape == (3, 1024, 3)
+        np.testing.assert_array_equal(
+            data["hoi/quality/depth_coverage"][:], np.full((3, 2), 0.75)
+        )
 
 
 def test_correction_uses_video_index(monkeypatch):
@@ -1558,7 +1562,10 @@ def test_depth_gate_requires_support(observed, rendered):
         np.full((10, 10), observed), np.full((10, 10), rendered), TrackingConfig()
     )
     assert (
-        not accepted and metrics["depth_pixels"] == 0 and metrics["depth_fraction"] == 0
+        not accepted
+        and metrics["depth_pixels"] == 0
+        and metrics["depth_fraction"] == 0
+        and metrics["depth_coverage"] == 0
     )
 
 
@@ -1626,6 +1633,7 @@ def test_viewer_marks_unmeasured_quality_as_missing():
                 "iou": np.array([[-1.0, 0.75]]),
                 "mask_source": np.array([[0.0, 1.0]]),
                 "depth_fraction": np.array([[0.8, 0.9]]),
+                "depth_coverage": np.array([[0.0, 0.7]]),
             }
         }
 
@@ -1639,11 +1647,14 @@ def test_viewer_marks_unmeasured_quality_as_missing():
     assert logged["hoi/object_1/iou"] == 0.75
     assert logged["hoi/object_0/mask_source"] == 0
     assert logged["hoi/object_0/depth_fraction"] == 0.8
+    assert logged["hoi/object_0/depth_coverage"] == 0.0
+    assert logged["hoi/object_1/depth_coverage"] == 0.7
 
 
 @pytest.mark.parametrize("truncated_reference", [False, True])
+@pytest.mark.parametrize("low_coverage", [False, True])
 def test_benchmark_reference_and_cleanup(
-    recovery_scene, monkeypatch, tmp_path, truncated_reference
+    recovery_scene, monkeypatch, tmp_path, truncated_reference, low_coverage
 ):
     import json
     import torch
@@ -1652,6 +1663,7 @@ def test_benchmark_reference_and_cleanup(
     module = script("benchmark_tracking")
     scene, frame, masks, _, _ = recovery_scene
     original_batch = tracking.track_objects
+    original_depth_quality = tracking.pose_depth_quality
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda index: "test GPU")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
@@ -1668,6 +1680,8 @@ def test_benchmark_reference_and_cleanup(
         nonlocal calls
         calls += 1
         tracker.initialize(frame, prompts)
+        if low_coverage:
+            frame.depth_m[10:] = 0
         # 三次预热后是逐帧基线；缺失参考必须报错，不能静默略过复核。
         if not (truncated_reference and calls == 4):
             tracker.track(frame)
@@ -1690,7 +1704,151 @@ def test_benchmark_reference_and_cleanup(
         module.main(args)
         runs = json.loads((output / "summary.json").read_text())
         assert [r["frames"] for r in runs] == [3, 3, 3]
-        assert [r["counts"]["sam_track"] for r in runs] == [2, 1, 0]
+        assert [r["counts"]["sam_track"] for r in runs] == (
+            [2, 2, 2] if low_coverage else [2, 1, 0]
+        )
+        assert [r["coverage_rejected_frames"] for r in runs] == (
+            [0, 2, 2] if low_coverage else [0, 0, 0]
+        )
+        assert [r["coverage_triggered_sam_frames"] for r in runs] == (
+            [0, 2, 2] if low_coverage else [0, 0, 0]
+        )
         assert all(r["reference_rejections"] == 0 for r in runs)
         assert (output / "comparison.json").is_file()
     assert tracking.track_objects is original_batch
+    assert tracking.pose_depth_quality is original_depth_quality
+
+
+@pytest.mark.parametrize(
+    "value", [True, False, 0, -0.1, 1.1, np.nan, np.inf, "bad", "0.5"]
+)
+def test_depth_coverage_config(value):
+    with pytest.raises(ValueError, match="min_depth_coverage"):
+        TrackingConfig(min_depth_coverage=value)
+
+
+@pytest.mark.parametrize("missing", [np.nan, 0.0])
+def test_sparse_depth_requires_coverage(missing):
+    from cordvip_geometry.tracking import pose_depth_quality, pose_quality
+
+    rendered = np.ones((100, 100))
+    observed = np.full_like(rendered, missing)
+    observed.flat[:30] = 1
+    config = TrackingConfig()
+    depth, accepted = pose_depth_quality(observed, rendered, config)
+    full, mask_accepted = pose_quality(
+        np.ones_like(rendered, bool), observed, rendered, config
+    )
+    assert not accepted and mask_accepted
+    assert depth["depth_pixels"] == 30 and depth["depth_fraction"] == 1
+    assert depth["depth_coverage"] == full["depth_coverage"] == 0.003
+
+
+@pytest.mark.parametrize("support", [49, 50, 51, 100])
+@pytest.mark.parametrize("fraction", [0.49, 0.5, 0.51, 1.0])
+def test_depth_coverage_and_match_boundaries(support, fraction):
+    from cordvip_geometry.tracking import pose_depth_quality
+
+    rendered = np.ones((100, 100))
+    observed = np.zeros_like(rendered)
+    observed[:support] = 2
+    matched = int(support * 100 * fraction)
+    observed.flat[:matched] = 1
+    metrics, accepted = pose_depth_quality(observed, rendered, TrackingConfig())
+    assert metrics["depth_coverage"] == support / 100
+    assert metrics["depth_fraction"] == matched / (support * 100)
+    assert accepted == (support >= 50 and fraction >= 0.5)
+
+
+def test_depth_coverage_does_not_replace_minimum_count():
+    from cordvip_geometry.tracking import pose_depth_quality
+
+    metrics, accepted = pose_depth_quality(
+        np.ones((5, 5)), np.ones((5, 5)), TrackingConfig()
+    )
+    assert not accepted and metrics["depth_pixels"] == 25
+    assert metrics["depth_coverage"] == metrics["depth_fraction"] == 1
+
+
+@pytest.mark.parametrize("interval,broken", [(3, False), (3, True), (1, False)])
+def test_low_coverage_refresh(recovery_scene, monkeypatch, interval, broken):
+    from dataclasses import replace
+    from cordvip_geometry import tracking
+
+    scene, frame, masks, _, _ = recovery_scene
+    scene.config = replace(scene.config, segmentation_interval_frames=interval)
+    frame.depth_m[10:] = 0
+    masks["banana"][10:] = False
+    if broken:
+        masks["apple"][:] = False
+        masks["apple"][:6] = True  # 深度点数足够，但轮廓 precision 不足。
+    renders, calls, refinements = [], [], []
+    for name in masks:
+
+        def render(rays, pose, name=name):
+            renders.append(name)
+            depth = np.ones((12, 12))
+            if name == "banana":
+                depth[5:] = 0
+            return depth.ravel()
+
+        scene.renderers[name].render = render
+    original = tracking.track_objects
+
+    def batch(*args):
+        refinements.append(1)
+        return original(*args)
+
+    monkeypatch.setattr(tracking, "track_objects", batch)
+    scene.segmenter.track = lambda rgb: calls.append(scene.frame_index) or masks.copy()
+    result = scene.track(frame)
+    assert calls == [1] and refinements == [1]
+    assert result.valid == {"apple": not broken, "banana": True}
+    assert scene.states["apple"] == ("LOST" if broken else "TRACKING")
+    assert sorted(renders) == ["apple", "banana"]
+    assert result.quality["banana"]["depth_coverage"] == 1
+    if not broken:
+        assert result.quality["apple"]["depth_coverage"] == 5 / 12
+        assert result.quality["apple"]["mask_source"] == 1
+
+
+def test_benchmark_coverage_counts_shared_frames():
+    module = script("benchmark_tracking")
+    check = dict(low_coverage=True, coverage_only_rejection=True)
+    rows = [
+        dict(
+            initial=False,
+            total_ms=1.0,
+            valid={"apple": True, "banana": True},
+            stages={"sam_track": [1.0]},
+            reference_rejected=[],
+            depth_checks=[check, check],
+        ),
+        dict(
+            initial=False,
+            total_ms=1.0,
+            valid={"apple": False, "banana": True},
+            stages={"sam_track": [1.0]},
+            reference_rejected=[],
+            depth_checks=[dict(low_coverage=True, coverage_only_rejection=False)],
+        ),
+    ]
+    stats = module.tracking_statistics(rows)
+    assert stats["coverage_rejected_frames"] == 1
+    assert stats["coverage_triggered_sam_frames"] == 2
+    assert stats["sam_calls"] == 2
+
+
+def test_coverage_is_independent_of_mask_and_occlusion():
+    from cordvip_geometry.tracking import pose_depth_quality, pose_quality
+
+    rendered = np.ones((10, 10))
+    rendered[:2] = 0
+    observed = np.ones_like(rendered)
+    observed[2:4] = 0
+    observed[4:6] = 0.8
+    mask = observed == 1
+    full, _ = pose_quality(mask, observed, rendered, TrackingConfig())
+    depth, _ = pose_depth_quality(observed, rendered, TrackingConfig())
+    assert full["depth_coverage"] == depth["depth_coverage"] == 0.75
+    assert full["occluded_fraction"] == 0.25

@@ -44,6 +44,10 @@ PYTHONDONTWRITEBYTECODE=1 python scripts/cordvip/benchmark_tracking.py --output 
 
 报告记录各阶段同步 CUDA 的墙钟时间、逐对象质量和有效性、LOST/恢复转换次数及视频/恢复 SAM2 调用数。总跟踪耗时排除读盘、初始化和独立参考复核；恢复帧包含在总跟踪分位数中。逐帧基线 mask 用于在计时外复核候选位姿；参考检查拒绝是需要调查的分歧，不是有真值支持的绝对位姿误差；参考帧缺失或汇总帧数不一致会直接报错。逐帧记录保存在各 Episode 的 JSON 中，`summary.json` 保存逐轮统计，`comparison.json` 保存跨轮汇总；环境、输入路径和对象列表见 `environment.json`。测量口径与已有结果见[后端实测](../../third_party/cordvip_geometry/README.md#p2-事件触发-sam2-实测)。
 
+覆盖率修复的复现输出使用 `--output logs/sam2_depth_coverage_ab`，保留历史 `logs/sam2_ab`。`depth_quality_by_mask_source` 分别汇总两条路径的匹配点数、匹配比例和覆盖率 p50/p95；两条路径的覆盖率定义相同，匹配比例分母不同。
+
+逐帧 `depth_checks` 保存刷新前的纯深度检查。`coverage_rejected_frames` 统计匹配点数和匹配比例原本通过、仅覆盖率失败的处理帧；`coverage_triggered_sam_frames` 统计实际刷新 SAM2 且至少一个候选覆盖不足的处理帧（可能同时存在其他质量异常）。两者均按共享帧去重，不等同于最终 LOST；最终新增无效帧须对照历史逐对象有效性。诊断只在评估入口收集，不改变跟踪状态机。
+
 ## 导出与查看
 
 使用 `scripts/export_zarr.py` 导出训练数据，使用 `scripts/visualize_episode.py` 查看点云与质量指标。联合导出物体点云和关节/FK 观测时，会按相机来源时间插值所需设备的关节，前后反馈最大间隔由 `execution.hoi_max_joint_gap_s` 指定，默认 0.10 秒。关节对齐只裁去连续区间不可对齐的首尾，内部缺口报错。随后过滤感知无效行，观测与动作同步选择，并将有效连续区间分别导出为训练 episode，避免训练窗口跨越遮挡缺口。

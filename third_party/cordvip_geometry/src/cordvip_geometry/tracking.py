@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass, field
+from numbers import Real
 from pathlib import Path
 from time import perf_counter
 
@@ -25,6 +26,7 @@ class TrackingConfig:
     depth_tolerance_m: float = 0.015
     min_depth_pixels: int = 30
     min_depth_fraction: float = 0.5
+    min_depth_coverage: float = 0.5
     min_precision: float = 0.5
     min_recall: float = 0.5
 
@@ -36,6 +38,13 @@ class TrackingConfig:
     recovery_text_threshold: float = 0.25
 
     def __post_init__(self):
+        if (
+            isinstance(self.min_depth_coverage, bool)
+            or not isinstance(self.min_depth_coverage, Real)
+            or not np.isfinite(self.min_depth_coverage)
+            or not 0 < self.min_depth_coverage <= 1
+        ):
+            raise ValueError("min_depth_coverage must be finite and lie in (0, 1]")
         if (
             type(self.segmentation_interval_frames) is not int
             or self.segmentation_interval_frames < 1
@@ -75,6 +84,7 @@ def pose_quality(mask, observed, rendered, config):
     """前景遮挡只能由 mask 外的有效传感器深度支持。"""
     valid = np.isfinite(observed) & (observed >= 0.001)
     projected = np.isfinite(rendered) & (rendered > 0)
+    projected_count = int(projected.sum())
     depth_error = np.abs(observed - rendered)
     hidden = (
         projected & ~mask & valid & (observed < rendered - config.depth_tolerance_m)
@@ -96,8 +106,9 @@ def pose_quality(mask, observed, rendered, config):
         iou=float(intersection_pixels / max(1, (mask | visible).sum())),
         depth_pixels=count,
         depth_fraction=float(count / max(1, depth_target.sum())),
+        depth_coverage=int((projected & valid).sum()) / max(1, projected_count),
         median_depth_error_m=float(np.median(residual)) if len(residual) else None,
-        occluded_fraction=float(hidden.sum() / max(1, projected.sum())),
+        occluded_fraction=float(hidden.sum() / max(1, projected_count)),
     )
     accepted = (
         count >= config.min_depth_pixels
@@ -114,7 +125,9 @@ def pose_depth_quality(observed, rendered, config):
     support = projected & np.isfinite(observed) & (observed >= 0.001)
     residual = np.abs(observed[support] - rendered[support])
     count = int(np.count_nonzero(residual <= config.depth_tolerance_m))
-    fraction = count / max(1, len(residual))
+    support_count = len(residual)
+    coverage = support_count / max(1, int(projected.sum()))
+    fraction = count / max(1, support_count)
     metrics: dict[str, float | int | None] = dict.fromkeys(
         (
             "mask_pixels",
@@ -129,11 +142,14 @@ def pose_depth_quality(observed, rendered, config):
     metrics.update(
         depth_pixels=count,
         depth_fraction=fraction,
+        depth_coverage=coverage,
         median_depth_error_m=float(np.median(residual)) if len(residual) else None,
     )
     return (
         metrics,
-        count >= config.min_depth_pixels and fraction >= config.min_depth_fraction,
+        count >= config.min_depth_pixels
+        and coverage >= config.min_depth_coverage
+        and fraction >= config.min_depth_fraction,
     )
 
 

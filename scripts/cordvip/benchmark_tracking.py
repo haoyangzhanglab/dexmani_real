@@ -59,6 +59,15 @@ def tracking_statistics(records):
             [row["total_ms"] for row in records if not row["initial"]]
         ),
         valid_fraction=np.mean([all(row["valid"].values()) for row in records]),
+        coverage_rejected_frames=sum(
+            any(q["coverage_only_rejection"] for q in row["depth_checks"])
+            for row in records
+        ),
+        coverage_triggered_sam_frames=sum(
+            bool(row["stages"].get("sam_track"))
+            and any(q["low_coverage"] for q in row["depth_checks"])
+            for row in records
+        ),
         reference_rejections=sum(len(row["reference_rejected"]) for row in records),
     )
 
@@ -115,7 +124,7 @@ def summarize(output):
             ]
             depths[str(source)] = {
                 key: percentiles([q[key] for q in metrics], total=False)
-                for key in ("depth_pixels", "depth_fraction")
+                for key in ("depth_pixels", "depth_fraction", "depth_coverage")
             }
         comparisons.append(
             dict(
@@ -178,6 +187,26 @@ def main(argv=None):
     current: dict[str, list[float]] = {}
     latest_masks: dict[str, np.ndarray] = {}
     original_batch = tracking.track_objects
+    original_depth_quality = tracking.pose_depth_quality
+    depth_checks = []
+
+    def checked_depth(observed, rendered, config):
+        metrics, accepted = original_depth_quality(observed, rendered, config)
+        low_coverage = metrics["depth_coverage"] < config.min_depth_coverage
+        depth_checks.append(
+            dict(
+                depth_coverage=metrics["depth_coverage"],
+                depth_fraction=metrics["depth_fraction"],
+                depth_pixels=metrics["depth_pixels"],
+                low_coverage=low_coverage,
+                coverage_only_rejection=(
+                    low_coverage
+                    and metrics["depth_pixels"] >= config.min_depth_pixels
+                    and metrics["depth_fraction"] >= config.min_depth_fraction
+                ),
+            )
+        )
+        return metrics, accepted
 
     def timed(function, key, masks=False):
         def call(*args, **kwargs):
@@ -206,12 +235,14 @@ def main(argv=None):
             ),
         )
     tracking.track_objects = timed(original_batch, "fp")
+    tracking.pose_depth_quality = checked_depth
     records: list[dict[str, Any]] = []
     references: list[dict[str, np.ndarray]] | None = None
 
     def record(function, initial):
         def call(frame, *args):
             current.clear()
+            depth_checks.clear()
             if initial:
                 latest_masks.clear()
             torch.cuda.synchronize()
@@ -231,6 +262,7 @@ def main(argv=None):
                     initial=initial,
                     total_ms=elapsed,
                     stages=dict(current),
+                    depth_checks=list(depth_checks),
                     valid={n: False for n in names} if result is None else result.valid,
                     quality={} if result is None else result.quality,
                     error=error,
@@ -330,6 +362,7 @@ def main(argv=None):
         summarize(args.output)
     finally:
         tracking.track_objects = original_batch
+        tracking.pose_depth_quality = original_depth_quality
 
 
 if __name__ == "__main__":
