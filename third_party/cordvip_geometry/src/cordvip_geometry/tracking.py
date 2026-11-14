@@ -28,12 +28,19 @@ class TrackingConfig:
     min_precision: float = 0.5
     min_recall: float = 0.5
 
+    segmentation_interval_frames: int = 2
+
     recovery_enabled: bool = True
     recovery_retry_interval_frames: int = 15
     recovery_box_threshold: float = 0.3
     recovery_text_threshold: float = 0.25
 
     def __post_init__(self):
+        if (
+            type(self.segmentation_interval_frames) is not int
+            or self.segmentation_interval_frames < 1
+        ):
+            raise ValueError("segmentation_interval_frames must be a positive integer")
         if type(self.recovery_enabled) is not bool:
             raise ValueError("recovery_enabled must be bool")
         if (
@@ -69,7 +76,9 @@ def pose_quality(mask, observed, rendered, config):
     valid = np.isfinite(observed) & (observed >= 0.001)
     projected = np.isfinite(rendered) & (rendered > 0)
     depth_error = np.abs(observed - rendered)
-    hidden = projected & ~mask & valid & (observed < rendered - config.depth_tolerance_m)
+    hidden = (
+        projected & ~mask & valid & (observed < rendered - config.depth_tolerance_m)
+    )
     visible = projected & ~hidden
     intersection = mask & visible
     depth_target = mask & valid
@@ -97,6 +106,35 @@ def pose_quality(mask, observed, rendered, config):
         and metrics["recall"] >= config.min_recall
     )
     return metrics, accepted
+
+
+def pose_depth_quality(observed, rendered, config):
+    """没有当前 mask 时，所有方向的有效深度偏差都计为不匹配。"""
+    projected = np.isfinite(rendered) & (rendered > 0)
+    support = projected & np.isfinite(observed) & (observed >= 0.001)
+    residual = np.abs(observed[support] - rendered[support])
+    count = int(np.count_nonzero(residual <= config.depth_tolerance_m))
+    fraction = count / max(1, len(residual))
+    metrics: dict[str, float | int | None] = dict.fromkeys(
+        (
+            "mask_pixels",
+            "visible_pixels",
+            "precision",
+            "recall",
+            "iou",
+            "occluded_fraction",
+        ),
+        -1,
+    )
+    metrics.update(
+        depth_pixels=count,
+        depth_fraction=fraction,
+        median_depth_error_m=float(np.median(residual)) if len(residual) else None,
+    )
+    return (
+        metrics,
+        count >= config.min_depth_pixels and fraction >= config.min_depth_fraction,
+    )
 
 
 class SceneTracker:
@@ -164,6 +202,7 @@ class SceneTracker:
         self.states = dict.fromkeys(self.trackers, "TRACKING")
         self.next_retry = dict.fromkeys(self.trackers, 0)
         self.frame_index = 0
+        self.last_sam_frame = 0
         self.frame_signature = (
             frame.depth_m.shape,
             frame.K.copy(),
@@ -221,12 +260,7 @@ class SceneTracker:
             raise ValueError("RGB grid changed within episode")
         rgb, depth_m = self.rectifier.apply(frame.rgb, frame.depth_m)
         self.frame_index += 1
-        started = perf_counter()
-        # 共享视频状态推理失败可能留下部分写入；不能当作单对象丢失继续使用。
-        masks = self.segmenter.track(rgb)
-        sam_ms = (perf_counter() - started) * 1000
-        result = self._estimate(rgb, depth_m, frame.K, masks, first=False)
-        result.timings_ms["sam2_tracking"] = sam_ms
+        result = self._estimate(rgb, depth_m, frame.K, None, first=False)
         logger.debug("HOI frame=%d timings_ms=%s", self.frame_index, result.timings_ms)
         return result
 
@@ -253,18 +287,18 @@ class SceneTracker:
         ):
             raise TrackingFailure("insufficient segmented depth")
 
-    def _quality(self, name, pose, mask, depth):
-        if np.shape(pose) != (4, 4) or not np.isfinite(pose).all():
-            raise TrackingFailure("FoundationPose returned nonfinite/invalid pose")
-        sampled = depth[::PIXEL_STRIDE, ::PIXEL_STRIDE]
-        rendered = (
-            self.renderers[name]
-            .render(self.directions.reshape(-1, 3), pose)
-            .reshape(sampled.shape)
-        )
-        return pose_quality(
-            mask[::PIXEL_STRIDE, ::PIXEL_STRIDE], sampled, rendered, self.config
-        )
+    def _refresh_masks(self, rgb, result, previous):
+        started = perf_counter()
+        try:
+            masks = self.segmenter.track(rgb)
+        except RuntimeError:
+            # 事件刷新可能在 refinement 之后发生；共享状态错误仍须终止实例。
+            for name, tracker in self.trackers.items():
+                tracker.estimator.pose_last = previous[name]
+            raise
+        result.timings_ms["sam2_tracking"] = (perf_counter() - started) * 1000
+        self.last_sam_frame = self.frame_index
+        return masks
 
     def _estimate(self, rgb, depth_m, K, masks, *, first):
         # 后端只替换 pose_last，不原地修改旧张量；保留引用即可回滚居中网格位姿。
@@ -283,6 +317,38 @@ class SceneTracker:
             if self.states[name] == "LOST" and self.frame_index >= self.next_retry[name]
         ]
 
+        result.timings_ms["sam2_tracking"] = 0.0
+        if not first and (
+            self.frame_index - self.last_sam_frame
+            >= self.config.segmentation_interval_frames
+            or (due and self.config.recovery_enabled)
+        ):
+            masks = self._refresh_masks(rgb, result, previous)
+        sampled = depth_m[::PIXEL_STRIDE, ::PIXEL_STRIDE]
+        rendered_depths = {}
+
+        def quality(name, pose, mask):
+            if np.shape(pose) != (4, 4) or not np.isfinite(pose).all():
+                raise TrackingFailure("FoundationPose returned nonfinite/invalid pose")
+            if name not in rendered_depths:
+                rendered_depths[name] = (
+                    self.renderers[name]
+                    .render(self.directions.reshape(-1, 3), pose)
+                    .reshape(sampled.shape)
+                )
+            rendered = rendered_depths[name]
+            if mask is None:
+                metrics, accepted = pose_depth_quality(sampled, rendered, self.config)
+            else:
+                metrics, accepted = pose_quality(
+                    mask[::PIXEL_STRIDE, ::PIXEL_STRIDE], sampled, rendered, self.config
+                )
+            metrics.update(
+                mask_source=int(mask is not None),
+                mask_age_frames=self.frame_index - self.last_sam_frame,
+            )
+            return metrics, accepted
+
         def reject(name, error):
             self.trackers[name].estimator.pose_last = previous[name]
             result.poses.pop(name, None)
@@ -291,7 +357,7 @@ class SceneTracker:
             logger.warning("%s: %s", name, error)
 
         def accept(name, pose, mask):
-            metrics, accepted = self._quality(name, pose, mask, depth_m)
+            metrics, accepted = quality(name, pose, mask)
             result.quality[name] = metrics
             if not accepted:
                 raise TrackingFailure(
@@ -318,11 +384,13 @@ class SceneTracker:
             if self.states[name] == "LOST":
                 continue
             try:
-                self._check_depth(masks.get(name), depth_m)
+                if masks is not None:
+                    self._check_depth(masks.get(name), depth_m)
                 active[name] = tracker
             except TrackingFailure as error:
                 reject(name, error)
         started = perf_counter()
+        sam_before = result.timings_ms["sam2_tracking"]
         if first:
             for name in active:
                 register(name, masks[name])
@@ -346,14 +414,37 @@ class SceneTracker:
                         )
                     except RuntimeError as error:
                         reject(name, error)
+            if masks is None:
+                refresh = False
+                for name, pose in list(candidates.items()):
+                    try:
+                        metrics, accepted = quality(name, pose, None)
+                        result.quality[name] = metrics
+                        refresh |= not accepted
+                    except TrackingFailure as error:
+                        reject(name, error)
+                        del candidates[name]
+                if refresh:
+                    masks = self._refresh_masks(rgb, result, previous)
+                    for name in list(candidates):
+                        try:
+                            self._check_depth(masks.get(name), depth_m)
+                        except TrackingFailure as error:
+                            reject(name, error)
+                            del candidates[name]
             for name, pose in candidates.items():
+                if masks is None:
+                    # 所有候选已通过深度门控；直接接受，保留刚计算的质量。
+                    result.poses[name] = pose
+                    result.valid[name] = True
+                    continue
                 try:
                     accept(name, pose, masks[name])
                 except TrackingFailure as error:
                     reject(name, error)
         result.timings_ms["registration" if first else "foundationpose_tracking"] = (
             perf_counter() - started
-        ) * 1000
+        ) * 1000 - (result.timings_ms["sam2_tracking"] - sam_before)
 
         if due and self.config.recovery_enabled and not first:
             recovery_start = perf_counter()

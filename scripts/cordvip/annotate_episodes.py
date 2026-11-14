@@ -138,6 +138,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", required=True)
     parser.add_argument("--episode", type=Path)
+    parser.add_argument(
+        "--segmentation-interval-frames",
+        type=int,
+        default=TrackingConfig().segmentation_interval_frames,
+    )
     args = parser.parse_args(argv)
     if Path(args.task).name != args.task or args.task in (".", ".."):
         parser.error("非法任务名")
@@ -149,7 +154,13 @@ def main(argv=None):
     )
     if not episodes:
         raise ValueError("没有 Episode")
-    annotate_episodes(episodes, task)
+    annotate_episodes(
+        episodes,
+        task,
+        tracking_config=TrackingConfig(
+            segmentation_interval_frames=args.segmentation_interval_frames
+        ),
+    )
     return 0
 
 

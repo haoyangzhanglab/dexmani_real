@@ -315,7 +315,8 @@ def test_scene_batch_keeps_per_object_depth_gate(monkeypatch):
     scene.states = dict.fromkeys(scene.trackers, "TRACKING")
     scene.next_retry = dict.fromkeys(scene.trackers, 0)
     scene.frame_index = 0
-    scene.config = TrackingConfig(recovery_enabled=False)
+    scene.last_sam_frame = 0
+    scene.config = TrackingConfig(recovery_enabled=False, segmentation_interval_frames=1)
     scene.frame_signature = (shape, np.eye(3), "none", np.zeros(5))
     scene.frame_cache = {}
     scene.renderers = {
@@ -834,7 +835,7 @@ def recovery_scene(monkeypatch):
         np.zeros(5),
     )
     scene = tracking.SceneTracker.__new__(tracking.SceneTracker)
-    scene.config = TrackingConfig(recovery_retry_interval_frames=3)
+    scene.config = TrackingConfig(recovery_retry_interval_frames=3, segmentation_interval_frames=1)
     masks = {n: np.ones(shape, bool) for n in ("apple", "banana")}
     scene.trackers = {}
     registrations = []
@@ -1304,3 +1305,392 @@ def test_viewer_keeps_joint_alignment_separate_from_object_validity(monkeypatch)
     # 无效帧无需读取物体点云，且须清除上一帧显示。
     viewer.log_step(0, np.zeros((1, 1, 3), np.uint8))
     assert clouds == [None] and logged["hoi/valid"] == 0
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "2"])
+def test_segmentation_interval_validation(value):
+    with pytest.raises(ValueError):
+        TrackingConfig(segmentation_interval_frames=value)
+
+
+@pytest.mark.parametrize("offset", [-0.1, 0.1])
+def test_depth_gate_counts_both_directions(offset):
+    from cordvip_geometry.tracking import pose_depth_quality
+
+    rendered = np.ones((10, 10))
+    observed = rendered.copy()
+    observed[:6] += offset
+    metrics, accepted = pose_depth_quality(observed, rendered, TrackingConfig())
+    assert not accepted and metrics["depth_pixels"] == 40
+    assert metrics["depth_fraction"] == 0.4
+    assert metrics["occluded_fraction"] == -1
+
+
+@pytest.mark.parametrize(
+    "interval,expected", [(1, [1, 2, 3, 4]), (2, [2, 4]), (3, [3])]
+)
+def test_segmentation_schedule(recovery_scene, interval, expected):
+    from dataclasses import replace
+
+    scene, frame, masks, _, _ = recovery_scene
+    scene.config = replace(scene.config, segmentation_interval_frames=interval)
+    calls = []
+    def track(rgb):
+        calls.append(scene.frame_index)
+        return masks.copy()
+
+    scene.segmenter.track = track
+    for index in range(1, 5):
+        result = scene.track(frame)
+        assert all(result.valid.values())
+        for metrics in result.quality.values():
+            assert all(np.isfinite(v) for v in metrics.values())
+            assert metrics["mask_source"] == int(index in expected)
+            assert metrics["mask_age_frames"] == index - scene.last_sam_frame
+    assert calls == expected
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_event_refresh_rechecks_all_and_rolls_back(recovery_scene, broken):
+    from dataclasses import replace
+
+    scene, frame, masks, _, _ = recovery_scene
+    scene.config = replace(scene.config, segmentation_interval_frames=3)
+    # 60% 投影被更近深度覆盖；当前 mask 提供真实遮挡证据。
+    frame.depth_m[:16] = 0.8
+    for mask in masks.values():
+        mask[:16] = False
+    calls, renders = [], []
+    for name in scene.renderers:
+        scene.renderers[name].render = lambda rays, pose, n=name: renders.append(
+            n
+        ) or np.ones(len(rays))
+    previous = {n: t.estimator.pose_last for n, t in scene.trackers.items()}
+
+    def refresh(rgb):
+        calls.append(scene.frame_index)
+        if broken:
+            raise RuntimeError("shared state broken")
+        return masks.copy()
+
+    scene.segmenter.track = refresh
+    if broken:
+        with pytest.raises(RuntimeError, match="shared state"):
+            scene.track(frame)
+        assert all(
+            t.estimator.pose_last is previous[n] for n, t in scene.trackers.items()
+        )
+    else:
+        result = scene.track(frame)
+        assert all(result.valid.values())
+        assert all(q["mask_source"] == 1 for q in result.quality.values())
+    assert calls == [1]
+    assert sorted(renders) == ["apple", "banana"]
+
+
+def test_event_rejection_and_due_recovery(recovery_scene):
+    from dataclasses import replace
+
+    scene, frame, masks, _, _ = recovery_scene
+    scene.config = replace(scene.config, segmentation_interval_frames=10)
+    scene.renderers["apple"].render = lambda rays, pose: np.full(len(rays), 2.0)
+    events = []
+    original_detect = scene.segmenter.detect
+
+    def track(rgb):
+        events.append(("track", scene.frame_index))
+        return masks.copy()
+
+    def detect(*args):
+        events.append(("detect", scene.frame_index))
+        return original_detect(*args)
+
+    scene.segmenter.track = track
+    scene.segmenter.detect = detect
+    assert scene.track(frame).valid == {"apple": False, "banana": True}
+    scene.renderers["apple"].render = lambda rays, pose: np.ones(len(rays))
+    assert all(scene.track(frame).valid.values())
+    assert events == [("track", 1), ("track", 2), ("detect", 2)]
+
+
+def test_mixed_quality_hdf5_is_finite(recovery_scene, tmp_path):
+    import h5py
+    from dataclasses import asdict, replace
+    from dexmani_real.data.hoi import write_hoi
+
+    scene, frame, masks, _, _ = recovery_scene
+    scene.config = replace(scene.config, segmentation_interval_frames=2)
+    results = [
+        scene.initialize(frame, scene.prompts),
+        scene.track(frame),
+        scene.track(frame),
+    ]
+    names = list(masks)
+    path = tmp_path / "data.h5"
+    with h5py.File(path, "w") as data:
+        data.create_dataset("timing/rows", data=np.arange(3))
+    write_hoi(
+        path,
+        dict(
+            points_local=np.ones((1024, 3), np.float32),
+            offsets=[0, 512, 1024],
+            object_names=names,
+        ),
+        np.array([[r.poses[n] for n in names] for r in results]),
+        np.eye(4),
+        quality=[[r.quality[n] for n in names] for r in results],
+        tracking_config=asdict(scene.config),
+        object_valid=np.ones((3, 2), bool),
+    )
+    with h5py.File(path, "r") as data:
+        for values in data["hoi/quality"].values():
+            assert np.isfinite(values[:]).all()
+        np.testing.assert_array_equal(data["hoi/quality/mask_source"][:, 0], [1, 0, 1])
+        assert data["hoi/object_pointcloud"].shape == (3, 1024, 3)
+
+
+def test_correction_uses_video_index(monkeypatch):
+    import torch
+    from contextlib import nullcontext
+    from cordvip_geometry.segmentation import SAM2Segmenter
+
+    monkeypatch.setattr(torch, "autocast", lambda *a, **kw: nullcontext())
+    segmenter = SAM2Segmenter.__new__(SAM2Segmenter)
+    segmenter.state = {"num_frames": 3}
+    calls = []
+    segmenter.tracker = SimpleNamespace(
+        add_new_mask=lambda state, **kw: calls.append(kw["frame_idx"]),
+        infer_single_frame=lambda state, index: index,
+    )
+    segmenter._masks = lambda result: result
+    assert segmenter.correct_masks({"apple": np.ones((2, 2), bool)}) == 2
+    assert calls == [2] and segmenter.state["num_frames"] == 3
+
+
+def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_path):
+    from dataclasses import replace
+    from dexmani_real.perception.hoi_worker import run_hoi_worker
+    from dexmani_real.geometry import hoi
+    from cordvip_geometry import tracking
+
+    scene, frame, masks, _, _ = recovery_scene
+    scene.config = replace(scene.config, segmentation_interval_frames=2)
+    names = list(masks)
+    calls = []
+    def track(rgb):
+        calls.append(scene.frame_index)
+        return masks.copy()
+
+    scene.segmenter.track = track
+
+    class Reader(FakeRawReader):
+        num_frames = 4
+
+        def read_camera(self):
+            return SimpleNamespace(
+                color=SimpleNamespace(
+                    height=24,
+                    width=24,
+                    matrix=lambda: frame.K,
+                    distortion_model="none",
+                    distortion_coeffs=np.zeros(5),
+                ),
+                depth_scale_m=0.001,
+                T_xarm_base_from_color=np.eye(4),
+            )
+
+        def __getitem__(self, name):
+            if name == "depth":
+                return np.full((4, 24, 24), 1000, np.uint16)
+            return np.array(
+                [(1, 1), (1, 1), (2, 2), (3, 3)],
+                dtype=[("camera_sequence", "i8"), ("camera_ns", "i8")],
+            )
+
+        def iter_rgb_frames(self):
+            yield from [frame.rgb] * 4
+
+    _, _, quality, validity = script("annotate_episodes").track_episode(
+        Reader(), scene, names, scene.prompts
+    )
+    assert calls == [2] and validity.all() and quality[0] == quality[1]
+    calls.clear()
+    monkeypatch.setattr(tracking, "SceneTracker", lambda *a, **kw: scene)
+    monkeypatch.setattr(
+        hoi, "task_objects", lambda task: [{"name": n, "prompt": n} for n in names]
+    )
+    monkeypatch.setattr(RGBDFrame, "from_camera", lambda *a: frame)
+    monkeypatch.setattr("signal.signal", lambda *a: None)
+    shared = SimpleNamespace(
+        is_running=SimpleNamespace(value=True), hoi_ready=SimpleNamespace(value=False)
+    )
+    shared.hoi_request = SimpleNamespace(
+        read=lambda: ({"episode_id": 1, "after_sequence": 0, "after_ns": 0}, 1)
+    )
+    frames = iter([({"timestamp_ns": n}, n) for n in (1, 1, 2, 3)])
+    shared.camera_ring = SimpleNamespace(read=lambda: next(frames))
+    written = []
+
+    def write(**row):
+        written.append(row)
+        if len(written) == 3:
+            shared.is_running.value = False
+
+    shared.hoi_ring = SimpleNamespace(field_names=(), write=write)
+    template = dict(
+        object_names=names,
+        points_local=np.ones((1024, 3), np.float32),
+        offsets=[0, 512, 1024],
+    )
+    run_hoi_worker(
+        shared, Reader().read_camera(), tmp_path, template, tracking_config=scene.config
+    )
+    assert calls == [2] and all(r["valid"] for r in written)
+    assert [r["source_camera_sequence"] for r in written] == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "observed,rendered", [(0.0, 1.0), (np.nan, 1.0), (1.0, 0.0), (1.0, np.inf)]
+)
+def test_depth_gate_requires_support(observed, rendered):
+    from cordvip_geometry.tracking import pose_depth_quality
+
+    metrics, accepted = pose_depth_quality(
+        np.full((10, 10), observed), np.full((10, 10), rendered), TrackingConfig()
+    )
+    assert (
+        not accepted and metrics["depth_pixels"] == 0 and metrics["depth_fraction"] == 0
+    )
+
+
+def test_depth_gate_boundary():
+    from cordvip_geometry.tracking import pose_depth_quality
+
+    observed = np.ones((10, 10))
+    observed[:5] = 2
+    metrics, accepted = pose_depth_quality(
+        observed, np.ones_like(observed), TrackingConfig(min_depth_pixels=50)
+    )
+    assert accepted and metrics["depth_fraction"] == 0.5
+
+
+def test_event_refresh_can_invalidate_other_candidate(recovery_scene):
+    from dataclasses import replace
+
+    scene, frame, masks, _, _ = recovery_scene
+    scene.config = replace(scene.config, segmentation_interval_frames=3)
+    scene.renderers["banana"].render = lambda rays, pose: np.full(len(rays), 2.0)
+    masks["apple"][:] = False
+    result = scene.track(frame)
+    assert result.valid == {"apple": False, "banana": False}
+    assert scene.last_sam_frame == 1
+
+
+def test_event_resets_keyframe_interval_and_initialization(recovery_scene):
+    from dataclasses import replace
+
+    scene, frame, masks, _, _ = recovery_scene
+    scene.config = replace(scene.config, segmentation_interval_frames=3)
+    calls = []
+    def track(rgb):
+        calls.append(scene.frame_index)
+        return masks.copy()
+
+    scene.segmenter.track = track
+    frame.depth_m[:16] = 0.8
+    for mask in masks.values():
+        mask[:16] = False
+    assert all(scene.track(frame).valid.values())
+    frame.depth_m[:] = 1
+    for mask in masks.values():
+        mask[:] = True
+    for _ in range(3):
+        assert all(scene.track(frame).valid.values())
+    assert calls == [1, 4]
+    scene.initialize(frame, scene.prompts)
+    assert scene.frame_index == scene.last_sam_frame == 0
+    assert not scene.frame_cache
+
+
+def test_viewer_marks_unmeasured_quality_as_missing():
+    from scripts.visualize_episode import EpisodeVisualizer
+
+    logged = {}
+    viewer = EpisodeVisualizer.__new__(EpisodeVisualizer)
+    viewer.rr = SimpleNamespace(
+        Scalar=float, log=lambda name, value: logged.update({name: value})
+    )
+
+    class Reader(dict):
+        data_file = {
+            "hoi/quality": {
+                "iou": np.array([[-1.0, 0.75]]),
+                "mask_source": np.array([[0.0, 1.0]]),
+                "depth_fraction": np.array([[0.8, 0.9]]),
+            }
+        }
+
+    viewer.reader = Reader(
+        {"timing/rows": [{"arm_ns": 1, "hand_ns": 1, "camera_ns": 1}]}
+    )
+    viewer.log_hoi_diagnostics(
+        0, {"arm_qpos": np.zeros((1, 7)), "hand_qpos": np.zeros((1, 12))}
+    )
+    assert np.isnan(logged["hoi/object_0/iou"])
+    assert logged["hoi/object_1/iou"] == 0.75
+    assert logged["hoi/object_0/mask_source"] == 0
+    assert logged["hoi/object_0/depth_fraction"] == 0.8
+
+
+@pytest.mark.parametrize("truncated_reference", [False, True])
+def test_benchmark_reference_and_cleanup(
+    recovery_scene, monkeypatch, tmp_path, truncated_reference
+):
+    import json
+    import torch
+    from cordvip_geometry import tracking
+
+    module = script("benchmark_tracking")
+    scene, frame, masks, _, _ = recovery_scene
+    original_batch = tracking.track_objects
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda index: "test GPU")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch, "manual_seed", lambda seed: None)
+    monkeypatch.setattr(module.subprocess, "check_output", lambda *a, **kw: "test")
+    monkeypatch.setattr(module.tracking, "SceneTracker", lambda *a, **kw: scene)
+    monkeypatch.setattr(
+        module, "task_objects", lambda task: [{"name": n, "prompt": n} for n in masks]
+    )
+    monkeypatch.setattr(module, "RawReader", FakeRawReader)
+    calls = 0
+
+    def replay(reader, tracker, names, prompts):
+        nonlocal calls
+        calls += 1
+        tracker.initialize(frame, prompts)
+        # 三次预热后是逐帧基线；缺失参考必须报错，不能静默略过复核。
+        if not (truncated_reference and calls == 4):
+            tracker.track(frame)
+            tracker.track(frame)
+
+    monkeypatch.setattr(module, "track_episode", replay)
+    output = tmp_path / "results"
+    args = [
+        "--episode",
+        str(tmp_path / "episode_test"),
+        "--repeats",
+        "1",
+        "--output",
+        str(output),
+    ]
+    if truncated_reference:
+        with pytest.raises(IndexError):
+            module.main(args)
+    else:
+        module.main(args)
+        runs = json.loads((output / "summary.json").read_text())
+        assert [r["frames"] for r in runs] == [3, 3, 3]
+        assert [r["counts"]["sam_track"] for r in runs] == [2, 1, 0]
+        assert all(r["reference_rejections"] == 0 for r in runs)
+        assert (output / "comparison.json").is_file()
+    assert tracking.track_objects is original_batch

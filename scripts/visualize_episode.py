@@ -264,7 +264,9 @@ class EpisodeVisualizer:
             self.rr.log(f"hoi/{device}_source_offset_ms", self.rr.Scalar(offset_ms))
         for name, values in self.reader.data_file["hoi/quality"].items():
             for index, value in enumerate(values[step_idx]):
-                self.rr.log(f"hoi/object_{index}/{name}", self.rr.Scalar(float(value)))
+                # −1 是未计算占位值；画成缺口，避免误报质量下降或沿用上一帧。
+                measured = np.nan if value == -1 else float(value)
+                self.rr.log(f"hoi/object_{index}/{name}", self.rr.Scalar(measured))
 
     def log_camera(self, step_idx: int, rgb: np.ndarray) -> np.ndarray:
         color = self.camera_model.color

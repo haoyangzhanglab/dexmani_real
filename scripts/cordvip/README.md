@@ -28,7 +28,21 @@ python scripts/cordvip/annotate_episodes.py --task pnp_apple_banana
 
 每个 `prompt` 须在去畸变后的首帧匹配唯一候选，缺失或歧义会使初始化失败，后续新帧重试。`instance` 仅用于参考图选择，不用于跟踪初始化。
 
-标注在 `/hoi` 中记录位姿、质量、有效性、模板和坐标变换，命令不会覆盖已有标注。已有标注缺少有效性字段或结构不符时直接报错。Python 调用 `annotate_episodes(..., tracking_config=...)` 可调整恢复参数，默认值见[后端说明](../../third_party/cordvip_geometry/README.md#遮挡恢复)。
+标注在 `/hoi` 中记录位姿、质量、有效性、模板和坐标变换，命令不会覆盖已有标注。已有标注缺少有效性字段或结构不符时直接报错。Python 调用 `annotate_episodes(..., tracking_config=...)` 可调整分割间隔与恢复参数，默认值见[后端说明](../../third_party/cordvip_geometry/README.md#遮挡恢复)。
+
+## 分割间隔与只读 A/B
+
+离线标注可传 `--segmentation-interval-frames 1` 使用逐帧基线，默认 2；在线 worker 的 Python 参数 `tracking_config` 接收同一配置。两者均仅对新的相机序列推进调度。
+
+在现有 `real_robot` CUDA 环境、仓库根目录运行，选择尚不存在的输出目录：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python scripts/cordvip/benchmark_tracking.py --output logs/sam2_ab_new
+```
+
+默认回放 pnp_apple_banana 全部已发布 Episode，对 interval=1/2/3 分别完整预热后各测量三次；可重复传 `--episode` 选择固定数据，`--repeats` 改重复次数。入口不写 Raw，不需要点云模板，不操作设备。所选 Episode 名称必须唯一，避免同名结果覆盖。
+
+报告记录各阶段同步 CUDA 的墙钟时间、逐对象质量和有效性、LOST/恢复转换次数及视频/恢复 SAM2 调用数。总跟踪耗时排除读盘、初始化和独立参考复核；恢复帧包含在总跟踪分位数中。逐帧基线 mask 用于在计时外复核候选位姿；参考检查拒绝是需要调查的分歧，不是有真值支持的绝对位姿误差；参考帧缺失或汇总帧数不一致会直接报错。逐帧记录保存在各 Episode 的 JSON 中，`summary.json` 保存逐轮统计，`comparison.json` 保存跨轮汇总；环境、输入路径和对象列表见 `environment.json`。测量口径与已有结果见[后端实测](../../third_party/cordvip_geometry/README.md#p2-事件触发-sam2-实测)。
 
 ## 导出与查看
 
