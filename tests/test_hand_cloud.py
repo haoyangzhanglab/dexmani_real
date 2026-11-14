@@ -77,7 +77,8 @@ def test_hand_geometry_batch_transform_preserves_link_segments(tmp_path, monkeyp
     expected_cloud = np.empty((len(eef_transforms), 6, 3), dtype=np.float32)
     for frame, (eef, qpos) in enumerate(zip(eef_transforms, hand_qpos)):
         base_from_hand = eef @ arm_from_eef
-        placements = hand_fk.forward(qpos, [*hand_fk.fingertip_frame_ids, *hand_cloud.frame_ids])
+        frame_ids = [*hand_fk.fingertip_frame_ids, *hand_cloud.frame_ids]
+        placements = hand_fk.forward(qpos, frame_ids)
         expected_tips[frame] = (
             placements[:5, :3, 3] @ base_from_hand[:3, :3].T
             + base_from_hand[:3, 3]
@@ -94,9 +95,8 @@ def test_hand_geometry_batch_transform_preserves_link_segments(tmp_path, monkeyp
     assert actual["hand_pointcloud"].dtype == np.float32
     np.testing.assert_array_equal(hand_cloud.local_points, local_points)
 
-    placements = hand_fk.forward(
-        hand_qpos[0], [*hand_fk.fingertip_frame_ids, *hand_cloud.frame_ids]
-    )
+    frame_ids = [*hand_fk.fingertip_frame_ids, *hand_cloud.frame_ids]
+    placements = hand_fk.forward(hand_qpos[0], frame_ids)
     single = hand_cloud.transform(placements[5:], eef_transforms[0] @ arm_from_eef)
     np.testing.assert_allclose(single, expected_cloud[0], atol=1e-7)
 
