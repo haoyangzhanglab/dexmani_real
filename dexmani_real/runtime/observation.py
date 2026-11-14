@@ -1,6 +1,7 @@
 """按需读取传感器快照，保留各来源时间与相机帧对应关系。"""
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -8,6 +9,12 @@ import numpy as np
 from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.utils.timing import sample_is_fresh
 
+_RECOVERABLE_HOI_ISSUES = frozenset({
+    "hoi_unavailable",
+    "hoi_pose_invalid",
+    "hoi_stale",
+    "hoi_joint_alignment_unavailable",
+})
 _HOI_METADATA_FIELDS = ("episode_id", "timestamp_ns", "source_camera_sequence", "valid")
 
 
@@ -193,3 +200,8 @@ def check_hoi_status(channels, runtime, *, now_ns=None) -> list[str]:
     hoi = _read_hoi(channels)
     now = time.monotonic_ns() if now_ns is None else now_ns
     return _hoi_issues(hoi, runtime, now)
+
+
+def is_recoverable_hoi_failure(issues: Sequence[str]) -> bool:
+    """只有非空且完全由 HOI 恢复问题组成的列表可以暂停重试。"""
+    return bool(issues) and all(issue in _RECOVERABLE_HOI_ISSUES for issue in issues)
