@@ -75,12 +75,6 @@ def hand_geometry(
     if hand_cloud is not None:
         frame_ids.extend(hand_cloud.frame_ids)
     arrays = {}
-    if include_fingertips:
-        arrays["fingertip_xyz"] = np.empty((len(eef_transforms), *HAND_FINGERTIP_SHAPE), dtype=np.float32)
-    if hand_cloud is not None:
-        arrays["hand_pointcloud"] = np.empty(
-            (len(eef_transforms), *hand_cloud.local_points.shape), dtype=np.float32
-        )
 
     placements = np.empty((len(base_from_hand), len(frame_ids), 4, 4), dtype=np.float64)
     for index, qpos in enumerate(hand_qpos):
