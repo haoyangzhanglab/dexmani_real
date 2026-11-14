@@ -95,7 +95,19 @@ if result.valid["apple"]:
 | `min_depth_coverage` | 0.5 | 纯深度路径的最低有效深度覆盖率，有限实数且在 (0, 1] 内 |
 | `min_precision`、`min_recall` | 0.5 | 可见轮廓的最低 precision、recall |
 
-每个候选位姿渲染一次完整模型投影。有当前 mask 时，使用遮挡感知的轮廓与深度检查：只有 mask 外的有效实测深度比模型近且超过容差，才计为前景遮挡；缺失深度不作为遮挡证据。无当前 mask 时使用下述深度门控。
+每个候选位姿渲染一次完整模型投影。有当前 mask 时，使用遮挡感知的轮廓与深度检查：只有 mask 外的有效实测深度比模型近且超过容差，才计为前景遮挡；缺失深度不作为遮挡证据。无当前 mask 时，仅使用深度几何门控。
+
+纯深度检查以有效 CAD 投影与有效传感器深度的交集为 support，统计绝对残差不超过 `depth_tolerance_m` 的匹配点数：
+
+| 指标 | 计算方式 | 接受条件 |
+| --- | --- | --- |
+| `depth_pixels` | `matched_count` | ≥ `min_depth_pixels` |
+| `depth_coverage` | `support_count / max(1, projected_count)` | ≥ `min_depth_coverage` |
+| `depth_fraction` | `matched_count / max(1, support_count)` | ≥ `min_depth_fraction` |
+
+三项条件必须同时满足。覆盖率衡量完整 CAD 投影获得了多少真实深度，匹配比例衡量这些有效深度与位姿的一致性，二者不能互相替代。没有有效投影或深度支持时，三项指标均为零并拒绝。无当前 mask 时，更近和更远的深度偏差都计为不匹配，不推断遮挡。
+
+有 mask 的 `pose_quality()` 输出同定义的 `depth_coverage`，仅用于诊断；其 `depth_fraction` 仍以 mask 内有效深度为分母，原有接受条件与遮挡算法不变。
 
 阈值需用实际 RGB-D 回放验证。当前 mask 深度不足或完整质量检查失败仅将对应对象置为 LOST；相机参数变化属于输入错误，直接报错。
 
@@ -105,11 +117,9 @@ if result.valid["apple"]:
 
 - 距上次实际推理达到 `segmentation_interval_frames`。
 - 启用恢复且 LOST 对象到达重试时间。
-- 任一中间帧候选未通过深度门控。
+- 任一中间帧候选未通过深度门控，包括有效深度全部匹配但覆盖率不足。
 
 调度使用相机处理帧号 `frame_index`，每次刷新更新 `last_sam_frame`；重复相机序列不推进计数。SAM2 内部帧号仅在追加视频帧时递增，校正和历史裁剪使用内部帧号。`memory_temporal_stride_for_eval` 仅控制 SAM2 记忆。
-
-普通中间帧使用有效 CAD 投影与有效传感器深度的交集作为 support，统计绝对深度残差不超过 `depth_tolerance_m` 的匹配点数。`depth_coverage = support_count / max(1, projected_count)` 表示完整 CAD 投影中获得有效实测深度的比例；`depth_fraction = matched_count / max(1, support_count)` 表示有效深度中的几何匹配比例。接受必须同时满足匹配点数 ≥ `min_depth_pixels`、覆盖率 ≥ `min_depth_coverage`、匹配比例 ≥ `min_depth_fraction`。没有有效投影或深度支持时，三项指标均为零并拒绝。即使少量有效像素全部匹配，覆盖不足仍立即触发当前帧 SAM2。无当前 mask 时，更近和更远的深度偏差都降低匹配比例，不推断遮挡。
 
 任一候选深度门控失败，本帧立即执行一次共享 SAM2，并用当前 mask 对全部候选执行原有深度与完整质量检查。位姿无需重复 refinement，同一候选 CAD 深度复用于这些检查以及恢复 mask 合并后的检查；最终失败对象才进入 LOST。FoundationPose 非法位姿和推理异常保留原有隔离及回滚。
 
@@ -117,11 +127,8 @@ if result.valid["apple"]:
 
 | 质量字段 | 含义 |
 | --- | --- |
-| `depth_coverage` | 完整 CAD 投影内有效实测深度数 / CAD 投影像素数；两条路径定义相同 |
 | `mask_source` | 1：当前 SAM2 mask 完整检查；0：纯深度检查 |
 | `mask_age_frames` | 距最近 SAM2 推理的处理帧数；刷新帧为 0 |
-
-有 mask 的 `pose_quality()` 也输出同定义覆盖率，但仅作为诊断，不参与其接受判定；其深度匹配比例仍以 mask 内有效深度为分母，轮廓、遮挡算法和阈值不变。覆盖率不受 mask 或遮挡分类影响，不能与匹配比例相互替代。
 
 纯深度路径的 `mask_pixels`、`visible_pixels`、`precision`、`recall`、`iou`、`occluded_fraction` 统一为未计算占位值 −1；深度指标为实际测量。有效对象的全部质量字段必须有限。
 

@@ -42,11 +42,25 @@ PYTHONDONTWRITEBYTECODE=1 python scripts/cordvip/benchmark_tracking.py --output 
 
 默认回放 pnp_apple_banana 全部已发布 Episode，对 interval=1/2/3 分别完整预热后各测量三次；可重复传 `--episode` 选择固定数据，`--repeats` 改重复次数。入口不写 Raw，不需要点云模板，不操作设备。所选 Episode 名称必须唯一，避免同名结果覆盖。
 
-报告记录各阶段同步 CUDA 的墙钟时间、逐对象质量和有效性、LOST/恢复转换次数及视频/恢复 SAM2 调用数。总跟踪耗时排除读盘、初始化和独立参考复核；恢复帧包含在总跟踪分位数中。逐帧基线 mask 用于在计时外复核候选位姿；参考检查拒绝是需要调查的分歧，不是有真值支持的绝对位姿误差；参考帧缺失或汇总帧数不一致会直接报错。逐帧记录保存在各 Episode 的 JSON 中，`summary.json` 保存逐轮统计，`comparison.json` 保存跨轮汇总；环境、输入路径和对象列表见 `environment.json`。测量口径与已有结果见[后端实测](../../third_party/cordvip_geometry/README.md#p2-事件触发-sam2-实测)。
+报告记录同步 CUDA 的阶段耗时、逐对象质量与有效性、LOST/恢复转换及 SAM2 调用数。总跟踪耗时排除读盘、初始化和独立参考复核，包含恢复帧。逐帧基线 mask 在计时外复核候选位姿；参考拒绝表示需调查的分歧，不等同于有真值支持的位姿误差。参考帧缺失或汇总帧数不一致会直接报错。
 
-覆盖率修复的复现输出使用 `--output logs/sam2_depth_coverage_ab`，保留历史 `logs/sam2_ab`。`depth_quality_by_mask_source` 分别汇总两条路径的匹配点数、匹配比例和覆盖率 p50/p95；两条路径的覆盖率定义相同，匹配比例分母不同。
+| 输出 | 内容 |
+| --- | --- |
+| 每段每轮 JSON | 逐帧结果，以及刷新前的纯深度检查 `depth_checks` |
+| `summary.json` | 各 Episode、间隔和重复轮次的统计 |
+| `comparison.json` | 跨轮汇总，包含按 `mask_source` 分组的深度指标 p50/p95 |
+| `environment.json` | 运行环境、输入路径与对象列表 |
 
-逐帧 `depth_checks` 保存刷新前的纯深度检查。`coverage_rejected_frames` 统计匹配点数和匹配比例原本通过、仅覆盖率失败的处理帧；`coverage_triggered_sam_frames` 统计实际刷新 SAM2 且至少一个候选覆盖不足的处理帧（可能同时存在其他质量异常）。两者均按共享帧去重，不等同于最终 LOST；最终新增无效帧须对照历史逐对象有效性。诊断只在评估入口收集，不改变跟踪状态机。
+`depth_quality_by_mask_source` 保留匹配点数、匹配比例与覆盖率。两条路径的覆盖率定义相同，匹配比例分母不同。
+
+覆盖率事件按共享处理帧去重：
+
+- `coverage_rejected_frames`：匹配点数和匹配比例通过、仅覆盖率失败。
+- `coverage_triggered_sam_frames`：实际刷新 SAM2，且至少一个候选覆盖不足；可能同时存在其他质量异常。
+
+这些事件不等同于最终 LOST；最终新增无效帧需对照历史逐对象有效性。诊断仅在评估入口收集，不改变跟踪状态机。
+
+初版与覆盖率修复记录分别位于 `logs/sam2_ab`、`logs/sam2_depth_coverage_ab`，复跑时须另选新目录。测量口径与结果见[后端实测](../../third_party/cordvip_geometry/README.md#p2-事件触发-sam2-实测)。
 
 ## 导出与查看
 

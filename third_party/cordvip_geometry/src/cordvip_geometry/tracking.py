@@ -93,7 +93,7 @@ def pose_quality(mask, observed, rendered, config):
     intersection = mask & visible
     depth_target = mask & valid
     matched = depth_target & projected & (depth_error <= config.depth_tolerance_m)
-    count = int(matched.sum())
+    matched_count = int(matched.sum())
     residual = depth_error[depth_target & projected]
     mask_pixels = int(mask.sum())
     visible_pixels = int(visible.sum())
@@ -104,14 +104,14 @@ def pose_quality(mask, observed, rendered, config):
         precision=intersection_pixels / max(1, visible_pixels),
         recall=intersection_pixels / max(1, mask_pixels),
         iou=float(intersection_pixels / max(1, (mask | visible).sum())),
-        depth_pixels=count,
-        depth_fraction=float(count / max(1, depth_target.sum())),
+        depth_pixels=matched_count,
+        depth_fraction=float(matched_count / max(1, depth_target.sum())),
         depth_coverage=int((projected & valid).sum()) / max(1, projected_count),
         median_depth_error_m=float(np.median(residual)) if len(residual) else None,
         occluded_fraction=float(hidden.sum() / max(1, projected_count)),
     )
     accepted = (
-        count >= config.min_depth_pixels
+        matched_count >= config.min_depth_pixels
         and metrics["depth_fraction"] >= config.min_depth_fraction
         and metrics["precision"] >= config.min_precision
         and metrics["recall"] >= config.min_recall
@@ -124,33 +124,29 @@ def pose_depth_quality(observed, rendered, config):
     projected = np.isfinite(rendered) & (rendered > 0)
     support = projected & np.isfinite(observed) & (observed >= 0.001)
     residual = np.abs(observed[support] - rendered[support])
-    count = int(np.count_nonzero(residual <= config.depth_tolerance_m))
+    matched_count = int(np.count_nonzero(residual <= config.depth_tolerance_m))
     support_count = len(residual)
-    coverage = support_count / max(1, int(projected.sum()))
-    fraction = count / max(1, support_count)
-    metrics: dict[str, float | int | None] = dict.fromkeys(
-        (
-            "mask_pixels",
-            "visible_pixels",
-            "precision",
-            "recall",
-            "iou",
-            "occluded_fraction",
-        ),
-        -1,
-    )
-    metrics.update(
-        depth_pixels=count,
+    projected_count = int(projected.sum())
+    coverage = support_count / max(1, projected_count)
+    fraction = matched_count / max(1, support_count)
+    metrics: dict[str, float | int | None] = dict(
+        mask_pixels=-1,
+        visible_pixels=-1,
+        precision=-1,
+        recall=-1,
+        iou=-1,
+        occluded_fraction=-1,
+        depth_pixels=matched_count,
         depth_fraction=fraction,
         depth_coverage=coverage,
         median_depth_error_m=float(np.median(residual)) if len(residual) else None,
     )
-    return (
-        metrics,
-        count >= config.min_depth_pixels
+    accepted = (
+        matched_count >= config.min_depth_pixels
         and coverage >= config.min_depth_coverage
-        and fraction >= config.min_depth_fraction,
+        and fraction >= config.min_depth_fraction
     )
+    return metrics, accepted
 
 
 class SceneTracker:

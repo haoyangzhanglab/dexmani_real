@@ -190,7 +190,8 @@ def main(argv=None):
     original_depth_quality = tracking.pose_depth_quality
     depth_checks = []
 
-    def checked_depth(observed, rendered, config):
+    def record_depth_quality(observed, rendered, config):
+        """保留刷新前的门控结果，避免被后续 mask 检查覆盖。"""
         metrics, accepted = original_depth_quality(observed, rendered, config)
         low_coverage = metrics["depth_coverage"] < config.min_depth_coverage
         depth_checks.append(
@@ -235,7 +236,7 @@ def main(argv=None):
             ),
         )
     tracking.track_objects = timed(original_batch, "fp")
-    tracking.pose_depth_quality = checked_depth
+    tracking.pose_depth_quality = record_depth_quality
     records: list[dict[str, Any]] = []
     references: list[dict[str, np.ndarray]] | None = None
 

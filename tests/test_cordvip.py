@@ -1707,12 +1707,9 @@ def test_benchmark_reference_and_cleanup(
         assert [r["counts"]["sam_track"] for r in runs] == (
             [2, 2, 2] if low_coverage else [2, 1, 0]
         )
-        assert [r["coverage_rejected_frames"] for r in runs] == (
-            [0, 2, 2] if low_coverage else [0, 0, 0]
-        )
-        assert [r["coverage_triggered_sam_frames"] for r in runs] == (
-            [0, 2, 2] if low_coverage else [0, 0, 0]
-        )
+        expected_coverage_events = [0, 2, 2] if low_coverage else [0, 0, 0]
+        for key in ("coverage_rejected_frames", "coverage_triggered_sam_frames"):
+            assert [r[key] for r in runs] == expected_coverage_events
         assert all(r["reference_rejections"] == 0 for r in runs)
         assert (output / "comparison.json").is_file()
     assert tracking.track_objects is original_batch
@@ -1770,8 +1767,8 @@ def test_depth_coverage_does_not_replace_minimum_count():
     assert metrics["depth_coverage"] == metrics["depth_fraction"] == 1
 
 
-@pytest.mark.parametrize("interval,broken", [(3, False), (3, True), (1, False)])
-def test_low_coverage_refresh(recovery_scene, monkeypatch, interval, broken):
+@pytest.mark.parametrize("interval,invalid_mask", [(3, False), (3, True), (1, False)])
+def test_low_coverage_refresh(recovery_scene, monkeypatch, interval, invalid_mask):
     from dataclasses import replace
     from cordvip_geometry import tracking
 
@@ -1779,7 +1776,7 @@ def test_low_coverage_refresh(recovery_scene, monkeypatch, interval, broken):
     scene.config = replace(scene.config, segmentation_interval_frames=interval)
     frame.depth_m[10:] = 0
     masks["banana"][10:] = False
-    if broken:
+    if invalid_mask:
         masks["apple"][:] = False
         masks["apple"][:6] = True  # 深度点数足够，但轮廓 precision 不足。
     renders, calls, refinements = [], [], []
@@ -1803,11 +1800,11 @@ def test_low_coverage_refresh(recovery_scene, monkeypatch, interval, broken):
     scene.segmenter.track = lambda rgb: calls.append(scene.frame_index) or masks.copy()
     result = scene.track(frame)
     assert calls == [1] and refinements == [1]
-    assert result.valid == {"apple": not broken, "banana": True}
-    assert scene.states["apple"] == ("LOST" if broken else "TRACKING")
+    assert result.valid == {"apple": not invalid_mask, "banana": True}
+    assert scene.states["apple"] == ("LOST" if invalid_mask else "TRACKING")
     assert sorted(renders) == ["apple", "banana"]
     assert result.quality["banana"]["depth_coverage"] == 1
-    if not broken:
+    if not invalid_mask:
         assert result.quality["apple"]["depth_coverage"] == 5 / 12
         assert result.quality["apple"]["mask_source"] == 1
 
