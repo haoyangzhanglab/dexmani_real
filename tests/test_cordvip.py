@@ -66,6 +66,12 @@ class FakeRawReader:
         yield from [np.zeros((2, 2, 3), np.uint8)] * 3
 
 
+def front_pose():
+    pose = np.eye(4)
+    pose[2, 3] = 1.0
+    return pose
+
+
 @pytest.fixture
 def grounded_segmenter():
     import torch
@@ -400,52 +406,27 @@ def test_prepare_reused_mesh_validates_measurement_without_models(tmp_path):
         module.prepare_task(tmp_path)
 
 
-def test_scene_batch_keeps_per_object_depth_gate(monkeypatch):
+def test_scene_batch_does_not_gate_on_mask_depth(recovery_scene, monkeypatch):
+    from dataclasses import replace
     from cordvip_geometry import tracking
 
-    shape = (24, 24)
-    mask = np.ones(shape, bool)
-    scene = tracking.SceneTracker.__new__(tracking.SceneTracker)
-    scene.rectifier = RGBDRectifier(shape, np.eye(3), np.zeros(5))
-    scene.directions = camera_rays(shape, np.eye(3), tracking.PIXEL_STRIDE)
-    scene.segmenter = SimpleNamespace(track=lambda rgb: {"apple": mask, "banana": mask})
-    scene.trackers = {
-        n: SimpleNamespace(estimator=SimpleNamespace(pose_last=np.eye(4)))
-        for n in ("apple", "banana")
-    }
-    scene.states = dict.fromkeys(scene.trackers, "TRACKING")
-    scene.next_retry = dict.fromkeys(scene.trackers, 0)
-    scene.frame_index = 0
-    scene.last_sam_frame = 0
-    scene.config = TrackingConfig(recovery_enabled=False, segmentation_interval_frames=1)
-    scene.frame_signature = (shape, np.eye(3), "none", np.zeros(5))
-    scene.frame_cache = {}
-    scene.renderers = {
-        "apple": SimpleNamespace(render=lambda rays, pose: np.ones(len(rays))),
-        "banana": SimpleNamespace(render=lambda rays, pose: np.full(len(rays), 2.0)),
-    }
+    scene, frame, masks, _, _ = recovery_scene
+    scene.config = replace(scene.config, recovery_enabled=False)
+    scene.renderers["banana"].render = lambda rays, pose: np.full(len(rays), 2.0)
     calls = []
+    original = tracking.track_objects
 
-    def batch(trackers, rgb, depth, K, frame_cache):
-        assert frame_cache is scene.frame_cache
+    def batch(trackers, *args):
         calls.append(list(trackers))
-        return {name: np.eye(4) for name in trackers}
+        return original(trackers, *args)
 
     monkeypatch.setattr(tracking, "track_objects", batch)
-    frame = RGBDFrame(
-        rgb=np.zeros((*shape, 3), np.uint8),
-        depth_m=np.ones(shape, np.float32),
-        K=np.eye(3),
-        distortion_model="none",
-        distortion_coeffs=np.zeros(5),
-    )
     result = scene.track(frame)
     assert result.valid == {"apple": True, "banana": False}
     assert list(result.poses) == ["apple"]
-    assert calls == [["apple", "banana"]]
-    mask[:] = False
+    masks["apple"][:] = False
     assert not any(scene.track(frame).valid.values())
-    assert len(calls) == 1
+    assert calls == [["apple", "banana"], ["apple"]]
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -482,6 +463,18 @@ def test_registration_computation_settings_are_local(fails):
         assert not torch.backends.cudnn.enabled
         assert not torch.backends.cudnn.deterministic
         assert torch.backends.cudnn.benchmark
+
+
+def test_registration_rejects_uninitialized_backend():
+    from cordvip_geometry.foundationpose import FoundationPoseTracker
+
+    tracker = FoundationPoseTracker.__new__(FoundationPoseTracker)
+    tracker.estimator = SimpleNamespace(
+        pose_last=np.eye(4), register=lambda **kwargs: np.eye(4)
+    )
+    with pytest.raises(TrackingFailure, match="did not initialize tracking"):
+        tracker.register(None, None, None, None)
+    assert tracker.estimator.pose_last is None
 
 
 @pytest.mark.parametrize(
@@ -780,11 +773,18 @@ def test_scene_initialization_rectifies_before_detection_and_resets_state():
     scene = SceneTracker.__new__(SceneTracker)
     scene.config = TrackingConfig()
     scene.trackers = {
-        name: SimpleNamespace(estimator=SimpleNamespace(pose_last=np.eye(4)))
+        name: SimpleNamespace(
+            estimator=SimpleNamespace(pose_last=front_pose()),
+            object_from_center=np.eye(4),
+        )
         for name in boxes
     }
     scene.renderers = {
-        name: SimpleNamespace(render=lambda rays, pose: np.ones(len(rays)))
+        name: SimpleNamespace(
+            render=lambda rays, pose, name=name: masks[name][::2, ::2]
+            .ravel()
+            .astype(float)
+        )
         for name in boxes
     }
     received = []
@@ -810,7 +810,7 @@ def test_scene_initialization_rectifies_before_detection_and_resets_state():
         np.testing.assert_array_equal(observed, expected_depth)
         np.testing.assert_array_equal(intrinsics, K)
         received.append(mask)
-        return np.eye(4)
+        return front_pose()
 
     scene.segmenter = SimpleNamespace(detect=detect, initialize=initialize)
     for tracker in scene.trackers.values():
@@ -822,7 +822,7 @@ def test_scene_initialization_rectifies_before_detection_and_resets_state():
         expected_rgb = cv2.remap(rgb, *maps, cv2.INTER_LINEAR)
         expected_depth = cv2.remap(depth, *maps, cv2.INTER_NEAREST)
         for tracker in scene.trackers.values():
-            tracker.estimator.pose_last = np.eye(4)
+            tracker.estimator.pose_last = front_pose()
         scene.frame_cache = {"K": K, "rgb": rgb}
         frame = RGBDFrame(rgb, depth, K, "brown_conrady", distortion)
         result = scene.initialize(frame, {"fruit": " Apple. ", "dish": "bowl"})
@@ -858,19 +858,22 @@ def test_pose_quality_requires_two_sided_evidence():
     target[10:30, 10:30] = True
     rendered = target.astype(float)
     observed = np.where(target, 1.0, 2.0)
-    assert pose_quality(target, observed, rendered, config)[1]
+    assert pose_quality(target, observed, rendered, config)[1] == "VALID"
     # mask 内完全匹配仍不能接受轮廓过大的模型。
-    assert not pose_quality(target, observed, np.ones_like(rendered), config)[1]
+    assert pose_quality(target, observed, np.ones_like(rendered), config)[1] == "LOST"
     visible = target.copy()
     visible[:, 20:] = False
     occluded_depth = observed.copy()
     occluded_depth[target & ~visible] = 0.8
-    metrics, valid = pose_quality(visible, occluded_depth, rendered, config)
-    assert valid and metrics["occluded_fraction"] == 0.5
+    metrics, verdict = pose_quality(visible, occluded_depth, rendered, config)
+    assert verdict == "VALID" and metrics["occluded_fraction"] == 0.5
     occluded_depth[target & ~visible] = 0
     # 缺失深度不能被计为遮挡。
-    assert pose_quality(visible, occluded_depth, rendered, config)[0]["occluded_fraction"] == 0
-    assert not pose_quality(target, observed, rendered * 1.1, config)[1]
+    assert (
+        pose_quality(visible, occluded_depth, rendered, config)[0]["occluded_fraction"]
+        == 0
+    )
+    assert pose_quality(target, observed, rendered * 1.1, config)[1] == "LOST"
 
 
 def test_joint_interpolation_boundaries_and_conflicts():
@@ -943,14 +946,19 @@ def recovery_scene(monkeypatch):
     scene.trackers = {}
     registrations = []
     for name in masks:
-        estimator = SimpleNamespace(pose_last=None)
+        estimator = SimpleNamespace(pose_last=None, diameter=0.1)
 
         def register(rgb, depth, K, mask, name=name, estimator=estimator):
             registrations.append(name)
-            estimator.pose_last = np.eye(4)
-            return np.eye(4)
+            estimator.pose_last = front_pose()
+            return front_pose()
 
-        scene.trackers[name] = SimpleNamespace(estimator=estimator, register=register)
+        scene.trackers[name] = SimpleNamespace(
+            estimator=estimator,
+            register=register,
+            object_from_center=np.eye(4),
+            symmetry_tfs=np.eye(4)[None],
+        )
     scene.renderers = {
         n: SimpleNamespace(render=lambda rays, pose: np.full(len(rays), pose[2, 2]))
         for n in masks
@@ -961,19 +969,23 @@ def recovery_scene(monkeypatch):
         detections.append(1)
         return [{"label": n, "box_xyxy": np.array([0, 0, 24, 24])} for n in masks]
 
+    def correct_masks(new):
+        masks.update(new)
+        return masks.copy()
+
     scene.segmenter = SimpleNamespace(
         detect=detect,
         initialize=lambda *args: masks.copy(),
         track=lambda rgb: masks.copy(),
         segment_boxes=lambda rgb, boxes: {n: np.ones(shape, bool) for n in boxes},
-        correct_masks=lambda new: {**masks, **new},
+        correct_masks=correct_masks,
     )
 
     def batch(trackers, *args):
         result = {}
         for n, t in trackers.items():
-            t.estimator.pose_last = np.eye(4)
-            result[n] = np.eye(4)
+            t.estimator.pose_last = front_pose()
+            result[n] = front_pose()
         return result
 
     monkeypatch.setattr(tracking, "track_objects", batch)
@@ -987,8 +999,12 @@ def test_object_recovery_and_identity(recovery_scene):
     lost = scene.track(frame)
     assert lost.valid == {"apple": False, "banana": True}
     assert list(lost.poses) == ["banana"]
+    pending = scene.track(frame)
+    assert pending.valid == {"apple": False, "banana": True}
+    assert set(scene.pending_pose) == {"apple"}
     recovered = scene.track(frame)
     assert all(recovered.valid.values())
+    assert not scene.pending_pose
     assert list(recovered.poses) == ["apple", "banana"]
     assert registrations == ["apple", "banana", "apple"]
     assert len(detections) == 2
@@ -1021,7 +1037,7 @@ def test_quality_rejection_restores_internal_pose(recovery_scene, monkeypatch):
     scene, frame, _, _, _ = recovery_scene
 
     def batch(trackers, *args):
-        poses = {n: np.eye(4) for n in trackers}
+        poses = {n: front_pose() for n in trackers}
         poses["apple"][2, 2] = 2
         for n in trackers:
             trackers[n].estimator.pose_last = poses[n].copy()
@@ -1031,7 +1047,7 @@ def test_quality_rejection_restores_internal_pose(recovery_scene, monkeypatch):
     result = scene.track(frame)
     assert result.valid == {"apple": False, "banana": True}
     np.testing.assert_array_equal(
-        scene.trackers["apple"].estimator.pose_last, np.eye(4)
+        scene.trackers["apple"].estimator.pose_last, front_pose()
     )
 
 
@@ -1100,7 +1116,7 @@ def test_worker_retries_initial_registration(monkeypatch, tmp_path):
     monkeypatch.setattr(
         hoi, "task_objects", lambda task: [{"name": "apple", "prompt": "apple"}]
     )
-    monkeypatch.setattr(RGBDFrame, "from_camera", lambda *args: object())
+    monkeypatch.setattr(RGBDFrame, "from_camera", lambda *args, **kwargs: object())
     monkeypatch.setattr("signal.signal", lambda *args: None)
     calls, written = [], []
 
@@ -1194,14 +1210,71 @@ def test_batch_exception_isolates_object(recovery_scene, monkeypatch):
             tracker.estimator.pose_last = np.full((4, 4), 9.0)
         if "apple" in trackers:
             raise TrackingFailure("apple failed")
-        return {"banana": np.eye(4)}
+        return {"banana": front_pose()}
 
     monkeypatch.setattr(tracking, "track_objects", batch)
     result = scene.track(frame)
     assert result.valid == {"apple": False, "banana": True}
     np.testing.assert_array_equal(
-        scene.trackers["apple"].estimator.pose_last, np.eye(4)
+        scene.trackers["apple"].estimator.pose_last, front_pose()
     )
+
+
+def test_single_object_failure_is_not_retried(recovery_scene, monkeypatch):
+    from cordvip_geometry import tracking
+
+    scene, frame, _, _, detections = recovery_scene
+    scene.states["banana"] = "LOST"
+    scene.next_retry["banana"] = 100
+    previous = scene.trackers["apple"].estimator.pose_last
+    calls = []
+
+    def fail(trackers, *args):
+        calls.append(list(trackers))
+        trackers["apple"].estimator.pose_last = np.full((4, 4), 99.0)
+        raise RuntimeError("refinement failed")
+
+    monkeypatch.setattr(tracking, "track_objects", fail)
+    result = scene.track(frame)
+    assert calls == [["apple"]]
+    assert not any(result.valid.values())
+    assert scene.trackers["apple"].estimator.pose_last is previous
+    assert "refinement failed" in result.failures["apple"]
+    assert len(detections) == 1
+
+
+def test_all_lost_waits_without_inference(recovery_scene, monkeypatch):
+    from cordvip_geometry import tracking
+
+    scene, frame, masks, _, detections = recovery_scene
+    original_batch = tracking.track_objects
+    original_detect = scene.segmenter.detect
+    sam_frames, pose_frames = [], []
+
+    def sam(rgb):
+        sam_frames.append(scene.frame_index)
+        return masks.copy()
+
+    def batch(*args):
+        pose_frames.append(scene.frame_index)
+        return original_batch(*args)
+
+    monkeypatch.setattr(scene.segmenter, "track", sam)
+    monkeypatch.setattr(tracking, "track_objects", batch)
+    for mask in masks.values():
+        mask[:] = False
+    assert not any(scene.track(frame).valid.values())  # 1: 明确丢失。
+    monkeypatch.setattr(scene.segmenter, "detect", lambda *args: [])
+    for _ in range(3):
+        assert not any(scene.track(frame).valid.values())  # 2: 检测失败；3、4: 等待。
+    assert sam_frames == [1, 2] and pose_frames == [1]
+
+    monkeypatch.setattr(scene.segmenter, "detect", original_detect)
+    assert not any(scene.track(frame).valid.values())  # 5: 注册为 Pending。
+    assert set(scene.pending_pose) == set(masks)
+    assert all(scene.track(frame).valid.values())  # 6: 确认恢复。
+    assert sam_frames == [1, 2, 5, 6] and pose_frames == [1, 6]
+    assert len(detections) == 2
 
 
 def test_offline_temporary_loss_preserves_frame_alignment():
@@ -1242,18 +1315,38 @@ def test_offline_temporary_loss_preserves_frame_alignment():
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    "name,value",
     [
-        dict(recovery_enabled=1),
-        dict(recovery_retry_interval_frames=0),
-        dict(recovery_retry_interval_frames=True),
-        dict(recovery_box_threshold=float("nan")),
-        dict(recovery_text_threshold=1.1),
+        ("recovery_enabled", 1),
+        ("min_depth_pixels", 0),
+        ("min_depth_pixels", 1.5),
+        ("segmentation_interval_frames", 0),
+        ("segmentation_interval_frames", True),
+        ("segmentation_interval_frames", 1.5),
+        ("recovery_retry_interval_frames", 0),
+        ("recovery_retry_interval_frames", True),
+        ("depth_tolerance_m", -1),
+        ("depth_tolerance_m", np.nan),
+        ("occlusion_timeout_s", 0),
+        ("occlusion_timeout_s", np.inf),
+        ("max_translation_speed_m_s", -1),
+        ("max_translation_speed_m_s", True),
+        ("max_rotation_speed_rad_s", np.nan),
+        ("max_rotation_speed_rad_s", "0.5"),
+        ("min_depth_coverage", 0),
+        ("min_depth_coverage", 1.1),
+        ("min_depth_coverage", np.nan),
+        ("min_depth_coverage", True),
+        ("min_depth_fraction", 0),
+        ("min_precision", np.nan),
+        ("min_recall", 1.1),
+        ("recovery_box_threshold", np.nan),
+        ("recovery_text_threshold", 1.1),
     ],
 )
-def test_invalid_recovery_config(kwargs):
-    with pytest.raises(ValueError):
-        TrackingConfig(**kwargs)
+def test_invalid_tracking_config(name, value):
+    with pytest.raises(ValueError, match=name):
+        TrackingConfig(**{name: value})
 
 
 def test_recovery_rejection_after_sam_merge_keeps_retry_interval(recovery_scene):
@@ -1350,25 +1443,33 @@ def test_nonfinite_candidate_only_invalidates_its_object(recovery_scene, monkeyp
     assert calls == [["apple", "banana"]] and len(detections) == 1
 
 
-@pytest.mark.parametrize("invalid", ["scale", "reflection", "shear", "last_row"])
-@pytest.mark.parametrize("stage", ["initialize", "track_mask", "track_depth", "recover"])
-def test_nonrigid_pose_is_rejected_before_rendering(recovery_scene, monkeypatch, invalid, stage):
+@pytest.mark.parametrize(
+    "invalid", ["scale", "reflection", "shear", "last_row", "behind", "camera_plane"]
+)
+@pytest.mark.parametrize(
+    "stage", ["initialize", "track_mask", "track_depth", "recover"]
+)
+def test_invalid_pose_is_rejected_before_rendering(
+    recovery_scene, monkeypatch, invalid, stage
+):
     from dataclasses import replace
     from cordvip_geometry import tracking
 
     scene, frame, _, _, _ = recovery_scene
-    pose = np.eye(4)
+    pose = front_pose()
     if invalid == "scale":
         pose[0, 0] = 2
     elif invalid == "reflection":
         pose[0, 0] = -1
     elif invalid == "shear":
         pose[0, 1] = 0.2
-    else:
+    elif invalid == "last_row":
         pose[3, 0] = 0.1
+    else:
+        pose[2, 3] = -1 if invalid == "behind" else 0
 
     def must_not_render(*args):
-        pytest.fail("nonrigid candidate reached the renderer")
+        pytest.fail("invalid candidate reached the renderer")
 
     monkeypatch.setattr(scene.renderers["apple"], "render", must_not_render)
     previous = scene.trackers["apple"].estimator.pose_last
@@ -1378,7 +1479,7 @@ def test_nonrigid_pose_is_rejected_before_rendering(recovery_scene, monkeypatch,
             return pose
         monkeypatch.setattr(scene.trackers["apple"], "register", register)
         if stage == "initialize":
-            with pytest.raises(TrackingFailure, match="invalid"):
+            with pytest.raises(TrackingFailure, match="invalid|in front"):
                 scene.initialize(frame, {"apple": "apple", "banana": "banana"})
             assert scene.trackers["apple"].estimator.pose_last is None
             assert scene.states == {"apple": "LOST", "banana": "TRACKING"}
@@ -1400,6 +1501,25 @@ def test_nonrigid_pose_is_rejected_before_rendering(recovery_scene, monkeypatch,
     assert list(result.poses) == ["banana"]
     assert scene.states["apple"] == "LOST"
     assert scene.trackers["apple"].estimator.pose_last is previous
+
+
+def test_pose_front_check_uses_mesh_center(recovery_scene, monkeypatch):
+    from cordvip_geometry import tracking
+
+    scene, frame, _, _, _ = recovery_scene
+    original_batch = tracking.track_objects
+    scene.trackers["apple"].object_from_center[2, 3] = 2
+
+    def batch(*args):
+        poses = original_batch(*args)
+        poses["apple"][2, 3] = -1  # 原点在相机后方，居中网格仍在前方。
+        return poses
+
+    monkeypatch.setattr(tracking, "track_objects", batch)
+    result = scene.track(frame)
+    assert all(result.valid.values())
+    assert result.poses["apple"][2, 3] == -1
+    assert scene.trackers["apple"].estimator.pose_last[2, 3] == 1
 
 
 def test_pose_gate_tolerates_float32_rotation_noise(recovery_scene, monkeypatch):
@@ -1480,11 +1600,6 @@ def test_viewer_keeps_joint_alignment_separate_from_object_validity(monkeypatch)
     viewer.log_step(0, np.zeros((1, 1, 3), np.uint8))
     assert clouds == [None] and logged["hoi/valid"] == 0
 
-@pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "2"])
-def test_segmentation_interval_validation(value):
-    with pytest.raises(ValueError):
-        TrackingConfig(segmentation_interval_frames=value)
-
 
 @pytest.mark.parametrize("offset", [-0.1, 0.1])
 def test_depth_gate_counts_both_directions(offset):
@@ -1493,8 +1608,8 @@ def test_depth_gate_counts_both_directions(offset):
     rendered = np.ones((10, 10))
     observed = rendered.copy()
     observed[:6] += offset
-    metrics, accepted = pose_depth_quality(observed, rendered, TrackingConfig())
-    assert not accepted and metrics["depth_pixels"] == 40
+    metrics, verdict = pose_depth_quality(observed, rendered, TrackingConfig())
+    assert verdict == "LOST" and metrics["depth_pixels"] == 40
     assert metrics["depth_fraction"] == 0.4
     assert metrics["occluded_fraction"] == -1
 
@@ -1582,8 +1697,9 @@ def test_event_rejection_and_due_recovery(recovery_scene):
     scene.segmenter.detect = detect
     assert scene.track(frame).valid == {"apple": False, "banana": True}
     scene.renderers["apple"].render = lambda rays, pose: np.ones(len(rays))
+    assert scene.track(frame).valid == {"apple": False, "banana": True}
     assert all(scene.track(frame).valid.values())
-    assert events == [("track", 1), ("track", 2), ("detect", 2)]
+    assert events == [("track", 1), ("track", 2), ("detect", 2), ("track", 3)]
 
 
 def test_mixed_quality_hdf5_is_finite(recovery_scene, tmp_path):
@@ -1650,25 +1766,46 @@ def test_correction_uses_video_index(monkeypatch):
 
 
 def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_path):
+    import multiprocessing as mp
     from dataclasses import replace
 
+    import h5py
+    import zarr
     from cordvip_geometry import tracking
 
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.data.export import ExportConfig, export_zarr
+    from dexmani_real.data.hoi import write_hoi
+    from dexmani_real.data.raw import TIMING_ROW_DTYPE
     from dexmani_real.geometry import hoi
+    from dexmani_real.ipc.sensors import SensorChannels
     from dexmani_real.perception.hoi_worker import run_hoi_worker
+    from dexmani_real.runtime.observation import check_hoi_status
 
     scene, frame, masks, _, _ = recovery_scene
     scene.config = replace(scene.config, segmentation_interval_frames=2)
     names = list(masks)
     calls = []
+
     def track(rgb):
         calls.append(scene.frame_index)
+        if rgb[0, 0, 0] == 4:
+            masks["apple"][:] = False
         return masks.copy()
 
     scene.segmenter.track = track
+    sequences = np.array([1, 2, 3, 3, 4, 5, 6])
+    stamps = 1_000_000_000 + (sequences - 1) * 100_000_000
+    depth = np.full((len(sequences), 24, 24), 1000, np.uint16)
+    depth[1] = 0  # 短暂完全遮挡，随后正常观测恢复。
+    images = [np.full_like(frame.rgb, sequence) for sequence in sequences]
+    timing = np.zeros(len(sequences), dtype=TIMING_ROW_DTYPE)
+    timing["control_ns"] = 1_000_000_000 + np.arange(len(sequences)) * 100_000_000
+    timing["observation_ns"] = timing["control_ns"] + 50_000_000
+    timing["camera_sequence"], timing["camera_ns"] = sequences, stamps
 
     class Reader(FakeRawReader):
-        num_frames = 4
+        num_frames = len(sequences)
 
         def read_camera(self):
             return SimpleNamespace(
@@ -1684,53 +1821,107 @@ def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_
             )
 
         def __getitem__(self, name):
-            if name == "depth":
-                return np.full((4, 24, 24), 1000, np.uint16)
-            return np.array(
-                [(1, 1), (1, 1), (2, 2), (3, 3)],
-                dtype=[("camera_sequence", "i8"), ("camera_ns", "i8")],
-            )
+            return depth if name == "depth" else timing
 
         def iter_rgb_frames(self):
-            yield from [frame.rgb] * 4
+            yield from images
 
-    _, _, quality, validity = script("annotate_episodes").track_episode(
+    poses, base, quality, validity = script("annotate_episodes").track_episode(
         Reader(), scene, names, scene.prompts
     )
-    assert calls == [2] and validity.all() and quality[0] == quality[1]
-    calls.clear()
-    monkeypatch.setattr(tracking, "SceneTracker", lambda *a, **kw: scene)
-    monkeypatch.setattr(
-        hoi, "task_objects", lambda task: [{"name": n, "prompt": n} for n in names]
-    )
-    monkeypatch.setattr(RGBDFrame, "from_camera", lambda *a: frame)
-    monkeypatch.setattr("signal.signal", lambda *a: None)
-    shared = SimpleNamespace(
-        is_running=SimpleNamespace(value=True), hoi_ready=SimpleNamespace(value=False)
-    )
-    shared.hoi_request = SimpleNamespace(
-        read=lambda: ({"episode_id": 1, "after_sequence": 0, "after_ns": 0}, 1)
-    )
-    frames = iter([({"timestamp_ns": n}, n) for n in (1, 1, 2, 3)])
-    shared.camera_ring = SimpleNamespace(read=lambda: next(frames))
-    written = []
-
-    def write(**row):
-        written.append(row)
-        if len(written) == 3:
-            shared.is_running.value = False
-
-    shared.hoi_ring = SimpleNamespace(field_names=(), write=write)
+    expected_valid = [True, False, True, True, False, False, True]
+    np.testing.assert_array_equal(validity.all(axis=1), expected_valid)
+    assert np.isnan(poses[~validity]).all()
+    assert calls == [1, 3, 4, 5] and quality[2] == quality[3]
     template = dict(
         object_names=names,
         points_local=np.ones((1024, 3), np.float32),
         offsets=[0, 512, 1024],
     )
+    episode = tmp_path / "episode_test"
+    episode.mkdir()
+    with h5py.File(episode / "data.h5", "w") as data:
+        data.create_group("meta").attrs.update(task_label="test", control_hz=10.0)
+        data.create_dataset("timing/rows", data=timing)
+        data.create_dataset("timing/segment_starts", data=np.array([0], np.int64))
+    write_hoi(
+        episode / "data.h5",
+        template,
+        poses,
+        base,
+        quality=quality,
+        object_valid=validity,
+        tracking_config={},
+    )
+    with h5py.File(episode / "data.h5", "r") as data:
+        offline_cloud = data["hoi/object_pointcloud"][:]
+        np.testing.assert_array_equal(data["hoi/valid"][:], expected_valid)
+        assert not offline_cloud[~np.array(expected_valid)].any()
+    output = tmp_path / "train.zarr"
+    export_zarr(
+        episode, output, processing=ExportConfig(), fields=("object_pointcloud",)
+    )
+    exported = zarr.open(str(output), mode="r")
+    np.testing.assert_array_equal(exported["meta/episode_ends"][:], [1, 3, 4])
+    np.testing.assert_array_equal(
+        exported["data/object_pointcloud"][:], offline_cloud[expected_valid]
+    )
+
+    calls.clear()
+    for mask in masks.values():
+        mask[:] = True
+    monkeypatch.setattr(tracking, "SceneTracker", lambda *a, **kw: scene)
+    monkeypatch.setattr(
+        hoi, "task_objects", lambda task: [{"name": n, "prompt": n} for n in names]
+    )
+    monkeypatch.setattr("signal.signal", lambda *a: None)
+    shared = SensorChannels(mp.get_context("spawn"), hoi=True)
+    shared.hoi_request.write(episode_id=1, after_sequence=0, after_ns=0)
+    frames = iter(
+        [
+            ({"timestamp_ns": stamp, "rgb": rgb, "depth": observed}, int(sequence))
+            for stamp, rgb, observed, sequence in zip(stamps, images, depth, sequences)
+        ]
+    )
+    shared.camera_ring = SimpleNamespace(read=lambda: next(frames))
+    written = []
+    states = []
+    ring_write = shared.hoi_ring.write
+
+    def write(**row):
+        ring_write(**row)
+        written.append(row)
+        states.append(scene.states.copy())
+        assert check_hoi_status(
+            shared, RealConfig(), now_ns=int(row["timestamp_ns"])
+        ) == ([] if row["valid"] else ["hoi_pose_invalid"])
+        if len(written) == 6:
+            shared.is_running.value = False
+
+    monkeypatch.setattr(shared.hoi_ring, "write", write)
     run_hoi_worker(
         shared, Reader().read_camera(), tmp_path, template, tracking_config=scene.config
     )
-    assert calls == [2] and all(r["valid"] for r in written)
-    assert [r["source_camera_sequence"] for r in written] == [1, 2, 3]
+    assert calls == [1, 3, 4, 5]
+    assert [r["source_camera_sequence"] for r in written] == [1, 2, 3, 4, 5, 6]
+    assert [state["apple"] for state in states] == [
+        "TRACKING",
+        "OCCLUDED",
+        "TRACKING",
+        "LOST",
+        "LOST",
+        "TRACKING",
+    ]
+    unique = [0, 1, 2, 4, 5, 6]
+    np.testing.assert_array_equal(
+        [r["valid"] for r in written], np.array(expected_valid)[unique]
+    )
+    np.testing.assert_array_equal(
+        [r["object_pointcloud"] for r in written], offline_cloud[unique]
+    )
+    assert all(r["object_pointcloud"].dtype == np.float32 for r in written)
+    assert scene.timestamp_ns == stamps[-1] and scene.source_sequence == 6
+    assert scene.frame_dt_s == 0.1
 
 
 @pytest.mark.parametrize(
@@ -1739,11 +1930,11 @@ def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_
 def test_depth_gate_requires_support(observed, rendered):
     from cordvip_geometry.tracking import pose_depth_quality
 
-    metrics, accepted = pose_depth_quality(
+    metrics, verdict = pose_depth_quality(
         np.full((10, 10), observed), np.full((10, 10), rendered), TrackingConfig()
     )
     assert (
-        not accepted
+        verdict == "OCCLUDED"
         and metrics["depth_pixels"] == 0
         and metrics["depth_fraction"] == 0
         and metrics["depth_coverage"] == 0
@@ -1755,10 +1946,10 @@ def test_depth_gate_boundary():
 
     observed = np.ones((10, 10))
     observed[:5] = 2
-    metrics, accepted = pose_depth_quality(
+    metrics, verdict = pose_depth_quality(
         observed, np.ones_like(observed), TrackingConfig(min_depth_pixels=50)
     )
-    assert accepted and metrics["depth_fraction"] == 0.5
+    assert verdict == "VALID" and metrics["depth_fraction"] == 0.5
 
 
 def test_event_refresh_can_invalidate_other_candidate(recovery_scene):
@@ -1832,18 +2023,6 @@ def test_viewer_marks_unmeasured_quality_as_missing():
     assert logged["hoi/object_1/depth_coverage"] == 0.7
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        True, False, np.bool_(True), 0, -0.1, 1.1, 10**100,
-        np.nan, np.inf, -np.inf, None, 1j, "bad", "0.5",
-    ],
-)
-def test_depth_coverage_config(value):
-    with pytest.raises(ValueError, match="min_depth_coverage"):
-        TrackingConfig(min_depth_coverage=value)
-
-
 @pytest.mark.parametrize("missing", [np.nan, 0.0])
 def test_sparse_depth_requires_coverage(missing):
     from cordvip_geometry.tracking import pose_depth_quality, pose_quality
@@ -1852,11 +2031,11 @@ def test_sparse_depth_requires_coverage(missing):
     observed = np.full_like(rendered, missing)
     observed.flat[:30] = 1
     config = TrackingConfig()
-    depth, accepted = pose_depth_quality(observed, rendered, config)
-    full, mask_accepted = pose_quality(
+    depth, verdict = pose_depth_quality(observed, rendered, config)
+    full, mask_verdict = pose_quality(
         np.ones_like(rendered, bool), observed, rendered, config
     )
-    assert not accepted and mask_accepted
+    assert verdict == mask_verdict == "OCCLUDED"
     assert depth["depth_pixels"] == 30 and depth["depth_fraction"] == 1
     assert depth["depth_coverage"] == full["depth_coverage"] == 0.003
 
@@ -1871,19 +2050,20 @@ def test_depth_coverage_and_match_boundaries(support, fraction):
     observed[:support] = 2
     matched = int(support * 100 * fraction)
     observed.flat[:matched] = 1
-    metrics, accepted = pose_depth_quality(observed, rendered, TrackingConfig())
+    metrics, verdict = pose_depth_quality(observed, rendered, TrackingConfig())
     assert metrics["depth_coverage"] == support / 100
     assert metrics["depth_fraction"] == matched / (support * 100)
-    assert accepted == (support >= 50 and fraction >= 0.5)
+    expected = "OCCLUDED" if support < 50 else ("VALID" if fraction >= 0.5 else "LOST")
+    assert verdict == expected
 
 
 def test_depth_coverage_does_not_replace_minimum_count():
     from cordvip_geometry.tracking import pose_depth_quality
 
-    metrics, accepted = pose_depth_quality(
+    metrics, verdict = pose_depth_quality(
         np.ones((5, 5)), np.ones((5, 5)), TrackingConfig()
     )
-    assert not accepted and metrics["depth_pixels"] == 25
+    assert verdict == "OCCLUDED" and metrics["depth_pixels"] == 25
     assert metrics["depth_coverage"] == metrics["depth_fraction"] == 1
 
 
@@ -1921,8 +2101,8 @@ def test_low_coverage_refresh(recovery_scene, monkeypatch, interval, invalid_mas
     scene.segmenter.track = lambda rgb: calls.append(scene.frame_index) or masks.copy()
     result = scene.track(frame)
     assert calls == [1] and refinements == [1]
-    assert result.valid == {"apple": not invalid_mask, "banana": True}
-    assert scene.states["apple"] == ("LOST" if invalid_mask else "TRACKING")
+    assert result.valid == {"apple": False, "banana": True}
+    assert scene.states["apple"] == "OCCLUDED"
     assert sorted(renders) == ["apple", "banana"]
     assert result.quality["banana"]["depth_coverage"] == 1
     if not invalid_mask:
@@ -1957,7 +2137,421 @@ def test_depth_thresholds_are_independent(min_coverage, min_fraction):
     config = TrackingConfig(
         min_depth_coverage=min_coverage, min_depth_fraction=min_fraction
     )
-    metrics, accepted = pose_depth_quality(observed, np.ones_like(observed), config)
+    metrics, verdict = pose_depth_quality(observed, np.ones_like(observed), config)
     assert metrics["depth_coverage"] == 0.5
     assert metrics["depth_fraction"] == 0.6
-    assert accepted == (min_coverage <= 0.5 and min_fraction <= 0.6)
+    expected = (
+        "OCCLUDED"
+        if min_coverage > 0.5
+        else ("VALID" if min_fraction <= 0.6 else "LOST")
+    )
+    assert verdict == expected
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [
+        ("normal", "VALID"),
+        ("partial_occlusion", "VALID"),
+        ("large_occlusion", "OCCLUDED"),
+        ("complete_occlusion", "OCCLUDED"),
+        ("missing", "OCCLUDED"),
+        ("nan", "OCCLUDED"),
+        ("sparse_match", "OCCLUDED"),
+        ("sparse_mismatch", "OCCLUDED"),
+        ("depth_contradiction", "LOST"),
+        ("empty_mask", "LOST"),
+        ("oversized_cad", "LOST"),
+        ("disjoint_mask", "LOST"),
+    ],
+)
+def test_geometric_evidence_classes(case, expected):
+    from cordvip_geometry.tracking import pose_quality
+
+    config = TrackingConfig()
+    mask = np.ones((20, 20), bool)
+    rendered = np.ones(mask.shape)
+    observed = rendered.copy()
+    if case in ("partial_occlusion", "large_occlusion", "complete_occlusion"):
+        hidden_rows = {
+            "partial_occlusion": 10,
+            "large_occlusion": 19,
+            "complete_occlusion": 20,
+        }[case]
+        mask[:hidden_rows] = False
+        observed[:hidden_rows] = 0.7
+    elif case in ("missing", "nan", "sparse_match", "sparse_mismatch"):
+        observed[:] = np.nan if case == "nan" else 0
+        if case.startswith("sparse"):
+            observed.flat[:30] = 1 if case == "sparse_match" else 2
+    elif case == "depth_contradiction":
+        observed[:] = 2
+    elif case == "empty_mask":
+        mask[:] = False
+    elif case == "oversized_cad":
+        mask[5:] = False
+        observed[5:] = 2  # 背景更远，不能解释为前景遮挡。
+    elif case == "disjoint_mask":
+        mask[10:] = False
+        rendered[:10] = 0
+    metrics, verdict = pose_quality(mask, observed, rendered, config)
+    assert verdict == expected
+
+
+def test_sufficient_contour_contradiction_is_not_hidden_by_missing_mask_depth():
+    from cordvip_geometry.tracking import pose_quality
+
+    mask = np.zeros((20, 20), bool)
+    mask[:5] = True
+    observed = np.full(mask.shape, 2.0)
+    observed[:5] = 0
+    metrics, verdict = pose_quality(
+        mask, observed, np.ones(mask.shape), TrackingConfig()
+    )
+    assert metrics["mask_depth_coverage"] == 0
+    assert metrics["visible_depth_coverage"] == 0.75
+    assert verdict == "LOST"
+
+
+def test_mask_depth_absence_still_tracks_and_rolls_back(recovery_scene, monkeypatch):
+    from cordvip_geometry import tracking
+
+    scene, frame, masks, _, detections = recovery_scene
+    masks["apple"][12:] = False
+    scene.renderers["apple"].render = (
+        lambda rays, pose: masks["apple"][::2, ::2].ravel().astype(float)
+    )
+    frame.depth_m[:12] = 0
+    original = tracking.track_objects
+    previous = scene.trackers["apple"].estimator.pose_last
+    seeds = []
+
+    def track(trackers, *args):
+        seeds.append(trackers["apple"].estimator.pose_last)
+        poses = original(trackers, *args)
+        poses["apple"][0, 3] = 0.01
+        trackers["apple"].estimator.pose_last = poses["apple"]
+        return poses
+
+    monkeypatch.setattr(tracking, "track_objects", track)
+    result = scene.track(frame)
+    assert result.valid == {"apple": False, "banana": True}
+    assert scene.states["apple"] == "OCCLUDED" and "apple" not in result.poses
+    assert scene.trackers["apple"].estimator.pose_last is previous
+    frame.depth_m[:] = 1
+    assert all(scene.track(frame).valid.values())
+    assert seeds == [previous, previous] and len(detections) == 1
+
+
+def test_missing_current_mask_uses_depth_quality(recovery_scene):
+    scene, frame, masks, _, _ = recovery_scene
+    scene.segmenter.track = lambda rgb: {"banana": masks["banana"]}
+    result = scene.track(frame)
+    assert all(result.valid.values())
+    assert result.quality["apple"]["mask_source"] == 0
+
+
+@pytest.mark.parametrize("long_occlusion", [False, True])
+def test_complete_occlusion_waits_then_tracks_or_recovers(
+    recovery_scene, long_occlusion
+):
+    from dataclasses import replace
+
+    scene, frame, masks, registrations, detections = recovery_scene
+    frame = replace(frame, source_sequence=10, timestamp_ns=1_000_000_000)
+    scene.initialize(frame, scene.prompts)
+    detections.clear()
+    registrations.clear()
+    frame.depth_m[:] = 0
+    first = scene.track(replace(frame, source_sequence=11, timestamp_ns=1_100_000_000))
+    assert not any(first.valid.values()) and set(scene.states.values()) == {"OCCLUDED"}
+    if long_occlusion:
+        scene.track(replace(frame, source_sequence=25, timestamp_ns=1_590_000_000))
+        assert set(scene.states.values()) == {"OCCLUDED"}
+        scene.track(replace(frame, source_sequence=26, timestamp_ns=1_600_000_000))
+        assert set(scene.states.values()) == {"LOST"} and not detections
+        frame.depth_m[:] = 1
+        pending = scene.track(
+            replace(frame, source_sequence=29, timestamp_ns=1_700_000_000)
+        )
+        assert not any(pending.valid.values()) and set(scene.pending_pose) == {
+            "apple",
+            "banana",
+        }
+        result = scene.track(
+            replace(frame, source_sequence=30, timestamp_ns=1_733_000_000)
+        )
+        assert len(detections) == 1 and registrations == ["apple", "banana"]
+    else:
+        frame.depth_m[:] = 1
+        result = scene.track(
+            replace(frame, source_sequence=17, timestamp_ns=1_300_000_000)
+        )
+        assert not detections and not registrations
+    assert all(result.valid.values()) and not scene.occluded_since
+
+
+def test_source_gaps_do_not_advance_sam_video_indices(recovery_scene):
+    from dataclasses import replace
+
+    scene, frame, masks, _, _ = recovery_scene
+    scene.config = replace(scene.config, segmentation_interval_frames=2)
+    frame = replace(frame, source_sequence=100, timestamp_ns=1_000_000_000)
+    scene.initialize(frame, scene.prompts)
+    scene.segmenter.state = {"num_frames": 1}
+    calls = []
+
+    def sam(rgb):
+        calls.append(scene.segmenter.state["num_frames"])
+        scene.segmenter.state["num_frames"] += 1
+        return masks.copy()
+
+    scene.segmenter.track = sam
+    for sequence, stamp, age, dt, gap in (
+        (105, 1_100_000_000, 5, 0.1, 5),
+        (109, 1_200_000_000, 0, 0.1, 4),
+        (120, 1_450_000_000, 11, 0.25, 11),
+    ):
+        result = scene.track(
+            replace(frame, source_sequence=sequence, timestamp_ns=stamp)
+        )
+        assert all(result.valid.values())
+        assert result.quality["apple"]["mask_age_frames"] == age
+        assert result.quality["apple"]["dt_s"] == dt
+        assert result.quality["apple"]["source_frame_gap"] == gap
+    assert calls == [1] and scene.frame_index == 3
+    assert scene.segmenter.state["num_frames"] == 2
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_pose_jump_checks_use_real_dt_and_preserve_geometry(
+    recovery_scene, monkeypatch, bounded
+):
+    from dataclasses import replace
+    from cordvip_geometry import tracking
+
+    scene, frame, _, _, detections = recovery_scene
+    scene.config = replace(
+        scene.config, max_translation_speed_m_s=1.0 if bounded else None
+    )
+    frame = replace(frame, source_sequence=1, timestamp_ns=1_000_000_000)
+    scene.initialize(frame, scene.prompts)
+    previous = scene.trackers["apple"].estimator.pose_last
+    original = tracking.track_objects
+    renders = []
+    scene.renderers["apple"].render = lambda rays, pose: renders.append(1) or np.ones(
+        len(rays)
+    )
+
+    def jump(trackers, *args):
+        poses = original(trackers, *args)
+        poses["apple"][0, 3] = 1
+        trackers["apple"].estimator.pose_last = poses["apple"]
+        return poses
+
+    monkeypatch.setattr(tracking, "track_objects", jump)
+    result = scene.track(replace(frame, source_sequence=2, timestamp_ns=1_033_000_000))
+    assert result.valid == {"apple": not bounded, "banana": True}
+    assert result.quality["apple"]["depth_fraction"] == 1
+    assert result.quality["apple"]["translation_delta_m"] == 1
+    assert result.quality["apple"]["pose_dt_s"] == 0.033
+    assert renders == [1] and len(detections) == 2  # 两次初始化；跳变帧不检测。
+    if bounded:
+        assert scene.states["apple"] == "LOST"
+        assert scene.trackers["apple"].estimator.pose_last is previous
+
+
+def test_symmetry_aware_motion_uses_center_and_one_equivalent_pose():
+    from scipy.spatial.transform import Rotation
+    from cordvip_geometry.tracking import pose_motion
+
+    symmetry = np.eye(4)
+    symmetry[:3, :3] = Rotation.from_euler("z", np.pi).as_matrix()
+    tracker = SimpleNamespace(
+        estimator=SimpleNamespace(diameter=0.1),
+        object_from_center=np.eye(4),
+        symmetry_tfs=np.stack([np.eye(4), symmetry]),
+    )
+    config = TrackingConfig(max_translation_speed_m_s=0.1, max_rotation_speed_rad_s=0.1)
+    metrics, allowed = pose_motion(np.eye(4), symmetry, tracker, 0.01, config)
+    assert allowed and metrics["rotation_delta_rad"] == 0
+    tracker.symmetry_tfs[1, 0, 3] = 1
+    assert not pose_motion(np.eye(4), symmetry, tracker, 0.01, config)[1]
+    tracker.symmetry_tfs = np.eye(4)[None]
+    tracker.object_from_center[0, 3] = 2
+    center_from_object = np.linalg.inv(tracker.object_from_center)
+    metrics, allowed = pose_motion(
+        center_from_object,
+        symmetry @ center_from_object,
+        tracker,
+        0.1,
+        TrackingConfig(max_translation_speed_m_s=0.1),
+    )
+    assert allowed and metrics["translation_delta_m"] == 0
+
+
+@pytest.mark.parametrize(
+    "failure", ["none", "depth", "motion", "inference", "batch_retry"]
+)
+def test_pending_pose_is_temporary_and_confirmation_is_independent(
+    recovery_scene, monkeypatch, failure
+):
+    from dataclasses import replace
+    from cordvip_geometry import tracking
+
+    scene, frame, masks, _, detections = recovery_scene
+    scene.config = replace(scene.config, max_translation_speed_m_s=1.0)
+    frame = replace(frame, source_sequence=10, timestamp_ns=1_000_000_000)
+    scene.initialize(frame, scene.prompts)
+    detections.clear()
+    masks["apple"][:] = False
+    previous = scene.trackers["apple"].estimator.pose_last
+    scene.track(replace(frame, source_sequence=11, timestamp_ns=1_010_000_000))
+    pending_internal = front_pose()
+    pending_internal[0, 3] = 0.7
+    pending_public = front_pose()
+    pending_public[0, 3] = 0.2
+
+    def register(*args):
+        scene.trackers["apple"].estimator.pose_last = pending_internal
+        return pending_public
+
+    scene.trackers["apple"].register = register
+    pending = scene.track(
+        replace(frame, source_sequence=12, timestamp_ns=1_020_000_000)
+    )
+    assert pending.valid == {"apple": False, "banana": True}
+    assert "apple" not in pending.poses and "apple" in scene.pending_pose
+    assert scene.trackers["apple"].estimator.pose_last is previous
+    retry = scene.next_retry["apple"]
+    original = tracking.track_objects
+    seeds = []
+
+    def confirm(trackers, *args):
+        if failure == "batch_retry" and len(trackers) > 1:
+            for tracker in trackers.values():
+                tracker.estimator.pose_last = np.full((4, 4), 99.0)
+            raise RuntimeError("batch failed")
+        if "apple" in trackers:
+            seeds.append(trackers["apple"].estimator.pose_last)
+            if failure == "inference":
+                raise TrackingFailure("apple inference failed")
+        poses = original(trackers, *args)
+        if "apple" in trackers:
+            poses["apple"] = pending_public.copy()
+            poses["apple"][0, 3] += 1 if failure == "motion" else 0.005
+            trackers["apple"].estimator.pose_last = poses["apple"]
+        return poses
+
+    monkeypatch.setattr(tracking, "track_objects", confirm)
+    if failure == "depth":
+        scene.renderers["apple"].render = lambda rays, pose: np.full(len(rays), 2.0)
+    result = scene.track(replace(frame, source_sequence=13, timestamp_ns=1_030_000_000))
+    succeeds = failure in ("none", "batch_retry")
+    assert result.valid == {"apple": succeeds, "banana": True}
+    assert all(seed is pending_internal for seed in seeds)
+    assert not scene.pending_pose
+    assert len(detections) == 1 and scene.next_retry["apple"] == retry
+    if not succeeds:
+        assert scene.states["apple"] == "LOST" and "apple" not in result.poses
+        assert scene.trackers["apple"].estimator.pose_last is previous
+        scene.track(replace(frame, source_sequence=14, timestamp_ns=1_040_000_000))
+        assert len(detections) == 1  # 失败确认仍遵守原定第 5 处理帧重试时间。
+
+
+def test_recovery_mask_merge_rechecks_healthy_object_once(recovery_scene):
+    scene, frame, masks, _, _ = recovery_scene
+    masks["apple"][:] = False
+    scene.track(frame)
+    renders = []
+    for name in masks:
+        scene.renderers[name].render = lambda rays, pose, name=name: renders.append(
+            name
+        ) or np.ones(len(rays))
+
+    def merge(corrections):
+        masks.update(corrections)
+        masks["banana"][:] = False
+        return masks.copy()
+
+    scene.segmenter.correct_masks = merge
+    result = scene.track(frame)
+    assert result.valid == {"apple": False, "banana": False}
+    assert set(scene.pending_pose) == {"apple"} and scene.states["banana"] == "LOST"
+    assert sorted(renders) == ["apple", "banana"]
+
+
+@pytest.mark.parametrize(
+    "sequence,stamp,reason",
+    [
+        (np.uint64(9), 1_010_000_000, "new camera source sequence"),
+        (np.uint64(10), 1_010_000_000, "new camera source sequence"),
+        (np.uint64(11), 999_000_000, "moved backwards"),
+        (np.uint64(0), 1_010_000_000, "must be positive"),
+    ],
+)
+def test_scene_rejects_invalid_source_metadata(recovery_scene, sequence, stamp, reason):
+    from dataclasses import replace
+
+    scene, frame, _, _, _ = recovery_scene
+    frame = replace(frame, source_sequence=np.uint64(10), timestamp_ns=1_000_000_000)
+    scene.initialize(frame, scene.prompts)
+    with pytest.raises(ValueError, match=reason):
+        scene.track(replace(frame, source_sequence=sequence, timestamp_ns=stamp))
+
+
+def test_rgbd_frame_carries_source_metadata():
+    camera = FakeRawReader().read_camera()
+    row = dict(
+        rgb=np.zeros((2, 2, 3), np.uint8),
+        depth=np.full((2, 2), 1000, np.uint16),
+        timestamp_ns=np.uint64(1_000_000_000),
+    )
+    frame = RGBDFrame.from_camera(camera, row, source_sequence=11)
+    assert frame.timestamp_ns == 1_000_000_000 and frame.source_sequence == 11
+    assert frame.depth_m.dtype == np.float32 and np.all(frame.depth_m == 1)
+    assert RGBDFrame.from_camera(camera, row).source_sequence is None
+
+
+def test_multiple_moving_objects_share_one_batch_per_frame(recovery_scene, monkeypatch):
+    from dataclasses import replace
+    from scipy.spatial.transform import Rotation
+    from cordvip_geometry import tracking
+
+    scene, frame, _, _, _ = recovery_scene
+    scene.config = replace(
+        scene.config,
+        segmentation_interval_frames=2,
+        max_translation_speed_m_s=1,
+        max_rotation_speed_rad_s=5,
+    )
+    frame = replace(frame, source_sequence=1, timestamp_ns=1_000_000_000)
+    scene.initialize(frame, scene.prompts)
+    calls = []
+
+    def move(trackers, rgb, depth, K, cache):
+        calls.append(list(trackers))
+        poses = {}
+        for index, (name, tracker) in enumerate(trackers.items(), start=1):
+            pose = front_pose()
+            pose[0, 3] = index * scene.frame_index * 0.01
+            pose[:3, :3] = Rotation.from_euler(
+                "z", index * scene.frame_index * 0.1
+            ).as_matrix()
+            tracker.estimator.pose_last = pose
+            poses[name] = pose
+        return poses
+
+    monkeypatch.setattr(tracking, "track_objects", move)
+    for step in range(1, 4):
+        result = scene.track(
+            replace(
+                frame,
+                source_sequence=step + 1,
+                timestamp_ns=1_000_000_000 + step * 100_000_000,
+            )
+        )
+        assert all(result.valid.values()) and list(result.poses) == ["apple", "banana"]
+        assert result.poses["apple"][0, 3] == step * 0.01
+        assert result.poses["banana"][0, 3] == step * 0.02
+    assert calls == [["apple", "banana"]] * 3

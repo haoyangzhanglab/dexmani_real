@@ -57,7 +57,7 @@ def run_hoi_worker(shared, camera, task, template, *, tracking_config=None):
         last_sequence = sequence
         if int(data["timestamp_ns"]) <= int(command["after_ns"]):
             continue
-        frame = RGBDFrame.from_camera(camera, data)
+        frame = RGBDFrame.from_camera(camera, data, source_sequence=sequence)
         failure = None
         try:
             scene = (

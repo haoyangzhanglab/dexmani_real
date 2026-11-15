@@ -100,7 +100,11 @@ def track_episode(reader, tracker, names, prompts):
             quality.append(quality[-1])
             valid[index] = valid[index - 1]
             continue
-        frame = RGBDFrame.from_camera(camera, {"rgb": rgb, "depth": depth[index]})
+        frame = RGBDFrame.from_camera(
+            camera,
+            {"rgb": rgb, "depth": depth[index], "timestamp_ns": stamps[index]},
+            source_sequence=sequences[index],
+        )
         try:
             result = (
                 tracker.initialize(frame, prompts) if first else tracker.track(frame)

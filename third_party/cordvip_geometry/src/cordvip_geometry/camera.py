@@ -14,9 +14,11 @@ class RGBDFrame:
     K: np.ndarray
     distortion_model: str
     distortion_coeffs: tuple[float, float, float, float, float]
+    source_sequence: int | None = None
+    timestamp_ns: int | None = None
 
     @classmethod
-    def from_camera(cls, camera, camera_row):
+    def from_camera(cls, camera, camera_row, *, source_sequence=None):
         """复用 CameraSnapshot 标定，将运行时相机行转为米制帧。"""
         return cls(
             rgb=camera_row["rgb"],
@@ -26,6 +28,8 @@ class RGBDFrame:
             K=camera.color.matrix(),
             distortion_model=camera.color.distortion_model,
             distortion_coeffs=camera.color.distortion_coeffs,
+            source_sequence=source_sequence,
+            timestamp_ns=camera_row.get("timestamp_ns"),
         )
 
 

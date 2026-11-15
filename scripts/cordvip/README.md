@@ -33,15 +33,15 @@ python scripts/generate_hand_template.py --overwrite
 
 ## 离线标注
 
-`annotate_episodes.py` 默认处理任务下所有已发布 Raw，也可用 `--episode <目录>` 指定单段。标注需要任务模板及 Raw 中的相机外参，校验并跳过已有 HOI 的 Raw，完成逐帧标注后写入基座坐标系下的米制 float32 点云；相同相机序列复用位姿、质量和有效性。暂时丢失的帧标为无效，后续帧继续尝试恢复。
+`annotate_episodes.py` 默认处理任务下所有已发布 Raw，也可用 `--episode <目录>` 指定单段。标注需要任务模板及 Raw 中的相机外参，校验并跳过已有 HOI 的 Raw，完成逐帧标注后写入基座坐标系下的米制 float32 点云；相同相机序列复用位姿、质量和有效性。遮挡、丢失和两帧恢复确认期间标为无效，后续新观测继续跟踪或恢复；时间间隔与 Mask 年龄使用 Raw 中真实相机时间和来源序列。
 
 每个 `prompt` 须在去畸变后的首帧匹配唯一候选，缺失或歧义会使初始化失败，后续新帧重试。`instance` 仅用于参考图选择，不用于跟踪初始化。
 
-标注在 `/hoi` 中记录位姿、质量、有效性、模板和坐标变换，命令不会覆盖已有标注。已有标注缺少有效性字段或结构不符时直接报错。Python 调用 `annotate_episodes(..., tracking_config=...)` 可调整跟踪配置，参数见后端的[质量检查](../../third_party/cordvip_geometry/README.md#质量检查)和[遮挡恢复](../../third_party/cordvip_geometry/README.md#遮挡恢复)。
+标注在 `/hoi` 中记录位姿、质量、有效性、模板和坐标变换，命令不会覆盖已有标注。Python 调用 `annotate_episodes(..., tracking_config=...)` 可调整跟踪配置，参数见后端的[质量检查](../../third_party/cordvip_geometry/README.md#质量检查)和[遮挡恢复](../../third_party/cordvip_geometry/README.md#遮挡恢复)。
 
 ## 分割间隔
 
-离线标注通过 `--segmentation-interval-frames` 调整 SAM2 的最大处理帧间隔，默认 2；设为 1 时逐帧分割。在线 worker 的 `tracking_config` 参数接收相同配置。两者均仅对新的相机序列推进调度，深度质量不通过或对象恢复到期时提前刷新。具体规则见[事件触发分割](../../third_party/cordvip_geometry/README.md#事件触发分割)。
+离线标注通过 `--segmentation-interval-frames` 调整活动对象的 SAM2 最大处理帧间隔，默认 2；设为 1 时逐帧分割。在线 worker 的 `tracking_config` 参数接收相同配置。两者均仅对新的相机序列推进处理计数；来源序列的跳跃不补造 SAM2 图像。深度质量不通过、对象恢复到期或正在确认恢复时提前刷新；全部对象 LOST 时等待恢复到期。具体规则见[事件触发分割](../../third_party/cordvip_geometry/README.md#事件触发分割)。
 
 ## 导出与查看
 

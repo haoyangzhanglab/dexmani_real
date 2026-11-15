@@ -8,8 +8,6 @@ import numpy as np
 
 from .mesh import simplify_mesh
 
-MIN_DEPTH_PIXELS = 4
-
 
 class TrackingFailure(RuntimeError):
     """当前观测无法通过跟踪或注册，允许后续帧重试。"""
@@ -78,6 +76,11 @@ class FoundationPoseTracker:
             scorer=shared_with.estimator.scorer if shared_with is not None else None,
             refiner=shared_with.estimator.refiner if shared_with is not None else None,
         )
+        # 连续性检查在 CPU 上执行；静态几何只复制一次。
+        self.object_from_center = np.linalg.inv(
+            self.estimator.tf_to_centered_mesh.detach().cpu().numpy()
+        )
+        self.symmetry_tfs = self.estimator.symmetry_tfs.detach().cpu().numpy()
 
     def register(self, rgb, depth_m, intrinsics, mask):
         import torch
@@ -115,12 +118,6 @@ def track_objects(trackers, rgb, depth_m, intrinsics, frame_cache):
     poses = torch.cat(
         [estimator.pose_last.reshape(1, 4, 4) for estimator in estimators]
     )
-    invalid = (poses[:, 2, 3] <= 0).cpu().numpy()
-    if invalid.any():
-        name = names[np.flatnonzero(invalid)[0]]
-        raise TrackingFailure(
-            f"{name}: Previous centered pose must be in front of the camera"
-        )
     with torch.inference_mode():
         rgb_tensor, xyz_map = prepare_tracking_frame(
             rgb, depth_m, intrinsics, refiner.cfg.input_resize, frame_cache

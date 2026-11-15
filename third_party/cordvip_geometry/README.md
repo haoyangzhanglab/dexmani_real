@@ -47,7 +47,7 @@ tracker = SceneTracker(
     {"apple": "assets/pointcloud_template/object/pnp_apple_banana/apple/mesh/mesh_m.obj"},
     workspace=".",
 )
-frame = RGBDFrame.from_camera(camera, camera_row)
+frame = RGBDFrame.from_camera(camera, camera_row, source_sequence=sequence)
 result = tracker.initialize(frame, {"apple": "apple"})
 result = tracker.track(next_frame)
 if result.valid["apple"]:
@@ -66,7 +66,7 @@ if result.valid["apple"]:
 - 每段调用 `initialize()`，复用模型并重置位姿、视频状态及场景缓存。
 - 同一段内相机参数和图像尺寸须保持固定。
 - 初始化失败抛出 `TrackingFailure`，后续新帧重试初始化；全部对象注册成功后才进入正常跟踪。
-- 跟踪期逐对象返回有效性。单对象推理的运行时失败和质量不通过进入 LOST；输入、接口及程序错误直接报错。共享 SAM2 视频推理或校正失败可能留下部分状态，不作为可恢复遮挡吞掉，调用方停止使用该实例。
+- 跟踪期逐对象返回有效性。观测不足进入 OCCLUDED，充分几何矛盾、非法位姿或单对象推理运行时失败进入 LOST；输入、接口及程序错误直接报错。共享 SAM2 视频推理或校正失败可能留下部分状态，不作为可恢复遮挡吞掉，调用方停止使用该实例。
 
 `SAM2Segmenter` 提供单图和视频接口：
 
@@ -83,74 +83,85 @@ if result.valid["apple"]:
 
 ## 质量检查
 
-`TrackingConfig` 集中定义质量阈值，通过 `SceneTracker(..., config=...)` 传入：
+`SceneTracker(..., config=TrackingConfig(...))` 配置质量阈值：
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `segmentation_interval_frames` | 2 | SAM2 最大处理帧间隔；严格正整数，1 为逐帧基线 |
-| `depth_tolerance_m` | 0.015 m | 实测与模型深度的匹配容差 |
-| `min_depth_pixels` | 30 | stride=2 网格上的最少匹配深度像素 |
-| `min_depth_fraction` | 0.5 | 对应检查区域内的最低深度匹配比例 |
-| `min_depth_coverage` | 0.5 | 纯深度路径的最低有效深度覆盖率，有限实数且在 (0, 1] 内 |
-| `min_precision`、`min_recall` | 0.5 | 可见轮廓的最低 precision、recall |
+| `depth_tolerance_m` | 0.015 m | 实测与 CAD 深度的匹配容差 |
+| `min_depth_pixels` | 30 | stride=2 网格上的最少匹配点数和支持点数 |
+| `min_depth_fraction` | 0.5 | 最低深度匹配比例 |
+| `min_depth_coverage` | 0.5 | 检查区域的最低有效深度覆盖率 |
+| `min_precision`、`min_recall` | 0.5 | 可见轮廓的最低一致性 |
 
-每个合法候选位姿渲染一次完整模型投影。有当前 mask 时，使用遮挡感知的轮廓与深度检查：只有 mask 外的有效实测深度比模型近且超过容差，才计为前景遮挡；缺失深度不作为遮挡证据。无当前 mask 时，仅使用深度几何门控。
+TRACKING 和 OCCLUDED 对象先合批执行 FoundationPose，再验证候选。注册需要 Mask 深度生成平移初值；正常 Track 不以 Mask 深度预检。
 
-渲染前检查候选位姿：矩阵须为有限 `[4,4]`，齐次末行绝对误差不超过 `1e-6`，旋转的 `R.T @ R` 与单位阵误差、`det(R)` 与 1 的误差均不超过 `1e-3`。容限允许 float32 迭代误差，非法候选进入 LOST 并回滚。
+每个候选的 SE(3)、运动连续性和 CAD 渲染只计算一次。Mask 更新或校正后，复用 CAD 深度重算当前可见证据。有 Mask 时使用 `pose_quality()`：仅 Mask 外更近、超出容差的有效深度支持前景遮挡，缺失深度不算遮挡。无 Mask 时使用 `pose_depth_quality()`，双向深度残差均计为不匹配。
 
-纯深度检查以有效 CAD 投影与有效传感器深度的交集为 support，统计绝对残差不超过 `depth_tolerance_m` 的匹配点数：
+两个质量函数均返回 `(metrics, verdict)`：
 
-| 指标 | 计算方式 | 接受条件 |
-| --- | --- | --- |
-| `depth_pixels` | `matched_count` | ≥ `min_depth_pixels` |
-| `depth_coverage` | `support_count / max(1, projected_count)` | ≥ `min_depth_coverage` |
-| `depth_fraction` | `matched_count / max(1, support_count)` | ≥ `min_depth_fraction` |
+| `verdict` | 判据 |
+| --- | --- |
+| VALID | 匹配点数、比例、覆盖率和可见轮廓均通过 |
+| OCCLUDED | 证据不足，且没有充分支持的几何矛盾 |
+| LOST | 有充分支持的深度或轮廓矛盾 |
 
-三项条件必须同时满足：覆盖率衡量 CAD 投影中的有效深度比例，匹配比例衡量这些深度与位姿的一致性。没有有效投影或深度支持时拒绝；无当前 mask 时，不推断遮挡。
+有 Mask 时，分别检查 Mask 和去除前景遮挡后的 CAD 可见区域。相应区域达到最少支持点数及覆盖率，才能将不匹配判为 LOST；VALID 要求两个区域的支持均充分。纯深度路径先检查支持点数和覆盖率，再判断深度匹配比例。
 
-有 mask 的 `pose_quality()` 输出同定义的 `depth_coverage`，仅用于诊断；其 `depth_fraction` 仍以 mask 内有效深度为分母，原有接受条件与遮挡算法不变。
+FoundationPose 输出须为有限 `[4,4]` 位姿，齐次末行容差为 `1e-6`，SO(3) 容差为 `1e-3`，且居中网格位于相机前方；渲染前逐对象拒绝非法候选并回滚。此检查使用网格中心，允许 CAD 原点偏离物体。
 
-阈值需用实际 RGB-D 回放验证。当前 mask 深度不足或完整质量检查失败仅将对应对象置为 LOST；相机参数变化属于输入错误，直接报错。
+主要指标：
+
+| 字段 | 含义 |
+| --- | --- |
+| `depth_pixels`、`depth_fraction` | 匹配点数及比例；Mask 路径以 Mask 内有效深度数为分母 |
+| `depth_support_pixels`、`depth_coverage` | 检查区域的支持点数，以及 CAD 总投影中的有效深度比例 |
+| `mask_depth_coverage`、`visible_depth_coverage` | Mask 和去遮挡后 CAD 可见区域的有效深度覆盖率 |
+| `precision`、`recall`、`iou` | 可见轮廓一致性 |
+| `supported_precision`、`supported_recall` | 有效深度支持下的可见轮廓一致性 |
+| `occluded_fraction` | 有深度证据支持的前景遮挡比例 |
+| `mask_source`、`mask_age_frames` | 是否使用当前 Mask，以及距最近 SAM2 输入的来源序列差 |
+| `dt_s`、`source_frame_gap` | 相邻处理观测的真实时间与来源序列间隔 |
+| `translation_delta_m`、`rotation_delta_rad`、`pose_dt_s` | 相对参考位姿的平移、旋转和时间间隔 |
+
+有效对象的质量指标均为有限数值。纯深度路径未计算的 Mask 指标为 −1；注册没有运动参考，运动指标为 0。
 
 ## 事件触发分割
 
-健康对象每个处理帧执行 FoundationPose 和 CAD/RGB-D 验证。SAM2 首帧初始化，随后在以下情况刷新：
+SAM2 在初始化、周期到期、候选深度质量不通过、恢复注册或恢复确认时共享刷新，同帧图像只追加一次。`segmentation_interval_frames=2` 表示活动对象每两个处理帧刷新，设为 1 时逐帧分割。全部对象 LOST 时，等待恢复到期再刷新。DINO 仅用于初始化和到期 LOST 对象的重新检测。
 
-- 距上次实际推理达到 `segmentation_interval_frames`。
-- 启用恢复且 LOST 对象到达重试时间。
-- 任一中间帧候选未通过深度门控，包括有效深度全部匹配但覆盖率不足。
+`RGBDFrame.from_camera(camera, row, source_sequence=...)` 的时间取自行内 `timestamp_ns`，来源序列通过参数传入。在线、离线分别使用 Camera Ring 和 Raw timing 中的元数据。三种计数各自负责：
 
-调度使用相机处理帧号 `frame_index`，每次刷新更新 `last_sam_frame`；重复相机序列不推进计数。SAM2 内部帧号仅在追加视频帧时递增，校正和历史裁剪使用内部帧号。`memory_temporal_stride_for_eval` 仅控制 SAM2 记忆。
+- `frame_index`：实际处理次数，用于分割和恢复调度。
+- `source_sequence`：Camera Ring 序列，用于相机帧间隔和 Mask 年龄；不是 RealSense 硬件帧号。
+- SAM2 内部视频索引：仅随实际输入图像递增，校正不增加索引。
 
-任一候选深度门控失败，本帧立即执行一次共享 SAM2，并用当前 mask 对全部候选执行原有深度与完整质量检查。位姿无需重复 refinement，同一候选 CAD 深度复用于这些检查以及恢复 mask 合并后的检查；最终失败对象才进入 LOST。FoundationPose 非法位姿和推理异常保留原有隔离及回滚。
-
-共享 SAM2 刷新或校正抛出 RuntimeError 时，先回滚本帧位姿再向外报错；调用方停止使用该实例。
-
-| 质量字段 | 含义 |
-| --- | --- |
-| `mask_source` | 1：当前 SAM2 mask 完整检查；0：纯深度检查 |
-| `mask_age_frames` | 距最近 SAM2 推理的处理帧数；刷新帧为 0 |
-
-纯深度路径的 `mask_pixels`、`visible_pixels`、`precision`、`recall`、`iou`、`occluded_fraction` 统一为未计算占位值 −1；深度指标为实际测量。有效对象的全部质量字段必须有限。
+调用方跳过重复来源序列，跳帧不补造图像。SceneTracker 要求新序列递增、时间不倒退。直接调用省略元数据时，使用处理计数和单调时钟；离线调用应传入记录时间，以正确计算遮挡超时和运动变化。
 
 ## 遮挡恢复
 
-失败对象恢复最后接受的内部 `pose_last`，进入 `LOST`；历史位姿不作为当前观测发布。批量推理发生运行时异常时先回滚，再逐对象调用以隔离失败；非法候选直接逐对象拒绝，不触发整批重算。
+| 状态 | 行为 |
+| --- | --- |
+| TRACKING | 当前候选通过验证后输出有效位姿 |
+| OCCLUDED | 保留最后可靠内部位姿，继续 Track；当前 `valid=False` |
+| LOST | 停止正常 refinement，按间隔检测并注册；当前 `valid=False` |
 
-`LOST` 对象不再执行正常 refinement。到期帧先刷新 SAM2 视频状态，再由到期对象共享一次 Grounding DINO 检测，按规范化 prompt 唯一匹配候选，随后重新分割并调用现有 `register()`。缺失、歧义或几何校验失败时继续保持 LOST；恢复使用与正常跟踪相同的质量阈值。
+`occlusion_timeout_s=0.5` 从首次证据不足的观测计时。等待期间证据恢复可直接返回 TRACKING；明确矛盾或遮挡超时进入 LOST，从下一处理帧开始恢复。
 
-| `TrackingConfig` 参数 | 默认值 | 含义 |
-| --- | --- | --- |
-| `recovery_enabled` | `True` | 是否尝试恢复 LOST 对象。 |
-| `recovery_retry_interval_frames` | `15` | 恢复失败后的重试间隔，按处理帧计数。 |
-| `recovery_box_threshold` | `0.3` | 恢复检测框阈值。 |
-| `recovery_text_threshold` | `0.25` | 恢复检测文本阈值。 |
+| 恢复参数 | 默认值 |
+| --- | --- |
+| `recovery_enabled` | `True` |
+| `recovery_retry_interval_frames` | `15` 个处理帧 |
+| `recovery_box_threshold`、`recovery_text_threshold` | `0.3`、`0.25` |
 
-首次恢复在丢失后的下一处理帧尝试。在线 worker 和离线标注负责跳过重复相机序列，可通过 `tracking_config` 参数传入相同配置。
+到期对象共享 DINO 检测，按规范化 Prompt 唯一匹配，经 SAM2 分割、FoundationPose 注册和质量检查后，用原 ID 的 `correct_masks()` 校正。合并 Mask 后复查全部当前候选，健康对象独立保留。
 
-通过注册校验的 mask 使用 SAM2 已有 ID 的当前帧 `add_new_mask()` 校正，不重置健康对象。合并后重新校验各对象，全部检查完成后才提交各对象的 TRACKING/LOST 状态；候选在合并后被拒绝时保留原定重试间隔。过期提示输入、输出和合并索引共同裁剪，保留首帧 conditioning。
+恢复需要两帧确认。首次通过后保存 Pending 位姿，保持 LOST；下一处理帧以 Pending 为临时初值，与健康对象合批 Track，再次通过后才提交 TRACKING。Pending 失败则清理并保留原重试间隔。所有不可信候选均回滚到最后可靠内部位姿，历史位姿和 Pending 不作为当前有效观测发布。
 
-在线发布、离线有效性和训练数据过滤契约见[主项目说明](../../docs/object_reconstruction.md#标注导出与回放)。
+连续性检查在居中网格坐标中计算平移及 SO(3) 测地距离，复用 FoundationPose 声明的对称变换。`max_translation_speed_m_s`、`max_rotation_speed_rad_s` 默认 `None`，只记录变化量；配置实测上限后才启用硬门控，余量由深度容差和物体直径换算。同一个对称等价位姿须同时满足两种限制。遮挡时参考最后可靠位姿，恢复确认时参考 Pending，均使用对应的真实时间间隔。
+
+多物体合批 refinement 运行时失败后才逐对象隔离；只有一个活动对象时直接拒绝并回滚，避免同帧重复推理。共享 SAM2 刷新或校正失败时，先回滚全部内部位姿再抛出，调用方停止使用该实例。
+
+在线发布、离线存储和训练过滤见[主项目说明](../../docs/object_reconstruction.md#标注导出与回放)。
 
 ## 推理实现
 
