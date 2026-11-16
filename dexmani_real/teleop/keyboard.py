@@ -145,7 +145,8 @@ class KeyboardTeleop:
 
     def run_home(self, expected_cancel_epoch):
         with self.runtime_state.motion_lock:
-            if not (self.runtime_state.cancel_epoch == expected_cancel_epoch and self.runtime_state.requests_allow_motion()):
+            if (self.runtime_state.cancel_epoch != expected_cancel_epoch
+                    or not self.runtime_state.requests_allow_motion()):
                 logger.info("Ignored revoked HOME intent")
                 return
             self.runtime_state.stop_signal.set()
@@ -166,17 +167,16 @@ class KeyboardTeleop:
         except HomeConfigurationError as exc:
             self.robot.check()
             logger.warning("本次 HOME 未完成：%s", exc)
-            return False
         except HomePathRejected as exc:
             self.robot.check()
             logger.warning(
                 "自动 HOME 路径不可行：%s。未执行 HOME 轨迹；可使用 Jog 手动调整姿态后再次按 R。",
                 exc,
             )
-            if (self.runtime_state.cancel_epoch != cancel_epoch
-                    or not self.runtime_state.requests_allow_motion()):
-                return False
         else:
             logger.info("HOME completed")
+        if (self.runtime_state.cancel_epoch != cancel_epoch
+                or not self.runtime_state.requests_allow_motion()):
+            return False
         self.prepare_jog(cancel_epoch)
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
