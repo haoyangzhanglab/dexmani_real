@@ -5,8 +5,6 @@ import logging
 import sys
 import time
 from collections.abc import Sequence
-from enum import Enum
-from typing import cast
 
 from dexmani_real.control.actions import StartPoseRejected
 from dexmani_real.control.ik import IKReferenceError
@@ -42,12 +40,6 @@ from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
 logger = logging.getLogger(__name__)
 
 
-class TeleopPhase(Enum):
-    IDLE = "idle"
-    PREPARING = "preparing"
-    ACTIVE = "active"
-
-
 class TeleopLoop:
     def __init__(
         self,
@@ -78,8 +70,7 @@ class TeleopLoop:
         self.keyboard = keyboard
         self.audio = audio
 
-        self.phase = TeleopPhase.IDLE
-        self.cancel_epoch = None
+        self.cancel_epoch = None  # None 表示段外；准备和控制按调用顺序执行。
         self.next_tick_ns = None
         self.control_dt_ns = sampling_clock_ns(runtime.teleop.control_hz)
 
@@ -133,7 +124,6 @@ class TeleopLoop:
             self.request_episode_end("recording_failed", run_end_reason=RunEndReason.FAILED)
             raise
         finally:
-            self.phase = TeleopPhase.IDLE
             self.cancel_epoch = None
         if failure is not None and primary_failure is None:
             raise failure
@@ -242,7 +232,7 @@ class TeleopLoop:
                 return None
             time.sleep(0.005)
 
-    def start_episode(self, expected_cancel_epoch):
+    def start_episode(self, expected_cancel_epoch) -> bool:
         if self.recorder is not None:
             raise RuntimeError("previous capture still owns resources")
         with self.runtime_state.motion_lock:
@@ -251,24 +241,23 @@ class TeleopLoop:
                 expected_cancel_epoch != self.runtime_state.cancel_epoch
                 or not self.runtime_state.requests_allow_motion()
             ):
-                return
+                return False
             self.runtime_state.stop_signal.set()
             self.cancel_epoch = self.runtime_state.cancel_epoch
             self.discard_requested = False
-            self.phase = TeleopPhase.PREPARING
         logger.info("Teleop preparing")
         self.pending_termination_reason = None
         self.termination_details = []
         try:
             if self.preparation_interrupted():
-                return
+                return False
 
             self.robot.stop()
             if self.preparation_interrupted():
-                return
+                return False
             # 全模态初值先于 writer；等待与资源初始化期间设备保持停止。
             if self.start_observation() is None or self.preparation_interrupted():
-                return
+                return False
             if self.recording_dir is not None:
                 metadata = snapshot_recording_metadata(
                     self.camera_snapshot,
@@ -291,13 +280,33 @@ class TeleopLoop:
                 )
             # writer 可能阻塞超过反馈 TTL，准备运动前重新等候新反馈。
             if self.recorder is not None and self.start_observation(after_ns=time.monotonic_ns()) is None:
-                return
+                return False
             if self.preparation_interrupted():
-                return
+                return False
             self.robot.prepare_streaming(self.cancel_epoch, poll_operator=self.poll_blocking_commands)
             if self.start_observation() is None:
-                return
-            self.try_begin()
+                return False
+            if self.preparation_interrupted():
+                return False
+            with self.runtime_state.motion_lock:
+                started_ns = (
+                    time.monotonic_ns()
+                    if self.preparation_valid() and not self.runtime_state.stop_signal.is_set()
+                    else None
+                )
+            if started_ns is None:
+                if not self.preparation_interrupted():
+                    self.request_episode_end("begin_unavailable")
+                return False
+            self.last_command = None
+            self.target_deadline_ns = None
+            self.hold_reason = None
+            self.episode_deadline_ns = (
+                started_ns + int(self.max_duration_s * 1e9) if self.recording_dir is not None else None
+            )
+            self.next_tick_ns = None
+            logger.info("Teleop active")
+            return True
         except FeedbackUnavailable as exc:
             if not self.preparation_interrupted():
                 self.request_episode_end(str(exc))
@@ -309,6 +318,7 @@ class TeleopLoop:
             self.poll_blocking_commands()
             if self.pending_termination_reason is None:
                 self.request_episode_end("preparation_cancelled")
+        return False
 
     def handle_operator_command(self, cmd: str):
         expected_cancel_epoch = None
@@ -316,11 +326,11 @@ class TeleopLoop:
             expected_cancel_epoch = self.keyboard.accept_operation(self.runtime_state)
             if expected_cancel_epoch is None:
                 return False
-        logger.debug("Teleop key=%s phase=%s", cmd.upper(), self.phase.value)
+        logger.debug("Teleop key=%s", cmd.upper())
         if cmd == "esc":
             self.runtime_state.request_emergency_stop()
             self.audio.play("emergency")
-            if self.phase is not TeleopPhase.IDLE:
+            if self.cancel_epoch is not None:
                 self.request_episode_end("estop", run_end_reason=RunEndReason.ESTOP)
             return True
         if self.runtime_state.estop_request:
@@ -328,13 +338,13 @@ class TeleopLoop:
 
         if cmd == "q":
             self.audio.play("quit")
-            if self.phase is not TeleopPhase.IDLE:
+            if self.cancel_epoch is not None:
                 self.request_episode_end("quit", run_end_reason=RunEndReason.QUIT)
             return True
         if self.runtime_state.quit_requested:
             return True
         if cmd in ("s", "c", "d"):
-            if self.phase is not TeleopPhase.IDLE:
+            if self.cancel_epoch is not None:
                 self.request_episode_end(
                     "discard" if cmd == "d" else "stop", run_end_reason=RunEndReason.OPERATOR,
                 )
@@ -343,7 +353,7 @@ class TeleopLoop:
         elif cmd == "h":
             return self._run_home(expected_cancel_epoch)
         elif cmd == "b":
-            if (self.phase is TeleopPhase.IDLE
+            if (self.cancel_epoch is None
                     and self.runtime_state.cancel_epoch == expected_cancel_epoch
                     and self.runtime_state.requests_allow_motion()):
                 self.run_episode(expected_cancel_epoch)
@@ -356,7 +366,7 @@ class TeleopLoop:
             logger.info("T ignored: hand is disabled")
             return False
         if (
-            self.phase is not TeleopPhase.IDLE or self.recorder is not None
+            self.cancel_epoch is not None or self.recorder is not None
             or self.runtime_state.cancel_epoch != expected_cancel_epoch
             or not self.runtime_state.requests_allow_motion()
         ):
@@ -375,7 +385,7 @@ class TeleopLoop:
 
     def _run_home(self, expected_cancel_epoch):
         with self.runtime_state.motion_lock:
-            if self.phase is not TeleopPhase.IDLE or self.recorder is not None:
+            if self.cancel_epoch is not None or self.recorder is not None:
                 logger.warning("H ignored: 请先按 S 结束本段，再回初始位。")
                 return True
             if (self.runtime_state.cancel_epoch != expected_cancel_epoch
@@ -422,7 +432,7 @@ class TeleopLoop:
                 and self.recorder.finish_request is not None):
             # 首次收尾请求已固定处置意图；此时只处理退出与急停。
             commands = tuple(event for event in commands if event in ("q", "esc"))
-        if "d" in commands and self.phase is not TeleopPhase.IDLE:
+        if "d" in commands and self.cancel_epoch is not None:
             self.discard_requested = True
         # 回调已置停止信号；先登记 D 意图，再按原优先级选择结束原因。
         for terminal in ("esc", "q", "d", "s", "c"):
@@ -433,33 +443,8 @@ class TeleopLoop:
             if self.handle_operator_command(event):
                 break
 
-    def try_begin(self):
-        if self.preparation_interrupted():
-            return
-        with self.runtime_state.motion_lock:
-            started_ns = (
-                time.monotonic_ns()
-                if self.runtime_state.cancel_epoch == self.cancel_epoch
-                and self.runtime_state.requests_allow_motion()
-                and not self.runtime_state.stop_signal.is_set()
-                else None
-            )
-        if started_ns is None:
-            if not self.preparation_interrupted():
-                self.request_episode_end("begin_unavailable")
-            return
-        self.phase = TeleopPhase.ACTIVE
-        self.last_command = None
-        self.target_deadline_ns = None
-        self.hold_reason = None
-        logger.info("Teleop active")
-        self.episode_deadline_ns = (
-            started_ns + int(self.max_duration_s * 1e9) if self.recording_dir is not None else None
-        )
-        self.next_tick_ns = None
-
     def execute_control_step(self, row):
-        cancel_epoch = cast(int, self.cancel_epoch)
+        cancel_epoch = self.cancel_epoch
         command = None
         compute_start_ns = time.monotonic_ns()
         first_target = self.last_command is None
@@ -583,14 +568,14 @@ class TeleopLoop:
             return False
         if self.recorder is not None:
             self.recorder.check_error()
-        if self.phase is TeleopPhase.ACTIVE and self.next_tick_ns is not None:
+        if self.next_tick_ns is not None:
             timeout = min(timeout, max(0.0, (self.next_tick_ns - time.monotonic_ns()) / 1e9))
         events, stopped = self.keyboard.poll(timeout=timeout, state=self.runtime_state)
         self.handle_commands(events)
         if self.pending_termination_reason is None:
             if self.runtime_state.cancel_epoch != self.cancel_epoch:
                 self.request_episode_end("operator_cancelled")
-            elif stopped and self.phase is TeleopPhase.ACTIVE:
+            elif stopped:
                 self.handle_executor_stop()
 
         return (
@@ -601,10 +586,9 @@ class TeleopLoop:
     def run_episode(self, expected_cancel_epoch):
         """顺序准备、控制、停止与录制收尾；每次 B 都创建独立新段。"""
         try:
-            self.start_episode(expected_cancel_epoch)
-            while self.phase is not TeleopPhase.IDLE:
-                if not self.service_episode(0.005):
-                    break
+            if not self.start_episode(expected_cancel_epoch):
+                return
+            while self.service_episode(0.005):
                 self.run_control_tick()
         except RecordingError:
             self.request_episode_end("recording_failed", run_end_reason=RunEndReason.FAILED)
@@ -616,7 +600,7 @@ class TeleopLoop:
             self.request_episode_end("episode_failed", run_end_reason=RunEndReason.FAILED)
             raise
         finally:
-            if self.phase is not TeleopPhase.IDLE:
+            if self.cancel_epoch is not None:
                 if self.pending_termination_reason is None:
                     self.request_episode_end(
                         "interrupted",

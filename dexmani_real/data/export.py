@@ -129,20 +129,6 @@ def canonical_array_specs(fields, processing, camera):
             for name in fields}
 
 
-def validate_export_episode(reader: RawReader, fields):
-    """校验所选输入、相机和控制时间；HOI 插值单独按连续区间处理。"""
-    frames = reader.num_frames
-    if frames <= 0:
-        raise ValueError("episode contains no rows")
-    inputs = {name for field in fields for name in FIELD_INPUTS[field]}
-    reader.require_fields(*inputs)
-    for name in inputs - {"rgb"}:
-        reader[name]
-    camera = export_camera(reader, fields)
-    reader.read_timing()
-    return camera
-
-
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
     """枚举所有 episode 目录，损坏文件由读取边界直接报错。"""
     requested_path = Path(input_root).expanduser()
@@ -193,6 +179,11 @@ def iter_canonical_blocks(
         )
     # 视频容器归 RawReader 所有，退出 reader 上下文时统一关闭。
     images = reader.iter_rgb_frames() if "rgb" in inputs else None
+    # 对齐结果是关节观测的唯一来源，不再读取随后会被丢弃的原始关节块。
+    sources = {
+        name: alignment[name] if alignment is not None and name in alignment else reader[name]
+        for name in inputs - {"rgb"}
+    }
     for start in range(0, frames, chunk_frames):
         end = min(frames, start + chunk_frames)
         if alignment is None:
@@ -200,12 +191,11 @@ def iter_canonical_blocks(
             count = end - start
         else:
             selected = alignment["keep"][start:end]
-            count = int(alignment["keep"][start:end].sum())
-        raw = {name: reader[name][start:end][selected] for name in inputs - {"rgb"}}
-        if alignment is not None:
-            for name in ("arm_qpos", "hand_qpos"):
-                if name in raw:
-                    raw[name] = alignment[name][start:end][selected]
+            count = int(selected.sum())
+        raw = (
+            {name: source[start:end][selected] for name, source in sources.items()}
+            if count else {}
+        )
         block = {}
         if images is not None:
             height, width = camera["shape"]
@@ -302,6 +292,7 @@ def export_zarr(
     staging = None
     store = None
     ends: list[int] = []
+    hoi_records = []
     try:
         for index, episode in enumerate(selected):
             if progress_callback:
@@ -311,9 +302,10 @@ def export_zarr(
                 require_published_raw(episode)
                 with RawReader(episode) as reader:
                     task_name = reader.meta["task_label"]
-                    camera = validate_export_episode(reader, fields)
-                    starts = reader.segment_starts
                     frames = reader.num_frames
+                    if frames <= 0:
+                        raise ValueError("episode contains no rows")
+                    camera = export_camera(reader, fields)
                     alignment = (
                         align_hoi_episode(
                             reader, processing.hoi_max_joint_gap_s, devices=joint_devices
@@ -326,6 +318,9 @@ def export_zarr(
                         frames = int(alignment["keep"].sum())
                         if frames == 0:
                             raise ValueError("No valid HOI rows to export")
+                    else:
+                        reader.read_timing()
+                        starts = reader.segment_starts
                     logger.info(
                         "%s: exporting %d rows in %d segments",
                         episode.name, frames, len(starts),
@@ -383,15 +378,13 @@ def export_zarr(
                         alignment=alignment,
                     )
                     if alignment is not None:
-                        records = list(root.attrs.get("hoi_alignment", []))
-                        records.append(
+                        hoi_records.append(
                             {
                                 "episode": episode.name,
                                 "kept_ranges": alignment["ranges"],
                                 "max_gap_s": processing.hoi_max_joint_gap_s,
                             }
                         )
-                        root.attrs["hoi_alignment"] = records
                     if "object_pointcloud" in fields:
                         saved = reader.data_file["hoi/template"]
                         template = {
@@ -411,6 +404,8 @@ def export_zarr(
                     ends.append(offset + frames)
             except (KeyError, ValueError) as exc:
                 raise ValueError(f"Raw {episode}: {exc}") from exc
+        if hoi_records:
+            root.attrs["hoi_alignment"] = hoi_records
         root.create_group("meta").create_dataset(
             "episode_ends", data=np.asarray(ends, dtype=np.int64)
         )

@@ -257,12 +257,12 @@ def test_hold_clears_context_and_refreshes_measured_hand(env):
     rollout.history.append({"old": np.ones(1)})
     rollout.plan, rollout.query = ActionChunk(np.ones((8, 19)), 0), Prediction(0, None)
     rollout.cursor, rollout.prev_action, rollout.ik_reference = 3, np.ones(19), object()
-    rollout.first_prediction, rollout.has_submitted = False, True
+    rollout.first_prediction = False
     enter_hold(env)
     assert not rollout.history
     assert rollout.plan is rollout.query is None
     assert rollout.prev_action is rollout.ik_reference is None
-    assert rollout.cursor == 0 and rollout.first_prediction and not rollout.has_submitted
+    assert rollout.cursor == 0 and rollout.first_prediction
     assert not env.state.stop_signal.is_set() and env.robot.stops == 0
     assert env.channels.hoi_request.data["episode_id"] == 7
     env.advance(0.99, False)
@@ -311,7 +311,7 @@ def test_complete_recovery_and_exact_action_boundary(env, mode, record_raw):
     env.advance()
     env.rollout.step()
     assert env.rollout.state == "RUNNING" and env.rollout.hoi_recovery_started_ns is None
-    assert env.rollout.has_submitted and not env.robot.sent[-1][1].arm_hold
+    assert not env.robot.sent[-1][1].arm_hold
     if record_raw:
         assert len(env.recorder.rows) == 1 and env.recorder.rows[0][1] is not None
         assert env.recorder.gaps == 1
@@ -488,7 +488,7 @@ def test_failed_resumed_submission_records_attempt_without_running(env, arm_publ
         env.rollout.step()
     assert caught.value is error
     assert env.rollout.state == "RESUMING"
-    assert not env.rollout.has_submitted and env.rollout.cursor == 0
+    assert env.rollout.cursor == 0
     assert env.rollout.prev_action is None
     if arm_published:
         assert len(published_arm) == 1
@@ -561,7 +561,7 @@ def test_recovery_before_submission_does_not_record(env, failure):
         with pytest.raises(error):
             env.rollout.step()
     assert env.rollout.state == "RESUMING"
-    assert not env.rollout.has_submitted and env.rollout.cursor == 0
+    assert env.rollout.cursor == 0
     assert all(cmd.arm_hold for _, cmd, _ in env.robot.sent)
     assert not env.recorder.rows
 
@@ -635,7 +635,7 @@ def test_slow_submission_does_not_extend_recovery(env, record_raw):
     assert env.rollout.result.termination_details == "hoi_recovery_timeout"
     assert env.rollout.result.termination_reason == "cancelled"
     assert env.rollout.state == "RESUMING"
-    assert not env.rollout.has_submitted and env.rollout.cursor == 0
+    assert env.rollout.cursor == 0
     assert env.rollout.prev_action is None
     assert env.robot.stops == 1 and env.state.stop_signal.is_set()
     assert env.channels.hoi_request.data["episode_id"] == 0
@@ -654,7 +654,7 @@ def test_run_recovers_without_restarting_lifecycle(env):
         nonlocal calls
         calls += 1
         assert calls < 10
-        if env.rollout.has_submitted:
+        if any(not command.arm_hold for _, command, _ in env.robot.sent):
             assert env.rollout.state == "RUNNING"
             assert env.channels.hoi_request.data["episode_id"] == 7
             assert not env.state.stop_signal.is_set() and env.robot.stops == 0
@@ -751,3 +751,67 @@ def test_eef_resume_uses_measured_reference(env):
     assert period == env.rollout.execution.control_dt_s
     assert env.rollout.state == "RUNNING"
     np.testing.assert_array_equal(env.rollout.ik_reference.anchor, measured)
+
+
+@pytest.mark.parametrize("failure", ["none", "ordinary", "interrupt", "exit", "timeout"])
+def test_session_shutdown_keeps_order_and_error_precedence(env, monkeypatch, failure):
+    from dexmani_real.deployment import session as session_module
+    from dexmani_real.deployment.inference import ModelShutdownTimeout
+    from dexmani_real.deployment.session import PolicySession
+
+    session = PolicySession.__new__(PolicySession)
+    session.runtime_state = env.state
+    session.robot, session.sensors, session.keyboard = env.robot, env.channels, object()
+    session.episode, session.episodes = env.rollout, [env.rollout.result]
+    session.errors = []
+    session.summary = {"termination_reason": None}
+    order = []
+    errors = {
+        "ordinary": [ValueError("device"), OSError("recording"), ValueError("model"), OSError("result")],
+        "interrupt": [None, KeyboardInterrupt(), None, OSError("result")],
+        "exit": [SystemExit(7), SystemExit(8), SystemExit(9), SystemExit(10)],
+    }.get(failure, [None] * 4)
+
+    def stage(name, index):
+        order.append(name)
+        if errors[index] is not None:
+            raise errors[index]
+        return True
+
+    monkeypatch.setattr(session_module, "close_runtime", lambda *a, **kw: stage("devices", 0))
+    monkeypatch.setattr(env.rollout, "finish_recording", lambda: stage("recording", 1))
+    closed = Future()
+    if failure != "timeout":
+        if errors[2] is None:
+            closed.set_result(None)
+        else:
+            closed.set_exception(errors[2])
+
+    def close_model():
+        order.append("model")
+        return closed
+
+    session.model = SimpleNamespace(close=close_model)
+    session.save_results = lambda: stage("results", 3)
+    monkeypatch.setattr(session_module, "MODEL_SHUTDOWN_TIMEOUT_S", 0)
+    if failure == "exit":
+        with pytest.raises(SystemExit) as caught:
+            session.close()
+        assert caught.value is errors[0]
+    elif failure == "timeout":
+        with pytest.raises(ModelShutdownTimeout):
+            session.close()
+        assert not closed.done()
+    else:
+        assert session.close() == (failure != "none")
+    assert order == ["devices", "recording", "model", "results"]
+    assert session.summary["ended_utc"]
+    if failure == "interrupt":
+        assert env.state.estop_request and session.summary["termination_reason"] == "estop"
+    elif failure == "none":
+        assert session.summary["termination_reason"] == "quit"
+    else:
+        assert session.summary["termination_reason"] == "failed"
+    if failure in {"ordinary", "exit"}:
+        assert [error["stage"] for error in session.errors] == ["shutdown", "results_write"]
+        assert [error["stage"] for error in env.rollout.result.errors] == ["recording_finalize", "model_close"]
