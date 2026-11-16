@@ -117,11 +117,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(declared, ensure_ascii=False, indent=2, allow_nan=False))
         return 0
 
-    from dexmani_real.deployment.run import run_policy
+    from dexmani_real.deployment.session import PolicySession
 
-    return run_policy(
-        args.policy,
+    return PolicySession(
         runtime,
+        args.policy,
         weights=args.weights,
         inference_steps=args.inference_steps,
         device=args.device,
@@ -129,9 +129,9 @@ def main(argv: list[str] | None = None) -> int:
         num_episodes=args.num_episodes,
         max_running_s=args.max_running_s,
         record_raw=args.record_raw,
-        output=args.output,
+        output_root=args.output,
         camera_calibration_path=args.camera_calibration,
-    )
+    ).run()
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import multiprocessing as mp
 import time
 from collections.abc import Sequence
@@ -12,7 +13,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.calibration_data import CAMERAS_PATH
-from dexmani_real.config.deployment import POLICY_RUNTIME_SECTIONS
+from dexmani_real.config.deployment import (
+    DEFAULT_MAX_RUNNING_S,
+    DEFAULT_NUM_EPISODES,
+    POLICY_RUNTIME_SECTIONS,
+)
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.data.raw import camera_metadata
 from dexmani_real.data.recorder import format_recording_result
@@ -87,9 +92,25 @@ def session_directory(root: Path) -> Path:
 
 class PolicySession:
     def __init__(
-        self, runtime, policy, *, weights, inference_steps, output_root, device, seed,
-        max_running_s, num_episodes, record_raw, camera_calibration_path,
+        self, runtime, policy, *, weights=None, inference_steps=None, output_root=None,
+        device="cuda:0", seed=0, max_running_s=DEFAULT_MAX_RUNNING_S,
+        num_episodes=DEFAULT_NUM_EPISODES, record_raw=False, camera_calibration_path=None,
     ):
+        # 实验预算在分配会话资源前校验；CLI 和直接 Python 调用共用此入口。
+        if max_running_s is not None:
+            if isinstance(max_running_s, bool):
+                raise TypeError("max_running_s must be a finite positive number or None")
+            max_running_s = float(max_running_s)
+            if not math.isfinite(max_running_s) or max_running_s <= 0:
+                raise ValueError("max_running_s must be finite and positive")
+        if num_episodes is not None:
+            if type(num_episodes) is not int:
+                raise TypeError("num_episodes must be a positive integer or None")
+            if num_episodes < 1:
+                raise ValueError("num_episodes must be a positive integer")
+        if camera_calibration_path is not None:
+            camera_calibration_path = Path(camera_calibration_path).expanduser().resolve()
+
         self.runtime, self.policy = runtime, policy
         self.weights, self.inference_steps = weights, inference_steps
         self.info: PolicyInfo

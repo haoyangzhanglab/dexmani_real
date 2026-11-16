@@ -7,7 +7,7 @@
 ## 整体架构
 
 ```mermaid
-flowchart LR
+flowchart TD
     sensors[RealSense / VR] --> observation[观测]
     robot[xArm7 + XHand] -->|关节与触觉反馈| observation
     observation --> teleop[遥操作] --> control[动作映射与运动约束] --> robot
@@ -23,13 +23,31 @@ flowchart LR
 
 ## 实验流程
 
-1. **准备设备与标定**：通过[相机标定](scripts/calibrate_camera.py)和 [VR 朝向标定](scripts/calibrate_vr_heading.py)建立观测与机器人之间的坐标关系。
-2. **采集示教**：使用 [VR 遥操作](scripts/collect_teleop.py)采集任务 Episode；需要手动调整姿态时使用[键盘点动](scripts/keyboard_teleop.py)。
-3. **检查数据**：通过 [Episode 可视化](scripts/visualize_episode.py)查看图像、状态和动作；需要人工记录任务成败时使用[结果标注](scripts/label_episode.py)。
-4. **导出与训练**：将 Raw [导出为 Zarr](scripts/export_zarr.py)，交给 dexmani_policy 训练。使用手物交互（HOI）点云的任务，先完成[物体资产准备与离线标注](docs/object_reconstruction.md)。
-5. **评估与回放**：通过[策略入口](scripts/run_policy.py)加载 Checkpoint 进行闭环评估，也可[回放 Raw 关节目标](scripts/replay_episode.py)检查已记录的动作。
+先完成[相机标定](scripts/calibrate_camera.py)与 [VR 朝向标定](scripts/calibrate_vr_heading.py)。在已配置依赖的 `real_robot` 环境、仓库根目录中运行以下入口；`TASK`、`EPISODE`、`CHECKPOINT` 替换为实际任务、录制目录与模型路径。
 
-实验配置由 [RealConfig](dexmani_real/config/real.py) 组装，涵盖设备、传感器、运动约束与运行方式。采集、部署和回放可通过 `--config` 使用本地 Python 实验配置；在已配置依赖的 `real_robot` 环境中从仓库根目录运行脚本，具体参数见各入口的 `--help`。
+| 要做的实验 | 命令 |
+| --- | --- |
+| 查看采集配置（不连接设备） | `python scripts/collect_teleop.py TASK --print-config` |
+| VR 采集 / 仅遥操作 | `python scripts/collect_teleop.py TASK` / 加 `--no-record` |
+| 键盘调整姿态 | `python scripts/keyboard_teleop.py` |
+| 查看记录 | `python scripts/visualize_episode.py EPISODE` |
+| 导出训练数据 | `python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr` |
+| 策略评估并录制 | `python scripts/run_policy.py CHECKPOINT --record-raw` |
+| 回放关节目标 | `python scripts/replay_episode.py EPISODE` |
+
+需要手动标记任务成败时使用 [label_episode.py](scripts/label_episode.py)。HOI 数据先完成[物体资产准备与离线标注](docs/object_reconstruction.md)。具体选项见各入口的 `--help`。
+
+实验配置由 [RealConfig](dexmani_real/config/real.py) 组装。用一个可信本地 Python 文件导出 `CONFIG`，将实际设备、工作空间、运动参数集中保存；采集、部署、导出和回放均可传 `--config experiment.py`。例如下面只改变采集周期，其余配置仍须符合实际设备：
+
+```python
+from dataclasses import replace
+from dexmani_real.config.real import RealConfig
+
+base = RealConfig()
+CONFIG = replace(base, teleop=replace(base.teleop, control_hz=20.0))
+```
+
+先用 `python scripts/collect_teleop.py TASK --config experiment.py --print-config` 检查声明值；策略的有效配置还会结合 checkpoint 在启动时解析。
 
 Raw 保留采集时的原始 RGB-D、K、畸变参数及已有外参。Canonical RGB/depth 与在线策略 RGB（包括纯 RGB 策略）统一采用固定 K、原始分辨率和光轴的无畸变针孔网格；RGB 双线性重采样，depth 使用同一映射最近邻重采样，越界填零。含图像的 Zarr 标记 `image_geometry="pinhole"`。Raw 可视化也使用矫正图像与针孔相机叠加；点云仍由原始 RGB-D 配对生成。
 
@@ -63,6 +81,25 @@ Zarr 根属性 `task_name` 来自 Raw 的 `meta.task_label`，不受目录名影
 | [replay](dexmani_real/replay/) | 按 Raw 中的连续区间回放关节目标。 |
 
 [config](dexmani_real/config/) 保存实验配置，[utils](dexmani_real/utils/) 提供标定与可视化工具，[assets](assets/) 保存机器人模型和几何模板。
+
+### 修改实验时从哪里入手
+
+| 需求 | 代码入口与职责 |
+| --- | --- |
+| 改采集过程 | `scripts/collect_teleop.py` → `teleop/run.py` 装配资源 → `TeleopLoop` 运行示教 |
+| 改策略执行 | `scripts/run_policy.py` → `PolicySession` 管会话资源 → `Rollout` 管单段控制；`schedule.py` 只计算动作窗口 |
+| 改模型观测 | `runtime/observation.py` 读取并检查来源 → `ObservationBuilder` 组装模型历史；字段依赖在 `FIELD_DEPENDENCIES` 声明 |
+| 改训练数据 | `RawReader` 按需读取并校验输入 → `export.py` 分块派生 → 完整产物发布；失败录制由 `EpisodeRecorder` 向运行层报告 |
+
+直接从 Python 启动策略使用 `PolicySession(runtime, checkpoint, record_raw=True).run()`（从 `dexmani_real.deployment.session` 导入）。原 `deployment.run.run_policy` 转发入口已移除；其 `output` 参数在会话入口名为 `output_root`，命令行参数保持不变。
+
+主进程持有会话与 XHand I/O；机械臂 SDK、相机、VR 与启用的感知任务运行在子进程；策略推理和录制各有自己的工作线程。设备 SDK 留在驱动层，动作映射只生成目标，实际发送归 `Robot`。新增实验优先修改配置和对应流程，独立算法放入现有几何或感知模块。
+
+输入文件、设备反馈、动作提交和资源回收承担各自的校验职责；已建立的内部契约直接复用。命令租约、取消状态、来源时间与录制失败传播分别对应真实的并发和 I/O 问题。重构时按这些行为验证，不以删行或增加抽象层作为目标。
+
+## 开发验证
+
+安装本项目与配套 Policy 的测试依赖后运行 `python -m pytest -p no:cacheprovider tests -q`。CUDA 用例需要可用 GPU；无设备测试会使用替身，因此通过不代表真机时序、实际执行误差或模型任务性能已验证。
 
 ## 主题文档
 

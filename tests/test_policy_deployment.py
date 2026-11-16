@@ -117,6 +117,53 @@ def test_hoi_eef_projection_requires_only_arm_history(info):
     assert np.isfinite(arrays["eef_pose"]).all()
 
 
+@pytest.mark.parametrize("with_hoi", [False, True])
+def test_joint_history_is_shared_by_state_and_geometry(info, with_hoi):
+    from dexmani_real.geometry.pose import encode_eef_pose
+
+    fields = ("joint_state", "eef_pose", "fingertip_xyz", "finger_tactile_force")
+    if with_hoi:
+        fields += ("object_pointcloud",)
+    builder = ObservationBuilder(replace(info, observation_fields=fields), RealConfig())
+    history, expected_state, expected_eef, expected_tips = [], [], [], []
+    for step in range(3):
+        arm = np.full(7, .02 * step)
+        hand = np.full(12, .1 * step)
+        # HOI 的历史关节与当前实测值不同，状态和几何必须使用同一来源。
+        row = SimpleNamespace(
+            arm={"qpos": arm[None].copy()},
+            hand={"qpos": hand[None].copy(), "tactile_aggregate": np.full((1, 5, 3), step, np.float32)},
+            aligned_joints={"arm_qpos": arm + .03, "hand_qpos": hand + .04},
+            hoi={"object_pointcloud": np.full((1024, 3), step, np.float32)},
+        )
+        history.append(builder.project(row))
+        if with_hoi:
+            arm, hand = row.aligned_joints["arm_qpos"], row.aligned_joints["hand_qpos"]
+        pose = builder.arm_fk.forward(arm)
+        tips = builder.hand_fk.forward(hand, builder.hand_fk.fingertip_frame_ids)
+        base_from_hand = pose @ builder.arm_fk.eef_from_handbase
+        expected_state.append(np.r_[arm, hand])
+        expected_eef.append(encode_eef_pose(pose))
+        expected_tips.append((base_from_hand @ tips)[:, :3, 3])
+        # 历史拥有低维快照，不受之后的反馈或插值缓存更新影响。
+        row.arm["qpos"][:] = 99
+        row.hand["qpos"][:] = 99
+        row.hand["tactile_aggregate"][:] = 99
+        for qpos in row.aligned_joints.values():
+            qpos[:] = 99
+    arrays = builder.build(history)
+    assert tuple(arrays) == fields
+    for field, expected in (
+        ("joint_state", expected_state), ("eef_pose", expected_eef),
+        ("fingertip_xyz", expected_tips),
+    ):
+        assert arrays[field].dtype == np.float32
+        np.testing.assert_allclose(arrays[field], np.asarray(expected, np.float32), atol=1e-7)
+    np.testing.assert_array_equal(arrays["finger_tactile_force"][:, 0, 0], [0, 1, 2])
+    if with_hoi:
+        np.testing.assert_array_equal(arrays["object_pointcloud"][:, 0, 0], [0, 1, 2])
+
+
 def test_rgb_only_rectifies_once_per_source_frame(info, monkeypatch):
     import cv2
 
