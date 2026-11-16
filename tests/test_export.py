@@ -11,7 +11,12 @@ import pytest
 import zarr
 
 from dexmani_real.data.export import ExportConfig, export_zarr
-from dexmani_real.data.raw import ARM_ACTION_SEMANTICS, TIMING_ROW_DTYPE, RawReader
+from dexmani_real.data.raw import (
+    ARM_ACTION_SEMANTICS,
+    TIMING_ROW_DTYPE,
+    RawDataError,
+    RawReader,
+)
 from dexmani_real.geometry.kinematics import ArmFK, eef_poses
 from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
@@ -65,9 +70,8 @@ def test_raw_reader_rejects_invalid_depth_grid(raw_episodes, shape, dtype):
     with h5py.File(episode / "data.h5", "r+") as data:
         data["meta"].attrs.update(camera_color_width=2, camera_color_height=2)
         data.create_dataset("depth", data=np.ones(shape, dtype=dtype))
-    with RawReader(episode) as reader:
-        with pytest.raises(ValueError, match="depth must be uint16"):
-            reader["depth"]
+    with RawReader(episode) as reader, pytest.raises(ValueError, match="depth must be uint16"):
+        reader["depth"]
 
 
 @pytest.mark.parametrize("width", [2, 3])
@@ -164,11 +168,11 @@ def hoi_episodes(raw_episodes):
     from dexmani_real.data.hoi import write_hoi
 
     source, states, actions = raw_episodes
-    template = dict(
-        points_local=np.zeros((1024, 3), np.float32),
-        offsets=np.array([0, 1024]),
-        object_names=np.array(["object"]),
-    )
+    template = {
+        "points_local": np.zeros((1024, 3), np.float32),
+        "offsets": np.array([0, 1024]),
+        "object_names": np.array(["object"]),
+    }
     for episode in sorted(source.iterdir()):
         with h5py.File(episode / "data.h5", "r+") as f:
             count = len(f["timing/rows"])
@@ -184,17 +188,26 @@ def hoi_episodes(raw_episodes):
     return source, states, actions
 
 
-def test_hoi_unalignable_boundaries_reject_whole_raw(tmp_path, hoi_episodes):
-    source, states, actions = hoi_episodes
+@pytest.mark.parametrize("with_object", [False, True])
+def test_hoi_unalignable_boundaries_reject_whole_raw(tmp_path, hoi_episodes, with_object):
+    source, _, _ = hoi_episodes
     for episode in source.iterdir():
         with h5py.File(episode / "data.h5", "r+") as f:
             rows = f["timing/rows"][:]
             rows["camera_ns"] -= 10_000_000
             f["timing/rows"][:] = rows
     output = tmp_path / "aligned.zarr"
+    fields = ("joint_state", "object_pointcloud") if with_object else ("joint_state",)
     with pytest.raises(ValueError, match="all Raw episodes rejected"):
-        export_zarr(source, output, processing=ExportConfig(), fields=("joint_state", "object_pointcloud"))
+        export_zarr(source, output, processing=ExportConfig(), fields=fields)
     assert not output.exists()
+    assert not list(tmp_path.glob(".aligned.zarr.tmp-*"))
+    output.mkdir()
+    sentinel = output / "keep.txt"
+    sentinel.write_text("existing output")
+    with pytest.raises(FileExistsError):
+        export_zarr(source, output, processing=ExportConfig(), fields=fields)
+    assert sentinel.read_text() == "existing output"
 
 
 @pytest.mark.parametrize("with_hoi", [False, True])
@@ -218,7 +231,8 @@ def test_export_skips_invalid_actions(tmp_path, hoi_episodes, with_hoi, invalid)
     assert not list(tmp_path.glob(".invalid_actions.zarr.tmp-*"))
 
 
-def test_hoi_eef_export_does_not_require_hand_history(tmp_path, hoi_episodes):
+@pytest.mark.parametrize("with_object", [False, True])
+def test_hoi_eef_export_does_not_require_hand_history(tmp_path, hoi_episodes, with_object):
     source, states, _ = hoi_episodes
     for episode in source.iterdir():
         with h5py.File(episode / "data.h5", "r+") as data:
@@ -228,7 +242,8 @@ def test_hoi_eef_export_does_not_require_hand_history(tmp_path, hoi_episodes):
             rows["hand_ns"] = 0
             data["timing/rows"][:] = rows
     output = tmp_path / "arm_only.zarr"
-    export_zarr(source, output, processing=ExportConfig(), fields=("eef_pose", "object_pointcloud"))
+    fields = ("eef_pose", "object_pointcloud") if with_object else ("eef_pose",)
+    export_zarr(source, output, processing=ExportConfig(), fields=fields)
     root = zarr.open_group(str(output), mode="r")
     expected = encode_eef_pose(eef_poses(states[:, :7], arm_fk=ArmFK()))
     np.testing.assert_allclose(root["data/eef_pose"][:], expected, atol=1e-6)
@@ -309,9 +324,10 @@ def test_export_rejects_episode_with_no_valid_hoi_rows(tmp_path, hoi_episodes):
 @pytest.mark.parametrize("rgb_only", [False, True])
 def test_pinhole_export_matches_online_and_keeps_raw_cloud(tmp_path, raw_episodes, monkeypatch, rgb_only):
     import cv2
-    from dexmani_real.config.real import RealConfig
+
     from dexmani_real.config.perception import PointCloudConfig
-    from dexmani_real.data.raw import camera_metadata, _VideoWriter
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.data.raw import _VideoWriter, camera_metadata
     from dexmani_real.deployment.observation import ObservationBuilder
     from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
     from dexmani_real.perception.pointcloud import PointCloudProcessor
@@ -472,14 +488,19 @@ def test_bad_raw_rolls_back_all_fields(tmp_path, raw_episodes, monkeypatch, faul
     assert root["meta/episode_ends"].shape == (2,)
 
 
-@pytest.mark.parametrize(
-    "failure", [OSError("disk full"), KeyboardInterrupt(), RuntimeError("bug")]
-)
-def test_output_failures_propagate(tmp_path, raw_episodes, monkeypatch, failure):
+@pytest.mark.parametrize("stage", ["read", "write"])
+@pytest.mark.parametrize("failure", [
+    OSError("disk full"), KeyboardInterrupt(), RuntimeError("bug"),
+    TypeError("bug"), IndexError("bug"),
+])
+def test_export_failures_propagate(tmp_path, raw_episodes, monkeypatch, stage, failure):
     def fail(*args, **kwargs):
         raise failure
 
-    monkeypatch.setattr("dexmani_real.data.export.append_rows", fail)
+    if stage == "read":
+        monkeypatch.setattr(RawReader, "read_timing", fail)
+    else:
+        monkeypatch.setattr("dexmani_real.data.export.append_rows", fail)
     output = tmp_path / "failed.zarr"
     with pytest.raises(type(failure)):
         export_zarr(raw_episodes[0], output, processing=ExportConfig(), fields=("joint_state",))
@@ -489,7 +510,11 @@ def test_output_failures_propagate(tmp_path, raw_episodes, monkeypatch, failure)
 
 @pytest.fixture
 def complete_episodes(raw_episodes):
-    from dexmani_real.data.raw import camera_metadata, _VideoWriter, TACTILE_FINGER_ORDER
+    from dexmani_real.data.raw import (
+        TACTILE_FINGER_ORDER,
+        _VideoWriter,
+        camera_metadata,
+    )
     from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 
     source, _, _ = raw_episodes
@@ -519,8 +544,8 @@ def complete_episodes(raw_episodes):
 
 @pytest.mark.parametrize("mode", ["none", "all", "mixed"])
 def test_default_complete_modalities(tmp_path, complete_episodes, mode):
-    from dexmani_real.data.export import DEFAULT_FIELDS
     from dexmani_real.config.perception import PointCloudConfig
+    from dexmani_real.data.export import FIELD_INPUTS
     from dexmani_real.data.hoi import write_hoi
 
     source = complete_episodes
@@ -531,11 +556,11 @@ def test_default_complete_modalities(tmp_path, complete_episodes, mode):
             n = reader.num_frames
         write_hoi(
             episode / "data.h5",
-            dict(
-                points_local=np.zeros((1024, 3), "f4"),
-                offsets=np.array([0, 1024]),
-                object_names=np.array(["object"]),
-            ),
+            {
+                "points_local": np.zeros((1024, 3), "f4"),
+                "offsets": np.array([0, 1024]),
+                "object_names": np.array(["object"]),
+            },
             np.tile(np.eye(4), (n, 1, 1, 1)),
             np.eye(4),
             quality=[[{"iou": 1.0}]] * n,
@@ -551,7 +576,7 @@ def test_default_complete_modalities(tmp_path, complete_episodes, mode):
     assert len(result["outputs"]) == (2 if mode == "mixed" else 1)
     for product in result["outputs"]:
         root = zarr.open_group(product["path"], mode="r")
-        expected = set(DEFAULT_FIELDS)
+        expected = set(FIELD_INPUTS) - {"object_pointcloud"}
         if mode == "all" or mode == "mixed" and product["episodes"] == ["episode_0"]:
             expected.add("object_pointcloud")
         assert set(root["data"]) == expected
@@ -567,7 +592,6 @@ def test_default_complete_modalities(tmp_path, complete_episodes, mode):
 
 def test_late_video_error_rolls_back_and_continues(tmp_path, complete_episodes, monkeypatch):
     import shutil
-    from dexmani_real.data.raw import RawDataError
 
     source = complete_episodes
     shutil.copytree(source / "episode_0", source / "episode_2")
@@ -591,11 +615,17 @@ def test_late_video_error_rolls_back_and_continues(tmp_path, complete_episodes, 
 
 
 def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes, hoi_episodes):
-    from omegaconf import OmegaConf
-    from dexmani_policy.datasets.preprocess.contact_map import generate
+    from dexmani_policy.common.checkpoint import (
+        Checkpoint,
+        load_checkpoint,
+        save_checkpoint,
+    )
     from dexmani_policy.datasets.episode_store import EpisodeStore
+    from dexmani_policy.datasets.preprocess.contact_map import generate
+    from dexmani_policy.datasets.pretrain.cordvip import CordViPPretrainDataset
     from dexmani_policy.training.common.data import record_data_processing
-    from dexmani_policy.common.checkpoint import Checkpoint, save_checkpoint, load_checkpoint
+    from omegaconf import OmegaConf
+
     from dexmani_real.config.real import RealConfig
     from dexmani_real.deployment.preflight import check_data_processing
     from dexmani_real.geometry.kinematics import HandFK
@@ -614,7 +644,7 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
     result = EpisodeStore(derived)
     assert result.attrs == source.attrs
     cfg = OmegaConf.create({})
-    record_data_processing(cfg, result)
+    record_data_processing(cfg, CordViPPretrainDataset(derived))
     checkpoint = Checkpoint(0, {}, None, {}, {}, OmegaConf.to_container(cfg, resolve=True))
     restored = load_checkpoint(save_checkpoint(tmp_path / "model.pt", checkpoint))
     assert restored.effective_config["data_processing"] == source.attrs["data_processing"]
@@ -628,18 +658,20 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
     )
     with h5py.File(complete_episodes / "episode_0/data.h5", "r") as raw:
         saved = raw["hoi/template"]
-        template = dict(
-            points_local=saved["points_local"][:],
-            offsets=saved["offsets"][:],
-            object_names=saved["object_names"].asstr()[:],
-        )
+        template = {
+            "points_local": saved["points_local"][:],
+            "offsets": saved["offsets"][:],
+            "object_names": saved["object_names"].asstr()[:],
+        }
     assert check_data_processing(info, runtime, observations, (None, template)) == info.data_processing
     template["points_local"][0, 0] += 0.01
     with pytest.raises(ValueError, match="data_processing mismatch: object_pointcloud"):
         check_data_processing(info, runtime, observations, (None, template))
 
 
-@pytest.mark.parametrize("invalid", ["missing_cloud", "invalid_flag", "nonfinite"])
+@pytest.mark.parametrize("invalid", [
+    "missing_cloud", "invalid_flag", "nonfinite", "scalar_names", "names_group",
+])
 def test_bad_optional_hoi_cannot_be_omitted(tmp_path, hoi_episodes, invalid):
     source, _, _ = hoi_episodes
     with h5py.File(source / "episode_0/data.h5", "r+") as data:
@@ -648,8 +680,14 @@ def test_bad_optional_hoi_cannot_be_omitted(tmp_path, hoi_episodes, invalid):
         elif invalid == "invalid_flag":
             data["hoi/valid"][0] = False
             data["hoi/object_valid"][0] = False
-        else:
+        elif invalid == "nonfinite":
             data["hoi/object_pointcloud"][-1, 0, 0] = np.nan
+        else:
+            del data["hoi/template/object_names"]
+            if invalid == "scalar_names":
+                data.create_dataset("hoi/template/object_names", data="object")
+            else:
+                data.create_group("hoi/template/object_names")
     result = export_zarr(
         source, tmp_path / "valid.zarr", processing=ExportConfig(), fields=("joint_state",)
     )
@@ -657,7 +695,12 @@ def test_bad_optional_hoi_cannot_be_omitted(tmp_path, hoi_episodes, invalid):
     assert result["rejected_episodes"][0]["episode"] == "episode_0"
 
 
-def test_complete_interpolation_preserves_every_row(tmp_path, hoi_episodes):
+@pytest.mark.parametrize("with_object", [False, True])
+def test_complete_interpolation_preserves_every_row(tmp_path, hoi_episodes, with_object, monkeypatch):
+    from dexmani_real.utils.timing import interpolate_joints
+
+    interpolate = Mock(wraps=interpolate_joints)
+    monkeypatch.setattr("dexmani_real.data.export.interpolate_joints", interpolate)
     source, states, actions = hoi_episodes
     expected = states.copy()
     offset = 0
@@ -671,14 +714,162 @@ def test_complete_interpolation_preserves_every_row(tmp_path, hoi_episodes):
                 0.2 * states[offset : offset + n - 2] + 0.8 * states[offset + 1 : offset + n - 1]
             )
             offset += n
+    fields = ("joint_state", "action", "object_pointcloud") if with_object else ("joint_state", "action")
     output = tmp_path / "aligned.zarr"
-    export_zarr(
-        source,
-        output,
-        processing=ExportConfig(),
-        fields=("joint_state", "action", "object_pointcloud"),
-    )
+    export_zarr(source, output, processing=ExportConfig(), fields=fields)
     root = zarr.open_group(str(output), mode="r")
-    np.testing.assert_allclose(root["data/joint_state"][:], expected, atol=1e-6)
+    assert interpolate.call_count == 4  # 两条 Raw，每条 arm、hand 各一次；动作不插值。
+    expected_states = expected if with_object else states
+    np.testing.assert_allclose(root["data/joint_state"][:], expected_states, atol=1e-6)
     np.testing.assert_allclose(root["data/action"][:], actions, atol=1e-6)
     np.testing.assert_array_equal(root["meta/episode_ends"][:], [4, 7])
+
+
+@pytest.mark.parametrize("with_object", [False, True])
+@pytest.mark.parametrize("fault", ["zero", "before_history", "gap"])
+def test_hoi_timing_rejected_independent_of_output(tmp_path, hoi_episodes, with_object, fault):
+    source, states, _ = hoi_episodes
+    with h5py.File(source / "episode_0/data.h5", "r+") as data:
+        rows = data["timing/rows"][:]
+        if fault == "zero":
+            rows["camera_ns"][0] = 0
+        elif fault == "before_history":
+            rows["camera_ns"][0] -= 10_000_000
+        else:
+            rows["camera_ns"][1] -= 10_000_000
+        data["timing/rows"][:] = rows
+    output = tmp_path / "valid.zarr"
+    fields = ("joint_state", "object_pointcloud") if with_object else ("joint_state",)
+    result = export_zarr(source, output, fields=fields, processing=ExportConfig(
+        hoi_max_joint_gap_s=0.01 if fault == "gap" else 0.10,
+    ))
+    assert result["episode_count"] == 1 and result["total_frames"] == 3
+    assert result["rejected_episodes"][0]["episode"] == "episode_0"
+    reason = result["rejected_episodes"][0]["reason"]
+    assert ("camera_ns" if fault == "zero" else "aligned") in reason
+    root = zarr.open_group(str(output), mode="r")
+    assert set(root["data"]) == set(fields)
+    assert root.attrs["source_episodes"] == ["episode_1"]
+    np.testing.assert_array_equal(root["meta/episode_ends"][:], [3])
+    np.testing.assert_array_equal(root["data/joint_state"][:], states[4:].astype("f4"))
+    assert all(array.shape[0] == 3 for array in root["data"].values())
+
+
+@pytest.mark.parametrize("bad_index", [0, 1])
+@pytest.mark.parametrize("fault,reason", [
+    ("scalar_timing", "timing/rows"),
+    ("group_timing", "timing/rows"),
+    ("matrix_timing", "timing/rows"),
+    ("integer_names", "arm_joint_names"),
+    ("audio_only", "video stream"),
+])
+def test_malformed_raw_is_skipped(tmp_path, complete_episodes, bad_index, fault, reason, caplog):
+    import shutil
+
+    import av
+
+    from dexmani_real.config.perception import PointCloudConfig
+
+    source = complete_episodes
+    shutil.copytree(source / "episode_1", source / "episode_2")
+    config = ExportConfig(pointcloud=PointCloudConfig(
+        remove_table=False, workspace=(-1., -1., 0., 1., 1., 2.),
+    ))
+    reference = tmp_path / "reference.zarr"
+    export_zarr(source, reference, processing=config)
+    bad = source / f"episode_{bad_index}"
+    if fault == "audio_only":
+        with av.open(str(bad / "rgb.mp4"), "w", format="mp4") as container:
+            stream = container.add_stream("aac", rate=48000)
+            stream.layout = "mono"
+            frame = av.AudioFrame.from_ndarray(
+                np.zeros((1, 2048), np.float32), format="fltp", layout="mono",
+            )
+            frame.sample_rate = 48000
+            for packet in stream.encode(frame):
+                container.mux(packet)
+            for packet in stream.encode(None):
+                container.mux(packet)
+        with av.open(str(bad / "rgb.mp4")) as container:
+            assert len(container.streams.audio) == 1
+            assert not container.streams.video
+    else:
+        with h5py.File(bad / "data.h5", "r+") as data:
+            if fault == "integer_names":
+                data["meta"].attrs["arm_joint_names"] = 123
+            else:
+                rows = data["timing/rows"][:]
+                del data["timing/rows"]
+                if fault == "group_timing":
+                    data.create_group("timing/rows")
+                else:
+                    values = rows[0] if fault == "scalar_timing" else rows[:, None]
+                    data.create_dataset("timing/rows", data=values)
+    reader = RawReader.__new__(RawReader)
+    with pytest.raises(RawDataError, match=reason):
+        reader.__init__(bad)
+        with reader:
+            if fault == "audio_only":
+                list(reader.iter_rgb_frames())
+            else:
+                reader["arm_qpos"]
+    assert reader.data_file is None and reader.video_container is None
+    output = tmp_path / "clean.zarr"
+    result = export_zarr(source, output, processing=config)
+    assert len(result["rejected_episodes"]) == 1
+    assert result["rejected_episodes"][0]["episode"] == bad.name
+    assert reason in result["rejected_episodes"][0]["reason"]
+    assert bad.name in caplog.text and reason in caplog.text
+    root = zarr.open_group(str(output), mode="r")
+    baseline = zarr.open_group(str(reference), mode="r")
+    keep = np.r_[4:10] if bad_index == 0 else np.r_[0:4, 7:10]
+    assert result["episode_count"] == 2 and result["total_frames"] == len(keep)
+    assert root.attrs["source_episodes"] == [f"episode_{i}" for i in range(3) if i != bad_index]
+    np.testing.assert_array_equal(root["meta/episode_ends"][:], [3, 6] if bad_index == 0 else [4, 7])
+    assert set(root["data"]) == set(baseline["data"])
+    for name in root["data"]:
+        np.testing.assert_array_equal(root["data"][name][:], baseline["data"][name][:][keep])
+    assert not list(tmp_path.glob(".clean.zarr.tmp-*"))
+
+
+@pytest.mark.parametrize("names,valid", [
+    (json.dumps(XARM7_JOINT_NAMES), True),
+    (np.bytes_(json.dumps(XARM7_JOINT_NAMES)), True),
+    ("[invalid json", False), (np.bytes_(b"\xff"), False),
+])
+def test_joint_names_json_boundary(raw_episodes, names, valid):
+    episode = raw_episodes[0] / "episode_0"
+    with h5py.File(episode / "data.h5", "r+") as data:
+        data["meta"].attrs["arm_joint_names"] = names
+    with RawReader(episode) as reader:
+        if valid:
+            reader["arm_qpos"]
+        else:
+            with pytest.raises(RawDataError, match="arm_joint_names: invalid joint names format"):
+                reader["arm_qpos"]
+    assert reader.data_file is None
+
+
+@pytest.mark.parametrize("fields", [None, ("joint_state",)])
+def test_export_cli_matches_api(tmp_path, complete_episodes, hoi_episodes, monkeypatch, fields):
+    from dexmani_real.config.perception import PointCloudConfig
+    from scripts import export_zarr as cli
+
+    config = ExportConfig(pointcloud=PointCloudConfig(
+        remove_table=False, workspace=(-1., -1., 0., 1., 1., 2.),
+    ))
+    monkeypatch.setattr(cli, "load_processing_config", lambda path, fields: config)
+    output = tmp_path / "cli.zarr"
+    args = [str(complete_episodes), "--output", str(output)]
+    if fields is not None:
+        args.extend(["--fields", *fields])
+    assert cli.main(args) == 0
+    reference = tmp_path / "api.zarr"
+    export_zarr(complete_episodes, reference, processing=config, fields=fields)
+    actual = zarr.open_group(str(output), mode="r")
+    expected = zarr.open_group(str(reference), mode="r")
+    assert dict(actual.attrs) == dict(expected.attrs)
+    assert set(actual["data"]) == set(expected["data"])
+    np.testing.assert_array_equal(actual["meta/episode_ends"][:], expected["meta/episode_ends"][:])
+    for name in actual["data"]:
+        np.testing.assert_array_equal(actual["data"][name][:], expected["data"][name][:])

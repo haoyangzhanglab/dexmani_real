@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from fractions import Fraction
 from dataclasses import asdict
+from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -411,7 +411,10 @@ class RawReader:
         self.dataset_cache: dict[str, h5py.Dataset] = {}
         self.data_file = h5py.File(self.path / "data.h5", "r")
         try:
-            self.num_frames = len(self.data_file["timing/rows"])
+            rows = self.data_file["timing/rows"]
+            if not isinstance(rows, h5py.Dataset) or rows.ndim != 1:
+                raise RawDataError("Raw timing/rows: expected a one-dimensional dataset")
+            self.num_frames = len(rows)
         except BaseException:
             try:
                 self.close()
@@ -530,7 +533,14 @@ class RawReader:
         if self.meta["joint_units"] != "rad":
             raise ValueError("Raw joint_units: expected rad")
         name = f"{device}_joint_names"
-        if json.loads(self.meta[name]) != list(joint_names):
+        encoded = self.meta[name]
+        if not isinstance(encoded, (str, bytes, bytearray)):
+            raise RawDataError(f"Raw {name}: invalid joint names format; expected JSON text")
+        try:
+            names = json.loads(encoded)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RawDataError(f"Raw {name}: invalid joint names format: {exc}") from exc
+        if names != list(joint_names):
             raise ValueError(f"Raw {name}: incompatible joint order")
 
     def validate_tactile_metadata(self) -> None:
@@ -559,6 +569,8 @@ class RawReader:
         self.require_fields("rgb")
         if self.video_container is None:
             self.video_container = av.open(str(self.rgb_path), "r")
+            if not self.video_container.streams.video:
+                raise RawDataError(f"Raw {self.rgb_path}: missing video stream")
             stream = self.video_container.streams.video[0]
             stream.thread_type = "AUTO"
             stream.thread_count = 4

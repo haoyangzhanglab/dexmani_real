@@ -31,7 +31,7 @@ flowchart LR
 
 实验配置由 [RealConfig](dexmani_real/config/real.py) 组装，涵盖设备、传感器、运动约束与运行方式。采集、部署和回放可通过 `--config` 使用本地 Python 实验配置；在已配置依赖的 `real_robot` 环境中从仓库根目录运行脚本，具体参数见各入口的 `--help`。
 
-Raw 保留采集时的原始 RGB-D、K、畸变参数及已有外参。Canonical RGB/depth 与在线策略 RGB（包括纯 RGB 策略）统一采用固定 K、原始分辨率和光轴的无畸变针孔网格；RGB 双线性重采样，depth 使用同一映射最近邻重采样，越界填零。含图像的 Zarr 标记 `image_geometry="pinhole"`。Raw 可视化也使用矫正图像与针孔相机叠加；点云仍由原始 RGB-D 配对生成；新契约不提供旧实验产物兼容路径。
+Raw 保留采集时的原始 RGB-D、K、畸变参数及已有外参。Canonical RGB/depth 与在线策略 RGB（包括纯 RGB 策略）统一采用固定 K、原始分辨率和光轴的无畸变针孔网格；RGB 双线性重采样，depth 使用同一映射最近邻重采样，越界填零。含图像的 Zarr 标记 `image_geometry="pinhole"`。Raw 可视化也使用矫正图像与针孔相机叠加；点云仍由原始 RGB-D 配对生成。
 
 Zarr 根属性 `task_name` 来自 Raw 的 `meta.task_label`，不受目录名影响；同一产物中的 Raw 必须属于同一任务。
 
@@ -39,11 +39,13 @@ Zarr 根属性 `task_name` 来自 Raw 的 `meta.task_label`，不受目录名影
 
 ## 数据导出
 
-导出默认保留全部基础模态，并在已有有效 HOI 标注时加入 `object_pointcloud`。一条完整 Raw 对应一条 Zarr episode；控制断点、录制截断、必要数据损坏或 HOI 无效/无法完整对齐均导致整条拒绝，其他 Raw 继续处理。任务失败标签不作为数据损坏依据。Raw 原始诊断信息保留。
+导出默认保留全部基础模态，并在已有有效 HOI 标注时加入 `object_pointcloud`。一条完整 Raw 对应一条 Zarr episode；控制断点、录制截断、必要数据损坏或 HOI 无效/无法完整对齐均导致整条拒绝，其他 Raw 继续处理。任务失败标签不作为数据损坏依据。
 
 请求 `--output datasets/task.zarr` 时，只有一类合格数据仍生成该路径；同时接纳有、无物体点云的数据时，整体发布 `datasets/task_modalities/`，内含 `with_object.zarr` 和 `without_object.zarr`。训练的 `zarr_path` 指向所需的具体子 Zarr。CLI 打印实际路径、各组 episode 数和帧数；全被拒绝时失败，已有输出不覆盖。显式 `--fields` 控制输出列，已有损坏 HOI 仍拒绝。
 
-旧的切段、裁剪或过滤无效帧的 Zarr 必须从原始 Raw 重新导出，不能仅修改 `episode_ends` 修复。导出属性 `source_episodes` 与 episode 顺序对应；`data_processing` 记录实际点云处理参数和模板内容标识，并经衍生数据传入 Checkpoint 的 `effective_config`。
+已有 HOI 时，无论是否输出物体点云，都检查相机时间为正、不晚于 observation 且非递减，并检查所选观测字段需要的关节流能否完整对齐。仅输出关节时保留原始观测值；联合输出物体点云时使用相机时间上的插值观测。动作目标始终保持原值，仅 EEF 观测不要求手部历史。
+
+导出属性 `source_episodes` 与完整 Raw episode 顺序对应；`data_processing` 记录实际点云处理参数和模板内容标识，并经衍生数据传入 Checkpoint 的 `effective_config`。模板内容标识用于检查训练与部署的点序、分段及几何一致性，不依赖文件路径。
 
 ## 核心模块
 

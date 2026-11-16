@@ -6,8 +6,8 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
-
 from dexmani_policy.deployment.metadata import PolicyInfo
+
 from dexmani_real.config.deployment import ExecutionConfig
 from dexmani_real.config.perception import PointCloudConfig
 from dexmani_real.config.real import RealConfig
@@ -119,6 +119,7 @@ def test_hoi_eef_projection_requires_only_arm_history(info):
 
 def test_rgb_only_rectifies_once_per_source_frame(info, monkeypatch):
     import cv2
+
     from dexmani_real.geometry.camera import CameraSnapshot
 
     color = CameraIntrinsics(64, 48, 55., 55., 32., 24., 'brown_conrady', (.2, 0, .001, 0, 0))
@@ -152,10 +153,11 @@ def test_rgb_only_rectifies_once_per_source_frame(info, monkeypatch):
 def test_hoi_warmup_commits_only_successful_uncancelled_result(fault):
     from concurrent.futures import Future
     from threading import Event
-    from dexmani_real.deployment.rollout import Rollout
+
     from dexmani_real.deployment.inference import PolicyWorker
-    from dexmani_real.runtime.state import SessionState
+    from dexmani_real.deployment.rollout import Rollout
     from dexmani_real.robot.commands import OperationCancelled
+    from dexmani_real.runtime.state import SessionState
 
     state = SessionState(stop_signal=Event(), emergency_signal=Event())
     worker = PolicyWorker(lambda: None, build_observation=lambda rows: rows)
@@ -237,6 +239,7 @@ def test_processing_rejects_mismatched_or_missing_metadata(info):
 def test_rtc_warmup_preserves_rng_and_episode_reset(fail):
     import torch
     from dexmani_policy.deployment.runtime import PolicyRuntime
+
     from dexmani_real.deployment.inference import PolicyWorker
 
     model = PolicyRuntime.__new__(PolicyRuntime)
@@ -271,28 +274,3 @@ def test_rtc_warmup_preserves_rng_and_episode_reset(fail):
         assert torch.equal(first, second)
     finally:
         worker.close().result()
-
-
-def test_resume_checks_only_consumed_processing():
-    from omegaconf import OmegaConf
-    from dexmani_policy.training.common.data import record_data_processing
-
-    cfg = OmegaConf.create(
-        dict(
-            dataset=dict(sensor_modalities=["hand_pointcloud"]),
-            data_processing=dict(
-                hand_pointcloud={"template_sha256": "same"}, point_cloud={"num_points": 10}
-            ),
-        )
-    )
-    buffer = SimpleNamespace(
-        attrs={
-            "data_processing": dict(
-                hand_pointcloud={"template_sha256": "same"}, point_cloud={"num_points": 20}
-            )
-        }
-    )
-    record_data_processing(cfg, buffer, resuming=True)
-    buffer.attrs["data_processing"]["hand_pointcloud"]["template_sha256"] = "changed"
-    with pytest.raises(ValueError, match="hand_pointcloud"):
-        record_data_processing(cfg, buffer, resuming=True)

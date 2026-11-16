@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """将 Raw episode 的所选字段导出为 Canonical Zarr。"""
 
 from __future__ import annotations
@@ -114,7 +113,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.input_root,
             output_path,
             processing=processing,
-            fields=args.fields,
+            fields=fields,
             exclude=tuple(args.exclude),
             progress_callback=update_progress,
         )
