@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+import cv2
 import numpy as np
 import zarr
 
@@ -19,7 +20,9 @@ from dexmani_real.data.raw import RawReader, require_published_raw
 from dexmani_real.geometry.camera import (
     camera_extrinsic_cv,
     depth_scales_match,
+    init_undistort_maps,
     parse_camera_matrix,
+    remap_image,
 )
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
 from dexmani_real.geometry.pose import encode_eef_pose, validate_rigid_transform
@@ -78,33 +81,21 @@ def resolve_fields(fields):
 
 
 def export_camera(reader, fields):
-    """只读取所选输出实际使用的相机参数，不补造完整相机快照。"""
+    """读取所选字段需要的相机参数，并为图像输出初始化映射。"""
     names = set(fields)
     camera: dict[str, Any] = {"parameters": {}}
-    snapshot = reader.read_camera() if "point_cloud" in names else None
+    snapshot = reader.read_camera() if names & {"rgb", "depth", "point_cloud"} else None
     if snapshot is not None:
-        if snapshot.T_xarm_base_from_color is None:
-            raise ValueError("point_cloud requires camera extrinsics")
         camera["snapshot"] = snapshot
-    if names & {"rgb", "depth", "point_cloud"}:
-        if snapshot is not None:
-            shape = (snapshot.color.height, snapshot.color.width)
-        else:
-            shape = tuple(
-                np.asarray(reader.meta[f"camera_color_{axis}"]).item()
-                for axis in ("height", "width")
-            )
-            if any(type(value) is not int or value <= 0 for value in shape):
-                raise ValueError("camera image dimensions must be positive integers")
-        camera["shape"] = shape
-    if names & {"depth", "point_cloud"}:
-        if snapshot is not None:
-            scale = snapshot.depth_scale_m
-        else:
-            scale = float(reader.meta["depth_scale"])
-            if not np.isfinite(scale) or scale <= 0:
-                raise ValueError("depth_scale must be finite and positive")
-        camera["depth_scale_m"] = scale
+        camera["shape"] = (snapshot.color.height, snapshot.color.width)
+        if names & {"point_cloud", "camera_extrinsic"} and snapshot.T_xarm_base_from_color is None:
+            raise ValueError("point_cloud/camera_extrinsic require camera extrinsics")
+        if names & {"depth", "point_cloud"}:
+            if snapshot.depth_scale_m is None:
+                raise ValueError("depth and point_cloud require a camera depth scale")
+            camera["depth_scale_m"] = snapshot.depth_scale_m
+        if names & {"rgb", "depth"}:
+            camera["image_maps"] = init_undistort_maps(snapshot.color)
     if "camera_intrinsic" in names:
         if snapshot is not None:
             matrix = snapshot.color.matrix(dtype=np.float32)
@@ -226,21 +217,23 @@ def iter_canonical_blocks(
                 )
             offset = 0
             for index in range(start, end):
-                image = next(images, None)
-                if image is None:
+                raw_rgb = next(images, None)
+                if raw_rgb is None:
                     raise ValueError(f"{reader.path / 'rgb.mp4'}: RGB missing at row {index}")
                 if alignment is not None and not alignment["keep"][index]:
                     continue
                 if "rgb" in fields:
-                    block["rgb"][offset] = image
+                    block["rgb"][offset] = remap_image(
+                        raw_rgb, camera["image_maps"], interpolation=cv2.INTER_LINEAR,
+                    )
                 if processor is not None:
-                    cloud = processor.process(raw["depth"][offset], image)
+                    cloud = processor.process(raw["depth"][offset], raw_rgb)
                     if not len(cloud):
                         raise ValueError(f"point_cloud unavailable at row {index}")
                     block["point_cloud"][offset] = cloud
                     del cloud
                 offset += 1
-                del image
+                del raw_rgb
         if count == 0:
             continue
         if "object_pointcloud" in fields:
@@ -268,7 +261,13 @@ def iter_canonical_blocks(
         for name, values in camera["parameters"].items():
             block[name] = np.broadcast_to(values, (count, values.size))
         if "depth" in fields:
-            block["depth"] = raw["depth"]
+            maps = camera["image_maps"]
+            if maps is None:
+                block["depth"] = raw["depth"]
+            else:
+                block["depth"] = np.empty_like(raw["depth"])
+                for index, frame in enumerate(raw["depth"]):
+                    block["depth"][index] = remap_image(frame, maps, interpolation=cv2.INTER_NEAREST)
         yield block
         del raw, block
     if images is not None and next(images, None) is not None:
@@ -459,6 +458,8 @@ def create_store(store, processing, camera, *, fields, control_hz, task_name):
             root.attrs["table_plane_abcd"] = processing.table_plane_abcd
     if "fingertip_xyz" in fields:
         root.attrs["fingertip_link_names"] = list(XHAND_FINGERTIP_LINK_NAMES)
+    if {"rgb", "depth"}.intersection(fields):
+        root.attrs["image_geometry"] = "pinhole"
     if "depth" in fields:
         root.attrs["depth_scale_m_per_unit"] = camera["depth_scale_m"]
     data = root.create_group("data")

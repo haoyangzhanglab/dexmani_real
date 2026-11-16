@@ -171,16 +171,17 @@ def camera_metadata(camera: CameraSnapshot):
 
 
 def decode_camera_metadata(meta) -> CameraSnapshot:
-    if meta["camera_payload_mode"] != "depth_to_color_aligned_rgbd":
-        raise ValueError("Raw camera payload must be depth-to-color aligned RGB-D")
+    mode = meta["camera_payload_mode"]
+    if mode not in {"rgb", "depth_to_color_aligned_rgbd"}:
+        raise ValueError(f"Unsupported Raw camera payload: {mode!r}")
     matrix = parse_camera_matrix(meta["camera_color_intrinsics"])
     color = CameraIntrinsics(
         width=np.asarray(meta["camera_color_width"]).item(),
         height=np.asarray(meta["camera_color_height"]).item(),
-        fx=matrix[0, 0],
-        fy=matrix[1, 1],
-        ppx=matrix[0, 2],
-        ppy=matrix[1, 2],
+        fx=float(matrix[0, 0]),
+        fy=float(matrix[1, 1]),
+        ppx=float(matrix[0, 2]),
+        ppy=float(matrix[1, 2]),
         distortion_model=meta["camera_color_distortion_model"],
         distortion_coeffs=tuple(meta["camera_color_distortion_coeffs"]),
     )
@@ -190,7 +191,8 @@ def decode_camera_metadata(meta) -> CameraSnapshot:
             np.asarray(meta["camera_T_xarm_base_from_color"]).reshape(4, 4),
             label="camera_T_xarm_base_from_color",
         )
-    return CameraSnapshot(meta.get("camera_serial"), color, float(meta["depth_scale"]), transform)
+    scale = float(meta["depth_scale"]) if mode == "depth_to_color_aligned_rgbd" else None
+    return CameraSnapshot(meta.get("camera_serial"), color, scale, transform)
 
 
 def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata):

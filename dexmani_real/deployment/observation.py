@@ -1,8 +1,9 @@
 """从已校验的传感快照构造策略观测。"""
 
+import cv2
 import numpy as np
 
-from dexmani_real.geometry.camera import camera_parameters_cv
+from dexmani_real.geometry.camera import camera_parameters_cv, init_undistort_maps, remap_image
 from dexmani_real.geometry.kinematics import (
     ArmFK,
     HandFK,
@@ -68,7 +69,7 @@ class ObservationBuilder:
                     else getattr(row, device)["qpos"][0]
                 )
                 values[name] = qpos.copy()
-        # 大数组已由 ring 独立复制；交给录制和模型历史后，快照数组只读。
+        # Ring 快照独立持有原始大数组，RGB 矫正结果单独进入模型历史。
         for name in fields:
             if name == "finger_tactile_force":
                 # 两种触觉已为 SDK / 255；独立复制避免聚合视图持有稠密载荷。
@@ -80,13 +81,22 @@ class ObservationBuilder:
             elif name == "point_cloud":
                 values[name] = row.point_cloud
             elif name == "rgb":
-                values[name] = row.camera[name]
+                sequence = row.camera["ring_sequence"]
+                if sequence != self.last_rgb_sequence:
+                    self.last_rgb = remap_image(
+                        row.camera["rgb"], self.rgb_maps, interpolation=cv2.INTER_LINEAR,
+                    )
+                    self.last_rgb_sequence = sequence
+                values[name] = self.last_rgb
         for value in values.values():
             value.flags.writeable = False
         return values
 
     def configure_camera(self, camera):
         self.camera_parameters = {}
+        self.rgb_maps = init_undistort_maps(camera.color) if "rgb" in self.fields else None
+        self.last_rgb_sequence = None
+        self.last_rgb = None
         requested = set(self.fields) & {"camera_intrinsic", "camera_extrinsic"}
         if not requested:
             return

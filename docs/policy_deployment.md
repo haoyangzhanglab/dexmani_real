@@ -22,6 +22,8 @@ Checkpoint 描述模型的观测字段、动作、RGB 预处理和控制周期�
 
 场景点云使用 `RealConfig.pointcloud`，应与训练数据的点数、坐标、工作空间和桌面处理保持一致；手表面点云使用 `RealConfig.hand_pointcloud`。指尖 FK 与数据导出共用机器人模型中的固定五指顺序（thumb、index、middle、ring、pinky）。这些配置不从 checkpoint 提取，也不自动校准仿真与真机的观测语义。
 
+所有策略 RGB 在进入观测历史前按 [Canonical 图像契约](../README.md#实验流程)矫正为针孔图像，包括不请求相机参数的纯 RGB 策略。映射在相机配置时初始化，同一来源序号复用最近的矫正结果；Policy 继续使用针孔投影及 resize 坐标变换。Raw 录制和点云取色仍使用原始 RGB-D，已有 XYZ 和来源时间不变。
+
 当前策略不消费原始 `depth`，部署观测入口会拒绝该字段。深度仍用于场景点云、HOI 和 Raw 录制；相机标定及深度单位检查保留在这些生产路径中。
 
 ## 核心模块

@@ -1,4 +1,4 @@
-"""对齐到 color 网格的相机参数与 RGB-D 反投影。"""
+"""相机参数、针孔图像矫正与原始 RGB-D 反投影。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from functools import lru_cache
 from typing import Any
 
+import cv2
 import numpy as np
 from numpy.typing import DTypeLike
 
@@ -30,9 +31,9 @@ def depth_scales_match(a: float, b: float) -> bool:
     return math.isclose(a, b, rel_tol=1e-6, abs_tol=0.0)
 
 
-def validate_aligned_depth_distortion(model: str) -> None:
+def validate_distortion_model(model: str) -> None:
     if model not in {"distortion.none", "none", "distortion.brown_conrady", "brown_conrady"}:
-        raise ValueError(f"depth deprojection has no validated path for distortion model {model!r}")
+        raise ValueError(f"unsupported camera distortion model {model!r}")
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,32 @@ def camera_parameters_cv(
     return parameters
 
 
+def init_undistort_maps(intrinsics: CameraIntrinsics) -> tuple[np.ndarray, np.ndarray] | None:
+    """固定 K、分辨率和 optical 轴的针孔网格；None 表示恒等映射。"""
+    validate_distortion_model(intrinsics.distortion_model)
+    if (intrinsics.distortion_model in {"none", "distortion.none"}
+            or not any(intrinsics.distortion_coeffs)):
+        return None
+    matrix = intrinsics.matrix()
+    return cv2.initUndistortRectifyMap(
+        matrix, np.asarray(intrinsics.distortion_coeffs), np.eye(3), matrix,
+        (intrinsics.width, intrinsics.height), cv2.CV_32FC1,
+    )
+
+
+def remap_image(
+    image: np.ndarray,
+    maps: tuple[np.ndarray, np.ndarray] | None,
+    *,
+    interpolation: int,
+) -> np.ndarray:
+    if maps is None:
+        return image
+    return cv2.remap(
+        image, *maps, interpolation, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+
+
 def camera_extrinsic_cv(T_xarm_base_from_color: np.ndarray) -> np.ndarray:
     """已校验的 color→base 变换转为训练所用 base→color [R|t]。"""
     rotation = T_xarm_base_from_color[:3, :3].T
@@ -116,7 +143,7 @@ def undistorted_depth_coordinates(
     columns: np.ndarray,
     intrinsics: CameraIntrinsics,
 ) -> tuple[np.ndarray, np.ndarray]:
-    validate_aligned_depth_distortion(intrinsics.distortion_model)
+    validate_distortion_model(intrinsics.distortion_model)
     xd = (np.asarray(columns, dtype=np.float32) - np.float32(intrinsics.ppx)) / np.float32(intrinsics.fx)
     yd = (np.asarray(rows, dtype=np.float32) - np.float32(intrinsics.ppy)) / np.float32(intrinsics.fy)
     if intrinsics.distortion_model in {"distortion.none", "none"}:

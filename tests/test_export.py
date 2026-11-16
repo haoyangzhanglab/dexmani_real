@@ -2,6 +2,7 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import h5py
 import numpy as np
@@ -242,7 +243,11 @@ def test_hoi_trim_precedes_fk_and_keeps_images_in_step(tmp_path, hoi_episodes, m
     for episode in source.iterdir():
         (episode / "rgb.mp4").touch()
         with h5py.File(episode / "data.h5", "r+") as data:
-            data["meta"].attrs.update(camera_color_width=2, camera_color_height=2)
+            data["meta"].attrs.update(
+                camera_color_width=2, camera_color_height=2, camera_payload_mode="rgb",
+                camera_color_intrinsics=np.eye(3).ravel(),
+                camera_color_distortion_model="none", camera_color_distortion_coeffs=np.zeros(5),
+            )
             rows = data["timing/rows"][:]
             rows["camera_ns"] -= 10_000_000
             data["timing/rows"][:] = rows
@@ -343,3 +348,140 @@ def test_export_rejects_episode_with_no_valid_hoi_rows(tmp_path, hoi_episodes):
             source, output, processing=ExportConfig(), fields=("object_pointcloud",)
         )
     assert not output.exists()
+
+
+@pytest.mark.parametrize("rgb_only", [False, True])
+def test_pinhole_export_matches_online_and_keeps_raw_cloud(tmp_path, raw_episodes, monkeypatch, rgb_only):
+    import cv2
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.config.perception import PointCloudConfig
+    from dexmani_real.data.raw import camera_metadata, _VideoWriter
+    from dexmani_real.deployment.observation import ObservationBuilder
+    from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
+    from dexmani_real.perception.pointcloud import PointCloudProcessor
+
+    source, _, _ = raw_episodes
+    episode = source / "episode_0"
+    color = CameraIntrinsics(64, 48, 100., 100., 32., 24., "brown_conrady", (.8, 0, .001, 0, 0))
+    camera = CameraSnapshot(None, color, None if rgb_only else .001, None if rgb_only else np.eye(4))
+    y, x = np.indices((48, 64))
+    image = np.stack((x * 4, y * 5, (x + y) * 2), axis=-1).astype(np.uint8)
+    depth = np.where(x < 32, 600, 1200).astype(np.uint16)
+    depth[18:28, 26:36] = 0
+    with h5py.File(episode / "data.h5", "r+") as f:
+        f["meta"].attrs.update(camera_metadata(camera))
+        if not rgb_only:
+            f.create_dataset("depth", data=np.repeat(depth[None], 4, axis=0))
+    video = _VideoWriter(episode / "rgb.mp4", fps=20, width=64, height=48)
+    video.open()
+    try:
+        for i in range(4):
+            video.write_frame(image, 1_000_000_000 + i * 50_000_000)
+    finally:
+        video.close()
+    with RawReader(episode) as reader:
+        images = list(reader.iter_rgb_frames())
+        snapshot = reader.read_camera()
+    before = [frame.copy() for frame in images]
+    init = Mock(wraps=cv2.initUndistortRectifyMap)
+    remap = Mock(wraps=cv2.remap)
+    monkeypatch.setattr(cv2, "initUndistortRectifyMap", init)
+    monkeypatch.setattr(cv2, "remap", remap)
+    config = ExportConfig(pointcloud=PointCloudConfig(
+        num_points=32, remove_table=False, workspace=(-2, -2, -2, 2, 2, 2),
+    ))
+    fields = ("rgb", "action") if rgb_only else (
+        "rgb", "depth", "point_cloud", "camera_intrinsic", "camera_extrinsic", "action",
+    )
+    output = tmp_path / "images.zarr"
+    export_zarr(episode, output, processing=config, fields=fields)
+    assert init.call_count == 1
+    assert remap.call_count == (4 if rgb_only else 8)
+    root = zarr.open_group(str(output), mode="r")
+    assert root.attrs["image_geometry"] == "pinhole"
+    builder = ObservationBuilder(SimpleNamespace(observation_fields=("rgb",)), RealConfig())
+    builder.configure_camera(snapshot)
+    history = []
+    for i, frame in enumerate(images):
+        observed = builder.project(SimpleNamespace(camera={"rgb": frame, "ring_sequence": i + 1}))
+        history.append(observed)
+        np.testing.assert_array_equal(root["data/rgb"][i], observed["rgb"])
+        np.testing.assert_array_equal(frame, before[i])
+    from dexmani_policy.common.inference import prepare_observations
+    from dexmani_policy.datasets.demonstration import DemonstrationDataset
+
+    resize = (24, 32) if rgb_only else None
+    modalities = ["rgb"] if rgb_only else ["rgb", "point_cloud", "camera_intrinsic", "camera_extrinsic"]
+    dataset = DemonstrationDataset(
+        str(output), sensor_modalities=modalities, obs_horizon=2, horizon=2,
+        rgb_preprocess_size=resize,
+    )
+    online = prepare_observations(
+        builder.build(history[:2]), normalization_dims={"rgb": 3}, n_obs_steps=2,
+        rgb_preprocessing={"resize_hw": resize, "center_crop_hw": None}, device="cpu",
+    )
+    np.testing.assert_array_equal(dataset[0]["obs"]["rgb"].numpy(), online["rgb"][0].numpy())
+
+    # 足够远的越界点全部填零，边界相邻点仍遵循双线性权重。
+    maps = builder.rgb_maps
+    outside = (maps[0] < -1) | (maps[0] > 64) | (maps[1] < -1) | (maps[1] > 48)
+    assert outside.any()
+    assert not root["data/rgb"][0][outside].any()
+    if not rgb_only:
+        from scripts import visualize_episode
+
+        # 只替换显示输出；实际矫正、Raw 读取及返回给点云的深度均走真实实现。
+        display = Mock()
+        monkeypatch.setattr(visualize_episode, "log_rgbd", display)
+        with RawReader(episode) as reader:
+            viewer = SimpleNamespace(reader=reader, camera_model=snapshot, image_maps=maps)
+            raw_depth = visualize_episode.EpisodeVisualizer.log_camera(viewer, 0, images[0])
+        np.testing.assert_array_equal(display.call_args.args[0], root["data/rgb"][0])
+        np.testing.assert_array_equal(display.call_args.args[1], root["data/depth"][0])
+        np.testing.assert_array_equal(raw_depth, depth)
+        np.testing.assert_array_equal(images[0], before[0])
+        processor = PointCloudProcessor(
+            depth_scale_m=.001, intrinsics=color, T_xarm_base_from_color=np.eye(4),
+            table_plane_abcd=None, config=config.pointcloud,
+        )
+        for i, frame in enumerate(images):
+            np.testing.assert_array_equal(root["data/point_cloud"][i], processor.process(depth, frame))
+        expected_depth = cv2.remap(
+            depth, *maps, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        np.testing.assert_array_equal(root["data/depth"][0], expected_depth)
+        assert root["data/depth"].dtype == np.uint16
+        assert set(np.unique(expected_depth)) == {0, 600, 1200}
+        assert not expected_depth[outside].any()
+        assert root.attrs["depth_scale_m_per_unit"] == .001
+        with h5py.File(episode / "data.h5", "r") as f:
+            np.testing.assert_array_equal(f["depth"][0], depth)
+        previous_calls = init.call_count, remap.call_count
+        cloud_output = tmp_path / "cloud.zarr"
+        export_zarr(episode, cloud_output, processing=config, fields=("point_cloud",))
+        assert (init.call_count, remap.call_count) == previous_calls
+        cloud_root = zarr.open_group(str(cloud_output), mode="r")
+        assert "image_geometry" not in cloud_root.attrs
+        np.testing.assert_array_equal(cloud_root["data/point_cloud"][:], root["data/point_cloud"][:])
+        cloud_root.store.close()
+        depth_output = tmp_path / "depth.zarr"
+        export_zarr(episode, depth_output, processing=config, fields=("depth",))
+        depth_root = zarr.open_group(str(depth_output), mode="r")
+        np.testing.assert_array_equal(depth_root["data/depth"][:], root["data/depth"][:])
+        assert depth_root.attrs["image_geometry"] == "pinhole"
+        depth_root.store.close()
+    root.store.close()
+
+
+@pytest.mark.parametrize("missing", [
+    "camera_color_intrinsics", "camera_color_distortion_model", "camera_color_distortion_coeffs",
+])
+def test_rgb_metadata_requires_actual_geometry(missing):
+    from dexmani_real.data.raw import camera_metadata, decode_camera_metadata
+    from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
+
+    camera = CameraSnapshot(None, CameraIntrinsics(4, 3, 4., 4., 2., 1., "none", (0.,) * 5), None, None)
+    meta = camera_metadata(camera)
+    del meta[missing]
+    with pytest.raises(KeyError, match=missing):
+        decode_camera_metadata(meta)

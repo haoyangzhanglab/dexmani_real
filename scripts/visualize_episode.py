@@ -15,12 +15,14 @@ from typing import cast
 
 os.environ.setdefault("RUST_LOG", "error")
 
+import cv2
 import numpy as np
 
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.config.real import load_config
 from dexmani_real.data.hoi import align_hoi_episode, read_hoi_validity
 from dexmani_real.data.raw import TACTILE_FINGER_ORDER, RawReader, read_episode_outcome
+from dexmani_real.geometry.camera import init_undistort_maps, remap_image
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
@@ -109,6 +111,7 @@ class EpisodeVisualizer:
             if max_frames is not None:
                 self.frame_count = min(self.frame_count, max_frames)
             self.camera_model = self.reader.read_camera()
+            self.image_maps = init_undistort_maps(self.camera_model.color)
             self.T_xarm_base_from_color = self.camera_model.T_xarm_base_from_color
             if pointcloud_config is not None and self.T_xarm_base_from_color is None:
                 logger.warning("No camera extrinsics: camera point cloud disabled")
@@ -269,15 +272,15 @@ class EpisodeVisualizer:
                 self.rr.log(f"hoi/object_{index}/{name}", self.rr.Scalar(measured))
 
     def log_camera(self, step_idx: int, rgb: np.ndarray) -> np.ndarray:
-        color = self.camera_model.color
-        if rgb.dtype != np.uint8 or rgb.shape != (color.height, color.width, 3):
-            raise ValueError(f"RGB shape or dtype invalid at frame {step_idx}")
         depth = np.asarray(self.reader["depth"][step_idx])
         depth_scale_m = cast(float, self.camera_model.depth_scale_m)
         log_rgbd(
-            rgb, depth, depth_scale_m=depth_scale_m,
+            remap_image(rgb, self.image_maps, interpolation=cv2.INTER_LINEAR),
+            remap_image(depth, self.image_maps, interpolation=cv2.INTER_NEAREST),
+            depth_scale_m=depth_scale_m,
             depth_range_m=(0, 10000 * depth_scale_m),
         )
+        # 后续点云仍按原始像素配对取色。
         return depth
 
     def log_pointcloud(self, rgb: np.ndarray, depth: np.ndarray) -> None:

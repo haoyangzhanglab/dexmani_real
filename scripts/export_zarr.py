@@ -54,7 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fields", nargs="+", choices=tuple(FIELD_INPUTS),
-        help="Canonical fields to export; omitted means all fields except object_pointcloud.",
+        help="Canonical fields to export; RGB/depth use the fixed-K pinhole grid. "
+             "Omitted means all fields except object_pointcloud.",
     )
     parser.add_argument(
         "--exclude",

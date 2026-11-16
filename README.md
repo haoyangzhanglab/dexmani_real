@@ -31,6 +31,8 @@ flowchart LR
 
 实验配置由 [RealConfig](dexmani_real/config/real.py) 组装，涵盖设备、传感器、运动约束与运行方式。采集、部署和回放可通过 `--config` 使用本地 Python 实验配置；在已配置依赖的 `real_robot` 环境中从仓库根目录运行脚本，具体参数见各入口的 `--help`。
 
+Raw 保留采集时的原始 RGB-D、K、畸变参数及已有外参。Canonical RGB/depth 与在线策略 RGB（包括纯 RGB 策略）统一采用固定 K、原始分辨率和光轴的无畸变针孔网格；RGB 双线性重采样，depth 使用同一映射最近邻重采样，越界填零。含图像的 Zarr 标记 `image_geometry="pinhole"`。Raw 可视化也使用矫正图像与针孔相机叠加；点云仍由原始 RGB-D 配对生成；新契约不提供旧实验产物兼容路径。
+
 Zarr 根属性 `task_name` 来自 Raw 的 `meta.task_label`，不受目录名影响；合并的各段必须属于同一任务。
 
 `action_space="joint"` 描述采集的绝对关节目标，即使仅导出观测或 `action_ee` 也保持不变。训练通过 `action_key` 选择关节目标 `action` 或经 FK 派生的 `action_ee`。

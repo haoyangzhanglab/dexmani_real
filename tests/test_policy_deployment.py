@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -69,7 +70,7 @@ def test_rgb_cloud_and_camera_parameters(info):
     builder = ObservationBuilder(replace(info, observation_fields=fields), RealConfig())
     color = CameraIntrinsics(4, 3, 2., 2., 2., 1., 'none', (0.,) * 5)
     builder.configure_camera(SimpleNamespace(color=color, T_xarm_base_from_color=np.eye(4)))
-    row = SimpleNamespace(camera={'rgb': np.zeros((3, 4, 3), np.uint8)}, point_cloud=np.zeros((17, 6), np.float32))
+    row = SimpleNamespace(camera={'rgb': np.zeros((3, 4, 3), np.uint8), 'ring_sequence': 1}, point_cloud=np.zeros((17, 6), np.float32))
     arrays = builder.build([builder.project(row)] * info.n_obs_steps)
     assert builder.needs.camera_fields == ('rgb',)
     assert builder.needs.point_cloud
@@ -114,3 +115,34 @@ def test_hoi_eef_projection_requires_only_arm_history(info):
     arrays = builder.build([builder.project(row)])
     assert arrays["eef_pose"].shape == (1, 9)
     assert np.isfinite(arrays["eef_pose"]).all()
+
+
+def test_rgb_only_rectifies_once_per_source_frame(info, monkeypatch):
+    import cv2
+    from dexmani_real.geometry.camera import CameraSnapshot
+
+    color = CameraIntrinsics(64, 48, 55., 55., 32., 24., 'brown_conrady', (.2, 0, .001, 0, 0))
+    camera = CameraSnapshot(None, color, None, None)
+    builder = ObservationBuilder(replace(info, observation_fields=('rgb',)), RealConfig())
+    init = Mock(wraps=cv2.initUndistortRectifyMap)
+    remap = Mock(wraps=cv2.remap)
+    monkeypatch.setattr(cv2, "initUndistortRectifyMap", init)
+    monkeypatch.setattr(cv2, "remap", remap)
+    builder.configure_camera(camera)
+    image = np.arange(48 * 64 * 3, dtype=np.uint8).reshape(48, 64, 3)
+    before = image.copy()
+    row = SimpleNamespace(camera={'rgb': image, 'ring_sequence': 4, 'timestamp_ns': 123})
+    first = builder.project(row)
+    assert builder.project(row)['rgb'] is first['rgb']
+    builder.build([first, first])
+    assert (init.call_count, remap.call_count) == (1, 1)
+    row.camera['ring_sequence'] = 5
+    second = builder.project(row)
+    assert second['rgb'] is not first['rgb']
+    assert (init.call_count, remap.call_count) == (1, 2)
+    builder.configure_camera(camera)
+    builder.project(row)
+    assert (init.call_count, remap.call_count) == (2, 3)
+    np.testing.assert_array_equal(image, before)
+    assert row.camera['timestamp_ns'] == 123
+    assert builder.camera_parameters == {}
