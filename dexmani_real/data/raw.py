@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from fractions import Fraction
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -30,6 +31,11 @@ if TYPE_CHECKING:
     import h5py
 
 logger = logging.getLogger(__name__)
+
+
+class RawDataError(ValueError):
+    """输入 Raw 不满足完整示教的数据契约。"""
+
 
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
 TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
@@ -195,9 +201,10 @@ def decode_camera_metadata(meta) -> CameraSnapshot:
     return CameraSnapshot(meta.get("camera_serial"), color, scale, transform)
 
 
-def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata):
+def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata, runtime):
     """记录本轮实际相机参数与触觉复位结果。"""
     metadata = camera_metadata(camera_snapshot)
+    metadata["effective_config"] = json.dumps(asdict(runtime), allow_nan=False)
     metadata.update(tactile_reset_metadata)
     if tactile_reset_metadata:
         # HDF5 属性不支持 dict，设备结果只在录制边界编码。
@@ -489,6 +496,9 @@ class RawReader:
                 raise ValueError(f"Raw arm_action_semantics: expected {ARM_ACTION_SEMANTICS}")
             path = "hoi/object_pointcloud" if name == "object_pointcloud" else name
             array = self.data_file[path]
+            import h5py
+            if not isinstance(array, h5py.Dataset):
+                raise RawDataError(f"Raw {name}: expected a dataset")
             spec = (
                 ((), TIMING_ROW_DTYPE) if name == "timing/rows"
                 else ROBOT_DATASET_SPECS.get(name, VR_DATASET_SPECS.get(name))

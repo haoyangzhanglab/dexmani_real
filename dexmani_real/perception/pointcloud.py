@@ -219,3 +219,21 @@ class PointCloudProcessor:
 
         selected = sample_indices(points, self.config.num_points)
         return np.column_stack((points[selected], colors[selected]))
+
+
+def processing_metadata(config):
+    """记录实际配置和固定滤波常量；与处理实现共用权威值。"""
+    from dataclasses import asdict
+
+    return dict(
+        config={**asdict(config), "workspace": list(config.workspace)},
+        depth_range_m=list(DEPTH_RANGE_M),
+        edge_jump_m=EDGE_JUMP_M,
+        edge_surface_band_m=EDGE_SURFACE_BAND_M,
+        depth_min_support=DEPTH_MIN_SUPPORT,
+        edge_min_support=EDGE_MIN_SUPPORT,
+        voxel_size_m=VOXEL_SIZE_M,
+        outlier_radius_m=OUTLIER_RADIUS_M,
+        outlier_min_neighbors=OUTLIER_MIN_NEIGHBORS,
+        outlier_min_component_points=OUTLIER_MIN_COMPONENT_POINTS,
+    )

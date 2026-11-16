@@ -5,18 +5,20 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import sys
 import tempfile
-from dataclasses import asdict, dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import cv2
 import numpy as np
 import zarr
 
 from dexmani_real.config.perception import HOI_NUM_POINTS, HandCloudConfig, PointCloudConfig
-from dexmani_real.data.hoi import align_hoi_episode
-from dexmani_real.data.raw import RawReader, require_published_raw
+from dexmani_real.data.hoi import read_hoi_validity
+from dexmani_real.data.raw import RawDataError, RawReader, require_published_raw, validate_task_label
 from dexmani_real.geometry.camera import (
     camera_extrinsic_cv,
     depth_scales_match,
@@ -24,15 +26,17 @@ from dexmani_real.geometry.camera import (
     parse_camera_matrix,
     remap_image,
 )
+from dexmani_real.geometry.hoi import template_digest, validate_task_template
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
 from dexmani_real.geometry.pose import encode_eef_pose, validate_rigid_transform
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
-from dexmani_real.perception.pointcloud import PointCloudProcessor
+from dexmani_real.perception.pointcloud import PointCloudProcessor, processing_metadata
 from dexmani_real.robot.model import (
     XHAND_FINGERTIP_LINK_NAMES,
     XHAND_TACTILE_SCALE_DIVISOR,
 )
 from dexmani_real.utils.io import publish
+from dexmani_real.utils.timing import interpolate_joints, validate_joint_gap
 
 CANONICAL_FORMAT = "dexmani.real.canonical"
 logger = logging.getLogger(__name__)
@@ -159,15 +163,20 @@ def iter_canonical_blocks(
     hand_fk,
     hand_cloud,
     camera,
-    alignment=None,
+    alignment,
 ):
     frames = reader.num_frames
     inputs = {name for field in fields for name in FIELD_INPUTS[field]}
+    # 已有 HOI 即使不输出，也在同一分块读取中检查有限性。
+    if "hoi" in reader.data_file:
+        inputs.add("object_pointcloud")
     specs = canonical_array_specs(fields, config, camera)
     row_bytes = sum(int(np.prod(shape)) * dtype.itemsize for shape, dtype in specs.values())
     if "point_cloud" in fields and "depth" not in fields:
-        # 点云逐帧计算，但原始深度仍按块读取；图像尺寸可以逐段变化。
+        # 点云逐帧计算，但原始深度仍按块读取；额外计入读取预算。
         row_bytes += int(np.prod(camera["shape"])) * np.dtype(np.uint16).itemsize
+    if "object_pointcloud" in inputs and "object_pointcloud" not in fields:
+        row_bytes += HOI_NUM_POINTS * 3 * np.dtype(np.float32).itemsize
     chunk_frames = min(MAX_BATCH_FRAMES, max(1, PROCESSING_BYTES // row_bytes))
     processor = None
     if "point_cloud" in fields:
@@ -181,21 +190,17 @@ def iter_canonical_blocks(
     images = reader.iter_rgb_frames() if "rgb" in inputs else None
     # 对齐结果是关节观测的唯一来源，不再读取随后会被丢弃的原始关节块。
     sources = {
-        name: alignment[name] if alignment is not None and name in alignment else reader[name]
+        name: alignment[name] if name in alignment else reader[name]
         for name in inputs - {"rgb"}
     }
     for start in range(0, frames, chunk_frames):
         end = min(frames, start + chunk_frames)
-        if alignment is None:
-            selected = slice(None)
-            count = end - start
-        else:
-            selected = alignment["keep"][start:end]
-            count = int(selected.sum())
-        raw = (
-            {name: source[start:end][selected] for name, source in sources.items()}
-            if count else {}
-        )
+        count = end - start
+        with raw_input():
+            raw = {name: source[start:end] for name, source in sources.items()}
+            for name, values in raw.items():
+                if not np.isfinite(values).all():
+                    raise RawDataError(f"{name}: nonfinite values in rows {start}:{end}")
         block = {}
         if images is not None:
             height, width = camera["shape"]
@@ -205,13 +210,11 @@ def iter_canonical_blocks(
                 block["point_cloud"] = np.empty(
                     (count, config.pointcloud.num_points, 6), dtype=np.float32
                 )
-            offset = 0
-            for index in range(start, end):
-                raw_rgb = next(images, None)
+            for offset, index in enumerate(range(start, end)):
+                with raw_input():
+                    raw_rgb = next(images, None)
                 if raw_rgb is None:
-                    raise ValueError(f"{reader.path / 'rgb.mp4'}: RGB missing at row {index}")
-                if alignment is not None and not alignment["keep"][index]:
-                    continue
+                    raise RawDataError(f"{reader.path / 'rgb.mp4'}: RGB missing at row {index}")
                 if "rgb" in fields:
                     block["rgb"][offset] = remap_image(
                         raw_rgb, camera["image_maps"], interpolation=cv2.INTER_LINEAR,
@@ -219,13 +222,10 @@ def iter_canonical_blocks(
                 if processor is not None:
                     cloud = processor.process(raw["depth"][offset], raw_rgb)
                     if not len(cloud):
-                        raise ValueError(f"point_cloud unavailable at row {index}")
+                        raise RawDataError(f"point_cloud unavailable at row {index}")
                     block["point_cloud"][offset] = cloud
                     del cloud
-                offset += 1
                 del raw_rgb
-        if count == 0:
-            continue
         if "object_pointcloud" in fields:
             block["object_pointcloud"] = raw["object_pointcloud"]
         if "joint_state" in fields:
@@ -260,181 +260,262 @@ def iter_canonical_blocks(
                     block["depth"][index] = remap_image(frame, maps, interpolation=cv2.INTER_NEAREST)
         yield block
         del raw, block
-    if images is not None and next(images, None) is not None:
-        raise ValueError(f"{reader.path / 'rgb.mp4'}: unexpected RGB frame at row {frames}")
+    with raw_input():
+        if images is not None and next(images, None) is not None:
+            raise RawDataError(f"{reader.path / 'rgb.mp4'}: unexpected RGB frame at row {frames}")
+
+
+@contextmanager
+def raw_input():
+    """仅包围输入读取和输入校验，不包含输出写入或模型计算。"""
+    from av.error import InvalidDataError, EOFError as VideoEOFError
+
+    try:
+        yield
+    except RawDataError:
+        raise
+    except (KeyError, ValueError, FileNotFoundError, InvalidDataError, VideoEOFError) as exc:
+        raise RawDataError(str(exc)) from exc
+    except OSError as exc:
+        # HDF5 内容损坏；权限、磁盘等系统错误仍由调用方处理。
+        if exc.errno is None and any(
+            detail in str(exc).lower()
+            for detail in (
+                "file signature not found",
+                "truncated file",
+                "inflate() failed",
+                "filter returned failure",
+                "checksum",
+            )
+        ):
+            raise RawDataError(str(exc)) from exc
+        raise
+
+
+def prepare_raw(reader, processing, fields):
+    """验证完整 Raw，并准备低维关节对齐；RGB-D 仍在写入时单遍读取。"""
+    with raw_input():
+        validate_task_label(reader.meta["task_label"])
+        if reader.num_frames <= 0:
+            raise RawDataError("episode contains no rows")
+        if reader.meta.get("recording_truncated_reason"):
+            raise RawDataError(str(reader.meta["recording_truncated_reason"]))
+        if not np.array_equal(reader.segment_starts, [0]):
+            raise RawDataError("Raw requires one continuous interval")
+        timing = reader.read_timing()
+        has_object = "hoi" in reader.data_file
+        if "object_pointcloud" in reader.data_file:
+            raise RawDataError("object_pointcloud must be stored in /hoi")
+        if "_hoi_staging" in reader.data_file:
+            raise RawDataError("incomplete HOI annotation")
+        if not has_object:
+            fields = tuple(name for name in fields if name != "object_pointcloud")
+        if not fields:
+            raise RawDataError("no selected fields available")
+        template = None
+        if has_object:
+            reader["object_pointcloud"]
+            if not read_hoi_validity(reader).all():
+                raise RawDataError("HOI contains invalid rows")
+            import h5py
+
+            saved = reader.data_file["hoi/template"]
+            if not isinstance(saved, h5py.Group) or any(
+                not isinstance(saved.get(key), h5py.Dataset)
+                for key in ("points_local", "offsets", "object_names")
+            ):
+                raise RawDataError("invalid HOI template datasets")
+            if h5py.check_string_dtype(saved["object_names"].dtype) is None:
+                raise RawDataError("HOI object_names must be strings")
+            template = {key: saved[key][:] for key in ("points_local", "offsets")}
+            template["object_names"] = saved["object_names"].asstr()[:].astype(str)
+            validate_task_template(template)
+        inputs = {name for field in fields for name in FIELD_INPUTS[field]}
+        source_clocks = {
+            "arm_qpos": "arm_ns",
+            "hand_qpos": "hand_ns",
+            "hand_contact": "tactile_aggregate_ns",
+            "hand_tactile_force": "tactile_dense_ns",
+            "rgb": "camera_ns",
+            "depth": "camera_ns",
+            "object_pointcloud": "camera_ns",
+        }
+        for clock in {source_clocks[name] for name in inputs if name in source_clocks}:
+            stamps = timing[clock]
+            if (
+                np.any(stamps <= 0)
+                or np.any(stamps > timing["observation_ns"])
+                or np.any(np.diff(stamps) < 0)
+            ):
+                raise RawDataError(f"invalid source timestamp: {clock}")
+        reader.require_fields(*inputs)
+        for name in inputs - {"rgb"}:
+            reader[name]
+        alignment = {}
+        if "object_pointcloud" in fields:
+            for device in ("arm", "hand"):
+                name = f"{device}_qpos"
+                if name in inputs:
+                    values, valid = interpolate_joints(
+                        timing[f"{device}_ns"],
+                        reader[name][:],
+                        timing["camera_ns"],
+                        processing.hoi_max_joint_gap_s,
+                    )
+                    if not valid.all():
+                        raise RawDataError(f"{device}: not all Raw rows can be aligned")
+                    alignment[name] = values
+        return fields, has_object, template, alignment, export_camera(reader, fields)
 
 
 def export_zarr(
-    input_root: str | Path,
-    output_path: str | Path,
-    *,
-    processing: ExportConfig,
-    fields=None,
-    exclude: tuple[str, ...] = (),
-    progress_callback=None,
-) -> dict:
-    fields = resolve_fields(fields)
-    inputs = {name for field in fields for name in FIELD_INPUTS[field]}
-    joint_devices = tuple(
-        device
-        for device in ("arm", "hand")
-        if "object_pointcloud" in fields and f"{device}_qpos" in inputs
-    )
-    if "point_cloud" in fields:
+    input_root, output_path, *, processing, fields=None, exclude=(), progress_callback=None
+):
+    selected_fields = resolve_fields(tuple(FIELD_INPUTS) if fields is None else fields)
+    validate_joint_gap(processing.hoi_max_joint_gap_s)
+    if "point_cloud" in selected_fields:
         processing.pointcloud.validate()
-    if "hand_pointcloud" in fields:
+        if processing.pointcloud.remove_table:
+            plane = np.asarray(processing.table_plane_abcd, dtype=float)
+            if (
+                plane.shape != (4,)
+                or not np.isfinite(plane).all()
+                or np.linalg.norm(plane[:3]) == 0
+            ):
+                raise ValueError("remove_table=True requires a finite calibrated table plane")
+    if "hand_pointcloud" in selected_fields:
         processing.hand_pointcloud.validate()
-    output = Path(output_path).expanduser()
-    target = output.resolve()
-    if os.path.lexists(output):
-        raise FileExistsError(f"refusing to overwrite existing canonical Zarr: {output}")
+    target = Path(output_path).expanduser().absolute()
+    if os.path.lexists(target):
+        raise FileExistsError(target)
     selected, excluded = select_episodes(input_root, exclude)
-    staging = None
-    store = None
-    ends: list[int] = []
-    hoi_records = []
+    arm_fk = ArmFK() if ARM_FK_FIELDS.intersection(selected_fields) else None
+    hand_fk = HandFK() if HAND_FK_FIELDS.intersection(selected_fields) else None
+    hand_cloud = (
+        HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
+        if "hand_pointcloud" in selected_fields
+        else None
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent))
+    groups: dict[str, dict[str, Any]] = {}
+    rejected = []
     try:
         for index, episode in enumerate(selected):
             if progress_callback:
                 progress_callback(index, len(selected))
-            offset = ends[-1] if ends else 0
+            group = None
+            offset = 0
             try:
-                require_published_raw(episode)
-                with RawReader(episode) as reader:
-                    task_name = reader.meta["task_label"]
-                    frames = reader.num_frames
-                    if frames <= 0:
-                        raise ValueError("episode contains no rows")
-                    camera = export_camera(reader, fields)
-                    alignment = (
-                        align_hoi_episode(
-                            reader, processing.hoi_max_joint_gap_s, devices=joint_devices
-                        )
-                        if "object_pointcloud" in fields
-                        else None
+                with raw_input():
+                    require_published_raw(episode)
+                    reader = RawReader(episode)
+                with reader:
+                    names, has_object, template, alignment, camera = prepare_raw(
+                        reader, processing, selected_fields
                     )
-                    if alignment is not None:
-                        starts = alignment["starts"]
-                        frames = int(alignment["keep"].sum())
-                        if frames == 0:
-                            raise ValueError("No valid HOI rows to export")
-                    else:
-                        reader.read_timing()
-                        starts = reader.segment_starts
-                    logger.info(
-                        "%s: exporting %d rows in %d segments",
-                        episode.name, frames, len(starts),
-                    )
-                    if index == 0:
-                        arm_fk = ArmFK() if ARM_FK_FIELDS.intersection(fields) else None
-                        hand_fk = HandFK() if HAND_FK_FIELDS.intersection(fields) else None
-                        hand_cloud = (
-                            HandPointCloud(
-                                cast(HandFK, hand_fk), processing.hand_pointcloud.num_points
-                            )
-                            if "hand_pointcloud" in fields else None
-                        )
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        staging = Path(
-                            tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent)
-                        )
-                        store = zarr.DirectoryStore(str(staging))
+                    key = "with_object" if has_object else "without_object"
+                    group = groups.get(key)
+                    if group is None:
                         root, arrays = create_store(
-                            store,
+                            zarr.DirectoryStore(str(staging / f"{key}.zarr")),
                             processing,
                             camera,
-                            fields=fields,
+                            fields=names,
                             control_hz=reader.control_hz,
-                            task_name=task_name,
+                            task_name=reader.meta["task_label"],
+                            hand_cloud=hand_cloud,
+                            template=template,
+                        )
+                        group = groups[key] = dict(
+                            root=root, arrays=arrays, ends=[], episodes=[], template=template
                         )
                     else:
-                        if task_name != root.attrs["task_name"]:
-                            raise ValueError(
-                                f"task_label mismatch: expected {root.attrs['task_name']!r}, "
-                                f"got {task_name!r}"
-                            )
-                        if not np.isclose(reader.dt, root.attrs["dt"], rtol=1e-6, atol=0):
-                            raise ValueError("one canonical store requires uniform dt")
-                        if "depth" in fields and not depth_scales_match(
+                        root, arrays = group["root"], group["arrays"]
+                        offset = group["ends"][-1]
+                        if reader.meta["task_label"] != root.attrs["task_name"] or not np.isclose(
+                            reader.dt, root.attrs["dt"], rtol=1e-6, atol=0
+                        ):
+                            raise RawDataError("task_label or dt mismatch")
+                        if "depth" in names and not depth_scales_match(
                             camera["depth_scale_m"], root.attrs["depth_scale_m_per_unit"]
                         ):
-                            raise ValueError("depth_scale_m_per_unit must be uniform")
-                        for name in ("rgb", "depth"):
-                            if name in fields:
-                                shape = (
-                                    (*camera["shape"], 3) if name == "rgb" else camera["shape"]
-                                )
-                                if shape != arrays[name].shape[1:]:
-                                    raise ValueError(f"inconsistent {name} shape")
-
+                            raise RawDataError("depth_scale_m_per_unit must be uniform")
+                        specs = canonical_array_specs(names, processing, camera)
+                        if any(
+                            arrays[name].shape[1:] != shape for name, (shape, _) in specs.items()
+                        ):
+                            raise RawDataError("inconsistent field shape")
+                        if template is not None and any(
+                            not np.array_equal(template[k], group["template"][k]) for k in template
+                        ):
+                            raise RawDataError("HOI templates differ between episodes")
                     blocks = iter_canonical_blocks(
                         reader,
                         processing,
-                        fields=fields,
+                        fields=names,
                         arm_fk=arm_fk,
                         hand_fk=hand_fk,
                         hand_cloud=hand_cloud,
                         camera=camera,
                         alignment=alignment,
                     )
-                    if alignment is not None:
-                        hoi_records.append(
-                            {
-                                "episode": episode.name,
-                                "kept_ranges": alignment["ranges"],
-                                "max_gap_s": processing.hoi_max_joint_gap_s,
-                            }
-                        )
-                    if "object_pointcloud" in fields:
-                        saved = reader.data_file["hoi/template"]
-                        template = {
-                            "points_local": saved["points_local"][:],
-                            "offsets": saved["offsets"][:],
-                            "object_names": saved["object_names"].asstr()[:],
-                        }
-                        if index == 0:
-                            task_template = template
-                        elif any(
-                            not np.array_equal(template[key], task_template[key])
-                            for key in template
-                        ):
-                            raise ValueError("HOI templates differ between episodes")
-                    append_rows(arrays, offset, blocks, frames)
-                    ends.extend(offset + int(start) for start in starts[1:])
-                    ends.append(offset + frames)
-            except (KeyError, ValueError) as exc:
-                raise ValueError(f"Raw {episode}: {exc}") from exc
-        if hoi_records:
-            root.attrs["hoi_alignment"] = hoi_records
-        root.create_group("meta").create_dataset(
-            "episode_ends", data=np.asarray(ends, dtype=np.int64)
+                    append_rows(arrays, offset, blocks, reader.num_frames)
+                    frames = reader.num_frames
+                group["ends"].append(offset + frames)
+                group["episodes"].append(episode.name)
+            except RawDataError as exc:
+                if group is not None:
+                    for array in group["arrays"].values():
+                        array.resize((offset, *array.shape[1:]))
+                    if not group["episodes"]:
+                        shutil.rmtree(staging / f"{key}.zarr")
+                        del groups[key]
+                rejected.append(dict(episode=episode.name, reason=str(exc)))
+                logger.warning("Rejected Raw %s: %s", episode, exc)
+        if not groups:
+            raise ValueError(f"all Raw episodes rejected: {rejected}")
+        outputs = []
+        mixed = len(groups) == 2
+        destination = (
+            target.with_name(target.name.removesuffix(".zarr") + "_modalities") if mixed else target
         )
-        root.store.close()
-        store = None
-        publish(cast(Path, staging), target)
-        staging = None
+        for key, group in groups.items():
+            root = group["root"]
+            root.attrs["source_episodes"] = group["episodes"]
+            root.create_group("meta").create_dataset(
+                "episode_ends", data=np.asarray(group["ends"], dtype=np.int64)
+            )
+            outputs.append(
+                dict(
+                    path=str(destination / f"{key}.zarr" if mixed else destination),
+                    episodes=group["episodes"],
+                    episode_count=len(group["ends"]),
+                    total_frames=group["ends"][-1],
+                )
+            )
+        publish(staging if mixed else staging / f"{next(iter(groups))}.zarr", destination)
         if progress_callback:
             progress_callback(len(selected), len(selected))
-        return {
-            "raw_episode_count": len(selected),
-            "episode_count": len(ends),
-            "total_frames": ends[-1],
-            "excluded_episodes": sorted(excluded),
-        }
+        return dict(
+            outputs=outputs,
+            rejected_episodes=rejected,
+            excluded_episodes=sorted(excluded),
+            episode_count=sum(o["episode_count"] for o in outputs),
+            total_frames=sum(o["total_frames"] for o in outputs),
+        )
     finally:
-        if staging is not None:
-            try:
-                if store is not None:
-                    store.close()
-            except BaseException:
-                logger.exception("export store close also failed")
-            try:
+        failure = sys.exc_info()[1]
+        try:
+            if staging.exists():
                 shutil.rmtree(staging)
-            except BaseException:
-                logger.exception("export staging cleanup also failed: %s", staging)
+        except OSError:
+            if failure is None:
+                raise
+            logger.exception("export staging cleanup also failed: %s", staging)
 
 
-def create_store(store, processing, camera, *, fields, control_hz, task_name):
+def create_store(store, processing, camera, *, fields, control_hz, task_name, hand_cloud, template):
     specs = canonical_array_specs(fields, processing, camera)
     root = zarr.group(store=store, overwrite=True)
     root.attrs.update(
@@ -447,16 +528,30 @@ def create_store(store, processing, camera, *, fields, control_hz, task_name):
         root.attrs["tactile_scale_divisor"] = XHAND_TACTILE_SCALE_DIVISOR
     if {"action", "action_ee"}.intersection(fields):
         root.attrs["action_semantics"] = "absolute_joint_goal_not_next_step_arrival"
-    if "point_cloud" in fields:
-        root.attrs["pointcloud_config"] = asdict(processing.pointcloud)
-        if processing.pointcloud.remove_table:
-            root.attrs["table_plane_abcd"] = processing.table_plane_abcd
+    if "point_cloud" in fields and processing.pointcloud.remove_table:
+        root.attrs["table_plane_abcd"] = processing.table_plane_abcd
     if "fingertip_xyz" in fields:
         root.attrs["fingertip_link_names"] = list(XHAND_FINGERTIP_LINK_NAMES)
     if {"rgb", "depth"}.intersection(fields):
         root.attrs["image_geometry"] = "pinhole"
     if "depth" in fields:
         root.attrs["depth_scale_m_per_unit"] = camera["depth_scale_m"]
+    metadata = {}
+    if "point_cloud" in fields:
+        metadata["point_cloud"] = processing_metadata(processing.pointcloud)
+    if "hand_pointcloud" in fields:
+        metadata["hand_pointcloud"] = dict(
+            num_points=processing.hand_pointcloud.num_points,
+            template_sha256=hand_cloud.template_sha256,
+        )
+    if "object_pointcloud" in fields:
+        metadata["object_pointcloud"] = dict(
+            template_sha256=template_digest(
+                template["points_local"], template["offsets"], template["object_names"]
+            ),
+            max_joint_gap_s=processing.hoi_max_joint_gap_s,
+        )
+    root.attrs["data_processing"] = metadata
     data = root.create_group("data")
     arrays = {}
     for name, (shape, dtype) in specs.items():
@@ -487,7 +582,7 @@ def append_rows(arrays, offset, blocks, frames):
                 valid = np.isfinite(values).reshape(rows, -1).all(axis=1)
                 if not valid.all():
                     row = count + int(np.flatnonzero(~valid)[0])
-                    raise ValueError(f"canonical {name}: nonfinite values at row {row}")
+                    raise RawDataError(f"canonical {name}: nonfinite values at row {row}")
             arrays[name][offset + count : offset + count + rows] = values
         count += rows
         # 同步写入完成后释放消费者引用，避免与下一块分配重叠。

@@ -142,10 +142,6 @@ class EpisodeVisualizer:
             self.hoi_alignment = None
             if self.has_hoi:
                 self.hoi_alignment = align_hoi_episode(self.reader, hoi_max_joint_gap_s)
-                logger.info(
-                    "HOI 可导出区间（关节对齐且感知有效）：%s",
-                    self.hoi_alignment["ranges"],
-                )
             self.state = self.preload_state()
 
             app_id = f"DexMani - {episode_name}"

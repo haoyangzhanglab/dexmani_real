@@ -46,23 +46,29 @@ def load_task_template(task):
     task = Path(task)
     with np.load(task / "hoi/template.npz", allow_pickle=False) as saved:
         template = {key: saved[key] for key in ("points_local", "offsets", "object_names")}
-    names = template["object_names"]
+    validate_task_template(template)
+    if set(template["object_names"]) != {obj["name"] for obj in task_objects(task)}:
+        raise ValueError("模板对象与任务对象不对应")
+    return template
+
+
+def validate_task_template(template):
+    """资产文件和 Raw 标注共用同一模板结构。"""
+    points, offsets, names = (template[key] for key in ("points_local", "offsets", "object_names"))
     if (
         names.ndim != 1
         or names.dtype.kind != "U"
         or not len(names)
         or len(set(names)) != len(names)
-        or set(names) != {obj["name"] for obj in task_objects(task)}
     ):
-        raise ValueError("模板对象与任务对象不对应")
-    points, offsets = template["points_local"], template["offsets"]
+        raise ValueError("非法 HOI 模板对象名")
     if (
         points.shape != (HOI_NUM_POINTS, 3)
         or points.dtype != np.float32
         or not np.isfinite(points).all()
     ):
         raise ValueError("非法 HOI 模板点")
-    # 直接比较顺序，避免整数差分溢出后掩盖倒序。
+    # 直接比较相邻值，避免整数差分溢出。
     if (
         offsets.dtype.kind not in "iu"
         or offsets.shape != (len(names) + 1,)
@@ -71,7 +77,6 @@ def load_task_template(task):
         or np.any(offsets[1:] <= offsets[:-1])
     ):
         raise ValueError("非法 HOI 点分段")
-    return template
 
 
 def transform_task_points(template, poses_camera, base_from_camera):
@@ -123,3 +128,16 @@ def sample_surface_points(mesh, num_points, seed=0):
         start_idx=0,
     )
     return dense[ids]
+
+
+def template_digest(points, offsets, names):
+    """按实际点序、分段和名称标识模板，不依赖资产路径或 NPZ 容器。"""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for values, dtype in ((points, "<f4"), (offsets, "<i8")):
+        array = np.asarray(values, dtype=dtype)
+        digest.update(json.dumps(array.shape).encode())
+        digest.update(array.tobytes())
+    digest.update(json.dumps(list(names), ensure_ascii=False).encode("utf-8"))
+    return digest.hexdigest()

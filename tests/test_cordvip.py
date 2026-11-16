@@ -1575,7 +1575,6 @@ def test_viewer_keeps_joint_alignment_separate_from_object_validity(monkeypatch)
         set_time_seconds=lambda *args: None,
     )
     viewer.hoi_alignment = {
-        "keep": np.array([False]),
         "arm_qpos": np.zeros((1, 7)),
         "hand_qpos": np.zeros((1, 12)),
     }
@@ -1770,7 +1769,6 @@ def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_
     from dataclasses import replace
 
     import h5py
-    import zarr
     from cordvip_geometry import tracking
 
     from dexmani_real.config.real import RealConfig
@@ -1858,14 +1856,9 @@ def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_
         np.testing.assert_array_equal(data["hoi/valid"][:], expected_valid)
         assert not offline_cloud[~np.array(expected_valid)].any()
     output = tmp_path / "train.zarr"
-    export_zarr(
-        episode, output, processing=ExportConfig(), fields=("object_pointcloud",)
-    )
-    exported = zarr.open(str(output), mode="r")
-    np.testing.assert_array_equal(exported["meta/episode_ends"][:], [1, 3, 4])
-    np.testing.assert_array_equal(
-        exported["data/object_pointcloud"][:], offline_cloud[expected_valid]
-    )
+    with pytest.raises(ValueError, match="all Raw episodes rejected"):
+        export_zarr(episode, output, processing=ExportConfig(), fields=("object_pointcloud",))
+    assert not output.exists()
 
     calls.clear()
     for mask in masks.values():

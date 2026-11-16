@@ -24,9 +24,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Export selected fields from published Raw episodes of one task to canonical Zarr. "
-            "Preserve continuous segments as separate episodes. HOI joint observations are aligned "
-            "to camera timestamps, with unalignable segment boundaries trimmed. "
-            "Reject missing/nonfinite selected data and publish only after all episodes succeed."
+            "Accept one complete Raw as one episode; reject damaged Raw and continue. "
+            "Mixed optional object clouds produce a <output-stem>_modalities directory."
         )
     )
     parser.add_argument(
@@ -55,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fields", nargs="+", choices=tuple(FIELD_INPUTS),
         help="Canonical fields to export; RGB/depth use the fixed-K pinhole grid. "
-             "Omitted means all fields except object_pointcloud.",
+             "Omitted means all base fields plus valid object_pointcloud when present.",
     )
     parser.add_argument(
         "--exclude",
@@ -115,19 +114,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.input_root,
             output_path,
             processing=processing,
-            fields=fields,
+            fields=args.fields,
             exclude=tuple(args.exclude),
             progress_callback=update_progress,
         )
-    print(
-        f"Exported {result['raw_episode_count']} Raw file(s) as "
-        f"{result['episode_count']} continuous episode(s), {result['total_frames']} frames.",
-        file=sys.stderr,
-    )
-    print(
-        f"Explicitly excluded {len(result['excluded_episodes'])} episode(s).",
-        file=sys.stderr,
-    )
+    for output in result["outputs"]:
+        print(f"{output['path']}: {output['episode_count']} episodes, {output['total_frames']} frames", file=sys.stderr)
+    print(f"Rejected {len(result['rejected_episodes'])}; explicitly excluded {len(result['excluded_episodes'])}.", file=sys.stderr)
     return 0
 
 

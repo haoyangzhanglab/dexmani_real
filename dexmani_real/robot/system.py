@@ -287,8 +287,7 @@ class Robot:
         target = validate_hand_target(
             qpos, self.hand_config.qpos_min_rad, self.hand_config.qpos_max_rad,
         )
-        check_abort()
-        self.check()
+        # 回调负责完整故障与取消检查；反馈和期限仍在实际发送前独立检查。
         check_abort()
         self._check_hand_feedback()
         if time.monotonic_ns() >= deadline_ns:

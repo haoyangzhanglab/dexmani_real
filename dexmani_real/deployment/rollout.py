@@ -288,7 +288,7 @@ class Rollout:
         if row is None:
             self.stop(self.preparation_issue)
             return
-        if self.observations.needs.hoi:
+        if self.observations.needs.hoi and not self.model.warmed_up:
             kwargs = ({"rtc_delay": self.execution.prefetch_steps, "rtc_guidance_cap": self.execution.rtc_guidance_cap}
                       if self.execution.mode == "rtc" else {})
             self.model.warmup((self.observations.project(row),) * self.policy_info.n_obs_steps, **kwargs)
@@ -304,6 +304,10 @@ class Rollout:
                 if future is not None:
                     future.result()
                 time.sleep(0.005)
+            poll_operator()
+            if not self.preparation_valid():
+                raise OperationCancelled("HOI warmup cancelled")
+            self.model.warmed_up = True
         poll_operator()
         if not self.preparation_valid():
             raise OperationCancelled("cancelled before recorder start")
@@ -311,7 +315,7 @@ class Rollout:
             self.recorder = EpisodeRecorder(self.output_dir, control_hz=1 / self.execution.control_dt_s)
             metadata = snapshot_recording_metadata(
                 self.camera_snapshot,
-                tactile_reset_metadata=self.robot.hand.tactile_reset_metadata,
+                tactile_reset_metadata=self.robot.hand.tactile_reset_metadata, runtime=self.runtime,
             )
             self.recorder.start(
                 task_label=self.policy_info.task_name,

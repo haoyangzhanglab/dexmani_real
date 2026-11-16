@@ -86,49 +86,25 @@ def write_hoi(
 
 
 def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand")):
-    """逐连续区间对齐关节，再按感知有效性拆分；关节内部缺口仍报错。"""
+    """为可视化对齐各原始区间；无法对齐的行保留 NaN，不筛行或生成 episode。"""
     validate_joint_gap(max_gap_s)
     timing = reader.read_timing()
-    count = reader.num_frames
     for key in ("camera_ns", *(f"{device}_ns" for device in devices)):
         if np.any(timing[key] <= 0) or np.any(timing[key] > timing["observation_ns"]):
             raise ValueError(f"Invalid HOI source timestamp: {key}")
-    keep = np.zeros(count, bool)
     joints = {
-        f"{device}_qpos": np.full(reader[f"{device}_qpos"].shape, np.nan) for device in devices
+        f"{device}_qpos": np.empty(reader[f"{device}_qpos"].shape) for device in devices
     }
-    boundaries = np.r_[reader.segment_starts, count]
+    boundaries = np.r_[reader.segment_starts, reader.num_frames]
     for start, end in pairwise(boundaries):
-        valid = np.ones(end - start, bool)
         for device in devices:
-            qpos_key = f"{device}_qpos"
-            positions, device_valid = interpolate_joints(
-                timing[f"{device}_ns"][start:end],
-                reader[qpos_key][start:end],
-                timing["camera_ns"][start:end],
-                max_gap_s,
+            name = f"{device}_qpos"
+            positions, _ = interpolate_joints(
+                timing[f"{device}_ns"][start:end], reader[name][start:end],
+                timing["camera_ns"][start:end], max_gap_s,
             )
-            joints[qpos_key][start:end] = positions
-            valid &= device_valid
-        indices = np.flatnonzero(valid)
-        if not len(indices):
-            raise ValueError(f"HOI segment {start}:{end} has no alignable rows")
-        lo, hi = int(indices[0]), int(indices[-1]) + 1
-        if not valid[lo:hi].all():
-            raise ValueError(f"HOI segment {start}:{end} has an internal joint gap")
-        keep[start + lo : start + hi] = True
-    keep &= read_hoi_validity(reader)
-    ranges, starts = [], []
-    offset = 0
-    for start, end in pairwise(boundaries):
-        transitions = np.diff(np.r_[False, keep[start:end], False].astype(int))
-        for lo, hi in zip(
-            np.flatnonzero(transitions == 1), np.flatnonzero(transitions == -1)
-        ):
-            ranges.append([int(start + lo), int(start + hi)])
-            starts.append(offset)
-            offset += int(hi - lo)
-    return {"keep": keep, "ranges": ranges, "starts": starts, **joints}
+            joints[name][start:end] = positions
+    return joints
 
 
 def read_hoi_validity(reader):

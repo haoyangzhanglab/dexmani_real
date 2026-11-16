@@ -261,7 +261,7 @@ class TeleopLoop:
             if self.recording_dir is not None:
                 metadata = snapshot_recording_metadata(
                     self.camera_snapshot,
-                    tactile_reset_metadata=self.robot.hand.tactile_reset_metadata,
+                    tactile_reset_metadata=self.robot.hand.tactile_reset_metadata, runtime=self.runtime,
                 )
                 metadata["vr_to_robot_rotation"] = self.controller.rotation.as_matrix().tolist()
                 retargeter = self.controller.hand_retargeter

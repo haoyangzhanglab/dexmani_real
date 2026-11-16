@@ -111,3 +111,32 @@ def resolve_hoi_inputs(info):
     from dexmani_real.geometry.hoi import load_task_template
     task = root / "assets/pointcloud_template/object" / name
     return task, load_task_template(task)
+
+
+def check_data_processing(info, runtime, observations, hoi_inputs):
+    """只核对模型消费的特征处理；现场标定另在 run_config 记录。"""
+    from dexmani_real.geometry.hoi import template_digest
+    from dexmani_real.perception.pointcloud import processing_metadata
+
+    actual = {}
+    if "point_cloud" in info.observation_fields:
+        actual["point_cloud"] = processing_metadata(runtime.pointcloud)
+    if "hand_pointcloud" in info.observation_fields:
+        actual["hand_pointcloud"] = dict(
+            num_points=runtime.hand_pointcloud.num_points,
+            template_sha256=observations.hand_cloud.template_sha256,
+        )
+    if hoi_inputs is not None:
+        template = hoi_inputs[1]
+        actual["object_pointcloud"] = dict(
+            template_sha256=template_digest(
+                template["points_local"], template["offsets"], template["object_names"]
+            ),
+            max_joint_gap_s=runtime.execution.hoi_max_joint_gap_s,
+        )
+    for name, values in actual.items():
+        if name not in info.data_processing:
+            raise ValueError(f"Checkpoint missing data_processing: {name}")
+        if values != info.data_processing[name]:
+            raise ValueError(f"Checkpoint data_processing mismatch: {name}")
+    return actual

@@ -4,6 +4,7 @@ import numpy as np
 
 from dexmani_real import ASSET_DIR
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
+from dexmani_real.geometry.hoi import template_digest
 
 HAND_TEMPLATE_DIR = ASSET_DIR / "pointcloud_template" / "hand"
 
@@ -37,6 +38,7 @@ class HandPointCloud:
             raise ValueError(
                 f"Hand point-cloud template names a link missing from the FK model: {path}"
             )
+        self.template_sha256 = template_digest(points, offsets, names)
         self.local_points = points
         self.part_offsets = offsets
 

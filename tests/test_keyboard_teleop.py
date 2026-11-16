@@ -227,3 +227,33 @@ def test_errors_propagate_without_retry_or_success_log(teleop, caplog, stage):
     assert session.tick_due_ns == original_tick
     assert "Keyboard jog ready" not in caplog.messages
     assert "HOME completed" not in caplog.messages
+
+
+@pytest.mark.parametrize('condition', ['valid', 'cancel', 'stale', 'expired'])
+def test_hand_home_submission_boundary(condition):
+    import time
+    from dexmani_real.robot.commands import FeedbackUnavailable, HomeTimeout
+    from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
+    runtime = RealConfig()
+    state = SessionState(stop_signal=threading.Event(), emergency_signal=threading.Event())
+    robot = Robot(runtime.arm, runtime.hand, runtime_state=state)
+    robot.connected = True
+    robot.hand_config = replace(runtime.hand, home_tor_max=100)
+    robot.hand = Mock(is_connected=True)
+    robot.hand._send_position.return_value = 0
+    frame = np.zeros(1, dtype=HAND_STATE_DTYPE)
+    frame['timestamp_ns'] = 1 if condition == 'stale' else time.monotonic_ns()
+    robot.hand_feedback.latest = frame
+    def check():
+        if condition == 'cancel':
+            raise OperationCancelled('cancelled')
+        robot.check()
+    deadline = 1 if condition == 'expired' else time.monotonic_ns()+1_000_000_000
+    target = (np.asarray(runtime.hand.qpos_min_rad) + runtime.hand.qpos_max_rad) / 2
+    if condition == 'valid':
+        robot.send_hand_home(target, deadline_ns=deadline, check_abort=check)
+        robot.hand._send_position.assert_called_once()
+    else:
+        with pytest.raises({'cancel':OperationCancelled,'stale':FeedbackUnavailable,'expired':HomeTimeout}[condition]):
+            robot.send_hand_home(target, deadline_ns=deadline, check_abort=check)
+        robot.hand._send_position.assert_not_called()

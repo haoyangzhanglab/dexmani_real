@@ -196,7 +196,7 @@ def _home_hand(robot, check):
 
 
 def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
-    """所有失败均完成停止收尾；停止失败保留原异常链并优先传播。"""
+    """cancel_requested 须服务故障并读取取消；所有失败均确认停止后传播。"""
 
     def cancelled():
         return (
@@ -206,9 +206,9 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
         )
 
     def check():
+        # cancel_requested 服务运行故障并读取操作指令；此处只补充本次操作的取消上下文。
         if cancelled():
             raise OperationCancelled("HOME cancelled")
-        robot.check()
 
     try:
         robot.stop()

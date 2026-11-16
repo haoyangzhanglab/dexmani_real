@@ -24,7 +24,7 @@ def info():
         checkpoint_path='test.pt', weights='raw', inference_steps=10, task_name='test',
         observation_fields=('point_cloud', 'joint_state'), n_obs_steps=2,
         n_action_steps=8, future_steps=15, control_action_dim=19, action_mode='joint',
-        rgb_preprocessing={}, supports_rtc=True, requires_prev_action=False, control_dt_s=.05,
+        data_processing={}, rgb_preprocessing={}, supports_rtc=True, requires_prev_action=False, control_dt_s=.05,
     )
 
 
@@ -146,3 +146,153 @@ def test_rgb_only_rectifies_once_per_source_frame(info, monkeypatch):
     np.testing.assert_array_equal(image, before)
     assert row.camera['timestamp_ns'] == 123
     assert builder.camera_parameters == {}
+
+
+@pytest.mark.parametrize("fault", ["none", "cancel", "failure"])
+def test_hoi_warmup_commits_only_successful_uncancelled_result(fault):
+    from concurrent.futures import Future
+    from threading import Event
+    from dexmani_real.deployment.rollout import Rollout
+    from dexmani_real.deployment.inference import PolicyWorker
+    from dexmani_real.runtime.state import SessionState
+    from dexmani_real.robot.commands import OperationCancelled
+
+    state = SessionState(stop_signal=Event(), emergency_signal=Event())
+    worker = PolicyWorker(lambda: None, build_observation=lambda rows: rows)
+    calls = []
+
+    def warmup(rows, **kwargs):
+        calls.append(kwargs)
+        worker.future = Future()
+        if fault == "failure":
+            worker.future.set_exception(ValueError("warmup failed"))
+        else:
+            worker.future.set_result(None)
+        if fault == "cancel":
+            state.request_stop()
+
+    worker.warmup = warmup
+    runtime = RealConfig(execution=ExecutionConfig(control_dt_s=0.05, action_steps=2, mode="rtc"))
+    observations = SimpleNamespace(
+        needs=SimpleNamespace(hoi=True, hoi_joint_devices=()), project=lambda row: {}
+    )
+    robot = SimpleNamespace(
+        stop=lambda: None,
+        check=lambda: None,
+        service_feedback=lambda: None,
+        prepare_streaming=lambda *a, **kw: state.stop_signal.clear(),
+    )
+    sensors = SimpleNamespace(
+        channels=SimpleNamespace(hoi_request=Mock(), camera_ring=SimpleNamespace(latest_sequence=1))
+    )
+    try:
+        for index in range(2):
+            rollout = Rollout(
+                state,
+                runtime,
+                SimpleNamespace(n_obs_steps=2),
+                cancel_epoch=state.cancel_epoch,
+                robot=robot,
+                observations=observations,
+                read_needs=None,
+                record_needs=None,
+                sensors=sensors,
+                action_mapper=None,
+                model=worker,
+                max_running_s=1,
+                index=index,
+                output_dir=None,
+                record_raw=False,
+            )
+            rollout.start_observation = lambda *a, **kw: object()
+            if fault != "none":
+                with pytest.raises(OperationCancelled if fault == "cancel" else ValueError):
+                    rollout.prepare(lambda: None)
+                assert not worker.warmed_up
+                break
+            rollout.prepare(lambda: None)
+            assert worker.warmed_up
+        assert len(calls) == 1
+        assert "rtc_delay" in calls[0] and "rtc_guidance_cap" in calls[0]
+    finally:
+        worker.close().result()
+
+
+def test_processing_rejects_mismatched_or_missing_metadata(info):
+    from dexmani_real.deployment.preflight import check_data_processing
+    from dexmani_real.perception.pointcloud import processing_metadata
+
+    runtime = RealConfig()
+    saved = {"point_cloud": processing_metadata(runtime.pointcloud)}
+    info = replace(info, data_processing=saved)
+    assert check_data_processing(info, runtime, None, None) == saved
+    changed = replace(runtime, pointcloud=replace(runtime.pointcloud, num_points=17))
+    with pytest.raises(ValueError, match="data_processing mismatch"):
+        check_data_processing(info, changed, None, None)
+    with pytest.raises(ValueError, match="missing data_processing"):
+        check_data_processing(replace(info, data_processing={}), runtime, None, None)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_rtc_warmup_preserves_rng_and_episode_reset(fail):
+    import torch
+    from dexmani_policy.deployment.runtime import PolicyRuntime
+    from dexmani_real.deployment.inference import PolicyWorker
+
+    model = PolicyRuntime.__new__(PolicyRuntime)
+    model.generator = torch.Generator().manual_seed(7)
+    calls = []
+
+    def predict(observation, **kwargs):
+        calls.append(kwargs)
+        value = torch.rand(3, generator=model.generator)
+        if fail and len(calls) == 2:
+            raise ValueError("rtc failure")
+        return value
+
+    model.predict = predict
+    original = model.generator.get_state().clone()
+    if fail:
+        with pytest.raises(ValueError, match="rtc failure"):
+            model.warmup({}, rtc_delay=1, rtc_guidance_cap=10.0)
+    else:
+        model.warmup({}, rtc_delay=1, rtc_guidance_cap=10.0)
+    assert len(calls) == 2 and "rtc_prefix" in calls[1]
+    assert torch.equal(original, model.generator.get_state())
+    worker = PolicyWorker(lambda: model, build_observation=lambda rows: {})
+    worker.model = model
+    try:
+        worker.predict([], reset_episode=True)
+        first = worker.future.result()
+        worker.poll()
+        worker.predict([], reset_episode=True)
+        second = worker.future.result()
+        worker.poll()
+        assert torch.equal(first, second)
+    finally:
+        worker.close().result()
+
+
+def test_resume_checks_only_consumed_processing():
+    from omegaconf import OmegaConf
+    from dexmani_policy.training.common.data import record_data_processing
+
+    cfg = OmegaConf.create(
+        dict(
+            dataset=dict(sensor_modalities=["hand_pointcloud"]),
+            data_processing=dict(
+                hand_pointcloud={"template_sha256": "same"}, point_cloud={"num_points": 10}
+            ),
+        )
+    )
+    buffer = SimpleNamespace(
+        attrs={
+            "data_processing": dict(
+                hand_pointcloud={"template_sha256": "same"}, point_cloud={"num_points": 20}
+            )
+        }
+    )
+    record_data_processing(cfg, buffer, resuming=True)
+    buffer.attrs["data_processing"]["hand_pointcloud"]["template_sha256"] = "changed"
+    with pytest.raises(ValueError, match="hand_pointcloud"):
+        record_data_processing(cfg, buffer, resuming=True)

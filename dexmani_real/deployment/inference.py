@@ -20,6 +20,7 @@ class PolicyWorker:
     def __init__(self, factory, *, build_observation):
         self.factory = factory
         self.build_observation = build_observation
+        self.warmed_up = False
         self.model = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-model")
         self.future = self.close_future = None

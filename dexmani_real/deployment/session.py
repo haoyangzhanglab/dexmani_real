@@ -24,6 +24,7 @@ from dexmani_real.deployment.inference import (
 from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import (
     resolve_deployment_config,
+    check_data_processing,
     resolve_hoi_inputs,
 )
 from dexmani_real.deployment.rollout import Rollout, utc_now
@@ -123,6 +124,7 @@ class PolicySession:
             return
         payload = {
             "policy": asdict(self.info),
+            "data_processing": self.data_processing,
             "runtime": {name: asdict(getattr(self.runtime, name)) for name in POLICY_RUNTIME_SECTIONS},
             "camera_calibration_path": str(self.camera_calibration_path or CAMERAS_PATH),
             "effective_camera": ({"camera_T_xarm_base_from_color": None,
@@ -197,6 +199,7 @@ class PolicySession:
         declared_execution = self.runtime.execution
         self.runtime = resolve_deployment_config(self.info, self.runtime)
         self.observations = ObservationBuilder(self.info, self.runtime)
+        self.data_processing = check_data_processing(self.info, self.runtime, self.observations, self.hoi_inputs)
         self.record_needs = RAW_RECORDING_NEEDS if self.record_raw else ObservationNeeds()
         model_needs = self.observations.needs
         self.sensor_needs = model_needs.union(self.record_needs)
@@ -417,6 +420,8 @@ class PolicySession:
             time.sleep(0.005)
 
     def warmup_policy(self):
+        if cast(PolicyWorker, self.model).warmed_up:
+            return
         self.check_startup()
         observation_deadline = time.monotonic() + INITIAL_STATE_TIMEOUT_S
         while True:
@@ -440,6 +445,7 @@ class PolicySession:
         self.check_startup()
         cast(PolicyWorker, self.model).warmup(rows, **kwargs)
         self.wait_model()
+        cast(PolicyWorker, self.model).warmed_up = True
 
     def poll_operator(self, *, timeout=0) -> int | None:
         return self.handle_command_batch(
