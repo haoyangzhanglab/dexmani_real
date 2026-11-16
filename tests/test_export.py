@@ -208,6 +208,27 @@ def test_hoi_export_trims_all_fields_and_preserves_segments(tmp_path, hoi_episod
     root.store.close()
 
 
+@pytest.mark.parametrize("with_hoi", [False, True])
+@pytest.mark.parametrize("invalid", ["missing", "shape", "semantics"])
+def test_export_rejects_invalid_actions_without_publishing(tmp_path, hoi_episodes, with_hoi, invalid):
+    source, _, _ = hoi_episodes
+    # 第一段正常写入后，第二段仍须由实际读取边界拒绝坏输入并清理临时产物。
+    with h5py.File(source / "episode_1" / "data.h5", "r+") as data:
+        if invalid == "semantics":
+            data["meta"].attrs["arm_action_semantics"] = "delta_joint"
+        else:
+            del data["action_arm_joint_target"]
+            if invalid == "shape":
+                data.create_dataset("action_arm_joint_target", data=np.zeros((3, 6)))
+    output = tmp_path / "invalid_actions.zarr"
+    fields = ("action", "object_pointcloud") if with_hoi else ("action",)
+    message = "arm_action_semantics" if invalid == "semantics" else "action_arm_joint_target"
+    with pytest.raises(ValueError, match=message):
+        export_zarr(source, output, processing=ExportConfig(), fields=fields)
+    assert not output.exists()
+    assert not list(tmp_path.glob(".invalid_actions.zarr.tmp-*"))
+
+
 def test_hoi_eef_export_does_not_require_hand_history(tmp_path, hoi_episodes):
     source, states, _ = hoi_episodes
     for episode in source.iterdir():

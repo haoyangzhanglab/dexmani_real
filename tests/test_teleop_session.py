@@ -59,10 +59,14 @@ def teleop():
 
 def test_two_episodes_stop_clear_and_restart(teleop):
     for _ in range(2):
-        teleop.run_episode(teleop.runtime_state.cancel_epoch)
+        teleop.keyboard.allow_start()
+        teleop.keyboard.handle_key("b", True)
+        commands, _ = teleop.keyboard.poll(teleop.runtime_state, timeout=0)
+        teleop.handle_commands(commands)
         assert teleop.cancel_epoch is None
         assert teleop.runtime_state.stop_signal.is_set()
         assert teleop.pending_termination_reason == "operator"
+        teleop.keyboard.handle_key("b", False)
         teleop.keyboard.handle_key("s", False)
     assert teleop.robot.send_action.call_count == 2
     assert teleop.robot.prepare_streaming.call_count == 2
