@@ -59,3 +59,4 @@ Zarr 根属性 `task_name` 来自 Raw 的 `meta.task_label`，不受目录名影
 - [手部重定向](docs/hand_retargeting.md)：人体关键点到 XHand 关节目标的映射。
 - [策略部署](docs/policy_deployment.md)：观测、推理、动作执行与多段评估流程。
 - [物体重建与 HOI](docs/object_reconstruction.md)：物体资产、固定点云模板及训练与部署流程。
+- [研究代码精简计划与实施记录](docs/research_simplification.md)：模块职责、参考项目取舍、本轮改动和验证范围。

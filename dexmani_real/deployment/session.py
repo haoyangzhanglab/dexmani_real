@@ -330,6 +330,19 @@ class PolicySession:
         exit_signal = failure if isinstance(failure, SystemExit) else None
         resources_closed = False
         model_timeout = None
+
+        def record_failure(stage, error, *, episode=False):
+            nonlocal exit_signal
+            if isinstance(error, SystemExit):
+                exit_signal = exit_signal or error
+            if isinstance(error, KeyboardInterrupt):
+                self.runtime_state.request_emergency_stop()
+            logger.exception("policy %s failed", stage)
+            if episode and self.episode is not None:
+                self.episode.fail(stage, error)
+            else:
+                self.errors.append(error_detail(stage, error))
+
         if failure is not None:
             self.errors.append(error_detail("session", failure))
         try:
@@ -338,24 +351,14 @@ class PolicySession:
             )
             resources_closed = True
         except BaseException as exc:
-            if isinstance(exc, SystemExit):
-                exit_signal = exit_signal or exc
-            if isinstance(exc, KeyboardInterrupt):
-                self.runtime_state.request_emergency_stop()
-            logger.exception("policy runtime shutdown failed")
-            self.errors.append(error_detail("shutdown", exc))
+            record_failure("shutdown", exc)
         if self.episode is not None:
             try:
                 recording_closed = self.episode.finish_recording()
                 resources_closed = resources_closed and recording_closed
             except BaseException as exc:
                 resources_closed = False
-                if isinstance(exc, SystemExit):
-                    exit_signal = exit_signal or exc
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                logger.exception("episode recording finalization failed")
-                self.episode.fail("recording_finalize", exc)
+                record_failure("recording_finalize", exc, episode=True)
         if self.model is not None:
             try:
                 closed = self.model.close()
@@ -366,15 +369,7 @@ class PolicySession:
                     raise model_timeout
                 closed.result()
             except BaseException as exc:
-                if isinstance(exc, SystemExit):
-                    exit_signal = exit_signal or exc
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                logger.exception("policy model close failed")
-                if self.episode is not None:
-                    self.episode.fail("model_close", exc)
-                else:
-                    self.errors.append(error_detail("model_close", exc))
+                record_failure("model_close", exc, episode=True)
         failed = bool(self.errors or any(result.errors for result in self.episodes)
                       or self.runtime_state.estop_request)
         if self.runtime_state.estop_request:
@@ -389,14 +384,9 @@ class PolicySession:
             self.save_results()
             results_saved = True
         except BaseException as exc:
-            if isinstance(exc, SystemExit):
-                exit_signal = exit_signal or exc
-            if isinstance(exc, KeyboardInterrupt):
-                self.runtime_state.request_emergency_stop()
-            self.errors.append(error_detail("results_write", exc))
+            record_failure("results_write", exc)
             self.summary["termination_reason"] = "estop" if self.runtime_state.estop_request else "failed"
             failed = True
-            logger.exception("session result write failed")
         # 运行或录制失败不等于资源未收尾；保存期间模型也可能已经关闭。
         if (resources_closed and results_saved and model_timeout is not None
                 and not closed.done()):

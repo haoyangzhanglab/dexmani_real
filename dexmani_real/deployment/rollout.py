@@ -103,7 +103,6 @@ class Rollout:
         self.last_slot = -1
         self.dt_ns = round(self.execution.control_dt_s * 1e9)
         self.started_ns = self.next_step_ns = 0
-        self.has_submitted = False
         self.ik_reference: IKReference | None = None
         self.first_prediction = True
         self.prev_action: np.ndarray | None = None
@@ -346,7 +345,7 @@ class Rollout:
             self.started_ns + self.max_duration_ns if self.max_duration_ns is not None else None
         )
         self.result.started_utc = utc_now()
-        logger.info("Policy active; first valid sample fills %d history frames", self.history.maxlen)
+        logger.info("Policy control loop started; waiting for the first prediction")
 
     def poll_model(self):
         future = self.model.poll()
@@ -530,7 +529,6 @@ class Rollout:
         self.prev_action = None
         self.ik_reference = None
         self.first_prediction = True
-        self.has_submitted = False
 
     def _enter_hoi_hold(self):
         if self.state == "HOI_HOLD":
@@ -602,15 +600,6 @@ class Rollout:
             return
         self.step_control()
 
-    def commit_arm(self, command, row):
-        submitted_ns = time.monotonic_ns()
-        if self.policy_info.action_mode == "eef":
-            anchor = (arm_reference_from_feedback(
-                row.arm["qpos"][0], *self.action_mapper.solver.limits.T,
-            ) if self.ik_reference is None else self.ik_reference.anchor)
-            self.ik_reference = IKReference(command.arm_qpos, anchor, submitted_ns)
-        self.has_submitted = True
-
     def _advance_control_slot(self):
         """暂停时也推进原调度，恢复后不补跑历史控制槽。"""
         slot, self.next_step_ns, skipped = control_slot(
@@ -665,9 +654,11 @@ class Rollout:
                 return
             if self.policy_info.requires_prev_action:
                 self.prev_action = np.concatenate((command.arm_qpos, command.hand_qpos))
-            if not self.has_submitted:
-                logger.info("Policy first target submitted")
-            self.commit_arm(command, row)
+            if self.policy_info.action_mode == "eef":
+                anchor = (arm_reference_from_feedback(
+                    row.arm["qpos"][0], *self.action_mapper.solver.limits.T,
+                ) if self.ik_reference is None else self.ik_reference.anchor)
+                self.ik_reference = IKReference(command.arm_qpos, anchor, time.monotonic_ns())
             if self.execution.mode in {"sync", "rtc"}:
                 self.cursor += 1
                 if self.execution.mode == "sync" and self.cursor == min(len(plan.actions), self.execution.action_steps):

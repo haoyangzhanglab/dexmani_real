@@ -213,31 +213,18 @@ def run_teleop(
 
 
 def initialize_teleop(loop, vr_process, *, cancel_epoch) -> None:
-    loop.robot.check()
-    if loop.runtime_state.cancel_epoch != cancel_epoch:
-        raise OperationCancelled("teleop startup cancelled")
-    if loop.poll_blocking_commands():
-        raise OperationCancelled("teleop startup cancelled")
+    def may_start():
+        if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
+            return False
+        loop.robot.service_idle()
+        return loop.keyboard.check_health()
+
     loop.sensors.start(
         vr_process,
         ring=loop.sensors.channels.vr_ring,
-        may_start=lambda: loop.keyboard.check_health() and loop.runtime_state.requests_allow_motion()
-            and loop.runtime_state.cancel_epoch == cancel_epoch,
+        timeout_s=VR_READY_TIMEOUT_S,
+        may_start=may_start,
     )
-    deadline = time.monotonic() + VR_READY_TIMEOUT_S
-    while True:
-        if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
-            raise OperationCancelled("teleop startup cancelled")
-        loop.robot.service_idle()
-        if loop.sensors.channels.vr_ring.latest_sequence > 0:
-            if loop.poll_blocking_commands():
-                raise OperationCancelled("teleop startup cancelled")
-            if not loop.sensors.check():
-                raise RuntimeError("VR worker exited during startup")
-            break
-        time.sleep(0.05)
-        if time.monotonic() >= deadline:
-            raise RuntimeError("VR failed to become ready before the startup timeout")
     calibrate_hand(loop, cancel_epoch)
     if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
         raise OperationCancelled("teleop startup cancelled")

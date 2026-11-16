@@ -38,20 +38,18 @@ class HandPointCloud:
                 f"Hand point-cloud template names a link missing from the FK model: {path}"
             )
         self.local_points = points
-        self.point_frame_indices = np.repeat(
-            np.arange(len(self.frame_ids), dtype=np.intp),
-            np.diff(offsets).astype(np.intp, copy=False),
-        )
+        self.part_offsets = offsets
 
     def transform_batch(self, base_from_links: np.ndarray) -> np.ndarray:
         """批量将 [T, links, 4, 4] 变换应用于固定点序的 link 局部点云。"""
-        point_transforms = np.take(base_from_links, self.point_frame_indices, axis=1)
-        xyz = np.matmul(
-            point_transforms[..., :3, :3],
-            self.local_points[None, :, :, None],
-        )[..., 0]
-        xyz += point_transforms[..., :3, 3]
-        return xyz.astype(np.float32, copy=False)
+        xyz = np.empty((len(base_from_links), len(self.local_points), 3), dtype=np.float32)
+        # 模板已按 link 连续分段，无需为每个点复制一份 4×4 变换。
+        for index, (start, end) in enumerate(zip(self.part_offsets[:-1], self.part_offsets[1:])):
+            transform = base_from_links[:, index]
+            segment = self.local_points[start:end] @ transform[:, :3, :3].swapaxes(1, 2)
+            segment += transform[:, None, :3, 3]
+            xyz[:, start:end] = segment
+        return xyz
 
 
 def hand_geometry(

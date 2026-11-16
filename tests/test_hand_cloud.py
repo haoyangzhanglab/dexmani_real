@@ -50,10 +50,12 @@ class FakeHandFK:
 
 
 @pytest.mark.parametrize("offset_dtype", [np.int64, np.uint64])
+@pytest.mark.parametrize("batch_size", [1, 4, 32])
 def test_hand_geometry_batch_transform_preserves_link_segments(
     tmp_path,
     monkeypatch,
     offset_dtype,
+    batch_size,
 ):
     from dexmani_real.perception import hand_cloud as module
 
@@ -74,9 +76,9 @@ def test_hand_geometry_batch_transform_preserves_link_segments(
     arm_from_eef[:3, 3] = (0.03, -0.02, 0.01)
     arm_fk = SimpleNamespace(eef_from_handbase=arm_from_eef)
 
-    eef_transforms = np.repeat(np.eye(4)[None], 4, axis=0)
-    eef_transforms[:, :3, 3] = rng.normal(0, 0.1, (4, 3))
-    hand_qpos = rng.uniform(-0.5, 0.5, (4, 12))
+    eef_transforms = np.repeat(np.eye(4)[None], batch_size, axis=0)
+    eef_transforms[:, :3, 3] = rng.normal(0, 0.1, (batch_size, 3))
+    hand_qpos = rng.uniform(-0.5, 0.5, (batch_size, 12))
 
     actual = module.hand_geometry(
         eef_transforms,
