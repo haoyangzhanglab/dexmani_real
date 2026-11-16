@@ -178,8 +178,14 @@ def camera_metadata(camera: CameraSnapshot):
 
 def decode_camera_metadata(meta) -> CameraSnapshot:
     mode = meta["camera_payload_mode"]
-    if mode not in {"rgb", "depth_to_color_aligned_rgbd"}:
+    if not isinstance(mode, str) or mode not in {"rgb", "depth_to_color_aligned_rgbd"}:
         raise ValueError(f"Unsupported Raw camera payload: {mode!r}")
+    model = meta["camera_color_distortion_model"]
+    if not isinstance(model, str):
+        raise ValueError("camera_color_distortion_model must be a string")
+    coeffs = np.asarray(meta["camera_color_distortion_coeffs"])
+    if coeffs.shape != (5,) or coeffs.dtype.kind not in "fiu":
+        raise ValueError("camera_color_distortion_coeffs must contain five numeric values")
     matrix = parse_camera_matrix(meta["camera_color_intrinsics"])
     color = CameraIntrinsics(
         width=np.asarray(meta["camera_color_width"]).item(),
@@ -188,8 +194,8 @@ def decode_camera_metadata(meta) -> CameraSnapshot:
         fy=float(matrix[1, 1]),
         ppx=float(matrix[0, 2]),
         ppy=float(matrix[1, 2]),
-        distortion_model=meta["camera_color_distortion_model"],
-        distortion_coeffs=tuple(meta["camera_color_distortion_coeffs"]),
+        distortion_model=model,
+        distortion_coeffs=tuple(coeffs),
     )
     transform = None
     if "camera_T_xarm_base_from_color" in meta:
@@ -465,24 +471,14 @@ class RawReader:
             logger.warning("%s: %s；按已记录的连续区间使用。", self.path, reason)
         return starts
 
-    @property
-    def fields(self):
-        """枚举可见字段；HOI 分组存在不代表其结构已经通过校验。"""
-        import h5py
-
-        names = {key for key, value in self.data_file.items()
-                 if isinstance(value, h5py.Dataset) and key != "object_pointcloud"}
-        if "hoi/object_pointcloud" in self.data_file:
-            names.add("object_pointcloud")
-        if self.rgb_path.is_file():
-            names.add("rgb")
-        return frozenset(names)
-
     def require_fields(self, *names):
-        requested = set(names)
-        missing = requested - self.fields
-        if missing:
-            raise ValueError(f"Raw {self.path}: missing fields {sorted(missing)}")
+        """按需打开并校验字段，不枚举与当前任务无关的 HDF5 对象。"""
+        for name in names:
+            if name == "rgb":
+                if not self.rgb_path.is_file():
+                    raise FileNotFoundError(self.rgb_path)
+            else:
+                self[name]
 
     def __getitem__(self, name):
         if name not in self.dataset_cache:
@@ -566,7 +562,6 @@ class RawReader:
     def iter_rgb_frames(self):
         import av
 
-        self.require_fields("rgb")
         if self.video_container is None:
             self.video_container = av.open(str(self.rgb_path), "r")
             if not self.video_container.streams.video:

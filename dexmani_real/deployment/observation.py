@@ -37,13 +37,10 @@ class ObservationBuilder:
         self.dependencies = frozenset(
             source for name in self.fields for source in FIELD_DEPENDENCIES[name]
         )
+        self.joint_devices = tuple(name for name in ("arm", "hand") if name in self.dependencies)
         self.needs = ObservationNeeds(
             hoi="hoi" in self.dependencies,
-            hoi_joint_devices=tuple(
-                name
-                for name in ("arm", "hand")
-                if "hoi" in self.dependencies and name in self.dependencies
-            ),
+            hoi_joint_devices=self.joint_devices if "hoi" in self.dependencies else (),
             camera_fields=("rgb",) if "rgb" in self.dependencies else (),
             point_cloud="cloud" in self.dependencies,
             required_tactile=tuple(c for c in ("aggregate", "dense") if c in self.dependencies),
@@ -58,19 +55,17 @@ class ObservationBuilder:
                 self.hand_cloud = HandPointCloud(self.hand_fk, runtime.hand_pointcloud.num_points)
 
     def project(self, row):
-        fields, dependencies = self.fields, self.dependencies
         values = {}
-        for device in ("arm", "hand"):
-            if device in dependencies:
-                name = f"{device}_qpos"
-                qpos = (
-                    row.aligned_joints[name]
-                    if self.needs.hoi_joint_devices
-                    else getattr(row, device)["qpos"][0]
-                )
-                values[name] = qpos.copy()
+        for device in self.joint_devices:
+            name = f"{device}_qpos"
+            qpos = (
+                row.aligned_joints[name]
+                if self.needs.hoi_joint_devices
+                else getattr(row, device)["qpos"][0]
+            )
+            values[name] = qpos.copy()
         # Ring 快照独立持有原始大数组，RGB 矫正结果单独进入模型历史。
-        for name in fields:
+        for name in self.fields:
             if name == "finger_tactile_force":
                 # 两种触觉已为 SDK / 255；独立复制避免聚合视图持有稠密载荷。
                 values[name] = row.hand["tactile_aggregate"][0].copy()
@@ -108,11 +103,14 @@ class ObservationBuilder:
 
     def build(self, rows):
         fields, dependencies = self.fields, self.dependencies
+        # 同一批关节同时服务状态与 FK，不为每种派生模态重复拼接历史。
+        joints = {
+            device: np.array([row[f"{device}_qpos"] for row in rows])
+            for device in self.joint_devices
+        }
         arrays = {}
         if "joint_state" in fields:
-            arrays["joint_state"] = np.stack([
-                np.concatenate((r["arm_qpos"], r["hand_qpos"])) for r in rows
-            ]).astype(np.float32)
+            arrays["joint_state"] = np.concatenate((joints["arm"], joints["hand"]), axis=1).astype(np.float32)
         for name in fields:
             sources = FIELD_DEPENDENCIES[name]
             if "camera_static" in sources:
@@ -122,12 +120,12 @@ class ObservationBuilder:
                 arrays[name] = np.stack([r[name] for r in rows])
 
         if self.arm_fk is not None:
-            poses = eef_poses(np.stack([r["arm_qpos"] for r in rows]), arm_fk=self.arm_fk)
+            poses = eef_poses(joints["arm"], arm_fk=self.arm_fk)
             if "eef_pose" in fields:
                 arrays["eef_pose"] = encode_eef_pose(poses).astype(np.float32)
             if self.hand_fk is not None:
                 arrays.update(hand_geometry(
-                    poses, np.stack([r["hand_qpos"] for r in rows]),
+                    poses, joints["hand"],
                     arm_fk=self.arm_fk, hand_fk=self.hand_fk,
                     hand_cloud=self.hand_cloud,
                     include_fingertips="fingertips" in dependencies,

@@ -31,6 +31,8 @@ HOME_RESULTS = (
 
 @pytest.fixture
 def teleop(monkeypatch, caplog):
+    # CLI tests may already have configured the package logger for console output.
+    monkeypatch.setattr(logging.getLogger("dexmani_real"), "propagate", True)
     caplog.set_level(logging.INFO, logger=keyboard.__name__)
     clock = SimpleNamespace(now_ns=10_000_000_000)
 

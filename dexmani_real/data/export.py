@@ -207,7 +207,7 @@ def iter_canonical_blocks(
         with raw_input():
             raw = {name: source[start:end] for name, source in sources.items()}
             for name, values in raw.items():
-                if not np.isfinite(values).all():
+                if values.dtype.kind == "f" and not np.isfinite(values).all():
                     raise RawDataError(f"{name}: nonfinite values in rows {start}:{end}")
         block = {}
         if images is not None:
@@ -360,7 +360,6 @@ def prepare_raw(reader, processing, fields):
                 or np.any(np.diff(stamps) < 0)
             ):
                 raise RawDataError(f"invalid source timestamp: {clock}")
-        reader.require_fields(*inputs)
         for name in inputs - {"rgb"}:
             reader[name]
         alignment = {}

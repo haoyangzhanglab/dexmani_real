@@ -850,6 +850,32 @@ def test_joint_names_json_boundary(raw_episodes, names, valid):
     assert reader.data_file is None
 
 
+@pytest.mark.parametrize("bad_index", [0, 1, 2])
+@pytest.mark.parametrize("key,value", [
+    ("camera_payload_mode", np.array(["rgb", "rgb"], dtype=h5py.string_dtype())),
+    ("camera_color_distortion_coeffs", 0.0),
+    ("camera_color_distortion_model", np.array(["none"], dtype=h5py.string_dtype())),
+])
+def test_bad_camera_metadata_rejects_only_that_raw(tmp_path, complete_episodes, bad_index, key, value):
+    import shutil
+
+    source = complete_episodes
+    shutil.copytree(source / "episode_1", source / "episode_2")
+    bad = source / f"episode_{bad_index}"
+    with h5py.File(bad / "data.h5", "r+") as data:
+        data["meta"].attrs[key] = value
+    output = tmp_path / "clean.zarr"
+    result = export_zarr(source, output, processing=ExportConfig(), fields=("joint_state", "rgb"))
+    assert [item["episode"] for item in result["rejected_episodes"]] == [bad.name]
+    assert result["episode_count"] == 2
+    root = zarr.open_group(str(output), mode="r")
+    assert root.attrs["source_episodes"] == [f"episode_{i}" for i in range(3) if i != bad_index]
+    ends = [3, 6] if bad_index == 0 else [4, 7]
+    np.testing.assert_array_equal(root["meta/episode_ends"][:], ends)
+    assert all(len(values) == ends[-1] for values in root["data"].values())
+    assert not list(tmp_path.glob(".clean.zarr.tmp-*"))
+
+
 @pytest.mark.parametrize("fields", [None, ("joint_state",)])
 def test_export_cli_matches_api(tmp_path, complete_episodes, hoi_episodes, monkeypatch, fields):
     from dexmani_real.config.perception import PointCloudConfig
