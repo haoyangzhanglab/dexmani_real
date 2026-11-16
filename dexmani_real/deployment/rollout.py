@@ -676,8 +676,8 @@ class Rollout:
                 self.state = "RUNNING"
                 self.hoi_recovery_started_ns = None
         finally:
-            # 恢复首条动作可以录制；其间断已在进入 HOLD 时标记。
-            if self.state == "RUNNING":
+            # 已尝试提交的恢复动作也需要记录。
+            if self.state == "RUNNING" or attempted is not None:
                 if skipped and was_running and self.recorder is not None:
                     self.recorder.mark_gap()
                 self.record_row(raw, attempted, quality_issue=quality_issue)

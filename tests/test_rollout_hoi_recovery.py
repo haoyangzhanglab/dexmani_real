@@ -144,7 +144,12 @@ class FakeRobot:
 
 
 @pytest.fixture
-def env(monkeypatch):
+def record_raw():
+    return True
+
+
+@pytest.fixture
+def env(monkeypatch, record_raw):
     clock = SimpleNamespace(now=10_000_000_000)
 
     def sleep(seconds):
@@ -164,6 +169,7 @@ def env(monkeypatch):
         n_obs_steps=2, action_mode="joint", requires_prev_action=True,
     )
     observations = ObservationBuilder(info, runtime)
+    record_needs = RAW_RECORDING_NEEDS if record_raw else ObservationNeeds()
     worker, recorder = FakePolicyWorker(), FakeRecorder()
     worker.build_observation = observations.build
     rollout = Rollout(
@@ -171,15 +177,15 @@ def env(monkeypatch):
         cancel_epoch=state.cancel_epoch, robot=robot, sensors=SimpleNamespace(channels=channels),
         observations=observations,
         read_needs=replace(
-            observations.needs.union(RAW_RECORDING_NEEDS),
+            observations.needs.union(record_needs),
             camera_fields=observations.needs.camera_fields,
         ),
-        record_needs=RAW_RECORDING_NEEDS,
+        record_needs=record_needs,
         action_mapper=SimpleNamespace(map_joint=lambda arm, hand: SimpleNamespace(
             arm_qpos=arm, hand_qpos=hand, rejection_reason=None)),
-        model=worker, max_running_s=60, index=7, output_dir=None, record_raw=True,
+        model=worker, max_running_s=60, index=7, output_dir=None, record_raw=record_raw,
     )
-    rollout.recorder = recorder
+    rollout.recorder = recorder if record_raw else None
     rollout.started_ns = rollout.next_step_ns = clock.now
     rollout.run_deadline_ns = clock.now + 60_000_000_000
 
@@ -282,7 +288,8 @@ def test_hand_disabled(env):
 
 
 @pytest.mark.parametrize("mode", ["sync", "async", "rtc"])
-def test_complete_recovery_and_exact_action_boundary(env, mode):
+@pytest.mark.parametrize("record_raw", [True, False], ids=["raw", "no_raw"])
+def test_complete_recovery_and_exact_action_boundary(env, mode, record_raw):
     env.rollout.execution = replace(env.rollout.execution, mode=mode)
     enter_hold(env)
     env.advance()
@@ -297,6 +304,7 @@ def test_complete_recovery_and_exact_action_boundary(env, mode):
     env.advance(1)
     env.rollout.step()
     assert env.rollout.state == "RESUMING"
+    assert not env.recorder.rows
     assert all(cmd.arm_hold for _, cmd, _ in env.robot.sent)
     env.worker.complete()
     assert env.worker.reset_count == 1
@@ -304,8 +312,11 @@ def test_complete_recovery_and_exact_action_boundary(env, mode):
     env.rollout.step()
     assert env.rollout.state == "RUNNING" and env.rollout.hoi_recovery_started_ns is None
     assert env.rollout.has_submitted and not env.robot.sent[-1][1].arm_hold
-    assert len(env.recorder.rows) == 1 and env.recorder.rows[0][1] is not None
-    assert env.recorder.gaps == 1
+    if record_raw:
+        assert len(env.recorder.rows) == 1 and env.recorder.rows[0][1] is not None
+        assert env.recorder.gaps == 1
+    else:
+        assert not env.recorder.rows and not env.recorder.gaps
     assert env.channels.hoi_request.data["episode_id"] == 7
 
 
@@ -350,6 +361,7 @@ def test_repeated_occlusion_keeps_timeout_and_gap(env):
     assert env.rollout.result.termination_details == "hoi_recovery_timeout"
     assert env.channels.hoi_request.data["episode_id"] == 0
     assert env.state.stop_signal.is_set()
+    assert not env.recorder.rows
 
 
 @pytest.mark.parametrize("failure", ["arm", "hand", "missing", "send"])
@@ -458,28 +470,98 @@ def test_run_cleanup_and_precedence(env, cause):
     assert env.rollout.result.termination_reason == expected[cause]
 
 
-
-def test_failed_resumed_submission_never_runs_or_records(env):
+@pytest.mark.parametrize("arm_published", [False, True])
+@pytest.mark.parametrize("record_raw", [True, False], ids=["raw", "no_raw"])
+def test_failed_resumed_submission_records_attempt_without_running(env, arm_published, record_raw):
     ready_to_send(env)
-    env.robot.send_error = RobotError("submission failed")
-    with pytest.raises(RobotError, match="submission failed"):
+    error = RobotError("submission failed")
+    published_arm = []
+
+    def send(command, **kwargs):
+        if arm_published:
+            # 模拟 arm 已发布、随后 hand 失败；发布不代表设备执行。
+            published_arm.append(command.arm_qpos)
+        raise error
+
+    env.robot.send_action = send
+    with pytest.raises(RobotError, match="submission failed") as caught:
         env.rollout.step()
+    assert caught.value is error
     assert env.rollout.state == "RESUMING"
-    assert not env.rollout.has_submitted and not env.recorder.rows
+    assert not env.rollout.has_submitted and env.rollout.cursor == 0
+    assert env.rollout.prev_action is None
+    if arm_published:
+        assert len(published_arm) == 1
+        np.testing.assert_array_equal(published_arm[0], np.full(7, 0.2))
+    if record_raw:
+        assert len(env.recorder.rows) == 1
+        _, command = env.recorder.rows[0]
+        np.testing.assert_array_equal(command.arm_qpos, np.full(7, 0.2))
+        np.testing.assert_array_equal(command.hand_qpos, np.full(12, 0.2))
+        assert not command.arm_hold
+    else:
+        assert not env.recorder.rows and not env.recorder.gaps
 
 
-def test_timeout_during_mapping_prevents_motion(env):
-    ready_to_send(env)
-    original = env.rollout.map_command
+@pytest.mark.parametrize("resuming", [False, True])
+def test_recording_failure_preserves_submission_error(env, resuming):
+    if resuming:
+        ready_to_send(env)
+    else:
+        env.rollout.plan = ActionChunk(np.full((8, 19), 0.2), 0)
+    env.robot.send_error = error = RobotError("submission failed")
 
-    def mapping(action, row):
-        result = original(action, row)
-        env.advance(5)
-        return result
+    def append(row, command, **kwargs):
+        assert command is not None
+        raise RecordingError("append failed")
 
-    env.rollout.map_command = mapping
+    env.recorder.append = append
+    env.rollout.prepare = lambda poll: None
+    with pytest.raises(RobotError, match="submission failed") as caught:
+        env.rollout.run(poll_operator=lambda **kwargs: None)
+    assert caught.value is error
+    assert env.rollout.state == ("RESUMING" if resuming else "RUNNING")
+    assert env.rollout.result.termination_reason == "failed"
+    assert env.rollout.result.errors == [
+        dict(stage="recording_append", exception_type="RecordingError", message="append failed"),
+        dict(stage="control", exception_type="RobotError", message="submission failed"),
+    ]
+    assert env.robot.stops == 1 and env.state.stop_signal.is_set()
+
+
+def test_running_without_submission_still_records(env):
     env.rollout.step()
-    assert env.rollout.result.termination_details == "hoi_recovery_timeout"
+    assert env.rollout.state == "RUNNING" and not env.robot.sent
+    assert len(env.recorder.rows) == 1 and env.recorder.rows[0][1] is None
+
+
+@pytest.mark.parametrize("failure", ["cancelled", "rejected", "exception", "timeout"])
+def test_recovery_before_submission_does_not_record(env, failure):
+    ready_to_send(env)
+    original = env.rollout.action_mapper.map_joint
+
+    def mapping(arm, hand):
+        if failure == "cancelled":
+            env.state.request_stop()
+            return original(arm, hand)
+        if failure == "timeout":
+            env.advance(5)
+            return original(arm, hand)
+        if failure == "rejected":
+            return SimpleNamespace(arm_qpos=None, hand_qpos=None, rejection_reason="unreachable")
+        raise ValueError("mapping failed")
+
+    env.rollout.action_mapper.map_joint = mapping
+    if failure in {"rejected", "timeout"}:
+        env.rollout.step()
+        expected = "action_rejected: unreachable" if failure == "rejected" else "hoi_recovery_timeout"
+        assert env.rollout.result.termination_details == expected
+    else:
+        error = OperationCancelled if failure == "cancelled" else ValueError
+        with pytest.raises(error):
+            env.rollout.step()
+    assert env.rollout.state == "RESUMING"
+    assert not env.rollout.has_submitted and env.rollout.cursor == 0
     assert all(cmd.arm_hold for _, cmd, _ in env.robot.sent)
     assert not env.recorder.rows
 
@@ -538,7 +620,8 @@ def test_second_recovery_interval_marks_new_gap(env):
     assert env.rollout.hoi_recovery_started_ns == env.clock.now
 
 
-def test_slow_submission_does_not_extend_recovery(env):
+@pytest.mark.parametrize("record_raw", [True, False], ids=["raw", "no_raw"])
+def test_slow_submission_does_not_extend_recovery(env, record_raw):
     ready_to_send(env)
     original = env.robot.send_action
 
@@ -547,9 +630,20 @@ def test_slow_submission_does_not_extend_recovery(env):
         env.advance(5)
 
     env.robot.send_action = send
-    env.rollout.step()
+    env.rollout.prepare = lambda poll: None
+    env.rollout.run(poll_operator=lambda **kwargs: None)
     assert env.rollout.result.termination_details == "hoi_recovery_timeout"
-    assert env.rollout.state == "RESUMING" and not env.recorder.rows
+    assert env.rollout.result.termination_reason == "cancelled"
+    assert env.rollout.state == "RESUMING"
+    assert not env.rollout.has_submitted and env.rollout.cursor == 0
+    assert env.rollout.prev_action is None
+    assert env.robot.stops == 1 and env.state.stop_signal.is_set()
+    assert env.channels.hoi_request.data["episode_id"] == 0
+    if record_raw:
+        assert len(env.recorder.rows) == 1
+        assert env.recorder.rows[0][1] is env.robot.sent[-1][1]
+    else:
+        assert not env.recorder.rows and not env.recorder.gaps
 
 
 def test_run_recovers_without_restarting_lifecycle(env):
@@ -577,7 +671,8 @@ def test_run_recovers_without_restarting_lifecycle(env):
     assert env.robot.stops == 1
 
 
-def test_real_recorder_preserves_raw_source_and_segment_boundary(env, tmp_path):
+@pytest.mark.parametrize("outcome", ["success", "failure", "timeout"])
+def test_real_recorder_preserves_raw_source_and_segment_boundary(env, tmp_path, outcome):
     recorder = EpisodeRecorder(tmp_path, control_hz=20)
     # 只验证生产者队列契约，不启动写盘线程。
     recorder.is_recording = True
@@ -590,29 +685,39 @@ def test_real_recorder_preserves_raw_source_and_segment_boundary(env, tmp_path):
     ready_to_send(env)
     assert recorder.queue.empty() and recorder.pending_segment_start
     env.channels.camera_ring.latest_sequence = 2
-    env.channels.camera_ring.data["timestamp_ns"] = env.clock.now - 10_000_000
-    env.rollout.step()
+    observed_ns = env.clock.now
+    env.channels.camera_ring.data["timestamp_ns"] = observed_ns - 10_000_000
+    attempted = []
+    original = env.robot.send_action
+
+    def send(command, **kwargs):
+        attempted.append(command)
+        if outcome == "failure":
+            raise RobotError("submission failed")
+        original(command, **kwargs)
+        if outcome == "timeout":
+            env.advance(5)
+
+    env.robot.send_action = send
+    if outcome == "failure":
+        with pytest.raises(RobotError, match="submission failed"):
+            env.rollout.step()
+    else:
+        env.rollout.step()
     raw, command, segment_start = recorder.queue.get_nowait()
-    assert segment_start and command is not None
+    assert segment_start
+    assert len(attempted) == 1 and command is attempted[0]
     assert raw.hoi is None and raw.camera["ring_sequence"] == 2
-    assert raw.camera["timestamp_ns"] == env.clock.now - 10_000_000
-    assert not recorder.pending_segment_start
+    assert raw.camera["timestamp_ns"] == observed_ns - 10_000_000
+    assert raw.observation_timestamp_ns == raw.control_timestamp_ns == observed_ns
+    assert recorder.queue.empty() and not recorder.pending_segment_start
 
-    env.advance()
-    env.rollout.step()
-    _, command, segment_start = recorder.queue.get_nowait()
-    assert command is not None and not segment_start
-
-
-def test_recovery_without_raw_recording(env):
-    env.rollout.recorder = None
-    env.rollout.record_raw = False
-    env.rollout.record_needs = ObservationNeeds()
-    env.rollout.read_needs = env.rollout.observations.needs
-    ready_to_send(env)
-    env.rollout.step()
-    assert env.rollout.state == "RUNNING"
-    assert not env.recorder.rows and not env.recorder.gaps
+    if outcome == "success":
+        env.advance()
+        env.rollout.step()
+        _, command, segment_start = recorder.queue.get_nowait()
+        assert command is not None and not segment_start
+        assert recorder.queue.empty()
 
 
 def test_eef_resume_uses_measured_reference(env):
