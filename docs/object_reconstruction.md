@@ -42,6 +42,8 @@ flowchart LR
 
 在线 worker 加载并预热模型后宣告就绪。每段首帧对 RGB-D 去畸变，经 Grounding DINO、SAM2 和 FoundationPose 注册得到初始位姿。后续对活动对象合批 refinement，使用 CAD、深度及当前 Mask 验证候选。SAM2 默认每两个处理帧刷新，质量异常或恢复时提前刷新；`segmentation_interval_frames=1` 为逐帧分割。全部对象 LOST 时等待恢复到期。质量规则见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)。
 
+当前默认按非对称物体进行 6D Pose Tracking，FoundationPose 仅使用单位对称变换，未提供按物体的对称性配置。对称物体可能出现几何等价姿态的旋转歧义，不保证绕对称轴的绝对旋转角稳定；任务方向是否等价需另行判断。具体行为和未来扩展见 [Object Symmetry](../third_party/cordvip_geometry/README.md#object-symmetry)。
+
 模型跨段复用，初始化重置视频、位姿和相机缓存，段内相机参数及图像尺寸固定。在线、离线共用 SceneTracker，并传入真实相机时间和来源序列；重复序列复用结果，跳帧不补造 SAM2 图像。
 
 对象独立维护 TRACKING、OCCLUDED、LOST。证据不足时保留可靠内部位姿继续 Track，但当前观测无效；明确矛盾或遮挡超时才进入 LOST。恢复经过检测、分割、注册及下一处理帧的再次验证，两帧可信后才发布有效位姿。初始化失败在后续新观测重试。状态和配置见[后端说明](../third_party/cordvip_geometry/README.md#遮挡恢复)。

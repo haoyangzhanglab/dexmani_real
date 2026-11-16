@@ -2361,28 +2361,40 @@ def test_pose_jump_checks_use_real_dt_and_preserve_geometry(
         assert scene.trackers["apple"].estimator.pose_last is previous
 
 
-def test_symmetry_aware_motion_uses_center_and_one_equivalent_pose():
-    from scipy.spatial.transform import Rotation
+@pytest.mark.parametrize("offset, continuous", [(0.0, True), (1.0, False)])
+def test_motion_limits_use_one_symmetry_equivalent_pose(offset, continuous):
     from cordvip_geometry.tracking import pose_motion
 
-    symmetry = np.eye(4)
-    symmetry[:3, :3] = Rotation.from_euler("z", np.pi).as_matrix()
+    half_turn = np.diag([-1.0, -1.0, 1.0, 1.0])
+    symmetry = half_turn.copy()
+    symmetry[0, 3] = offset
     tracker = SimpleNamespace(
         estimator=SimpleNamespace(diameter=0.1),
         object_from_center=np.eye(4),
         symmetry_tfs=np.stack([np.eye(4), symmetry]),
     )
     config = TrackingConfig(max_translation_speed_m_s=0.1, max_rotation_speed_rad_s=0.1)
-    metrics, allowed = pose_motion(np.eye(4), symmetry, tracker, 0.01, config)
-    assert allowed and metrics["rotation_delta_rad"] == 0
-    tracker.symmetry_tfs[1, 0, 3] = 1
-    assert not pose_motion(np.eye(4), symmetry, tracker, 0.01, config)[1]
-    tracker.symmetry_tfs = np.eye(4)[None]
-    tracker.object_from_center[0, 3] = 2
-    center_from_object = np.linalg.inv(tracker.object_from_center)
+    metrics, allowed = pose_motion(np.eye(4), half_turn, tracker, 0.01, config)
+    assert allowed is continuous
+    assert metrics["rotation_delta_rad"] == 0
+    assert metrics["translation_delta_m"] == offset
+
+
+def test_motion_uses_mesh_center_instead_of_object_origin():
+    from cordvip_geometry.tracking import pose_motion
+
+    object_from_center = np.eye(4)
+    object_from_center[0, 3] = 2
+    tracker = SimpleNamespace(
+        estimator=SimpleNamespace(diameter=0.1),
+        object_from_center=object_from_center,
+        symmetry_tfs=np.eye(4)[None],
+    )
+    center_from_object = np.linalg.inv(object_from_center)
+    half_turn = np.diag([-1.0, -1.0, 1.0, 1.0])
     metrics, allowed = pose_motion(
         center_from_object,
-        symmetry @ center_from_object,
+        half_turn @ center_from_object,
         tracker,
         0.1,
         TrackingConfig(max_translation_speed_m_s=0.1),

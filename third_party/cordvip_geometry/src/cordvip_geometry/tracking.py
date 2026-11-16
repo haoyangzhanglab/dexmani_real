@@ -217,7 +217,7 @@ def pose_depth_quality(observed, rendered, config):
 
 
 def pose_motion(previous, current, tracker, dt, config):
-    """在居中网格坐标中比较同一个对称等价位姿，避免局部原点引入假平移。"""
+    """在居中网格坐标中比较等价位姿，报告同一候选的平移和转角。"""
     previous = previous @ tracker.object_from_center
     equivalent = (current @ tracker.object_from_center)[None] @ tracker.symmetry_tfs
     translations = np.linalg.norm(equivalent[:, :3, 3] - previous[:3, 3], axis=1)
@@ -428,16 +428,6 @@ class SceneTracker:
             )
         return matches[0]["box_xyxy"]
 
-    def _check_registration_depth(self, mask, depth):
-        if mask is None:
-            raise TrackingFailure("missing registration mask")
-        valid = mask & np.isfinite(depth) & (depth >= 0.001)
-        if (
-            np.count_nonzero(valid[::PIXEL_STRIDE, ::PIXEL_STRIDE])
-            < self.config.min_depth_pixels
-        ):
-            raise TrackingFailure("insufficient segmented depth")
-
     def _pose_geometry(self, name, pose, reference, dt):
         """检查候选刚体位姿，生成与当前 Mask 无关的几何证据。"""
         if np.shape(pose) != (4, 4) or not np.isfinite(pose).all():
@@ -595,7 +585,15 @@ class SceneTracker:
 
         def register(name, mask):
             try:
-                self._check_registration_depth(mask, depth_m)
+                if mask is None:
+                    raise TrackingFailure("missing registration mask")
+                valid = (
+                    mask[::PIXEL_STRIDE, ::PIXEL_STRIDE]
+                    & np.isfinite(sampled)
+                    & (sampled >= 0.001)
+                )
+                if np.count_nonzero(valid) < self.config.min_depth_pixels:
+                    raise TrackingFailure("insufficient segmented depth")
                 pose = self.trackers[name].register(rgb, depth_m, K, mask)
             except RuntimeError as error:
                 reject(name, error)
