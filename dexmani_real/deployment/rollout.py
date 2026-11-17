@@ -219,18 +219,20 @@ class Rollout:
             self.robot.check()
         return valid
 
-    def read_observations(self, *, images=True) -> tuple[Observation, Observation]:
+    def read_observations(self, *, include_visual_payloads=True) -> tuple[Observation, Observation]:
         """共享关节采样；派生模型图像同源，Raw 独立取最新相机帧。"""
         row = read_observation(
             self.sensors.channels,
             self.robot,
-            needs=self.read_needs if images else replace(self.read_needs, camera_fields=()),
+            needs=self.read_needs,
             joint_gap_s=self.execution.hoi_max_joint_gap_s,
+            include_visual_payloads=include_visual_payloads,
         )
         raw = row
         if self.record_raw and (self.observations.needs.hoi or self.observations.needs.point_cloud):
             camera = read_camera_frame(
-                self.sensors.channels, fields=self.record_needs.camera_fields if images else (),
+                self.sensors.channels,
+                fields=self.record_needs.camera_fields if include_visual_payloads else (),
             )
             raw = replace(row, camera=camera, hoi=None, observation_timestamp_ns=time.monotonic_ns())
         return row, raw
@@ -450,8 +452,8 @@ class Rollout:
             self.robot.check()
             raise OperationCancelled("operation cancelled")
 
-    def sample_observation(self, *, images=True) -> tuple[Observation, Observation]:
-        row, raw = self.read_observations(images=images)
+    def sample_observation(self, *, include_visual_payloads=True) -> tuple[Observation, Observation]:
+        row, raw = self.read_observations(include_visual_payloads=include_visual_payloads)
         devices = check_device_feedback(row, self.runtime)
         if devices:
             raise FeedbackUnavailable("device feedback: " + "; ".join(devices))
@@ -584,13 +586,15 @@ class Rollout:
             self._refresh_hoi_hold()
         if self.state == "HOI_HOLD":
             # 即使旧推理未完成，也不能掩盖设备或其他输入故障。
-            # 暂停不构建模型历史或追加 Raw，读取来源元数据即可检查图像时效。
-            row, raw = self.sample_observation(images=False)
+            # 暂停不构建模型历史或追加 Raw，仅读取视觉来源元数据检查时效。
+            row, raw = self.sample_observation(include_visual_payloads=False)
             quality_issue = self.recording_issue(raw) if self.recorder is not None else None
             if quality_issue is not None:
                 self.stop(quality_issue)
                 return
-            issues = check_observation(row, self.runtime, self.observations.needs)
+            issues = check_observation(
+                row, self.runtime, self.observations.needs, include_visual_payloads=False,
+            )
             if issues and not is_recoverable_hoi_failure(issues):
                 self.stop("model_input: " + "; ".join(issues))
                 return

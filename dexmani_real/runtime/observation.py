@@ -74,17 +74,25 @@ class Observation:
     aligned_joints: dict | None = None
 
 
-def read_observation(channels, robot, *, needs: ObservationNeeds, joint_gap_s=0.10) -> Observation:
+def read_observation(
+    channels, robot, *, needs: ObservationNeeds, joint_gap_s=0.10, include_visual_payloads=True,
+) -> Observation:
+    """可省略视觉大数组；来源元数据、设备反馈及关节对齐仍按 needs 读取。"""
     control_ns = time.monotonic_ns()
     state = robot.read_state()
+    camera_fields = needs.camera_fields if include_visual_payloads else ()
     cloud_result = None
     if needs.point_cloud:
-        fields = ("timestamp_ns", "source_camera_sequence", "point_cloud", *needs.camera_fields)
+        fields: tuple[str, ...] = ("timestamp_ns", "source_camera_sequence")
+        if include_visual_payloads:
+            fields += ("point_cloud", *camera_fields)
         cloud_result = channels.pointcloud_ring.read(fields=fields)
     cloud = cloud_result[0] if cloud_result else None
     hoi = None
     if needs.hoi:
-        hoi = _read_hoi(channels, fields=("object_pointcloud", *needs.camera_fields))
+        hoi = _read_hoi(
+            channels, fields=("object_pointcloud", *camera_fields) if include_visual_payloads else (),
+        )
     camera = None
     if needs.camera_fields:
         if needs.hoi or needs.point_cloud:
@@ -93,10 +101,10 @@ def read_observation(channels, robot, *, needs: ObservationNeeds, joint_gap_s=0.
                 camera = {
                     "timestamp_ns": int(source["timestamp_ns"]),
                     "ring_sequence": int(source["source_camera_sequence"]),
-                    **{name: source[name] for name in needs.camera_fields},
+                    **{name: source[name] for name in camera_fields},
                 }
         else:
-            camera = read_camera_frame(channels, fields=needs.camera_fields)
+            camera = read_camera_frame(channels, fields=camera_fields)
     vr_result = channels.vr_ring.read() if needs.vr else None
     aligned_joints = None
     if needs.hoi_joint_devices and hoi is not None and hoi["valid"]:
@@ -108,7 +116,7 @@ def read_observation(channels, robot, *, needs: ObservationNeeds, joint_gap_s=0.
         aligned_joints=aligned_joints,
         camera=camera,
         vr=vr_result[0] if vr_result is not None else None,
-        point_cloud=cloud["point_cloud"] if cloud is not None else None,
+        point_cloud=cloud["point_cloud"] if include_visual_payloads and cloud is not None else None,
         observation_timestamp_ns=time.monotonic_ns(),
         control_timestamp_ns=control_ns,
         pointcloud_timestamp_ns=int(cloud["timestamp_ns"]) if cloud is not None else 0,
@@ -129,7 +137,7 @@ def check_device_feedback(row, runtime, *, now_ns=None):
     return issues
 
 
-def check_observation(row, runtime, needs, *, now_ns=None):
+def check_observation(row, runtime, needs, *, now_ns=None, include_visual_payloads=True):
     """模型或录制所需模态，不重复检查关节反馈。"""
     now = time.monotonic_ns() if now_ns is None else now_ns
     issues: list[str] = []
@@ -137,7 +145,7 @@ def check_observation(row, runtime, needs, *, now_ns=None):
         stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0]) if row.hand is not None else 0
         if not sample_is_fresh(stamp, runtime.hand.feedback_max_age_s, now):
             issues.append(f"hand_tactile_{channel}_timestamp_ns_unavailable_or_stale")
-    # read_observation 已让派生快照携带所需同源图像，只检查对应点云/HOI 来源。
+    # 派生观测的相机时效由对应点云/HOI 来源统一检查。
     if needs.camera_fields and not (needs.point_cloud or needs.hoi):
         if row.camera is None:
             issues.append("camera_source_unavailable_or_unmatched")
@@ -146,12 +154,12 @@ def check_observation(row, runtime, needs, *, now_ns=None):
             if not sample_is_fresh(stamp, runtime.camera.max_frame_age_s, now):
                 issues.append("camera_source_stale")
     if needs.point_cloud:
-        if row.point_cloud is None:
+        stamp = row.pointcloud_timestamp_ns
+        available = row.point_cloud is not None if include_visual_payloads else stamp > 0
+        if not available:
             issues.append("pointcloud_unavailable")
-        else:
-            stamp = row.pointcloud_timestamp_ns
-            if not sample_is_fresh(stamp, runtime.camera.max_frame_age_s, now):
-                issues.append("pointcloud_stale")
+        elif not sample_is_fresh(stamp, runtime.camera.max_frame_age_s, now):
+            issues.append("pointcloud_stale")
     if needs.hoi:
         issues.extend(_hoi_issues(row.hoi, runtime, now))
         if needs.hoi_joint_devices and row.aligned_joints is None:

@@ -29,7 +29,10 @@ from dexmani_real.robot.commands import (
 from dexmani_real.runtime.observation import (
     RAW_RECORDING_NEEDS,
     ObservationNeeds,
+    check_device_feedback,
+    check_observation,
     is_recoverable_hoi_failure,
+    read_observation,
 )
 from dexmani_real.runtime.state import RunEndReason, SessionState
 
@@ -155,7 +158,12 @@ def record_raw():
 
 
 @pytest.fixture
-def env(monkeypatch, record_raw):
+def observation_fields():
+    return ("object_pointcloud", "joint_state")
+
+
+@pytest.fixture
+def env(monkeypatch, record_raw, observation_fields):
     clock = SimpleNamespace(now=10_000_000_000)
 
     def sleep(seconds):
@@ -167,14 +175,18 @@ def env(monkeypatch, record_raw):
     robot = FakeRobot(clock, state)
     channels = SimpleNamespace(
         hoi_request=FakeRing({"episode_id": 7, "after_ns": 1, "after_sequence": 0}),
-        hoi_ring=FakeRing(None), camera_ring=FakeRing(None),
+        hoi_ring=FakeRing(None), camera_ring=FakeRing(None), pointcloud_ring=FakeRing(None),
     )
     runtime = RealConfig(execution=ExecutionConfig(control_dt_s=0.05, action_steps=8))
     info = SimpleNamespace(
-        observation_fields=("object_pointcloud", "joint_state"),
+        observation_fields=observation_fields,
         n_obs_steps=2, action_mode="joint", requires_prev_action=True,
     )
     observations = ObservationBuilder(info, runtime)
+    if "rgb" in observation_fields:
+        observations.configure_camera(CameraSnapshot(
+            "test", CameraIntrinsics(2, 2, 2., 2., 1., 1., "none", (0.,) * 5), .001, None,
+        ))
     record_needs = RAW_RECORDING_NEEDS if record_raw else ObservationNeeds()
     worker, recorder = FakePolicyWorker(), FakeRecorder()
     worker.build_observation = observations.build
@@ -200,8 +212,12 @@ def env(monkeypatch, record_raw):
             "timestamp_ns": clock.now, "rgb": np.zeros((2, 2, 3), np.uint8),
             "depth": np.ones((2, 2), np.uint16),
         }
+        channels.pointcloud_ring.data = {
+            **channels.camera_ring.data, "source_camera_sequence": 1,
+            "point_cloud": np.zeros((4, 6), np.float32),
+        }
         channels.hoi_ring.data = {
-            "episode_id": 7, "timestamp_ns": clock.now, "source_camera_sequence": 1,
+            **channels.camera_ring.data, "episode_id": 7, "source_camera_sequence": 1,
             "valid": valid, "object_pointcloud": np.full((4, 3), clock.now, dtype=float),
         }
 
@@ -230,6 +246,90 @@ def ready_to_send(env):
     env.rollout.step()
     env.worker.complete()
     env.advance()
+
+
+@pytest.mark.parametrize("source", ["camera", "pointcloud", "hoi"])
+@pytest.mark.parametrize("include_visual_payloads", [True, False], ids=["full", "metadata"])
+def test_observation_read_modes_keep_sources_and_nonvisual_inputs(
+    env, monkeypatch, source, include_visual_payloads,
+):
+    channels = env.channels
+    channels.camera_ring.latest_sequence = 8
+    channels.pointcloud_ring.data.update(timestamp_ns=env.clock.now - 10, source_camera_sequence=4)
+    channels.hoi_ring.data.update(timestamp_ns=env.clock.now - 20, source_camera_sequence=6)
+    channels.vr_ring = FakeRing({"recv_ts_ns": env.clock.now, "landmarks": np.ones((21, 3))})
+    aligned = Mock(wraps=env.robot.aligned_joints)
+    monkeypatch.setattr(env.robot, "aligned_joints", aligned)
+    needs = ObservationNeeds(
+        camera_fields=("rgb", "depth"), point_cloud=source == "pointcloud", hoi=source == "hoi",
+        hoi_joint_devices=("arm", "hand") if source == "hoi" else (),
+        vr=True, required_tactile=("aggregate", "dense"),
+    )
+    row = read_observation(
+        channels, env.robot, needs=needs, joint_gap_s=.025, include_visual_payloads=include_visual_payloads,
+    )
+    data = getattr(channels, f"{source}_ring").data
+    assert row.camera["timestamp_ns"] == data["timestamp_ns"]
+    assert row.camera["ring_sequence"] == (8 if source == "camera" else data["source_camera_sequence"])
+    assert set(row.camera) == {
+        "timestamp_ns", "ring_sequence", *(needs.camera_fields if include_visual_payloads else ()),
+    }
+    if include_visual_payloads:
+        for name in needs.camera_fields:
+            assert row.camera[name] is data[name]
+    if source == "camera":
+        fields = ("timestamp_ns", *needs.camera_fields) if include_visual_payloads else ("timestamp_ns",)
+        assert channels.camera_ring.reads == [fields]
+    else:
+        assert not channels.camera_ring.reads
+    if source == "pointcloud":
+        fields = ("timestamp_ns", "source_camera_sequence")
+        if include_visual_payloads:
+            fields += ("point_cloud", *needs.camera_fields)
+        assert channels.pointcloud_ring.reads == [fields]
+        assert row.point_cloud is (data["point_cloud"] if include_visual_payloads else None)
+        assert row.pointcloud_timestamp_ns == data["timestamp_ns"]
+        if include_visual_payloads:
+            stale = replace(row, pointcloud_timestamp_ns=0)
+            assert check_observation(stale, env.rollout.runtime, needs) == ["pointcloud_stale"]
+    else:
+        assert row.point_cloud is None and row.pointcloud_timestamp_ns == 0
+        assert not channels.pointcloud_ring.reads
+    if source == "hoi":
+        fields = ("episode_id", "timestamp_ns", "source_camera_sequence", "valid")
+        if include_visual_payloads:
+            fields += ("object_pointcloud", *needs.camera_fields)
+        assert channels.hoi_ring.reads == [fields] and set(row.hoi) == set(fields)
+        aligned.assert_called_once_with(data["timestamp_ns"], .025)
+        np.testing.assert_array_equal(row.aligned_joints["hand_qpos"], env.robot.hand_qpos)
+    else:
+        assert row.hoi is row.aligned_joints is None and not channels.hoi_ring.reads
+        aligned.assert_not_called()
+    assert row.vr["landmarks"] is channels.vr_ring.data["landmarks"] and channels.vr_ring.reads == [None]
+    assert row.control_timestamp_ns == row.observation_timestamp_ns == env.clock.now
+    assert not check_device_feedback(row, env.rollout.runtime)
+    assert not check_observation(row, env.rollout.runtime, needs, include_visual_payloads=include_visual_payloads)
+
+
+@pytest.mark.parametrize("source", ["camera", "vr"])
+@pytest.mark.parametrize("failure", ["missing", "stale"])
+def test_metadata_observation_checks_camera_and_vr_sources(env, source, failure):
+    channels = env.channels
+    channels.vr_ring = FakeRing({"recv_ts_ns": env.clock.now})
+    ring = getattr(channels, f"{source}_ring")
+    if failure == "missing":
+        ring.data = None
+    else:
+        ring.data["timestamp_ns" if source == "camera" else "recv_ts_ns"] = 0
+    needs = ObservationNeeds(camera_fields=("rgb", "depth"), vr=True)
+    row = read_observation(channels, env.robot, needs=needs, include_visual_payloads=False)
+    expected = {
+        ("camera", "missing"): "camera_source_unavailable_or_unmatched",
+        ("camera", "stale"): "camera_source_stale",
+        ("vr", "missing"): "vr_unavailable",
+        ("vr", "stale"): "vr_stale",
+    }[source, failure]
+    assert check_observation(row, env.rollout.runtime, needs, include_visual_payloads=False) == [expected]
 
 
 @pytest.mark.parametrize("issues,expected", [
@@ -489,12 +589,20 @@ def test_hold_device_errors_propagate(env, failure):
         env.rollout.step()
 
 
-@pytest.mark.parametrize("issue", ["episode", "stale", "alignment", "unavailable"])
+@pytest.mark.parametrize("issue", [
+    "episode", "request_time", "source_sequence", "invalid", "stale", "alignment", "unavailable",
+])
 def test_recovery_requires_all_hoi_conditions(env, issue):
     enter_hold(env)
     env.advance()
     if issue == "episode":
         env.channels.hoi_ring.data["episode_id"] = 8
+    elif issue == "request_time":
+        env.channels.hoi_request.data["after_ns"] = env.clock.now
+    elif issue == "source_sequence":
+        env.channels.hoi_ring.data["source_camera_sequence"] = 0
+    elif issue == "invalid":
+        env.channels.hoi_ring.data["valid"] = False
     elif issue == "stale":
         env.channels.hoi_ring.data["timestamp_ns"] -= 1_000_000_000
     elif issue == "alignment":
@@ -503,14 +611,27 @@ def test_recovery_requires_all_hoi_conditions(env, issue):
         env.channels.hoi_ring.data = None
     env.rollout.step()
     assert env.rollout.state == "HOI_HOLD" and not env.worker.calls
+    assert not env.rollout.finished
 
 
-def test_unrelated_modality_failure_not_hidden(env):
-    env.rollout.observations.needs = replace(env.rollout.observations.needs, point_cloud=True)
-    env.publish(False)
+@pytest.mark.parametrize("observation_fields", [("joint_state", "point_cloud", "object_pointcloud")])
+@pytest.mark.parametrize("source,issue", [
+    ("missing", "pointcloud_unavailable"), ("zero", "pointcloud_unavailable"),
+    ("stale", "pointcloud_stale"), ("future", "pointcloud_stale"),
+])
+def test_hold_checks_pointcloud_source_between_control_slots(env, source, issue):
+    enter_hold(env)
+    env.advance(.001, False)
+    if source == "missing":
+        env.channels.pointcloud_ring.data = None
+    else:
+        env.channels.pointcloud_ring.data["timestamp_ns"] = {
+            "zero": 0, "stale": env.clock.now - 1_000_000_000, "future": env.clock.now + 1,
+        }[source]
     env.rollout.step()
     assert env.rollout.finished
-    assert "pointcloud_unavailable" in env.rollout.result.termination_details
+    assert issue in env.rollout.result.termination_details
+    assert env.rollout.last_slot == 0 and not env.recorder.rows
 
 
 def test_final_check_prevents_action_and_recording(env):
@@ -678,14 +799,14 @@ def test_recovery_before_submission_does_not_record(env, failure):
     assert not env.recorder.rows
 
 
-@pytest.mark.parametrize("kind", ["camera", "tactile"])
+@pytest.mark.parametrize("kind", ["camera", "tactile_aggregate", "tactile_dense"])
 def test_raw_requirements_checked_while_paused(env, kind):
-    if kind == "tactile":
+    if kind != "camera":
         original = env.robot.read_state
 
         def read_state():
             state = original()
-            state.hand["tactile_aggregate_timestamp_ns"] = 0
+            state.hand[f"{kind}_timestamp_ns"] = 0
             return state
 
         env.robot.read_state = read_state
@@ -694,60 +815,134 @@ def test_raw_requirements_checked_while_paused(env, kind):
         env.channels.camera_ring.data = None
     env.rollout.step()
     assert env.rollout.finished and not env.recorder.rows
+    expected = ("camera_source_unavailable_or_unmatched" if kind == "camera"
+                else f"hand_{kind}_timestamp_ns_unavailable_or_stale")
+    assert env.rollout.result.termination_details == expected
 
 
-def test_hold_reads_image_metadata_then_recovers_from_fresh_full_frame(env):
+@pytest.mark.parametrize("record_raw", [False])
+@pytest.mark.parametrize("observation_fields", [
+    ("joint_state", "object_pointcloud", "finger_tactile_force"),
+    ("joint_state", "object_pointcloud", "taxel_tactile_force"),
+])
+def test_hold_checks_model_tactile_without_raw(env, monkeypatch):
+    enter_hold(env)
+    original = env.robot.read_state
+    channel, = env.rollout.observations.needs.required_tactile
+
+    def read_state():
+        state = original()
+        state.hand[f"tactile_{channel}_timestamp_ns"] = 0
+        return state
+
+    monkeypatch.setattr(env.robot, "read_state", read_state)
+    env.rollout.step()
+    assert env.rollout.finished and not env.recorder.rows
+    assert f"hand_tactile_{channel}_timestamp_ns_unavailable_or_stale" in env.rollout.result.termination_details
+
+
+@pytest.mark.parametrize("record_raw", [True, False], ids=["raw", "no_raw"])
+@pytest.mark.parametrize("observation_fields", [
+    ("joint_state", "point_cloud", "object_pointcloud"),
+    ("joint_state", "point_cloud", "object_pointcloud", "rgb"),
+], ids=["clouds", "clouds_rgb"])
+def test_hold_reads_visual_metadata_then_recovers_from_fresh_payloads(env, record_raw, observation_fields):
     rollout = env.rollout
-    rollout.policy_info.observation_fields += ("rgb",)
-    rollout.observations = ObservationBuilder(rollout.policy_info, rollout.runtime)
-    rollout.observations.configure_camera(CameraSnapshot(
-        "test", CameraIntrinsics(2, 2, 2., 2., 1., 1., "none", (0.,) * 5), .001, None,
-    ))
-    env.worker.build_observation = rollout.observations.build
-    rollout.read_needs = replace(rollout.read_needs, camera_fields=("rgb",))
+    assert rollout.observations.needs.point_cloud and rollout.observations.needs.hoi
+    assert rollout.read_needs.point_cloud and rollout.read_needs.hoi
+    rollout.step()
+    old_future = env.worker.future
+    recorded_before = len(env.recorder.rows)
+    for ring in (env.channels.camera_ring, env.channels.pointcloud_ring, env.channels.hoi_ring):
+        ring.reads.clear()
     enter_hold(env)
     for _ in range(5):
         env.advance(.001, False)
         rollout.step()
-    # 暂停逐轮检查来源，但不从任一个 Ring 请求像素载荷。
-    assert all("rgb" not in fields and "depth" not in fields
-               for ring in (env.channels.camera_ring, env.channels.hoi_ring) for fields in ring.reads)
-    assert not rollout.history and not env.worker.calls and not env.recorder.rows
-
     env.publish()
-    env.channels.hoi_ring.data["rgb"] = np.full((2, 2, 3), 3, np.uint8)
-    rollout.step()  # 未到下个槽也能立即登记恢复，元数据观测不进入历史。
-    assert rollout.state == "RESUMING" and not rollout.history and not env.worker.calls
+    row, raw = rollout.read_observations(include_visual_payloads=False)
+    assert row.point_cloud is None and row.pointcloud_timestamp_ns == env.clock.now
+    assert row.hoi == {
+        "episode_id": 7, "timestamp_ns": env.clock.now, "source_camera_sequence": 1, "valid": True,
+    }
+    assert row.aligned_joints is not None and not check_device_feedback(row, rollout.runtime)
+    assert row.control_timestamp_ns == row.observation_timestamp_ns == env.clock.now
+    assert not check_observation(row, rollout.runtime, rollout.observations.needs, include_visual_payloads=False)
+    # 默认完整模式仍先报告数组缺失，不能被新鲜或过期的来源时间掩盖。
+    for candidate in (row, replace(row, pointcloud_timestamp_ns=0)):
+        assert check_observation(candidate, rollout.runtime, rollout.observations.needs) == [
+            "pointcloud_unavailable",
+        ]
+    if "rgb" in observation_fields:
+        assert row.camera == {"timestamp_ns": env.clock.now, "ring_sequence": 1}
+    else:
+        assert row.camera is None
+    if record_raw:
+        assert raw.camera == {"timestamp_ns": env.clock.now, "ring_sequence": 1}
+        assert raw.hoi is None and rollout.recording_issue(raw) is None
+    rollout.step()
+    assert rollout.state == "HOI_HOLD" and not rollout.history and len(env.worker.calls) == 1
+    old_future.set_result(np.full((8, 19), 99))
+    rollout.step()  # 未到下个槽也能登记恢复；元数据和旧预测均不进入历史。
+    assert rollout.state == "RESUMING" and not rollout.history and len(env.worker.calls) == 1
     assert rollout.last_slot == 0
+    assert len(env.recorder.rows) == recorded_before and env.recorder.gaps == int(record_raw)
+    cloud_fields = ("timestamp_ns", "source_camera_sequence")
+    hoi_fields = ("episode_id", "timestamp_ns", "source_camera_sequence", "valid")
+    assert env.channels.pointcloud_ring.reads and env.channels.hoi_ring.reads
+    assert all(fields == cloud_fields for fields in env.channels.pointcloud_ring.reads)
+    assert all(fields == hoi_fields for fields in env.channels.hoi_ring.reads)
+    assert bool(env.channels.camera_ring.reads) == record_raw
+    assert all(fields == ("timestamp_ns",) for fields in env.channels.camera_ring.reads)
 
     env.advance(.05)
+    env.channels.pointcloud_ring.data["point_cloud"][:] = 11
     env.channels.hoi_ring.data.update(
+        object_pointcloud=np.full((4, 3), 12, np.float32),
         rgb=np.full((2, 2, 3), 7, np.uint8), source_camera_sequence=7,
     )
     env.channels.camera_ring.data["rgb"][:] = 9
     env.channels.camera_ring.latest_sequence = 8
     rollout.step()
-    assert len(env.worker.calls) == 1 and rollout.last_slot == 1
-    rows, _ = env.worker.calls[0]
-    assert all(np.all(row["rgb"] == 7) for row in rows)
-    assert rollout.observations.last_rgb_sequence == 7
-    assert "rgb" in env.channels.hoi_ring.reads[-1]
-    assert "rgb" in env.channels.camera_ring.reads[-1] and "depth" in env.channels.camera_ring.reads[-1]
-    assert not env.recorder.rows
+    assert len(env.worker.calls) == 2 and rollout.last_slot == 1
+    assert env.channels.pointcloud_ring.reads[-1] == (*cloud_fields, "point_cloud", *rollout.read_needs.camera_fields)
+    assert env.channels.hoi_ring.reads[-1] == (*hoi_fields, "object_pointcloud", *rollout.read_needs.camera_fields)
+    env.worker.model.predict = Mock(wraps=env.worker.model.predict)
+    env.worker.complete()
+    arrays = env.worker.model.predict.call_args.args[0]
+    assert np.all(arrays["point_cloud"] == 11) and np.all(arrays["object_pointcloud"] == 12)
+    if "rgb" in observation_fields:
+        assert np.all(arrays["rgb"] == 7) and rollout.observations.last_rgb_sequence == 7
+    assert len(env.recorder.rows) == recorded_before and rollout.state == "RESUMING"
+    env.advance()
+    env.channels.camera_ring.data["rgb"] = np.full((2, 2, 3), 13, np.uint8)
+    env.channels.camera_ring.data["depth"] = np.full((2, 2), 14, np.uint16)
+    rollout.step()
+    assert rollout.state == "RUNNING" and not env.robot.sent[-1][1].arm_hold
+    assert env.recorder.gaps == int(record_raw)
+    assert len(env.recorder.rows) == recorded_before + int(record_raw)
+    if record_raw:
+        raw, command = env.recorder.rows[-1]
+        assert command is env.robot.sent[-1][1] and raw.hoi is None
+        assert raw.camera["timestamp_ns"] == env.clock.now and raw.camera["ring_sequence"] == 8
+        assert np.all(raw.camera["rgb"] == 13) and np.all(raw.camera["depth"] == 14)
+        assert env.channels.camera_ring.reads[-1] == ("timestamp_ns", "rgb", "depth")
+    else:
+        assert not env.channels.camera_ring.reads
 
 
-@pytest.mark.parametrize("source", ["camera", "arm"])
+@pytest.mark.parametrize("source", ["camera", "arm", "hand"])
 def test_hold_rechecks_source_health_between_control_slots(env, source):
     enter_hold(env)
     env.clock.now += 1_000_000
     if source == "camera":
-        env.channels.camera_ring.data["timestamp_ns"] = 0
+        env.channels.camera_ring.data["timestamp_ns"] = env.clock.now - 1_000_000_000
         env.rollout.step()
         assert env.rollout.finished
         assert env.rollout.result.termination_details == "camera_source_stale"
     else:
-        env.robot.arm_age = 1_000_000_000
-        with pytest.raises(FeedbackUnavailable, match="arm_feedback_stale"):
+        setattr(env.robot, f"{source}_age", 1_000_000_000)
+        with pytest.raises(FeedbackUnavailable, match=f"{source}_"):
             env.rollout.step()
     assert env.rollout.last_slot == 0 and not env.recorder.rows
 
