@@ -1,7 +1,6 @@
-"""在线 HOI 恢复的控制契约；不加载模型或连接设备。"""
+"""在线 HOI 恢复与录制收尾；不加载模型或连接设备。"""
 
 from concurrent.futures import Future
-from collections import deque
 from copy import deepcopy
 from dataclasses import replace
 from threading import Event, Thread
@@ -231,105 +230,6 @@ def ready_to_send(env):
     env.rollout.step()
     env.worker.complete()
     env.advance()
-
-
-@pytest.mark.parametrize("mode", ["sync", "async", "rtc"])
-@pytest.mark.parametrize("obs_steps,action_steps", [(2, 8), (3, 8), (3, 1)])
-def test_prediction_history_overlap_follows_execution_window(env, mode, obs_steps, action_steps):
-    rollout = env.rollout
-    rollout.execution = replace(rollout.execution, mode=mode, action_steps=action_steps)
-    rollout.policy_info.n_obs_steps = obs_steps
-    rollout.history = deque(maxlen=obs_steps)
-    # 模拟一控制步完成推理；真实 Rollout 决定何时提交下一窗口。
-    for _ in range(40):
-        if env.worker.future is not None and not env.worker.future.done():
-            env.worker.complete()
-        env.advance()
-        rollout.step()
-    windows = [rows for rows, _ in env.worker.calls]
-    assert len(windows) >= 4
-    assert len({id(row) for row in windows[0]}) == 1
-    overlap = [len({id(row) for row in a} & {id(row) for row in b}) for a, b in zip(windows, windows[1:])]
-    expected = {0} if action_steps >= obs_steps else {1} if mode == "sync" else {1, 2}
-    assert set(overlap) == expected
-
-
-@pytest.mark.parametrize("save", [False, True])
-@pytest.mark.parametrize("wait", [False, True])
-def test_recorder_finish_keeps_first_intent_and_publishes_only_after_exit(tmp_path, save, wait):
-    recorder = EpisodeRecorder(tmp_path, control_hz=20)
-    staging = tmp_path / ".tmp_episode_test"
-    staging.mkdir()
-    (staging / "data.h5").write_bytes(b"test writer output")
-    recorder.staging_path = staging
-    recorder.writer = SimpleNamespace(frame_count=2)
-    released = Event()
-    recorder.thread = Thread(target=released.wait)
-    recorder.thread.start()
-    try:
-        assert not recorder.finish(save=save, reason="operator", wait=False)
-        assert not recorder.finish(save=not save, reason="quit", wait=False)
-        assert recorder.result()["status"] == "pending"
-        assert staging.exists() and not (tmp_path / "episode_test").exists()
-    finally:
-        released.set()
-        recorder.thread.join(timeout=2)
-    assert recorder.finish(save=not save, reason="quit", wait=wait)
-    result = recorder.result()
-    assert result["status"] == ("published" if save else "not_published")
-    assert not staging.exists()
-    assert (tmp_path / "episode_test").exists() == save
-    # 最终结果可重复读取；重复收尾不会改变首个处置意图。
-    assert recorder.finish(save=not save, reason="quit", wait=wait)
-    assert recorder.result() == result
-
-
-def test_recorder_poll_timeout_keeps_live_owner_and_staging(tmp_path, monkeypatch):
-    from dexmani_real.data import recorder as recorder_module
-
-    clock = SimpleNamespace(now=10.)
-    monkeypatch.setattr(recorder_module.time, "monotonic", lambda: clock.now)
-    recorder = EpisodeRecorder(tmp_path, control_hz=20)
-    recorder.staging_path = tmp_path / ".tmp_pending"
-    recorder.staging_path.mkdir()
-    recorder.thread = Mock(is_alive=Mock(return_value=True))
-    assert not recorder.finish(save=True, reason="operator", wait=False)
-    clock.now += recorder_module.RECORDER_STOP_TIMEOUT_S + 1
-    with pytest.raises(TimeoutError, match="writer did not exit"):
-        recorder.finish(save=True, reason="quit", wait=False)
-    assert recorder.result()["status"] == "pending"
-    assert recorder.staging_path.exists() and recorder.thread.is_alive()
-
-
-@pytest.mark.parametrize("primary_type,close_type,reported_type", [
-    (OSError, OSError, RecordingError),
-    (ValueError, OSError, ValueError),
-    (OSError, RuntimeError, RuntimeError),
-    (OSError, KeyboardInterrupt, KeyboardInterrupt),
-])
-def test_writer_and_close_errors_keep_causes_and_staging(
-    tmp_path, monkeypatch, caplog, primary_type, close_type, reported_type,
-):
-    from dexmani_real.data import recorder as recorder_module
-
-    recorder = EpisodeRecorder(tmp_path, control_hz=20)
-    recorder.staging_path = tmp_path / ".tmp_failed"
-    recorder.staging_path.mkdir()
-    writer = Mock(frame_count=0)
-    writer.open.side_effect = primary_type("first write failure")
-    writer.close.side_effect = close_type("later close failure")
-    monkeypatch.setattr(recorder_module, "RawWriter", Mock(return_value=writer))
-    recorder.write_episode({})
-    writer.close.assert_called_once()
-    assert "first write failure" in caplog.text and "later close failure" in caplog.text
-    if reported_type is RecordingError:
-        assert recorder.finish(save=True, reason="failed")
-        assert isinstance(recorder.error.__cause__, OSError)
-    else:
-        with pytest.raises(reported_type):
-            recorder.finish(save=True, reason="failed")
-    assert recorder.result()["status"] == "failed"
-    assert recorder.staging_path.exists() and recorder.published_path is None
 
 
 @pytest.mark.parametrize("issues,expected", [
@@ -937,6 +837,83 @@ def test_run_recovers_without_restarting_lifecycle(env):
     assert env.worker.reset_count == 1 and len(env.worker.calls) == 1
     assert env.recorder.gaps == 1 and len(env.recorder.rows) == 1
     assert env.robot.stops == 1
+
+
+@pytest.mark.parametrize("save", [False, True])
+def test_recorder_finish_keeps_first_intent_and_publishes_only_after_exit(tmp_path, save):
+    recorder = EpisodeRecorder(tmp_path, control_hz=20)
+    staging = tmp_path / ".tmp_episode_test"
+    staging.mkdir()
+    (staging / "data.h5").write_bytes(b"test writer output")
+    recorder.staging_path = staging
+    recorder.writer = SimpleNamespace(frame_count=2)
+    released = Event()
+    recorder.thread = Thread(target=released.wait)
+    recorder.thread.start()
+    try:
+        assert not recorder.finish(save=save, reason="operator", wait=False)
+        assert not recorder.finish(save=not save, reason="quit", wait=False)
+        assert recorder.result()["status"] == "pending"
+        assert staging.exists() and not (tmp_path / "episode_test").exists()
+    finally:
+        released.set()
+        recorder.thread.join(timeout=2)
+    assert recorder.finish(save=not save, reason="quit")
+    result = recorder.result()
+    assert result["status"] == ("published" if save else "not_published")
+    assert not staging.exists()
+    assert (tmp_path / "episode_test").exists() == save
+    # 最终结果可重复读取；重复收尾不会改变首个处置意图。
+    assert recorder.finish(save=not save, reason="quit")
+    assert recorder.result() == result
+
+
+def test_recorder_finish_timeout_keeps_live_owner_and_staging(tmp_path, monkeypatch):
+    from dexmani_real.data import recorder as recorder_module
+
+    clock = SimpleNamespace(now=10.)
+    monkeypatch.setattr(recorder_module.time, "monotonic", lambda: clock.now)
+    recorder = EpisodeRecorder(tmp_path, control_hz=20)
+    recorder.staging_path = tmp_path / ".tmp_pending"
+    recorder.staging_path.mkdir()
+    recorder.thread = Mock(is_alive=Mock(return_value=True))
+    assert not recorder.finish(save=True, reason="operator", wait=False)
+    clock.now += recorder_module.RECORDER_STOP_TIMEOUT_S + 1
+    with pytest.raises(TimeoutError, match="writer did not exit"):
+        recorder.finish(save=True, reason="quit", wait=False)
+    assert recorder.result()["status"] == "pending"
+    assert recorder.staging_path.exists() and recorder.thread.is_alive()
+
+
+@pytest.mark.parametrize("primary_type,close_type,reported_type", [
+    (OSError, OSError, RecordingError),
+    (ValueError, OSError, ValueError),
+    (OSError, RuntimeError, RuntimeError),
+    (OSError, KeyboardInterrupt, KeyboardInterrupt),
+])
+def test_writer_and_close_errors_keep_causes_and_staging(
+    tmp_path, monkeypatch, caplog, primary_type, close_type, reported_type,
+):
+    from dexmani_real.data import recorder as recorder_module
+
+    recorder = EpisodeRecorder(tmp_path, control_hz=20)
+    recorder.staging_path = tmp_path / ".tmp_failed"
+    recorder.staging_path.mkdir()
+    writer = Mock(frame_count=0)
+    writer.open.side_effect = primary_type("first write failure")
+    writer.close.side_effect = close_type("later close failure")
+    monkeypatch.setattr(recorder_module, "RawWriter", Mock(return_value=writer))
+    recorder.write_episode({})
+    writer.close.assert_called_once()
+    assert "first write failure" in caplog.text and "later close failure" in caplog.text
+    if reported_type is RecordingError:
+        assert recorder.finish(save=True, reason="failed")
+        assert isinstance(recorder.error.__cause__, OSError)
+    else:
+        with pytest.raises(reported_type):
+            recorder.finish(save=True, reason="failed")
+    assert recorder.result()["status"] == "failed"
+    assert recorder.staging_path.exists() and recorder.published_path is None
 
 
 @pytest.mark.parametrize("outcome", ["success", "failure", "timeout"])

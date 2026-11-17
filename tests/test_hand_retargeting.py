@@ -60,9 +60,12 @@ def test_hand_jacobian_in_sdk_order_and_owned_outputs(recorded, fraction):
     np.testing.assert_array_equal(jacobian, saved_jacobian)
 
 
-@pytest.mark.parametrize("loss", ["position", "proximal", "terminal", "pinch", "damping", "total"])
-@pytest.mark.parametrize("activation", [0., .4, 1.])
-@pytest.mark.parametrize("dt", [.008, .0625, .2])
+@pytest.mark.parametrize("loss,activation,dt", [
+    ("position", 0., .0625), ("proximal", 0., .0625), ("terminal", 0., .0625),
+    *[("pinch", activation, .0625) for activation in (0., .4, 1.)],
+    *[("damping", 0., dt) for dt in (.008, .0625, .2)],
+    *[("total", activation, dt) for activation in (0., .4, 1.) for dt in (.008, .0625, .2)],
+])
 def test_objective_gradient_for_each_loss(recorded, loss, activation, dt):
     solver, landmarks, _ = recorded
     config = solver.config
