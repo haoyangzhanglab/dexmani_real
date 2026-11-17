@@ -12,7 +12,8 @@ import pytest
 
 from dexmani_real.config.real import RealConfig
 from dexmani_real.control.actions import ActionResult
-from dexmani_real.data.recorder import RecordingError
+from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
+from dexmani_real.geometry.pose import Pose
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
 from dexmani_real.runtime.keyboard import Keyboard
@@ -58,13 +59,30 @@ def teleop():
     return loop
 
 
+@pytest.fixture
+def active_teleop(teleop, monkeypatch):
+    clock = SimpleNamespace(now=10_000_000_000)
+    monkeypatch.setattr(loop_module.time, "monotonic_ns", lambda: clock.now)
+    monkeypatch.setattr(loop_module.time, "monotonic", lambda: clock.now / 1e9)
+    teleop.robot.send_action.side_effect = None
+    assert teleop.start_episode(teleop.runtime_state.cancel_epoch)
+    return teleop, clock
+
+
+def control_row(teleop):
+    return loop_module.read_observation(
+        teleop.sensors.channels, teleop.robot, needs=teleop.capture_needs,
+    )
+
+
+
 def test_two_episodes_stop_clear_and_restart(teleop):
     for _ in range(2):
         teleop.keyboard.allow_start()
         teleop.keyboard.handle_key("b", True)
         commands, _ = teleop.keyboard.poll(teleop.runtime_state, timeout=0)
         teleop.handle_commands(commands)
-        assert teleop.cancel_epoch is None
+        assert teleop.episode_cancel_epoch is None
         assert teleop.runtime_state.stop_signal.is_set()
         assert teleop.pending_termination_reason == "operator"
         teleop.keyboard.handle_key("b", False)
@@ -88,14 +106,14 @@ def test_interrupted_preparation_never_submits(teleop, interruption):
     if interruption == "fault":
         with pytest.raises(RobotError, match="prepare failed"):
             teleop.run_episode(teleop.runtime_state.cancel_epoch)
-        assert teleop.failed
+        assert teleop.session_failed
     else:
         teleop.run_episode(teleop.runtime_state.cancel_epoch)
     teleop.robot.send_action.assert_not_called()
     teleop.controller.compute_target.assert_not_called()
     teleop.controller.clear.assert_called_once()
     assert teleop.robot.stop.call_count == 2
-    assert teleop.cancel_epoch is None
+    assert teleop.episode_cancel_epoch is None
     assert teleop.runtime_state.stop_signal.is_set()
 
 
@@ -112,7 +130,7 @@ def test_observation_loss_after_preparation_never_submits(teleop, monkeypatch):
     teleop.robot.send_action.assert_not_called()
     teleop.controller.clear.assert_called_once()
     assert "vr_unavailable" in teleop.termination_details[0]["reason"]
-    assert teleop.cancel_epoch is None
+    assert teleop.episode_cancel_epoch is None
     assert teleop.runtime_state.stop_signal.is_set()
 
 
@@ -124,7 +142,7 @@ def test_revoked_start_does_not_enter_or_cleanup_episode(teleop):
     teleop.robot.send_action.assert_not_called()
     teleop.robot.stop.assert_not_called()
     teleop.controller.clear.assert_not_called()
-    assert teleop.cancel_epoch is None
+    assert teleop.episode_cancel_epoch is None
 
 
 def test_partial_recorder_start_is_finished_before_return(teleop, monkeypatch, tmp_path):
@@ -157,8 +175,8 @@ def test_partial_recorder_start_is_finished_before_return(teleop, monkeypatch, t
     teleop.robot.prepare_streaming.assert_not_called()
     teleop.robot.send_action.assert_not_called()
     assert teleop.recorder is None
-    assert teleop.cancel_epoch is None
-    assert teleop.failed
+    assert teleop.episode_cancel_epoch is None
+    assert teleop.session_failed
 
 
 @pytest.mark.parametrize("outcome", ["success", "before_stop", "epoch", "poll_fault", "stop_fault"])
@@ -237,3 +255,84 @@ def test_vr_startup_uses_worker_wait_and_keeps_servicing(teleop, monkeypatch, ou
     process.start.assert_called_once()
     assert teleop.robot.service_idle.call_count >= 3
     assert process in teleop.sensors.processes
+
+
+def test_failed_submission_records_attempt_without_advancing_state(active_teleop, tmp_path):
+    teleop, clock = active_teleop
+    teleop.execute_control_step(control_row(teleop))
+    previous, deadline = teleop.last_command, teleop.target_deadline_ns
+    teleop.controller.commit.reset_mock()
+    clock.now += 10_000_000
+    teleop.controller.compute_target.return_value = ActionResult(np.full(7, .1), None)
+    recorder = teleop.recorder = EpisodeRecorder(tmp_path, control_hz=teleop.runtime.teleop.control_hz)
+    recorder.is_recording = True  # 仅验证真实入队契约，不启动 writer。
+    failure = RobotError("device submission failed")
+    teleop.robot.send_action.side_effect = failure
+    row = control_row(teleop)
+    with pytest.raises(RobotError) as caught:
+        teleop.execute_control_step(row)
+    assert caught.value is failure
+    recorded, command, _ = recorder.queue.get_nowait()
+    assert command is teleop.robot.send_action.call_args.args[0]
+    np.testing.assert_array_equal(command.arm_qpos, np.full(7, .1))
+    assert recorded.control_timestamp_ns == row.control_timestamp_ns
+    assert recorder.queue.empty()
+    teleop.controller.commit.assert_not_called()
+    assert teleop.last_command is previous
+    assert teleop.target_deadline_ns == deadline
+    assert teleop.runtime_state.stop_signal.is_set()
+
+
+def test_rejected_ik_resubmits_previous_command_without_renewing_lease(active_teleop):
+    teleop, clock = active_teleop
+    pose = Pose(np.zeros(3), np.array([1., 0., 0., 0.]))
+    teleop.controller.compute_target.return_value = ActionResult(np.zeros(7), None, eef_pose=pose)
+    teleop.execute_control_step(control_row(teleop))
+    command, deadline = teleop.last_command, teleop.target_deadline_ns
+    teleop.controller.previous_eef_target = pose
+    clock.now += 10_000_000
+    teleop.controller.compute_target.return_value = ActionResult(None, None, "unreachable")
+    teleop.execute_control_step(control_row(teleop))
+    assert teleop.robot.send_action.call_count == 2
+    assert teleop.robot.send_action.call_args.args[0] is command
+    assert teleop.robot.send_action.call_args.kwargs["expires_ns"] == deadline
+    assert teleop.controller.commit.call_args.kwargs["eef_pose"] is pose
+    assert teleop.last_command is command and teleop.target_deadline_ns == deadline
+    assert teleop.pending_termination_reason is None
+
+
+@pytest.mark.parametrize("expired", ["observation", "previous_target"])
+def test_expired_target_stops_episode_without_submission(active_teleop, expired):
+    teleop, clock = active_teleop
+    if expired == "previous_target":
+        teleop.execute_control_step(control_row(teleop))
+        clock.now = teleop.target_deadline_ns
+    row = control_row(teleop)
+    if expired == "observation":
+        row = replace(row, control_timestamp_ns=clock.now - int(teleop.runtime.teleop.target_max_age_s * 1e9))
+    teleop.robot.send_action.reset_mock()
+    teleop.controller.commit.reset_mock()
+    teleop.execute_control_step(row)
+    teleop.robot.send_action.assert_not_called()
+    teleop.controller.commit.assert_not_called()
+    assert teleop.pending_termination_reason == "cancelled"
+    assert teleop.termination_details == [{"stage": "termination", "reason": "target_expired"}]
+    assert teleop.runtime_state.stop_signal.is_set()
+    assert not teleop.service_episode(0)
+    teleop.end_episode()
+    assert teleop.episode_cancel_epoch is None
+    teleop.controller.clear.assert_called_once()
+    assert teleop.robot.stop.call_count == 2
+
+
+def test_session_failure_survives_successful_new_episode(teleop):
+    prepare = teleop.robot.prepare_streaming.side_effect
+    teleop.robot.prepare_streaming.side_effect = RobotError("prepare failed")
+    with pytest.raises(RobotError):
+        teleop.run_episode(teleop.runtime_state.cancel_epoch)
+    assert teleop.session_failed
+    teleop.robot.prepare_streaming.side_effect = prepare
+    teleop.run_episode(teleop.runtime_state.cancel_epoch)
+    teleop.robot.send_action.assert_called_once()
+    assert teleop.pending_termination_reason == "operator"
+    assert teleop.session_failed and teleop.episode_cancel_epoch is None

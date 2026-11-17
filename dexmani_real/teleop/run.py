@@ -208,7 +208,7 @@ def run_teleop(
                 logger.exception("teleop audio cleanup failed")
     return int(
         not runtime_state.quit_requested or primary_failure is not None or runtime_state.estop_request
-        or loop is not None and loop.failed
+        or loop is not None and loop.session_failed
     )
 
 

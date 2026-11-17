@@ -1,17 +1,40 @@
-"""部署入口的预算、默认值与 CLI 转发；不加载模型或连接设备。"""
+"""部署入口、启动取消与资源生命周期；模型和设备边界使用替身。"""
 
 import importlib.util
 import json
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from dexmani_policy.deployment.metadata import PolicyInfo
 
 from dexmani_real.config.deployment import DEFAULT_MAX_RUNNING_S, DEFAULT_NUM_EPISODES
 from dexmani_real.config.real import RealConfig
 from dexmani_real.deployment import session
+from dexmani_real.runtime.state import SessionState
+
+
+@pytest.fixture
+def policy_info():
+    return PolicyInfo(
+        checkpoint_path="policy.pt", weights="raw", inference_steps=4, task_name="test",
+        observation_fields=("joint_state",), n_obs_steps=2, n_action_steps=4, future_steps=8,
+        control_action_dim=19, action_mode="joint", rgb_preprocessing={}, supports_rtc=False,
+        requires_prev_action=False, control_dt_s=.05, data_processing=None,
+    )
+
+
+@pytest.fixture
+def policy_session(monkeypatch):
+    monkeypatch.setattr(session, "SessionState", lambda: SessionState(stop_signal=Event(), emergency_signal=Event()))
+    configured = session.PolicySession(RealConfig(), "policy.pt", device="cpu")
+    configured.keyboard.start = Mock()
+    configured.keyboard.stop = Mock()
+    configured.keyboard.check_health = Mock(return_value=True)
+    return configured
 
 
 @pytest.mark.parametrize("name,value,error", [
@@ -115,16 +138,7 @@ def test_declared_config_does_not_require_json_values(tmp_path, capsys, script):
     assert "object at" in capsys.readouterr().out
 
 
-def test_policy_records_only_used_parameters(monkeypatch, tmp_path):
-    from dexmani_policy.deployment.metadata import PolicyInfo
-    from dexmani_real.runtime.state import SessionState
-
-    info = PolicyInfo(
-        checkpoint_path="policy.pt", weights="raw", inference_steps=4, task_name="test",
-        observation_fields=("joint_state",), n_obs_steps=2, n_action_steps=4, future_steps=8,
-        control_action_dim=19, action_mode="joint", rgb_preprocessing={}, supports_rtc=False,
-        requires_prev_action=False, control_dt_s=.05, data_processing=None,
-    )
+def test_policy_records_only_used_parameters(monkeypatch, tmp_path, policy_info):
     runtime = RealConfig()
     runtime = replace(runtime, arm=replace(runtime.arm, homing=object()),
                       hand=replace(runtime.hand, home_tor_max=object()),
@@ -134,7 +148,7 @@ def test_policy_records_only_used_parameters(monkeypatch, tmp_path):
     monkeypatch.setattr(session, "PolicyWorker", Mock())
     configured = session.PolicySession(runtime, "policy.pt", device="cpu", output_root=tmp_path)
     configured.keyboard = Mock(check_health=Mock(return_value=True))
-    configured.wait_model = lambda: info
+    configured.wait_model = lambda: policy_info
     configured.prepare_resources()
     parameters = configured.effective_parameters
     assert parameters["execution"] == dict(mode="sync", control_dt_s=.05, action_steps=4)
@@ -168,3 +182,77 @@ def test_vr_calibration_uses_config_and_explicit_port(tmp_path, capsys, port):
     output = capsys.readouterr().out
     assert "host='127.0.0.2'" in output
     assert f"port={8123 if port is None else port}" in output
+
+
+def test_model_load_failure_precedes_device_allocation(policy_session, monkeypatch):
+    import dexmani_policy.deployment as deployment
+
+    failure = ValueError("checkpoint load failed")
+    monkeypatch.setattr(deployment, "load_policy", Mock(side_effect=failure))
+    robot = Mock()
+    channels = Mock()
+    monkeypatch.setattr(session, "Robot", robot)
+    monkeypatch.setattr(session, "SensorChannels", channels)
+    configured = policy_session
+    try:
+        with pytest.raises(ValueError) as caught:
+            configured.prepare_resources()
+        assert caught.value is failure
+        robot.assert_not_called()
+        channels.assert_not_called()
+        assert configured.robot is None and configured.episode is None
+        assert configured.sensors.processes == []
+    finally:
+        exit_code = configured.close(failure=failure)
+    assert exit_code == 1
+    assert configured.model.close_future.done()
+    configured.keyboard.stop.assert_called_once()
+
+
+def test_sensor_startup_cancel_reaches_session_cleanup(policy_session, policy_info, monkeypatch):
+    import dexmani_policy.deployment as deployment
+
+    configured = policy_session
+    info = replace(policy_info, observation_fields=("rgb",))
+    model = Mock(info=info)
+    monkeypatch.setattr(deployment, "load_policy", Mock(return_value=model))
+    robot = Mock()
+    monkeypatch.setattr(session, "Robot", Mock(return_value=robot))
+    channels = SimpleNamespace(camera_ring=SimpleNamespace(latest_sequence=0), is_running=SimpleNamespace(value=True))
+    monkeypatch.setattr(session, "SensorChannels", Mock(return_value=channels))
+    process = Mock(pid=123, exitcode=None)
+    process.name = "camera"
+    process.is_alive.return_value = True
+
+    def start():
+        assert configured.startup_allowed()
+        configured.runtime_state.request_stop()
+        assert not configured.startup_allowed()
+
+    def join(**kwargs):
+        assert process in configured.sensors.processes
+        process.is_alive.return_value = False
+        process.exitcode = 0
+
+    process.start.side_effect = start
+    process.join.side_effect = join
+    context = SimpleNamespace(Process=Mock(return_value=process))
+    monkeypatch.setattr(session.mp, "get_context", lambda *args: context)
+    loop = Mock(wraps=configured.run_control_loop)
+    monkeypatch.setattr(configured, "run_control_loop", loop)
+    snapshot = Mock()
+    monkeypatch.setattr(session, "snapshot_camera_parameters", snapshot)
+    assert configured.run() == 0
+    assert configured.summary["termination_reason"] == "startup_cancelled"
+    process.start.assert_called_once()
+    process.join.assert_called_once()
+    assert configured.sensors.processes == [] and not channels.is_running.value
+    robot.connect.assert_called_once()
+    robot.close.assert_called_once()
+    robot.send_action.assert_not_called()
+    loop.assert_not_called()
+    snapshot.assert_not_called()
+    model.warmup.assert_not_called()
+    model.predict.assert_not_called()
+    model.close.assert_called_once()
+    assert configured.episode is None and configured.episodes == []

@@ -71,7 +71,7 @@ class TeleopLoop:
         self.keyboard = keyboard
         self.audio = audio
 
-        self.cancel_epoch = None  # None 表示段外；准备和控制按调用顺序执行。
+        self.episode_cancel_epoch: int | None = None  # None 表示当前无活动段；Recorder 仍可能在收尾。
         self.next_tick_ns = None
         self.control_dt_ns = sampling_clock_ns(runtime.teleop.control_hz)
 
@@ -80,7 +80,7 @@ class TeleopLoop:
         self.discard_requested = False
         self.pending_termination_reason = None
         self.termination_details = []
-        self.failed = False  # 新段会重置结束状态，会话失败保留到退出。
+        self.session_failed = False  # 新段会重置结束状态，会话失败保留到退出。
 
     def record_error(self, stage, exc):
         if isinstance(exc, KeyboardInterrupt):
@@ -125,7 +125,7 @@ class TeleopLoop:
             self.request_episode_end("recording_failed", run_end_reason=RunEndReason.FAILED)
             raise
         finally:
-            self.cancel_epoch = None
+            self.episode_cancel_epoch = None
         if failure is not None and primary_failure is None:
             raise failure
         if failure is None:
@@ -175,7 +175,7 @@ class TeleopLoop:
         """先请求停止并保留结束意图，资源收尾由 run_episode 的边界执行。"""
         self.runtime_state.stop_signal.set()
         if run_end_reason is RunEndReason.FAILED:
-            self.failed = True
+            self.session_failed = True
         if self.pending_termination_reason is None or (
             run_end_reason is RunEndReason.FAILED and self.pending_termination_reason != "failed"
         ):
@@ -196,7 +196,7 @@ class TeleopLoop:
 
     def preparation_valid(self):
         return (
-            self.runtime_state.cancel_epoch == self.cancel_epoch
+            self.runtime_state.cancel_epoch == self.episode_cancel_epoch
             and self.runtime_state.requests_allow_motion()
         )
 
@@ -244,7 +244,7 @@ class TeleopLoop:
             ):
                 return False
             self.runtime_state.stop_signal.set()
-            self.cancel_epoch = self.runtime_state.cancel_epoch
+            self.episode_cancel_epoch = self.runtime_state.cancel_epoch
             self.discard_requested = False
         logger.info("Teleop preparing")
         self.pending_termination_reason = None
@@ -309,7 +309,7 @@ class TeleopLoop:
                 return False
             if self.preparation_interrupted():
                 return False
-            self.robot.prepare_streaming(self.cancel_epoch, poll_operator=self.poll_blocking_commands)
+            self.robot.prepare_streaming(self.episode_cancel_epoch, poll_operator=self.poll_blocking_commands)
             if self.start_observation() is None:
                 return False
             if self.preparation_interrupted():
@@ -324,9 +324,9 @@ class TeleopLoop:
                 if not self.preparation_interrupted():
                     self.request_episode_end("begin_unavailable")
                 return False
-            self.last_command = None
-            self.target_deadline_ns = None
-            self.hold_reason = None
+            self.last_command: RobotCommand | None = None
+            self.target_deadline_ns: int | None = None
+            self.hold_reason: str | None = None
             self.episode_deadline_ns = (
                 started_ns + int(self.max_duration_s * 1e9) if self.recording_dir is not None else None
             )
@@ -338,7 +338,7 @@ class TeleopLoop:
                 self.request_episode_end(str(exc))
         except OperationCancelled:
             self.robot.check()
-            if (self.runtime_state.cancel_epoch == self.cancel_epoch
+            if (self.runtime_state.cancel_epoch == self.episode_cancel_epoch
                     and self.runtime_state.requests_allow_motion()):
                 raise
             self.poll_blocking_commands()
@@ -356,7 +356,7 @@ class TeleopLoop:
         if cmd == "esc":
             self.runtime_state.request_emergency_stop()
             self.audio.play("emergency")
-            if self.cancel_epoch is not None:
+            if self.episode_cancel_epoch is not None:
                 self.request_episode_end("estop", run_end_reason=RunEndReason.ESTOP)
             return True
         if self.runtime_state.estop_request:
@@ -364,13 +364,13 @@ class TeleopLoop:
 
         if cmd == "q":
             self.audio.play("quit")
-            if self.cancel_epoch is not None:
+            if self.episode_cancel_epoch is not None:
                 self.request_episode_end("quit", run_end_reason=RunEndReason.QUIT)
             return True
         if self.runtime_state.quit_requested:
             return True
         if cmd in ("s", "c", "d"):
-            if self.cancel_epoch is not None:
+            if self.episode_cancel_epoch is not None:
                 self.request_episode_end(
                     "discard" if cmd == "d" else "stop", run_end_reason=RunEndReason.OPERATOR,
                 )
@@ -379,7 +379,7 @@ class TeleopLoop:
         elif cmd == "h":
             return self._run_home(expected_cancel_epoch)
         elif cmd == "b":
-            if (self.cancel_epoch is None
+            if (self.episode_cancel_epoch is None
                     and self.runtime_state.cancel_epoch == expected_cancel_epoch
                     and self.runtime_state.requests_allow_motion()):
                 self.run_episode(expected_cancel_epoch)
@@ -392,7 +392,7 @@ class TeleopLoop:
             logger.info("T ignored: hand is disabled")
             return False
         if (
-            self.cancel_epoch is not None or self.recorder is not None
+            self.episode_cancel_epoch is not None or self.recorder is not None
             or self.runtime_state.cancel_epoch != expected_cancel_epoch
             or not self.runtime_state.requests_allow_motion()
         ):
@@ -411,7 +411,7 @@ class TeleopLoop:
 
     def _run_home(self, expected_cancel_epoch):
         with self.runtime_state.motion_lock:
-            if self.cancel_epoch is not None or self.recorder is not None:
+            if self.episode_cancel_epoch is not None or self.recorder is not None:
                 logger.warning("H ignored: 请先按 S 结束本段，再回初始位。")
                 return True
             if (self.runtime_state.cancel_epoch != expected_cancel_epoch
@@ -458,7 +458,7 @@ class TeleopLoop:
                 and self.recorder.finish_request is not None):
             # 首次收尾请求已固定处置意图；此时只处理退出与急停。
             commands = tuple(event for event in commands if event in ("q", "esc"))
-        if "d" in commands and self.cancel_epoch is not None:
+        if "d" in commands and self.episode_cancel_epoch is not None:
             self.discard_requested = True
         # 回调已置停止信号；先登记 D 意图，再按原优先级选择结束原因。
         for terminal in ("esc", "q", "d", "s", "c"):
@@ -470,7 +470,7 @@ class TeleopLoop:
                 break
 
     def execute_control_step(self, row):
-        cancel_epoch = self.cancel_epoch
+        episode_cancel_epoch = self.episode_cancel_epoch
         command = None
         compute_start_ns = time.monotonic_ns()
         first_target = self.last_command is None
@@ -485,7 +485,7 @@ class TeleopLoop:
             result = self.controller.compute_target(row, control_ns=compute_start_ns)
             if self.recorder is not None:
                 self.recorder.check_error()
-            if (self.runtime_state.cancel_epoch != cancel_epoch
+            if (self.runtime_state.cancel_epoch != episode_cancel_epoch
                     or not self.runtime_state.requests_allow_motion()
                     or self.runtime_state.stop_signal.is_set()):
                 raise OperationCancelled("teleop cancelled before submission")
@@ -599,7 +599,7 @@ class TeleopLoop:
         events, stopped = self.keyboard.poll(timeout=timeout, state=self.runtime_state)
         self.handle_commands(events)
         if self.pending_termination_reason is None:
-            if self.runtime_state.cancel_epoch != self.cancel_epoch:
+            if self.runtime_state.cancel_epoch != self.episode_cancel_epoch:
                 self.request_episode_end("operator_cancelled")
             elif stopped:
                 self.handle_executor_stop()
@@ -626,7 +626,7 @@ class TeleopLoop:
             self.request_episode_end("episode_failed", run_end_reason=RunEndReason.FAILED)
             raise
         finally:
-            if self.cancel_epoch is not None:
+            if self.episode_cancel_epoch is not None:
                 if self.pending_termination_reason is None:
                     self.request_episode_end(
                         "interrupted",

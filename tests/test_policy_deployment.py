@@ -240,7 +240,7 @@ def test_hoi_warmup_commits_only_successful_uncancelled_result(fault):
                 state,
                 runtime,
                 SimpleNamespace(n_obs_steps=2),
-                cancel_epoch=state.cancel_epoch,
+                episode_cancel_epoch=state.cancel_epoch,
                 robot=robot,
                 observations=observations,
                 read_needs=None,

@@ -625,7 +625,7 @@ class PolicySession:
                 time.sleep(0.005)
                 continue
             episode = self.episode = Rollout(
-                self.runtime_state, self.runtime, self.info, cancel_epoch=cancel_epoch,
+                self.runtime_state, self.runtime, self.info, episode_cancel_epoch=cancel_epoch,
                 robot=self.robot, sensors=self.sensors, observations=self.observations,
                 read_needs=self.read_needs, record_needs=self.record_needs,
                 action_mapper=self.action_mapper, model=self.model,

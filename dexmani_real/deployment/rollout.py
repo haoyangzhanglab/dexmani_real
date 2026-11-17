@@ -69,7 +69,7 @@ class EpisodeResult:
 
 class Rollout:
     def __init__(
-        self, runtime_state, runtime, policy_info, *, cancel_epoch, robot,
+        self, runtime_state, runtime, policy_info, *, episode_cancel_epoch: int, robot,
         observations, read_needs: ObservationNeeds, record_needs: ObservationNeeds,
         sensors, action_mapper, model, max_running_s,
         index, output_dir, record_raw, effective_parameters, camera_snapshot=None,
@@ -94,7 +94,7 @@ class Rollout:
         self.camera_snapshot = camera_snapshot
         self.effective_parameters = effective_parameters
         self.max_duration_ns = int(max_running_s * 1e9) if max_running_s is not None else None
-        self.cancel_epoch = cancel_epoch
+        self.episode_cancel_epoch = episode_cancel_epoch
         self.history: deque[dict[str, np.ndarray]] = deque(maxlen=policy_info.n_obs_steps)
         self.plan: ActionChunk | None = None
         self.query: Prediction | None = None
@@ -193,7 +193,7 @@ class Rollout:
                 # 取消不能掩盖同时发生的设备或 worker 故障。
                 self.robot.check()
                 poll_operator()
-                if (not self.started_ns and self.runtime_state.cancel_epoch == self.cancel_epoch
+                if (not self.started_ns and self.runtime_state.cancel_epoch == self.episode_cancel_epoch
                         and self.runtime_state.requests_allow_motion()):
                     raise
                 self.stop(str(exc))
@@ -213,7 +213,7 @@ class Rollout:
 
     def preparation_valid(self):
         valid = (
-            self.runtime_state.cancel_epoch == self.cancel_epoch
+            self.runtime_state.cancel_epoch == self.episode_cancel_epoch
             and self.runtime_state.requests_allow_motion()
         )
         if not valid:
@@ -334,14 +334,14 @@ class Rollout:
         poll_operator()
         if not self.preparation_valid():
             raise OperationCancelled("cancelled before streaming preparation")
-        self.robot.prepare_streaming(self.cancel_epoch, poll_operator=poll_operator)
+        self.robot.prepare_streaming(self.episode_cancel_epoch, poll_operator=poll_operator)
         if self.start_observation(poll_operator) is None:
             self.stop(self.preparation_issue)
             return
         with self.runtime_state.motion_lock:
             started_ns = (
                 time.monotonic_ns()
-                if self.runtime_state.cancel_epoch == self.cancel_epoch
+                if self.runtime_state.cancel_epoch == self.episode_cancel_epoch
                 and self.runtime_state.requests_allow_motion()
                 and not self.runtime_state.stop_signal.is_set()
                 else None
@@ -448,7 +448,7 @@ class Rollout:
         return self.plan.actions[self.cursor if rtc else slot - self.plan.anchor_slot]
 
     def check_motion(self):
-        if (self.runtime_state.cancel_epoch != self.cancel_epoch
+        if (self.runtime_state.cancel_epoch != self.episode_cancel_epoch
                 or not self.runtime_state.requests_allow_motion()
                 or self.runtime_state.stop_signal.is_set()):
             self.robot.check()

@@ -174,7 +174,7 @@ def env(monkeypatch, record_raw):
     worker.build_observation = observations.build
     rollout = Rollout(
         state, runtime, info,
-        cancel_epoch=state.cancel_epoch, robot=robot, sensors=SimpleNamespace(channels=channels),
+        episode_cancel_epoch=state.cancel_epoch, robot=robot, sensors=SimpleNamespace(channels=channels),
         observations=observations,
         read_needs=replace(
             observations.needs.union(record_needs),
@@ -909,3 +909,66 @@ def test_session_shutdown_keeps_order_and_error_precedence(env, monkeypatch, fai
     if failure in {"ordinary", "exit"}:
         assert [error["stage"] for error in session.errors] == ["shutdown", "results_write"]
         assert [error["stage"] for error in env.rollout.result.errors] == ["recording_finalize", "model_close"]
+
+
+@pytest.mark.parametrize("pending", ["recorder", "model", None], ids=["recorder", "model", "complete"])
+def test_episode_finalization_releases_only_completed_resources(env, monkeypatch, tmp_path, pending):
+    from unittest.mock import Mock
+    from dexmani_real.deployment import session as session_module
+
+    monkeypatch.setattr(session_module, "SessionState", lambda: env.state)
+    session = session_module.PolicySession(env.rollout.runtime, "policy.pt", device="cpu")
+    session.robot = Mock()
+    session.keyboard = Mock()
+    session.episode, session.episodes = env.rollout, [env.rollout.result]
+    env.rollout.stop("operator input", run_end_reason=RunEndReason.OPERATOR)
+    recorder = env.rollout.recorder = EpisodeRecorder(tmp_path, control_hz=20)
+    # 只替换线程存活信号；请求、pending 判定、结果和收尾均走真实 Recorder。
+    recorder.thread = Mock(is_alive=Mock(return_value=pending == "recorder"))
+    worker = session.model = env.rollout.model = PolicyWorker(lambda: None, build_observation=lambda rows: rows)
+    model = worker.model = Mock()
+    task = worker.future = Future()
+    if pending != "model":
+        task.set_result(None)
+
+    def poll_operator(*args, **kwargs):
+        # 请求录制收尾后，在尚有资源 pending 时模拟退出。
+        if recorder.finish_request is not None and pending is not None:
+            env.state.request_quit()
+        return (), False
+
+    session.keyboard.poll.side_effect = poll_operator
+    save = Mock(wraps=session.save_results)
+    monkeypatch.setattr(session, "save_results", save)
+    try:
+        session.finish_episode()
+        assert recorder.finish_request.reason == "operator"
+        if pending is None:
+            assert session.episode is None and worker.future is None
+            save.assert_called_once()
+        else:
+            assert session.episode is env.rollout
+            save.assert_not_called()
+        if pending == "recorder":
+            assert env.rollout.recorder is recorder
+            assert recorder.result()["status"] == "pending"
+        else:
+            assert env.rollout.recorder is None
+        if pending == "model":
+            assert worker.future is task and not task.done()
+
+        # 后台工作结束后，由 Session 完成资源回收。
+        recorder.thread.is_alive.return_value = False
+        if not task.done():
+            task.set_result(None)
+        assert session.close() == 0
+        assert env.rollout.recorder is None and worker.future is None
+        assert env.rollout.result.raw["status"] == "not_published"
+        assert worker.close_future.done()
+        model.close.assert_called_once()
+        session.robot.close.assert_called_once()
+        assert save.call_count == (2 if pending is None else 1)
+    finally:
+        if not task.done():
+            task.set_result(None)
+        worker.close().result()

@@ -51,7 +51,7 @@ CONFIG = replace(base, teleop=replace(base.teleop, control_hz=20.0))
 
 VR 朝向标定复用 `CONFIG.vr`：`python scripts/calibrate_vr_heading.py --config experiment.py`，临时端口可用 `--port` 覆盖。相机离线求解须指定候选文件，例如 `python scripts/calibrate_camera.py solve samples/run1 --output candidate_cameras.json`；合法可解的结果即使残差超过经验阈值也会保存并警告。采集或部署用 `--camera-calibration candidate_cameras.json` 选择采用它。
 
-策略每轮默认总预算 60 秒，包含 HOI 遮挡等待；`--max-duration none` 表示直到用户停止或真实失败。HOI 遮挡会保持并等待恢复，没有独立的 5 秒恢复期限。启动、首帧、暖机及关闭仍有各自等待期限。
+策略每轮默认总预算 60 秒，包含 HOI 遮挡等待；`--max-duration none` 表示直到用户停止或真实失败。HOI 遮挡会保持并等待恢复，不设独立恢复期限。启动、首帧、暖机及关闭仍有各自等待期限。
 
 每份 Raw 的 `effective_parameters` 记录实际使用的控制与算法参数、相机信息、相关 VR 标定和当次触觉复位结果，不自动归档整个配置。策略仍写静态 `run_config.yaml` 与动态 `session_result.json`。普通 EEF/Jog 不检查 HOME 专用盒子及参数；显式 HOME 仍要求默认关闭的人工确认。Jog 可以从工作空间外尝试一步，但只有 IK 得到合法终点且满足关节、速度、lead、时效与停止要求才提交。
 
