@@ -1,6 +1,4 @@
 """离线查看 Raw episode 的观测与点云，或输出数据概要。"""
-# Usage: python scripts/visualize_episode.py episodes/TASK/episode_001
-# 已有 hoi.h5 时自动叠加物体点云；追加 --info 仅输出数据概要。
 
 from __future__ import annotations
 
@@ -49,7 +47,7 @@ FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
     (255, 200, 40),  # ring   — gold
     (220, 60, 255),  # pinky  — magenta
 )
-# Fixed, easily distinguishable from the five finger colors.
+# 白色末端标记与五指颜色区分。
 EEF_COLOR = (255, 255, 255)
 
 
@@ -101,10 +99,13 @@ class EpisodeVisualizer:
                     raise ValueError("max_frames must be positive")
                 self.frame_count = min(self.frame_count, max_frames)
             self.timestamps_s = self.reader.read_timestamps_s(stop=self.frame_count)
-            self.has_hoi = hoi and (self.reader.path / "hoi.h5").is_file()
-            if self.has_hoi:
+            self.hoi_alignment = None
+            if hoi and (self.reader.path / "hoi.h5").is_file():
                 self.reader["object_pointcloud"]
                 self.hoi_valid = read_hoi_validity(self.reader, stop=self.frame_count)
+                self.hoi_alignment = align_hoi_episode(
+                    self.reader, hoi_max_joint_gap_s, stop=self.frame_count,
+                )
 
             self.reader.require_fields(
                 "rgb",
@@ -145,11 +146,6 @@ class EpisodeVisualizer:
             self.arm_fk = ArmFK()
             self.hand_fk = HandFK()
             self.hand_cloud = HandPointCloud(self.hand_fk, hand_pointcloud_config.num_points)
-            self.hoi_alignment = None
-            if self.has_hoi:
-                self.hoi_alignment = align_hoi_episode(
-                    self.reader, hoi_max_joint_gap_s, stop=self.frame_count,
-                )
             self.state = self.preload_state()
 
             app_id = f"DexMani - {episode_name}"
@@ -219,7 +215,8 @@ class EpisodeVisualizer:
         depth = self.log_camera(step_idx, rgb)
         self.log_pointcloud(rgb, depth)
         self.log_hand_geometry(step_idx)
-        if self.has_hoi:
+        if self.hoi_alignment is not None:
+            self.log_hoi_diagnostics(step_idx, self.hoi_alignment)
             points = None
             if self.hoi_valid[step_idx]:
                 points = self.reader["object_pointcloud"][step_idx]
@@ -231,12 +228,9 @@ class EpisodeVisualizer:
             self.rr.log("hoi/valid", self.rr.Scalar(int(self.hoi_valid[step_idx])))
 
     def log_hand_geometry(self, step_idx: int) -> None:
-        arm = self.state["arm_qpos"][step_idx]
-        hand = self.state["hand_qpos"][step_idx]
-        if self.hoi_alignment is not None:
-            arm = self.hoi_alignment["arm_qpos"][step_idx]
-            hand = self.hoi_alignment["hand_qpos"][step_idx]
-            self.log_hoi_diagnostics(step_idx, self.hoi_alignment)
+        joints = self.state if self.hoi_alignment is None else self.hoi_alignment
+        arm = joints["arm_qpos"][step_idx]
+        hand = joints["hand_qpos"][step_idx]
         pose = self.arm_fk.forward(arm) if np.isfinite(arm).all() else None
         fingertips, cloud = None, None
         if pose is not None and np.isfinite(hand).all():
@@ -269,7 +263,7 @@ class EpisodeVisualizer:
         for device in ("arm", "hand"):
             offset_ms = (int(timing[f"{device}_ns"]) - int(timing["camera_ns"])) / 1e6
             self.rr.log(f"hoi/{device}_source_offset_ms", self.rr.Scalar(offset_ms))
-        for name, values in self.reader.hoi_file.get("quality", {}).items():
+        for name, values in self.reader.hoi_file["quality"].items():
             for index, value in enumerate(values[step_idx]):
                 # −1 是未计算占位值；画成缺口，避免误报质量下降或沿用上一帧。
                 measured = np.nan if value == -1 else float(value)

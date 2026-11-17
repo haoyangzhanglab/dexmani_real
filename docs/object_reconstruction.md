@@ -68,7 +68,7 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 | 相机到基座的变换 | `hoi.h5:/base_from_camera` |
 | 实际跟踪配置 | `hoi.h5` 根属性 `tracking_config` |
 
-可选诊断缺失或为 `None` 时保存 NaN 并显示缺口；实际状态判定所需指标仍由 tracker 校验。`mask_source=0` 表示纯深度检查，未计算的 mask 专属指标为 −1；`mask_age_frames` 记录距最近 SAM2 输入的真实相机来源序列差。两条路径均输出 `depth_coverage`；Mask 路径另外检查 Mask 和去遮挡后可见 CAD 的有效深度覆盖率。证据不足、遮挡超时及两帧恢复确认的定义见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)。
+`quality` 组始终存在；没有质量指标时为空组。指标缺失或为 `None` 时保存 NaN 并显示缺口；实际状态判定所需指标仍由 tracker 校验。`mask_source=0` 表示纯深度检查，未计算的 mask 专属指标为 −1；`mask_age_frames` 记录距最近 SAM2 输入的真实相机来源序列差。两条路径均输出 `depth_coverage`；Mask 路径另外检查 Mask 和去遮挡后可见 CAD 的有效深度覆盖率。证据不足、遮挡超时及两帧恢复确认的定义见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)。
 
 无效对象的位姿为 NaN，缺失质量指标可为 NaN。只有全部对象有效时才生成模板点云，否则该帧物体点云全零。整帧有效性由 `object_valid.all(axis=1)` 唯一决定，不另存 `valid`；缺少 `object_valid` 或其 dtype、形状与对象数不符时直接报错。
 
@@ -76,7 +76,10 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 
 Zarr 元数据记录实际使用的处理参数。object `geometry_sha256` 使用有序局部点与 offsets 的固定字节编码，供固定槽接触监督使用，不包括显示名。手模板不计算哈希，但 link 名称仍必须有效映射到 FK。最终接纳的采集共享同一数值模板时记录公共摘要，否则为 `null`。普通策略允许同 schema 的合法模板混用，处理参数差异作为研究记录；固定槽 contact loss 必须有明确共享身份，`null` 不满足该约束。
 
-[visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则，显示手物几何、有效性、逐物体质量及原始来源时差；未计算的质量占位值显示为曲线缺口，隐藏无效物体点云，不可对齐的行保留原始时间位置并隐藏手几何，内部缺口不会阻止其余帧的诊断。`--max-frames N` 只分配展示前缀的状态、有效性和对齐结果；必要时在同一原生段内顺序查找尾部来源时间，仅读取实际需要的左右邻点关节值，精确命中只取该样本。`--no-hoi`（Python 参数 `hoi=False`）完全绕过标注，手部几何使用 Raw 关节；与 `--info` 组合也不打开 HOI 文件。
+[visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则，显示手物几何、有效性、逐物体质量及原始来源时差；未计算的质量占位值显示为曲线缺口，隐藏无效物体点云，不可对齐的行保留原始时间位置并隐藏手几何，内部缺口不会阻止其余帧的诊断。
+
+- `--max-frames N` 只分配展示前缀的状态、有效性和对齐结果；必要时在同一原生段内顺序查找尾部来源时间，仅读取实际需要的左右邻点关节值，精确命中只取该样本。
+- `--no-hoi`（Python 参数 `hoi=False`）完全绕过标注，手部几何使用 Raw 关节；与 `--info` 组合也不打开 HOI 文件。
 
 ## 代码入口与参考
 

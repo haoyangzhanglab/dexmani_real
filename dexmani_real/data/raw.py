@@ -438,7 +438,7 @@ class RawReader:
         return hz
 
     def read_timing(self, stop: int | None = None) -> np.ndarray:
-        """读取并校验时间行；周期偏差只诊断，断点以 segment_starts 为准。"""
+        """读取并校验所选时间行；连续段由 segment_starts 指定。"""
         rows = self["timing/rows"][:stop]
         control, observation = rows["control_ns"], rows["observation_ns"]
         for bad, detail, offset in (
@@ -449,15 +449,10 @@ class RawReader:
             indices = np.flatnonzero(bad)
             if len(indices):
                 raise ValueError(f"Raw {self.path}: {detail} at row {int(indices[0]) + offset}")
-        period = round(1e9 / self.control_hz)
-        if np.any(np.abs(np.diff(control) - period) > period // 4):
-            logger.warning("%s: 控制周期存在抖动或间隙；按标称频率使用，不重采样，真实时间保留于 Raw。", self.path)
         return rows
 
     @property
     def segment_starts(self) -> np.ndarray:
-        if "timing/segment_starts" not in self.data_file:
-            raise ValueError(f"Raw {self.path}: missing timing/segment_starts")
         import h5py
 
         dataset = self.data_file["timing/segment_starts"]
@@ -470,9 +465,6 @@ class RawReader:
                 or np.any(starts[1:] <= starts[:-1])
                 or np.any(starts >= self.num_frames)):
             raise ValueError(f"Raw {self.path}: invalid timing/segment_starts")
-        reason = self.meta.get("recording_truncated_reason")
-        if reason is not None:
-            logger.warning("%s: %s；按已记录的连续区间使用。", self.path, reason)
         return starts
 
     def require_fields(self, *names):

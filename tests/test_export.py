@@ -1087,14 +1087,17 @@ def test_rejected_first_source_does_not_set_baselines(tmp_path, complete_episode
     assert all(len(array) == 3 for array in root["data"].values())
 
 
-def test_segment_group_corruption_rejects_only_that_raw(tmp_path, raw_episodes):
+@pytest.mark.parametrize("fault", ["missing", "group"])
+def test_invalid_segments_reject_only_that_raw(tmp_path, raw_episodes, fault):
     source, states, _ = raw_episodes
     with h5py.File(source / "episode_0/data.h5", "r+") as data:
         del data["timing/segment_starts"]
-        data.create_group("timing/segment_starts")
+        if fault == "group":
+            data.create_group("timing/segment_starts")
     result = export_zarr(source, tmp_path / "segments.zarr", processing=ExportConfig(), fields=("joint_state",))
     assert result["source_count"] == 1
-    assert "segment_starts must be a dataset" in result["rejected_episodes"][0]["reason"]
+    message = "segment_starts must be a dataset" if fault == "group" else "segment_starts"
+    assert message in result["rejected_episodes"][0]["reason"]
     root = zarr.open_group(result["path"], mode="r")
     np.testing.assert_array_equal(root["data/joint_state"][:], states[4:].astype("f4"))
 
