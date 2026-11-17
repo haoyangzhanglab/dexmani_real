@@ -77,16 +77,16 @@ class Observation:
 def read_observation(
     channels, robot, *, needs: ObservationNeeds, joint_gap_s=0.10, include_visual_payloads=True,
 ) -> Observation:
-    """可省略视觉大数组；来源元数据、设备反馈及关节对齐仍按 needs 读取。"""
+    """省略视觉载荷时仍读取来源元数据、非视觉输入及必要的关节对齐。"""
     control_ns = time.monotonic_ns()
     state = robot.read_state()
     camera_fields = needs.camera_fields if include_visual_payloads else ()
     cloud_result = None
     if needs.point_cloud:
-        fields: tuple[str, ...] = ("timestamp_ns", "source_camera_sequence")
-        if include_visual_payloads:
-            fields += ("point_cloud", *camera_fields)
-        cloud_result = channels.pointcloud_ring.read(fields=fields)
+        fields = ("point_cloud", *camera_fields) if include_visual_payloads else ()
+        cloud_result = channels.pointcloud_ring.read(
+            fields=("timestamp_ns", "source_camera_sequence", *fields),
+        )
     cloud = cloud_result[0] if cloud_result else None
     hoi = None
     if needs.hoi:
