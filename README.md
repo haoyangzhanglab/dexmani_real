@@ -111,6 +111,8 @@ Raw 以整个 episode 目录为单位使用：`data.h5` 保存采集数据，`rg
 
 ### 修改实验时从哪里入手
 
+设计取舍、资源所有权及本轮删减/优化计划见[个人研究工作流与代码简化](docs/research_design.md)。
+
 | 需求 | 代码入口与职责 |
 | --- | --- |
 | 改采集过程 | `scripts/collect_teleop.py` → `teleop/run.py` 装配资源 → `TeleopLoop` 运行示教 |

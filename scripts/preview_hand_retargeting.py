@@ -18,6 +18,8 @@ from dexmani_real.robot.model import XHAND_SDK_JOINT_NAMES
 from dexmani_real.teleop.retargeting.landmarks import HandCalibration
 from dexmani_real.teleop.retargeting.solver import HandRetargeter
 
+LANDMARK_BLOCK_ROWS = 256
+
 
 def read_recorded_parameters(reader: RawReader, config_path: str | Path | None = None):
     parameters = json.loads(reader.meta["effective_parameters"])
@@ -53,37 +55,40 @@ def preview_episode(
         if count == 0:
             raise ValueError("episode must contain at least one row")
         config, limits, calibration = read_recorded_parameters(reader, config_path)
-        timestamps = reader.read_timing(stop=count)["observation_ns"]
+        timestamps = reader.read_timing(stop=count)["observation_ns"].copy()
         starts = {int(start) for start in reader.segment_starts if start < count}
         measured = reader["hand_qpos"][:count]
-        landmarks = reader["vr_landmarks"][:count]
+        landmarks = reader["vr_landmarks"]
         if not np.isfinite(measured).all():
             raise ValueError("Raw hand_qpos contains nonfinite values in the selected prefix")
         episode_name = reader.path.name
 
-    retargeter = HandRetargeter(config, limits)
-    retargeter.calibration = calibration
-    candidates = np.full(measured.shape, np.nan)
-    references = np.empty_like(candidates)
-    solve_times = []
-    reasons = [None] * count
-    for index, timestamp in enumerate(timestamps):
-        timestamp = int(timestamp)
-        if index in starts:
-            retargeter.reset(measured[index], timestamp_ns=timestamp)
-        else:
-            if not np.isfinite(landmarks[index]).all():
-                raise ValueError(f"Raw vr_landmarks contains nonfinite values at row {index}")
-            before = perf_counter()
-            candidate = retargeter.retarget(landmarks[index], timestamp_ns=timestamp)
-            solve_times.append(perf_counter() - before)
-            if candidate is None:
-                reasons[index] = retargeter.rejection_reason
-            else:
-                candidates[index] = candidate
-                # 离线接受候选；这里不表示真实设备曾成功提交该命令。
-                retargeter.commit(candidate, timestamp_ns=timestamp)
-        references[index] = retargeter.reference_qpos
+        retargeter = HandRetargeter(config, limits)
+        retargeter.calibration = calibration
+        candidates = np.full(measured.shape, np.nan)
+        references = np.empty_like(candidates)
+        solve_times = []
+        reasons = [None] * count
+        # 关键点仅当前求解步消费，不与返回的关节曲线一起常驻整段内存。
+        for start in range(0, count, LANDMARK_BLOCK_ROWS):
+            block = landmarks[start:min(start + LANDMARK_BLOCK_ROWS, count)]
+            for index, points in enumerate(block, start=start):
+                timestamp = int(timestamps[index])
+                if index in starts:
+                    retargeter.reset(measured[index], timestamp_ns=timestamp)
+                else:
+                    if not np.isfinite(points).all():
+                        raise ValueError(f"Raw vr_landmarks contains nonfinite values at row {index}")
+                    before = perf_counter()
+                    candidate = retargeter.retarget(points, timestamp_ns=timestamp)
+                    solve_times.append(perf_counter() - before)
+                    if candidate is None:
+                        reasons[index] = retargeter.rejection_reason
+                    else:
+                        candidates[index] = candidate
+                        # 离线接受候选；这里不表示真实设备曾成功提交该命令。
+                        retargeter.commit(candidate, timestamp_ns=timestamp)
+                references[index] = retargeter.reference_qpos
 
     result = {
         "observation_ns": timestamps, "segment_starts": starts,

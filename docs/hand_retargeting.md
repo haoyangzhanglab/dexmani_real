@@ -33,6 +33,8 @@ python scripts/preview_hand_retargeting.py /data/episodes/pick/episode_001 --max
 
 入口只读取所选前缀的实测手关节、VR landmarks、时间行及段边界，不读取图像或 HOI，不连接设备、不写回数据。路径支持 `~`，相对路径以 cwd 为准。
 
+预览与在线重定向共用 NLopt 求解器，其依赖由 `pip install -e '.[control]'` 安装；仍需已有环境中的 Pinocchio。关键点每次最多读取256行，计算块之间延续同一个求解参考，只有录制段界会重置。返回的关节曲线仍按所选帧数保留。
+
 默认从 `effective_parameters` 恢复完整的 `hand_retargeting`、`hand_retargeting_calibration` 及手部限位。`--config` 加载导出 `CONFIG: RealConfig` 的 Python 文件，仅替换 `hand_retargeting`；标定和限位始终取自 Raw。缺少所需记录或配置错误直接报错。
 
 计算使用记录的 `observation_ns`：段首按实测关节和该行时间 `reset`，只展示参考；后续有效候选以同一行时间 `commit`。拒绝行保留上一参考位置与时间，显示原因并断开候选曲线；段间重置平滑状态。这里的 `commit` 表示离线接受候选，不能证明真实硬件执行成功。

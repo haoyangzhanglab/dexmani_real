@@ -344,8 +344,8 @@ def prepare_raw(reader, processing, fields):
                 name = f"{device}_qpos"
                 if name not in inputs:
                     continue
-                source = reader[name][:]
-                values = np.empty_like(source, dtype=np.float64)
+                source = reader[name]
+                values = np.empty(source.shape, dtype=np.float64)
                 for segment, (start, stop) in enumerate(pairwise(boundaries)):
                     aligned, valid = interpolate_joints(
                         timing[f"{device}_ns"][start:stop], source[start:stop],

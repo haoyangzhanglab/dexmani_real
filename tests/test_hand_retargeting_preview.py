@@ -214,11 +214,39 @@ def test_max_frames_reads_only_selected_prefix(episode, fake_solver, monkeypatch
     monkeypatch.setattr(h5py.Dataset, "__getitem__", record_read)
     result = preview.preview_episode(episode, max_frames=3, view=False)
     assert len(result["observation_ns"]) == 3
-    for name in ("/hand_qpos", "/vr_landmarks", "/timing/rows"):
+    for name in ("/hand_qpos", "/timing/rows"):
         assert [(path, key) for path, key in reads if path == name] == [(name, slice(None, 3))]
+    assert [(path, key) for path, key in reads if path == "/vr_landmarks"] == [
+        ("/vr_landmarks", slice(0, 3)),
+    ]
     assert {path for path, _ in reads} == {
         "/hand_qpos", "/vr_landmarks", "/timing/rows", "/timing/segment_starts",
     }
+
+
+@pytest.mark.parametrize("block_rows", [2, 4])
+def test_landmark_blocks_preserve_segments_and_rejected_references(
+    episode, fake_solver, monkeypatch, block_rows,
+):
+    expected = preview.preview_episode(episode, view=False)
+    monkeypatch.setattr(preview, "LANDMARK_BLOCK_ROWS", block_rows)
+    reads = []
+    getitem = h5py.Dataset.__getitem__
+
+    def read(dataset, key):
+        if dataset.name == "/vr_landmarks":
+            reads.append(key)
+        return getitem(dataset, key)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
+    actual = preview.preview_episode(episode, view=False)
+    assert all(0 < key.stop - key.start <= block_rows for key in reads)
+    assert [row for key in reads for row in range(key.start, key.stop)] == list(range(6))
+    for name in ("observation_ns", "measured_qpos", "candidate_qpos", "reference_qpos"):
+        np.testing.assert_array_equal(actual[name], expected[name])
+    assert actual["segment_starts"] == expected["segment_starts"] == {0, 3}
+    assert actual["rejection_reasons"] == expected["rejection_reasons"]
+    assert len(actual["solve_times_s"]) == len(expected["solve_times_s"]) == 4
 
 
 def test_no_view_cli_does_not_initialize_viewer(episode, fake_solver, monkeypatch, capsys):

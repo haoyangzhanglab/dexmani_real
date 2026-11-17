@@ -39,8 +39,10 @@ class FakeRing:
         self.data = data
         self.latest_sequence = 1
         self.writes = []
+        self.reads = []
 
     def read(self, *, fields=None):
+        self.reads.append(fields)
         if self.data is None:
             return None
         data = dict(self.data) if fields is None else {key: self.data[key] for key in fields}
@@ -692,6 +694,62 @@ def test_raw_requirements_checked_while_paused(env, kind):
         env.channels.camera_ring.data = None
     env.rollout.step()
     assert env.rollout.finished and not env.recorder.rows
+
+
+def test_hold_reads_image_metadata_then_recovers_from_fresh_full_frame(env):
+    rollout = env.rollout
+    rollout.policy_info.observation_fields += ("rgb",)
+    rollout.observations = ObservationBuilder(rollout.policy_info, rollout.runtime)
+    rollout.observations.configure_camera(CameraSnapshot(
+        "test", CameraIntrinsics(2, 2, 2., 2., 1., 1., "none", (0.,) * 5), .001, None,
+    ))
+    env.worker.build_observation = rollout.observations.build
+    rollout.read_needs = replace(rollout.read_needs, camera_fields=("rgb",))
+    enter_hold(env)
+    for _ in range(5):
+        env.advance(.001, False)
+        rollout.step()
+    # 暂停逐轮检查来源，但不从任一个 Ring 请求像素载荷。
+    assert all("rgb" not in fields and "depth" not in fields
+               for ring in (env.channels.camera_ring, env.channels.hoi_ring) for fields in ring.reads)
+    assert not rollout.history and not env.worker.calls and not env.recorder.rows
+
+    env.publish()
+    env.channels.hoi_ring.data["rgb"] = np.full((2, 2, 3), 3, np.uint8)
+    rollout.step()  # 未到下个槽也能立即登记恢复，元数据观测不进入历史。
+    assert rollout.state == "RESUMING" and not rollout.history and not env.worker.calls
+    assert rollout.last_slot == 0
+
+    env.advance(.05)
+    env.channels.hoi_ring.data.update(
+        rgb=np.full((2, 2, 3), 7, np.uint8), source_camera_sequence=7,
+    )
+    env.channels.camera_ring.data["rgb"][:] = 9
+    env.channels.camera_ring.latest_sequence = 8
+    rollout.step()
+    assert len(env.worker.calls) == 1 and rollout.last_slot == 1
+    rows, _ = env.worker.calls[0]
+    assert all(np.all(row["rgb"] == 7) for row in rows)
+    assert rollout.observations.last_rgb_sequence == 7
+    assert "rgb" in env.channels.hoi_ring.reads[-1]
+    assert "rgb" in env.channels.camera_ring.reads[-1] and "depth" in env.channels.camera_ring.reads[-1]
+    assert not env.recorder.rows
+
+
+@pytest.mark.parametrize("source", ["camera", "arm"])
+def test_hold_rechecks_source_health_between_control_slots(env, source):
+    enter_hold(env)
+    env.clock.now += 1_000_000
+    if source == "camera":
+        env.channels.camera_ring.data["timestamp_ns"] = 0
+        env.rollout.step()
+        assert env.rollout.finished
+        assert env.rollout.result.termination_details == "camera_source_stale"
+    else:
+        env.robot.arm_age = 1_000_000_000
+        with pytest.raises(FeedbackUnavailable, match="arm_feedback_stale"):
+            env.rollout.step()
+    assert env.rollout.last_slot == 0 and not env.recorder.rows
 
 
 def test_recorder_io_failure_uses_existing_stop_path(env):
