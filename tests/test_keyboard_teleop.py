@@ -29,6 +29,79 @@ HOME_RESULTS = (
 )
 
 
+@pytest.mark.parametrize("outside_m,accepted", [(0.001, True), (0.020, False)])
+def test_jog_from_outside_only_accepts_legal_ik_endpoint(outside_m, accepted):
+    from dexmani_real.control.actions import ActionMapper
+    from dexmani_real.geometry.kinematics import ArmFK
+
+    runtime = RealConfig()
+    measured = np.asarray(runtime.arm.home_qpos)
+    position = ArmFK().forward(measured)[:3, 3]
+    environment = replace(
+        runtime.environment,
+        workspace=replace(runtime.environment.workspace, x_min=position[0] + outside_m),
+        eef_workspace_tolerance_m=0.,
+    )
+    mapper = ActionMapper.for_mode(
+        "eef", arm=runtime.arm, hand=runtime.hand, motion=runtime.motion, environment=environment,
+    )
+    bounds = environment.workspace.as_array()
+    jog = CartesianJog(mapper.solver, runtime.keyboard_teleop, (bounds[:, 0], bounds[:, 1]))
+    result = jog.propose({"w"}, measured, control_ns=1_000_000_000)
+    assert (result.qpos is not None) == accepted
+    if accepted:
+        endpoint = mapper.solver.compute_eef_pose_base(result.qpos).p
+        assert mapper.solver.constraints.endpoint_rejection(position=endpoint) is None
+        assert np.all(np.abs(result.qpos - measured) <= mapper.solver.speed / runtime.keyboard_teleop.control_hz)
+        assert np.all(np.abs(result.qpos - measured) <= mapper.solver.lead)
+    else:
+        assert result.reason == "final_eef_workspace"
+
+
+def test_home_parameters_are_checked_only_for_home():
+    from dexmani_real.config.control import StaticCollisionBox
+    from dexmani_real.config.xarm7 import HomingConfig
+    from dexmani_real.runtime.preflight import validate_robot_config
+
+    runtime = RealConfig()
+    runtime = replace(
+        runtime,
+        environment=replace(runtime.environment, home_model_confirmed=None,
+                            static_boxes=(StaticCollisionBox(size_xyz_m=(-1, 1, 1)),)),
+        arm=replace(runtime.arm, homing=HomingConfig(max_acceleration_deg_per_s2=float("nan"))),
+        hand=replace(runtime.hand, home_tor_max=None),
+    )
+    validate_robot_config(runtime)
+    runtime.environment.validate()
+    with pytest.raises(ValueError, match="home_model_confirmed"):
+        runtime.environment.validate_home()
+    with pytest.raises(ValueError, match="positive"):
+        replace(runtime.environment, home_model_confirmed=True).validate_home()
+    with pytest.raises(ValueError):
+        runtime.arm.validate_home()
+    with pytest.raises(ValueError, match="HOME output"):
+        runtime.hand.validate_home()
+    assert RealConfig().environment.home_model_confirmed is False
+
+
+def test_home_acceleration_uses_positive_limit_without_sdk_planner_minimum():
+    from dexmani_real.config.xarm7 import HomingConfig
+
+    runtime = RealConfig()
+    homing = HomingConfig(
+        max_jerk_deg_per_s3=1000., collision_margin_m=.01, tracking_error_rad=.1,
+        hand_hold_tolerance_rad=.1, max_lateness_s=.005, max_acceleration_deg_per_s2=.001,
+    )
+    arm = replace(runtime.arm, homing=homing)
+    arm.validate()
+    arm.validate_home()
+    for acceleration in (0., -1., float("nan"), arm.max_joint_acceleration_deg_per_s2 + 1):
+        with pytest.raises(ValueError):
+            replace(arm, homing=replace(homing, max_acceleration_deg_per_s2=acceleration)).validate_home()
+    with pytest.raises(ValueError, match="SDK command range"):
+        replace(arm, max_joint_acceleration_deg_per_s2=.001).validate()
+
+
 @pytest.fixture
 def teleop(monkeypatch, caplog):
     # CLI tests may already have configured the package logger for console output.

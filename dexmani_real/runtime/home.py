@@ -216,7 +216,7 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
         try:
             robot.arm_config.validate_home()
             robot.hand_config.validate_home()
-            environment.validate()
+            environment.validate_home()
             if not environment.home_model_confirmed or not robot.hand_config.enabled:
                 raise ValueError(
                     "HOME requires confirmed environment and measured XHand posture"

@@ -7,8 +7,7 @@
 from __future__ import annotations
 
 import argparse
-import json
-from dataclasses import asdict
+from pprint import pprint
 
 from dexmani_real.config.real import load_config
 from dexmani_real.config.teleop import DEFAULT_TASK_NAME
@@ -54,13 +53,9 @@ def main(argv: list[str] | None = None) -> int:
     runtime = load_config(args.config)
     if args.print_config:
         # collection 展示最终 CLI 选项；运行直接消费下面的显式参数。
-        snapshot = asdict(runtime)
-        snapshot["collection"] = dict(
-            enabled=args.record,
-            episodes_dir=args.episodes_dir,
-            max_duration_s=args.max_duration,
-        )
-        print(json.dumps(snapshot, ensure_ascii=False, indent=2, allow_nan=False))
+        pprint({"runtime": runtime, "collection": dict(
+            enabled=args.record, episodes_dir=args.episodes_dir, max_duration_s=args.max_duration,
+        )}, sort_dicts=False)
         return 0
 
     from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH

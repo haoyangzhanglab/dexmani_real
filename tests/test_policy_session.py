@@ -2,7 +2,9 @@
 
 import importlib.util
 import json
+from dataclasses import replace
 from pathlib import Path
+from threading import Event
 from unittest.mock import Mock
 
 import pytest
@@ -54,8 +56,8 @@ def test_session_defaults_and_explicit_unbounded_budget(monkeypatch, tmp_path):
     assert unlimited.output_root == Path(session.__file__).resolve().parents[2] / "rollouts"
 
 
-def load_cli():
-    path = Path(__file__).parents[1] / "scripts/run_policy.py"
+def load_cli(name="run_policy.py"):
+    path = Path(__file__).parents[1] / "scripts" / name
     spec = importlib.util.spec_from_file_location("run_policy_cli", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -86,6 +88,83 @@ def test_print_config_does_not_create_session(monkeypatch, capsys):
     constructor = Mock(side_effect=AssertionError("print-config must not create a session"))
     monkeypatch.setattr(session, "PolicySession", constructor)
     assert load_cli().main(["--print-config"]) == 0
-    declared = json.loads(capsys.readouterr().out)
-    assert declared["execution"]["control_dt_s"] is None
+    assert "control_dt_s=None" in capsys.readouterr().out
     constructor.assert_not_called()
+
+
+def test_cli_accepts_unbounded_duration(monkeypatch):
+    constructor = Mock()
+    constructor.return_value.run.return_value = 0
+    monkeypatch.setattr(session, "PolicySession", constructor)
+    assert load_cli().main(["policy.pt", "--max-duration", "none"]) == 0
+    assert constructor.call_args.kwargs["max_running_s"] is None
+
+
+@pytest.mark.parametrize("script", ["run_policy.py", "collect_teleop.py", "tools/control_xhand.py"])
+def test_declared_config_does_not_require_json_values(tmp_path, capsys, script):
+    path = tmp_path / "experiment.py"
+    path.write_text(
+        "from dataclasses import replace\n"
+        "from dexmani_real.config.real import RealConfig\n"
+        "base = RealConfig()\n"
+        "CONFIG = replace(base, arm=replace(base.arm, homing=object()), "
+        "hand=replace(base.hand, home_tor_max=object()), "
+        "execution=replace(base.execution, rtc_guidance_cap=object()))\n"
+    )
+    assert load_cli(script).main(["--config", str(path), "--print-config"]) == 0
+    assert "object at" in capsys.readouterr().out
+
+
+def test_policy_records_only_used_parameters(monkeypatch, tmp_path):
+    from dexmani_policy.deployment.metadata import PolicyInfo
+    from dexmani_real.runtime.state import SessionState
+
+    info = PolicyInfo(
+        checkpoint_path="policy.pt", weights="raw", inference_steps=4, task_name="test",
+        observation_fields=("joint_state",), n_obs_steps=2, n_action_steps=4, future_steps=8,
+        control_action_dim=19, action_mode="joint", rgb_preprocessing={}, supports_rtc=False,
+        requires_prev_action=False, control_dt_s=.05, data_processing=None,
+    )
+    runtime = RealConfig()
+    runtime = replace(runtime, arm=replace(runtime.arm, homing=object()),
+                      hand=replace(runtime.hand, home_tor_max=object()),
+                      execution=replace(runtime.execution, rtc_guidance_cap=object(), prefetch_steps=object()),
+                      environment=replace(runtime.environment, home_model_confirmed=object(), static_boxes=(object(),)))
+    monkeypatch.setattr(session, "SessionState", lambda: SessionState(stop_signal=Event(), emergency_signal=Event()))
+    monkeypatch.setattr(session, "PolicyWorker", Mock())
+    configured = session.PolicySession(runtime, "policy.pt", device="cpu", output_root=tmp_path)
+    configured.keyboard = Mock(check_health=Mock(return_value=True))
+    configured.wait_model = lambda: info
+    configured.prepare_resources()
+    parameters = configured.effective_parameters
+    assert parameters["execution"] == dict(mode="sync", control_dt_s=.05, action_steps=4)
+    assert "homing" not in parameters["arm"] and "home_tor_max" not in parameters["hand"]
+    assert "environment" not in parameters and "camera_config" not in parameters
+    assert "data_processing" not in parameters["policy"]
+    json.dumps(parameters, allow_nan=False)
+    configured.save_run_config()
+    import yaml
+
+    saved = yaml.safe_load((configured.output_dir / "run_config.yaml").read_text())
+    assert saved["training_processing"] is None
+    assert saved["actual_processing"] == {}
+    assert "data_processing" not in saved
+
+
+@pytest.mark.parametrize("port", [None, 8124])
+def test_vr_calibration_uses_config_and_explicit_port(tmp_path, capsys, port):
+    path = tmp_path / "experiment.py"
+    path.write_text(
+        "from dataclasses import replace\n"
+        "from dexmani_real.config.real import RealConfig\n"
+        "base = RealConfig()\n"
+        "CONFIG = replace(base, vr=replace(base.vr, host='127.0.0.2', port=8123))\n"
+    )
+    cli = load_cli("calibrate_vr_heading.py")
+    argv = ["--config", str(path), "--print-config"]
+    if port is not None:
+        argv += ["--port", str(port)]
+    assert cli.main(argv) == 0
+    output = capsys.readouterr().out
+    assert "host='127.0.0.2'" in output
+    assert f"port={8123 if port is None else port}" in output

@@ -130,12 +130,8 @@ class HandConfig:
         if np.any(lower < XHAND_RATED_QPOS_MIN_RAD) or np.any(upper > XHAND_RATED_QPOS_MAX_RAD):
             raise ValueError("hand command limits exceed the rated device envelope")
 
-    def validate_home_pose(self) -> None:
-        self.validate_limits()
-        validate_hand_target(np.deg2rad(self.home_qpos_deg), self.qpos_min_rad, self.qpos_max_rad)
-
     def validate_home(self) -> None:
-        self.validate_home_pose()
+        validate_hand_target(np.deg2rad(self.home_qpos_deg), self.qpos_min_rad, self.qpos_max_rad)
         if type(self.home_tor_max) is not int or not 0 < self.home_tor_max <= 400:
             raise ValueError("HOME output limit requires a tested integer in [1, 400]")
         for value in (self.home_timeout_s, self.home_tolerance_deg, self.home_max_step_deg):

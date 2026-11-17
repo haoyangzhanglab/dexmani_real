@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -176,7 +175,14 @@ def camera_metadata(camera: CameraSnapshot):
     return values
 
 
-def decode_camera_metadata(meta) -> CameraSnapshot:
+def positive_metadata_scalar(meta, key):
+    value = np.asarray(meta[key])
+    if value.shape != () or value.dtype.kind not in "fiu" or not np.isfinite(value) or value <= 0:
+        raise RawDataError(f"Raw metadata {key}: expected finite positive numeric scalar")
+    return float(value)
+
+
+def decode_camera_metadata(meta, *, include_depth=True, include_extrinsics=True) -> CameraSnapshot:
     mode = meta["camera_payload_mode"]
     if not isinstance(mode, str) or mode not in {"rgb", "depth_to_color_aligned_rgbd"}:
         raise ValueError(f"Unsupported Raw camera payload: {mode!r}")
@@ -198,24 +204,15 @@ def decode_camera_metadata(meta) -> CameraSnapshot:
         distortion_coeffs=tuple(coeffs),
     )
     transform = None
-    if "camera_T_xarm_base_from_color" in meta:
+    if include_extrinsics and "camera_T_xarm_base_from_color" in meta:
         transform = validate_rigid_transform(
             np.asarray(meta["camera_T_xarm_base_from_color"]).reshape(4, 4),
             label="camera_T_xarm_base_from_color",
         )
-    scale = float(meta["depth_scale"]) if mode == "depth_to_color_aligned_rgbd" else None
+    scale = None
+    if include_depth and mode == "depth_to_color_aligned_rgbd":
+        scale = positive_metadata_scalar(meta, "depth_scale")
     return CameraSnapshot(meta.get("camera_serial"), color, scale, transform)
-
-
-def snapshot_recording_metadata(camera_snapshot, *, tactile_reset_metadata, runtime):
-    """记录本轮实际相机参数与触觉复位结果。"""
-    metadata = camera_metadata(camera_snapshot)
-    metadata["effective_config"] = json.dumps(asdict(runtime), allow_nan=False)
-    metadata.update(tactile_reset_metadata)
-    if tactile_reset_metadata:
-        # HDF5 属性不支持 dict，设备结果只在录制边界编码。
-        metadata["hand_tactile_reset_result"] = json.dumps(metadata["hand_tactile_reset_result"])
-    return metadata
 
 
 class _VideoWriter:
@@ -415,6 +412,7 @@ class RawReader:
         self.rgb_path = self.path / "rgb.mp4"
         self.video_container: av.container.InputContainer | None = None
         self.dataset_cache: dict[str, h5py.Dataset] = {}
+        self._hoi_file = None
         self.data_file = h5py.File(self.path / "data.h5", "r")
         try:
             rows = self.data_file["timing/rows"]
@@ -434,7 +432,7 @@ class RawReader:
 
     @property
     def control_hz(self):
-        hz = float(self.meta["control_hz"])
+        hz = positive_metadata_scalar(self.meta, "control_hz")
         sampling_clock_ns(hz)
         return hz
 
@@ -459,7 +457,12 @@ class RawReader:
     def segment_starts(self) -> np.ndarray:
         if "timing/segment_starts" not in self.data_file:
             raise ValueError(f"Raw {self.path}: missing timing/segment_starts")
-        starts = np.asarray(self.data_file["timing/segment_starts"][()])
+        import h5py
+
+        dataset = self.data_file["timing/segment_starts"]
+        if not isinstance(dataset, h5py.Dataset):
+            raise RawDataError(f"Raw {self.path}: timing/segment_starts must be a dataset")
+        starts = np.asarray(dataset[()])
         if (starts.ndim != 1 or starts.dtype.kind not in "iu"
                 or (self.num_frames == 0 and starts.size != 0)
                 or (self.num_frames > 0 and (starts.size == 0 or starts[0] != 0))
@@ -493,8 +496,7 @@ class RawReader:
                 and self.meta["arm_action_semantics"] != ARM_ACTION_SEMANTICS
             ):
                 raise ValueError(f"Raw arm_action_semantics: expected {ARM_ACTION_SEMANTICS}")
-            path = "hoi/object_pointcloud" if name == "object_pointcloud" else name
-            array = self.data_file[path]
+            array = (self.hoi_file if name == "object_pointcloud" else self.data_file)[name]
             import h5py
             if not isinstance(array, h5py.Dataset):
                 raise RawDataError(f"Raw {name}: expected a dataset")
@@ -513,7 +515,7 @@ class RawReader:
             if name == "object_pointcloud" and (
                 array.shape != (self.num_frames, HOI_NUM_POINTS, 3) or array.dtype != np.float32
             ):
-                raise ValueError("Raw /hoi/object_pointcloud: shape/dtype 错误")
+                raise ValueError("Raw hoi.h5/object_pointcloud: shape/dtype 错误")
             if spec is not None:
                 shape, dtype = spec
                 valid_dtype = array.dtype.kind == "f" if dtype.kind == "f" else array.dtype == dtype
@@ -522,8 +524,18 @@ class RawReader:
             self.dataset_cache[name] = array
         return self.dataset_cache[name]
 
-    def read_camera(self) -> CameraSnapshot:
-        return decode_camera_metadata(self.meta)
+    @property
+    def hoi_file(self):
+        import h5py
+
+        if self._hoi_file is None:
+            self._hoi_file = h5py.File(self.path / "hoi.h5", "r")
+        return self._hoi_file
+
+    def read_camera(self, *, include_depth=True, include_extrinsics=True) -> CameraSnapshot:
+        return decode_camera_metadata(
+            self.meta, include_depth=include_depth, include_extrinsics=include_extrinsics,
+        )
 
     def validate_joint_metadata(self, device, joint_names) -> None:
         if self.meta["joint_units"] != "rad":
@@ -542,7 +554,7 @@ class RawReader:
     def validate_tactile_metadata(self) -> None:
         if self.meta.get("hand_tactile_finger_order") != TACTILE_FINGER_ORDER:
             raise ValueError("Raw hand_tactile_finger_order: incompatible tactile semantics")
-        divisor = self.meta.get("hand_tactile_scale_divisor")
+        divisor = positive_metadata_scalar(self.meta, "hand_tactile_scale_divisor")
         if divisor != XHAND_TACTILE_SCALE_DIVISOR:
             raise ValueError(
                 f"Raw hand_tactile_scale_divisor: expected {XHAND_TACTILE_SCALE_DIVISOR}, "
@@ -578,6 +590,7 @@ class RawReader:
                     f"Raw {self.path}: RGB grid invalid at row {index}, expected {expected}"
                 )
             yield image
+            del image, frame
 
     def close(self):
         self.dataset_cache.clear()
@@ -586,9 +599,14 @@ class RawReader:
                 self.video_container.close()
                 self.video_container = None
         finally:
-            if self.data_file is not None:
-                self.data_file.close()
-                self.data_file = None
+            try:
+                if self._hoi_file is not None:
+                    self._hoi_file.close()
+                    self._hoi_file = None
+            finally:
+                if self.data_file is not None:
+                    self.data_file.close()
+                    self.data_file = None
 
     def __enter__(self):
         return self

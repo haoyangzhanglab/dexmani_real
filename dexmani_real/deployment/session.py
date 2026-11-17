@@ -16,7 +16,6 @@ from dexmani_real.config.calibration_data import CAMERAS_PATH
 from dexmani_real.config.deployment import (
     DEFAULT_MAX_RUNNING_S,
     DEFAULT_NUM_EPISODES,
-    POLICY_RUNTIME_SECTIONS,
 )
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.data.raw import camera_metadata
@@ -29,7 +28,7 @@ from dexmani_real.deployment.inference import (
 from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import (
     resolve_deployment_config,
-    check_data_processing,
+    collect_data_processing,
     resolve_hoi_inputs,
 )
 from dexmani_real.deployment.rollout import Rollout, utc_now
@@ -144,9 +143,9 @@ class PolicySession:
         if self.output_dir is None:
             return
         payload = {
-            "policy": asdict(self.info),
-            "data_processing": self.data_processing,
-            "runtime": {name: asdict(getattr(self.runtime, name)) for name in POLICY_RUNTIME_SECTIONS},
+            "effective_parameters": self.effective_parameters,
+            "training_processing": self.info.data_processing,
+            "actual_processing": self.actual_processing,
             "camera_calibration_path": str(self.camera_calibration_path or CAMERAS_PATH),
             "effective_camera": ({"camera_T_xarm_base_from_color": None,
                                   **camera_metadata(self.camera_snapshot)}
@@ -154,7 +153,6 @@ class PolicySession:
             "table_plane_abcd": self.table_plane_abcd,
             "table_plane_path": (str(resolve_table_plane_path(self.runtime.environment.table_plane_path))
                                  if self.table_plane_abcd is not None else None),
-            "seed": self.seed, "device": self.device,
             "num_episodes": self.num_episodes, "max_duration_s": self.max_running_s,
             "record_raw": self.record_raw,
         }
@@ -220,7 +218,7 @@ class PolicySession:
         declared_execution = self.runtime.execution
         self.runtime = resolve_deployment_config(self.info, self.runtime)
         self.observations = ObservationBuilder(self.info, self.runtime)
-        self.data_processing = check_data_processing(self.info, self.runtime, self.observations, self.hoi_inputs)
+        self.actual_processing = collect_data_processing(self.info, self.runtime, self.observations, self.hoi_inputs)
         self.record_needs = RAW_RECORDING_NEEDS if self.record_raw else ObservationNeeds()
         model_needs = self.observations.needs
         self.sensor_needs = model_needs.union(self.record_needs)
@@ -233,6 +231,50 @@ class PolicySession:
         camera_required = needs.camera_worker or self.observations.camera_static
         if camera_required:
             self.runtime.camera.validate()
+        runtime = self.runtime
+        policy_parameters = asdict(self.info)
+        policy_parameters.pop("data_processing")
+        execution = {
+            "mode": runtime.execution.mode,
+            "control_dt_s": runtime.execution.control_dt_s,
+            "action_steps": runtime.execution.action_steps,
+        }
+        if runtime.execution.mode != "sync":
+            execution["prefetch_steps"] = runtime.execution.prefetch_steps
+        if runtime.execution.mode == "rtc":
+            execution["rtc_guidance_cap"] = runtime.execution.rtc_guidance_cap
+        if model_needs.hoi:
+            execution["hoi_max_age_s"] = runtime.execution.hoi_max_age_s
+        if model_needs.hoi_joint_devices:
+            execution["hoi_max_joint_gap_s"] = runtime.execution.hoi_max_joint_gap_s
+        self.effective_parameters = {
+            "policy": policy_parameters,
+            "seed": self.seed, "device": self.device,
+            "max_duration_s": self.max_running_s,
+            "execution": execution,
+            "arm": {name: getattr(runtime.arm, name) for name in (
+                "ip", "collision_sensitivity", "tcp_load_mass_kg", "tcp_load_cog_mm",
+                "joint_limit_lower", "joint_limit_upper", "max_joint_velocity_deg_per_s",
+                "max_joint_acceleration_deg_per_s2", "max_joint_jerk_deg_per_s3", "servo_hz",
+                "feedback_hz", "feedback_max_age_s", "standstill_position_tolerance_rad",
+                "standstill_velocity_tolerance_rad_s",
+            )},
+            "hand": {name: getattr(runtime.hand, name) for name in (
+                "enabled", "comm_type", "device_name", "device_id", "qpos_min_rad", "qpos_max_rad",
+                "kp", "ki", "kd", "tor_max", "feedback_max_age_s",
+                "baudrate" if runtime.hand.comm_type == "serial" else "ethercat_slave_position",
+            )},
+        }
+        if self.info.action_mode == "eef":
+            self.effective_parameters.update(
+                motion=asdict(runtime.motion),
+                environment={
+                    "workspace": asdict(runtime.environment.workspace),
+                    "eef_workspace_tolerance_m": runtime.environment.eef_workspace_tolerance_m,
+                },
+            )
+        if camera_required:
+            self.effective_parameters["camera_config"] = asdict(runtime.camera)
         self.action_mapper = ActionMapper.for_mode(
             self.info.action_mode, arm=self.runtime.arm, hand=self.runtime.hand,
             motion=self.runtime.motion, environment=self.runtime.environment,
@@ -252,7 +294,7 @@ class PolicySession:
             f"control_dt_s={self.runtime.execution.control_dt_s:g} "
             f"({'Checkpoint' if declared_execution.control_dt_s is None else 'RealConfig'})"
         )
-        duration = f"{self.max_running_s:g} s" if self.max_running_s is not None else "无限制"
+        duration = f"{self.max_running_s:g} s" if self.max_running_s is not None else "直到用户停止或真实失败"
         print(f"评估：{self.num_episodes if self.num_episodes is not None else '不限'} 轮 | 每轮预算 {duration} | 输入：{', '.join(self.info.observation_fields)}")
         for name, field in (("pointcloud", "point_cloud"), ("hand_pointcloud", "hand_pointcloud")):
             if field in self.info.observation_fields:
@@ -589,6 +631,7 @@ class PolicySession:
                 action_mapper=self.action_mapper, model=self.model,
                 max_running_s=self.max_running_s,
                 index=len(self.episodes) + 1, output_dir=self.output_dir, record_raw=self.record_raw,
+                effective_parameters={**self.effective_parameters, "actual_processing": self.actual_processing},
                 camera_snapshot=self.camera_snapshot,
             )
             try:

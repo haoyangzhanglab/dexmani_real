@@ -31,7 +31,7 @@ flowchart TD
 | VR 采集 / 仅遥操作 | `python scripts/collect_teleop.py TASK` / 加 `--no-record` |
 | 键盘调整姿态 | `python scripts/keyboard_teleop.py` |
 | 查看记录 | `python scripts/visualize_episode.py EPISODE` |
-| 导出训练数据 | `python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr` |
+| 导出训练数据 | `python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr --fields joint_state action` |
 | 策略评估并录制 | `python scripts/run_policy.py CHECKPOINT --record-raw` |
 | 回放关节目标 | `python scripts/replay_episode.py EPISODE` |
 
@@ -49,6 +49,12 @@ CONFIG = replace(base, teleop=replace(base.teleop, control_hz=20.0))
 
 先用 `python scripts/collect_teleop.py TASK --config experiment.py --print-config` 检查声明值；策略的有效配置还会结合 checkpoint 在启动时解析。
 
+VR 朝向标定复用 `CONFIG.vr`：`python scripts/calibrate_vr_heading.py --config experiment.py`，临时端口可用 `--port` 覆盖。相机离线求解须指定候选文件，例如 `python scripts/calibrate_camera.py solve samples/run1 --output candidate_cameras.json`；合法可解的结果即使残差超过经验阈值也会保存并警告。采集或部署用 `--camera-calibration candidate_cameras.json` 选择采用它。
+
+策略每轮默认总预算 60 秒，包含 HOI 遮挡等待；`--max-duration none` 表示直到用户停止或真实失败。HOI 遮挡会保持并等待恢复，没有独立的 5 秒恢复期限。启动、首帧、暖机及关闭仍有各自等待期限。
+
+每份 Raw 的 `effective_parameters` 记录实际使用的控制与算法参数、相机信息、相关 VR 标定和当次触觉复位结果，不自动归档整个配置。策略仍写静态 `run_config.yaml` 与动态 `session_result.json`。普通 EEF/Jog 不检查 HOME 专用盒子及参数；显式 HOME 仍要求默认关闭的人工确认。Jog 可以从工作空间外尝试一步，但只有 IK 得到合法终点且满足关节、速度、lead、时效与停止要求才提交。
+
 Raw 保留采集时的原始 RGB-D、K、畸变参数及已有外参。Canonical RGB/depth 与在线策略 RGB（包括纯 RGB 策略）统一采用固定 K、原始分辨率和光轴的无畸变针孔网格；RGB 双线性重采样，depth 使用同一映射最近邻重采样，越界填零。含图像的 Zarr 标记 `image_geometry="pinhole"`。Raw 可视化也使用矫正图像与针孔相机叠加；点云仍由原始 RGB-D 配对生成。
 
 Zarr 根属性 `task_name` 来自 Raw 的 `meta.task_label`，不受目录名影响；同一产物中的 Raw 必须属于同一任务。
@@ -57,13 +63,17 @@ Zarr 根属性 `task_name` 来自 Raw 的 `meta.task_label`，不受目录名影
 
 ## 数据导出
 
-导出默认保留全部基础模态，并在已有有效 HOI 标注时加入 `object_pointcloud`。一条完整 Raw 对应一条 Zarr episode；控制断点、录制截断、必要数据损坏或 HOI 无效/无法完整对齐均导致整条拒绝，其他 Raw 继续处理。任务失败标签不作为数据损坏依据。
+`--fields` 必填，一条命令只发布 `--output` 指定的一份 Zarr，字段集合固定。缺少所选数据或晚发现损坏时整条 Raw 回滚，继续其他采集；全被拒绝时失败，已有输出不覆盖。
 
-请求 `--output datasets/task.zarr` 时，只有一类合格数据仍生成该路径；同时接纳有、无物体点云的数据时，整体发布 `datasets/task_modalities/`，内含 `with_object.zarr` 和 `without_object.zarr`。训练的 `zarr_path` 指向所需的具体子 Zarr。CLI 打印实际路径、各组 episode 数和帧数；全被拒绝时失败，已有输出不覆盖。显式 `--fields` 控制输出列，已有损坏 HOI 仍拒绝。
+HOI 标注独立保存在 `episode/hoi.h5`，默认跳过已有标注，使用 `annotate_episodes.py --overwrite` 明确重算。重算失败保留此前完整文件，不修改 `data.h5` 或 `rgb.mp4`。未选 `object_pointcloud` 时完全不读取 HOI；纯关节导出不需要相机，纯 RGB 不需要深度单位。
 
-已有 HOI 时，无论是否输出物体点云，都检查相机时间为正、不晚于 observation 且非递减，并检查所选观测字段需要的关节流能否完整对齐。仅输出关节时保留原始观测值；联合输出物体点云时使用相机时间上的插值观测。动作目标始终保持原值，仅 EEF 观测不要求手部历史。
+每个 `timing/segment_starts` 原生连续段成为一个 Zarr episode。联合 HOI 输出只在各段内对齐所需关节，不裁边、不补帧、不按质量重新切段。任一段不合法则拒绝整条 Raw；正常提前终止或队列满留下的完整有效前缀仍可接纳。动作目标保留原值。
 
-导出属性 `source_episodes` 与完整 Raw episode 顺序对应；`data_processing` 记录实际点云处理参数和模板内容标识，并经衍生数据传入 Checkpoint 的 `effective_config`。模板内容标识用于检查训练与部署的点序、分段及几何一致性，不依赖文件路径。
+`source_episodes` 与 `source_row_ranges=[start, stop)` 每段一项，对齐 `episode_ends`。Policy 的策略训练、观察预训练和手部 VQ 先验均按原采集分组划分训练/验证集；`val_episodes`、`max_train_episodes` 按采集组计数，采样窗口不跨段。
+
+`data_processing` 是研究记录，普通训练、恢复和部署不要求它相等或存在。`geometry_sha256` 标识有序局部点及 offsets 的数值身份；混合合法几何时公共摘要为 null。只有开启 contact loss 的固定 1024 槽预训练及完整续训要求明确且一致的共享身份。部署分别保存 `training_processing` 与 `actual_processing`，缺少记录为 None。
+
+本次直接采用新格式，不提供旧内嵌 HOI、旧来源缺失数据或模板摘要的迁移与兼容；不会自动改写或清理已有实验文件。
 
 ## 核心模块
 

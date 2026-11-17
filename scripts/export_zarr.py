@@ -23,8 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Export selected fields from published Raw episodes of one task to canonical Zarr. "
-            "Accept one complete Raw as one episode; reject damaged Raw and continue. "
-            "Mixed optional object clouds produce a <output-stem>_modalities directory."
+            "Export native segments; reject damaged whole Raw and continue."
         )
     )
     parser.add_argument(
@@ -51,9 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Trusted Python experiment file exporting CONFIG: RealConfig; execution.hoi_max_joint_gap_s bounds joint interpolation intervals (default 0.10 s)",
     )
     parser.add_argument(
-        "--fields", nargs="+", choices=tuple(FIELD_INPUTS),
+        "--fields", nargs="+", required=True, choices=tuple(FIELD_INPUTS),
         help="Canonical fields to export; RGB/depth use the fixed-K pinhole grid. "
-             "Omitted means all base fields plus valid object_pointcloud when present.",
+             "The fixed nonempty field selection is required.",
     )
     parser.add_argument(
         "--exclude",
@@ -117,8 +116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             exclude=tuple(args.exclude),
             progress_callback=update_progress,
         )
-    for output in result["outputs"]:
-        print(f"{output['path']}: {output['episode_count']} episodes, {output['total_frames']} frames", file=sys.stderr)
+    print(f"{result['path']}: {result['source_count']} sources, {result['episode_count']} segments, {result['total_frames']} frames", file=sys.stderr)
     print(f"Rejected {len(result['rejected_episodes'])}; explicitly excluded {len(result['excluded_episodes'])}.", file=sys.stderr)
     return 0
 

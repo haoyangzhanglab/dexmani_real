@@ -35,10 +35,10 @@ def prefetch_handoff(plan, *, slot, action_steps, prefetch_steps):
 
 def control_slot(*, now_ns, next_step_ns, last_slot, dt_ns):
     if now_ns < next_step_ns:
-        return None, next_step_ns, 0
+        return None, 0
     skipped = (now_ns - next_step_ns) // dt_ns
     slot = last_slot + 1 + skipped
-    return slot, next_step_ns + (skipped + 1) * dt_ns, skipped
+    return slot, skipped
 
 
 def plan_exhausted(plan, slot):

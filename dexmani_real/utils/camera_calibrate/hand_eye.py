@@ -75,7 +75,7 @@ def closed_loop_errors(transform, eef_inverse, marker_poses):
 
 
 def solve_hand_eye(eef_poses: np.ndarray, marker_poses: np.ndarray) -> HandEyeResult:
-    """由 T_base_from_eef、T_camera_from_marker 求外参与残差，固定使用 HORAUD；质量门槛由写入边界执行。"""
+    """由 T_base_from_eef、T_camera_from_marker 求外参与残差，固定使用 HORAUD。"""
     if len(eef_poses) < MIN_SAMPLES:
         raise ValueError(f"need at least {MIN_SAMPLES} samples, have {len(eef_poses)}")
     check_excitation(eef_poses[:, :3, :3])

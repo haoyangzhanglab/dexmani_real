@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import time
@@ -13,7 +14,7 @@ from typing import Literal, cast
 import numpy as np
 
 from dexmani_real.control.ik import IKReferenceError
-from dexmani_real.data.raw import snapshot_recording_metadata
+from dexmani_real.data.raw import camera_metadata
 from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
 from dexmani_real.deployment.schedule import (
     ActionChunk,
@@ -47,7 +48,6 @@ from dexmani_real.utils.log import error_detail
 
 logger = logging.getLogger(__name__)
 
-HOI_RECOVERY_TIMEOUT_S = 5.0
 HOI_HOLD_REFRESH_S = 1.0
 
 
@@ -72,7 +72,7 @@ class Rollout:
         self, runtime_state, runtime, policy_info, *, cancel_epoch, robot,
         observations, read_needs: ObservationNeeds, record_needs: ObservationNeeds,
         sensors, action_mapper, model, max_running_s,
-        index, output_dir, record_raw, camera_snapshot=None,
+        index, output_dir, record_raw, effective_parameters, camera_snapshot=None,
     ):
         self.runtime_state = runtime_state
         self.runtime = runtime
@@ -92,6 +92,7 @@ class Rollout:
         self.output_dir, self.record_raw = output_dir, record_raw
         self.result = EpisodeResult(index)
         self.camera_snapshot = camera_snapshot
+        self.effective_parameters = effective_parameters
         self.max_duration_ns = int(max_running_s * 1e9) if max_running_s is not None else None
         self.cancel_epoch = cancel_epoch
         self.history: deque[dict[str, np.ndarray]] = deque(maxlen=policy_info.n_obs_steps)
@@ -102,14 +103,17 @@ class Rollout:
         self.run_deadline_ns: int | None = None
         self.last_slot = -1
         self.dt_ns = round(self.execution.control_dt_s * 1e9)
-        self.started_ns = self.next_step_ns = 0
+        self.started_ns = 0
         self.ik_reference: IKReference | None = None
         self.first_prediction = True
         self.prev_action: np.ndarray | None = None
         self.discard_requested = False
         self.state: Literal["RUNNING", "HOI_HOLD", "RESUMING"] = "RUNNING"
-        self.hoi_recovery_started_ns: int | None = None
         self.next_hoi_hold_ns = 0
+
+    @property
+    def next_step_ns(self):
+        return self.started_ns + (self.last_slot + 1) * self.dt_ns
 
     @property
     def finished(self):
@@ -313,10 +317,12 @@ class Rollout:
             raise OperationCancelled("cancelled before recorder start")
         if self.record_raw:
             self.recorder = EpisodeRecorder(self.output_dir, control_hz=1 / self.execution.control_dt_s)
-            metadata = snapshot_recording_metadata(
-                self.camera_snapshot,
-                tactile_reset_metadata=self.robot.hand.tactile_reset_metadata, runtime=self.runtime,
-            )
+            metadata = camera_metadata(self.camera_snapshot)
+            metadata["effective_parameters"] = json.dumps({
+                **self.effective_parameters,
+                "camera": metadata.copy(),
+                "tactile_reset": self.robot.hand.tactile_reset_metadata,
+            }, allow_nan=False)
             self.recorder.start(
                 task_label=self.policy_info.task_name,
                 episode_name=f"episode_{self.result.index:03d}", collection_source="policy_rollout", metadata=metadata,
@@ -344,7 +350,6 @@ class Rollout:
             self.robot.check()
             raise OperationCancelled("final admission declined")
         self.started_ns = started_ns
-        self.next_step_ns = self.started_ns
         self.run_deadline_ns = (
             self.started_ns + self.max_duration_ns if self.max_duration_ns is not None else None
         )
@@ -484,7 +489,7 @@ class Rollout:
             self.stop(issue)
             return None
         self.check_motion()
-        if self.duration_expired() or self._recovery_expired():
+        if self.duration_expired():
             return None
         issues = check_device_feedback(row, self.runtime)
         if issues:
@@ -539,7 +544,6 @@ class Rollout:
             return
         # 首条恢复动作提交前的再次遮挡仍属于同一个恢复区间。
         if self.state == "RUNNING":
-            self.hoi_recovery_started_ns = time.monotonic_ns()
             if self.recorder is not None:
                 self.recorder.mark_gap()
         self.state = "HOI_HOLD"
@@ -563,14 +567,6 @@ class Rollout:
         )
         self.next_hoi_hold_ns = now + int(HOI_HOLD_REFRESH_S * 1e9)
 
-    def _recovery_expired(self):
-        if (self.hoi_recovery_started_ns is not None
-                and time.monotonic_ns() - self.hoi_recovery_started_ns
-                >= int(HOI_RECOVERY_TIMEOUT_S * 1e9)):
-            self.stop("hoi_recovery_timeout")
-            return True
-        return False
-
     def step(self):
         """由 run 在反馈服务与健康检查成功后调用。"""
         if self.finished:
@@ -578,7 +574,7 @@ class Rollout:
         self.check_motion()
         if self.recorder is not None:
             self.recorder.check_error()
-        if self.duration_expired() or self._recovery_expired():
+        if self.duration_expired():
             return
         if self.observations.needs.hoi:
             issues = check_hoi_status(self.sensors.channels, self.runtime)
@@ -606,7 +602,7 @@ class Rollout:
 
     def _advance_control_slot(self):
         """暂停时也推进原调度，恢复后不补跑历史控制槽。"""
-        slot, self.next_step_ns, skipped = control_slot(
+        slot, skipped = control_slot(
             now_ns=time.monotonic_ns(), next_step_ns=self.next_step_ns,
             last_slot=self.last_slot, dt_ns=self.dt_ns,
         )
@@ -654,7 +650,7 @@ class Rollout:
                 return
             attempted = command
             self.robot.send_action(command, expires_ns=now + COMMAND_LEASE_NS)
-            if self.state == "RESUMING" and self._recovery_expired():
+            if self.duration_expired():
                 return
             if self.policy_info.requires_prev_action:
                 self.prev_action = np.concatenate((command.arm_qpos, command.hand_qpos))
@@ -669,7 +665,6 @@ class Rollout:
                     self.plan = None
             if self.state == "RESUMING":
                 self.state = "RUNNING"
-                self.hoi_recovery_started_ns = None
         finally:
             # 已尝试提交的恢复动作也需要记录。
             if self.state == "RUNNING" or attempted is not None:

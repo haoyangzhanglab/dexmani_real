@@ -38,8 +38,8 @@ class HomingConfig:
             if value is None or not isfinite(value) or value <= 0:
                 raise ValueError(f"homing.{name} requires a measured positive value")
         acceleration = self.max_acceleration_rad_per_s2
-        if not isfinite(acceleration) or not 0.01 <= acceleration <= 20:
-            raise ValueError("homing acceleration must be in [0.01, 20] rad/s²")
+        if not isfinite(acceleration) or acceleration <= 0:
+            raise ValueError("homing acceleration must be finite and positive")
         if not isfinite(self.timeout_s) or self.timeout_s <= 0:
             raise ValueError("homing.timeout_s must be finite and positive")
         speed = self.max_speed_rad_per_s
@@ -139,7 +139,6 @@ class ArmConfig:
     def validate_home(self) -> None:
         from dexmani_real.robot.commands import validate_arm_target
 
-        self.validate()
         self.homing.validate()
         if cast(float, self.homing.max_lateness_s) >= 1 / self.servo_hz:
             raise ValueError("HOME lateness must be below one servo period")

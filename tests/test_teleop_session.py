@@ -1,5 +1,6 @@
 """遥操作顺序生命周期：未完成准备不提交，取消/失败仍停止并释放本段。"""
 
+import json
 import threading
 import time
 from dataclasses import replace
@@ -131,7 +132,12 @@ def test_partial_recorder_start_is_finished_before_return(teleop, monkeypatch, t
     teleop.robot.hand.tactile_reset_metadata = {}
     teleop.controller.rotation.as_matrix.return_value = np.eye(3)
     teleop.controller.hand_retargeter = None
-    monkeypatch.setattr(loop_module, "snapshot_recording_metadata", lambda *args, **kwargs: {})
+    teleop.runtime = replace(
+        teleop.runtime, arm=replace(teleop.runtime.arm, homing=object()),
+        environment=replace(teleop.runtime.environment, home_model_confirmed=object(), static_boxes=(object(),)),
+        execution=replace(teleop.runtime.execution, rtc_guidance_cap=object()),
+    )
+    monkeypatch.setattr(loop_module, "camera_metadata", lambda *args: {})
     recorder = Mock(
         error=RecordingError("writer failed"),
         start=Mock(side_effect=RecordingError("writer failed")),
@@ -140,6 +146,12 @@ def test_partial_recorder_start_is_finished_before_return(teleop, monkeypatch, t
     )
     monkeypatch.setattr(loop_module, "EpisodeRecorder", Mock(return_value=recorder))
     teleop.run_episode(teleop.runtime_state.cancel_epoch)
+    metadata = recorder.start.call_args.kwargs["metadata"]
+    parameters = json.loads(metadata["effective_parameters"])
+    assert "homing" not in parameters["arm"]
+    assert "home_model_confirmed" not in parameters["environment"]
+    assert "execution" not in parameters
+    assert parameters["vr_to_robot_rotation"] == np.eye(3).tolist()
     recorder.request_finish.assert_called_once()
     recorder.poll_finish.assert_called_once()
     teleop.robot.prepare_streaming.assert_not_called()
@@ -147,6 +159,48 @@ def test_partial_recorder_start_is_finished_before_return(teleop, monkeypatch, t
     assert teleop.recorder is None
     assert teleop.cancel_epoch is None
     assert teleop.failed
+
+
+@pytest.mark.parametrize("outcome", ["success", "before_stop", "epoch", "poll_fault", "stop_fault"])
+def test_tactile_reset_uses_callback_faults_and_preserves_cancel_stop(outcome):
+    from dexmani_real.robot.system import Robot
+
+    runtime = RealConfig()
+    state = SessionState(stop_signal=threading.Event(), emergency_signal=threading.Event())
+    robot = Robot(runtime.arm, runtime.hand, runtime_state=state)
+    robot.hand = Mock()
+    robot.stop = Mock()
+    robot.check = Mock()
+
+    def poll():
+        robot.check()
+        if outcome == "before_stop":
+            return True
+        if outcome == "epoch" and callback.call_count == 2:
+            state.request_stop()
+        if outcome == "poll_fault" and callback.call_count == 3:
+            raise RobotError("device failed during reset")
+        return False
+
+    callback = Mock(side_effect=poll)
+
+    def reset(*, cancel_requested):
+        assert not cancel_requested()
+        return {2: 0}
+
+    robot.hand.reset_tactile_sensors.side_effect = reset
+    if outcome == "stop_fault":
+        robot.stop.side_effect = RobotError("stop failed")
+    if outcome == "success":
+        assert robot.reset_tactile_sensors(cancel_epoch=1, cancel_requested=callback) == {2: 0}
+    else:
+        error = OperationCancelled if outcome in {"before_stop", "epoch"} else RobotError
+        with pytest.raises(error):
+            robot.reset_tactile_sensors(cancel_epoch=1, cancel_requested=callback)
+    assert robot.check.call_count == callback.call_count
+    assert robot.stop.call_count == (0 if outcome == "before_stop" else 1)
+    if outcome in {"before_stop", "epoch", "stop_fault"}:
+        robot.hand.reset_tactile_sensors.assert_not_called()
 
 
 @pytest.mark.parametrize("outcome", ["ready", "cancel", "exited", "timeout"])

@@ -10,7 +10,6 @@ from typing import cast
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from dexmani_real.control.constraints import workspace_start_rejection
 from dexmani_real.control.ik import IKReferenceError, IKResult
 from dexmani_real.geometry.pose import Pose, quat_multiply
 from dexmani_real.robot.commands import (
@@ -111,15 +110,6 @@ class CartesianJog:
             period_s=1 / self.config.control_hz,
         )
         baseline_pose = self.solver.compute_eef_pose_base(command)
-        if self.ik_reference is None:
-            workspace = self.solver.constraints.workspace_with_tolerance
-            reason = workspace_start_rejection(
-                baseline_pose.p,
-                workspace[:, 0],
-                workspace[:, 1],
-            )
-            if reason is not None:
-                return IKResult(qpos=None, reason=reason)
         dx, drpy = jog_delta(
             pressed_keys, self.config.delta_pos_m, self.config.delta_rpy_rad
         )

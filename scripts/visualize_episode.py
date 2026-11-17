@@ -1,6 +1,6 @@
 """离线查看 Raw episode 的观测与点云，或输出数据概要。"""
 # Usage: python scripts/visualize_episode.py episodes/pnp_apple_banana/episode_20261101_165909
-# 已有 /hoi 时自动叠加物体点云；追加 --info 仅输出数据概要。
+# 已有 hoi.h5 时自动叠加物体点云；追加 --info 仅输出数据概要。
 
 from __future__ import annotations
 
@@ -68,6 +68,10 @@ def print_episode_info(episode_path: str) -> None:
             if isinstance(obj, h5py.Dataset):
                 print(f"  {name}: shape={obj.shape}, dtype={obj.dtype}")
         data.visititems(describe)
+    if (path / "hoi.h5").is_file():
+        print("HOI: hoi.h5")
+        with h5py.File(path / "hoi.h5", "r") as hoi:
+            hoi.visititems(describe)
 
 
 class EpisodeVisualizer:
@@ -89,7 +93,7 @@ class EpisodeVisualizer:
         try:
             self.reader = RawReader(episode_path)
             self.timestamps_s = self.reader.timestamps_s
-            self.has_hoi = "hoi" in self.reader.data_file
+            self.has_hoi = (self.reader.path / "hoi.h5").is_file()
             if self.has_hoi:
                 self.reader.require_fields("object_pointcloud")
                 self.reader["object_pointcloud"]
@@ -261,7 +265,7 @@ class EpisodeVisualizer:
         for device in ("arm", "hand"):
             offset_ms = (int(timing[f"{device}_ns"]) - int(timing["camera_ns"])) / 1e6
             self.rr.log(f"hoi/{device}_source_offset_ms", self.rr.Scalar(offset_ms))
-        for name, values in self.reader.data_file["hoi/quality"].items():
+        for name, values in self.reader.hoi_file.get("quality", {}).items():
             for index, value in enumerate(values[step_idx]):
                 # −1 是未计算占位值；画成缺口，避免误报质量下降或沿用上一帧。
                 measured = np.nan if value == -1 else float(value)

@@ -1,13 +1,20 @@
 """发布 HOI 标注，并按 Raw 连续区间对齐关节。"""
 
 import json
+import logging
+import os
+import tempfile
 from itertools import pairwise
+from pathlib import Path
 
 import numpy as np
 
 from dexmani_real.config.perception import HOI_NUM_POINTS
 from dexmani_real.geometry.hoi import transform_task_points
+from dexmani_real.utils.io import publish
 from dexmani_real.utils.timing import interpolate_joints, validate_joint_gap
+
+logger = logging.getLogger(__name__)
 
 
 def write_hoi(
@@ -19,6 +26,7 @@ def write_hoi(
     quality,
     tracking_config,
     object_valid,
+    overwrite=False,
 ):
     import h5py
 
@@ -41,48 +49,51 @@ def write_hoi(
         or any(len(row) != len(template["object_names"]) for row in quality)
     ):
         raise ValueError("HOI quality shape does not match poses/template")
-    with h5py.File(path, "r+") as data:
-        if len(data["timing/rows"]) != frames:
-            raise ValueError("HOI 与 Raw 帧数不一致")
-        if "hoi" in data:
-            raise FileExistsError(f"拒绝覆盖已有 /hoi：{path}")
-        if "_hoi_staging" in data:
-            del data["_hoi_staging"]
-        group = data.create_group("_hoi_staging")
-        group.attrs["tracking_config"] = json.dumps(tracking_config)
-        group.create_dataset("object_pose_camera", data=poses)
-        group.create_dataset("object_valid", data=object_valid)
-        group.create_dataset("valid", data=valid)
-        group.create_dataset("base_from_camera", data=base_from_camera)
-        saved_template = group.create_group("template")
-        for key, value in template.items():
-            value = np.asarray(value)
-            if value.dtype.kind == "U":
-                value = value.astype(h5py.string_dtype("utf-8"))
-            saved_template.create_dataset(key, data=value)
-        quality_group = group.create_group("quality")
-        for key in sorted({key for row in quality for obj in row for key in obj}):
-            values = np.array(
-                [[obj.get(key, np.nan) for obj in row] for row in quality], dtype=float
-            )
-            if not np.isfinite(values[object_valid]).all():
-                raise ValueError(f"Nonfinite HOI quality: {key}")
-            quality_group.create_dataset(key, data=values)
-        cloud = group.create_dataset(
-            "object_pointcloud", (frames, HOI_NUM_POINTS, 3), dtype="f4",
-            chunks=(1, HOI_NUM_POINTS, 3),
-        )
-        for start in range(0, frames, 128):
-            selected = valid[start : start + 128]
-            points = np.zeros((len(selected), HOI_NUM_POINTS, 3), np.float32)
-            if selected.any():
-                points[selected] = transform_task_points(
-                    template, poses[start : start + 128][selected], base_from_camera
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
+    try:
+        os.close(fd)
+        with h5py.File(temporary, "w") as data:
+            data.attrs["tracking_config"] = json.dumps(tracking_config)
+            data.create_dataset("object_pose_camera", data=poses)
+            data.create_dataset("object_valid", data=object_valid)
+            data.create_dataset("valid", data=valid)
+            data.create_dataset("base_from_camera", data=base_from_camera)
+            saved_template = data.create_group("template")
+            for key, value in template.items():
+                value = np.asarray(value)
+                if value.dtype.kind == "U":
+                    value = value.astype(h5py.string_dtype("utf-8"))
+                saved_template.create_dataset(key, data=value)
+            quality_group = data.create_group("quality")
+            for key in sorted({key for row in quality for obj in row for key in obj}):
+                values = np.array(
+                    [[obj.get(key, np.nan) for obj in row] for row in quality], dtype=float
                 )
-            cloud[start : start + 128] = points
-        data.flush()
-        data.move("_hoi_staging", "hoi")
-        data.flush()
+                quality_group.create_dataset(key, data=values)
+            cloud = data.create_dataset(
+                "object_pointcloud", (frames, HOI_NUM_POINTS, 3), dtype="f4",
+                chunks=(1, HOI_NUM_POINTS, 3),
+            )
+            for start in range(0, frames, 128):
+                selected = valid[start : start + 128]
+                points = np.zeros((len(selected), HOI_NUM_POINTS, 3), np.float32)
+                if selected.any():
+                    points[selected] = transform_task_points(
+                        template, poses[start : start + 128][selected], base_from_camera
+                    )
+                cloud[start : start + 128] = points
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            publish(temporary, path)
+    except BaseException:
+        try:
+            Path(temporary).unlink(missing_ok=True)
+        except BaseException:
+            logger.exception("HOI temporary file cleanup also failed: %s", temporary)
+        raise
+    return path
 
 
 def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand")):
@@ -108,11 +119,11 @@ def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand")):
 
 
 def read_hoi_validity(reader):
-    """读取当前 HOI 契约的显式有效性，缺失字段由读取边界报错。"""
-    data = reader.data_file
-    valid = np.asarray(data["hoi/valid"])
-    objects = np.asarray(data["hoi/object_valid"])
-    count = len(data["hoi/template/object_names"])
+    """读取显式有效性，缺失字段由读取边界报错。"""
+    data = reader.hoi_file
+    valid = np.asarray(data["valid"])
+    objects = np.asarray(data["object_valid"])
+    count = len(data["template/object_names"])
     if (
         valid.dtype != bool
         or objects.dtype != bool
