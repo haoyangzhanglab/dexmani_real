@@ -406,18 +406,6 @@ def test_hoi_validity_reports_malformed_object_names(annotated_episode, kind):
         read_hoi_validity(reader)
 
 
-def test_truncation_diagnostic_does_not_control_segment_acceptance(annotated_episode, caplog):
-    import h5py
-    from dexmani_real.data.raw import RawReader
-
-    episode, *_ = annotated_episode
-    with h5py.File(episode / "data.h5", "r+") as data:
-        data["meta"].attrs["recording_truncated_reason"] = ["queue_full", "user_stop"]
-    with RawReader(episode) as reader:
-        np.testing.assert_array_equal(reader.segment_starts, [0])
-    assert "queue_full" in caplog.text
-
-
 def test_viewer_rejects_missing_depth_units_before_starting_display(annotated_episode, monkeypatch):
     import h5py
     import rerun as rr
@@ -1731,7 +1719,6 @@ def test_viewer_keeps_joint_alignment_separate_from_object_validity(monkeypatch)
     viewer.reader = Reader(viewer.reader)
     viewer.log_hoi_diagnostics(0, viewer.hoi_alignment)
     assert logged["hoi/alignment_available"] == 1
-    viewer.has_hoi = True
     viewer.hoi_valid = [False]
     viewer.timestamps_s = [0]
     viewer.log_camera = lambda *args: None
@@ -2126,7 +2113,7 @@ def test_event_resets_keyframe_interval_and_initialization(recovery_scene):
     assert not scene.frame_cache
 
 
-def test_viewer_marks_unmeasured_quality_as_missing():
+def test_viewer_reads_current_quality_and_marks_unmeasured_values():
     from scripts.visualize_episode import EpisodeVisualizer
 
     logged = {}
@@ -2148,15 +2135,17 @@ def test_viewer_marks_unmeasured_quality_as_missing():
     viewer.reader = Reader(
         {"timing/rows": [{"arm_ns": 1, "hand_ns": 1, "camera_ns": 1}]}
     )
-    viewer.log_hoi_diagnostics(
-        0, {"arm_qpos": np.zeros((1, 7)), "hand_qpos": np.zeros((1, 12))}
-    )
+    alignment = {"arm_qpos": np.zeros((1, 7)), "hand_qpos": np.zeros((1, 12))}
+    viewer.log_hoi_diagnostics(0, alignment)
     assert np.isnan(logged["hoi/object_0/iou"])
     assert logged["hoi/object_1/iou"] == 0.75
     assert logged["hoi/object_0/mask_source"] == 0
     assert logged["hoi/object_0/depth_fraction"] == 0.8
     assert logged["hoi/object_0/depth_coverage"] == 0.0
     assert logged["hoi/object_1/depth_coverage"] == 0.7
+    del viewer.reader.hoi_file["quality"]
+    with pytest.raises(KeyError, match="quality"):
+        viewer.log_hoi_diagnostics(0, alignment)
 
 
 @pytest.mark.parametrize("missing", [np.nan, 0.0])

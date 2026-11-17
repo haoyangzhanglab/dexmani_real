@@ -73,7 +73,7 @@ HOI 标注独立保存在 `episode/hoi.h5`，默认跳过已有标注，使用 `
 
 `data_processing` 是研究记录，普通训练、恢复和部署不要求它相等或存在。Zarr 的 object `geometry_sha256` 标识有序局部点及 offsets 的数值身份；混合合法几何时公共摘要为 null。只有开启 contact loss 的固定 1024 槽预训练及完整续训要求明确且一致的共享身份。部署分别保存 `training_processing` 与 `actual_processing`，只比较实际使用的处理参数，不计算模板哈希；缺少记录为 None。
 
-Raw 以整个 episode 目录为单位使用：`data.h5` 保存采集数据，`rgb.mp4` 保存图像，`hoi.h5` 保存可选标注。读取时不寻找其他位置的附件。
+Raw 以整个 episode 目录为单位使用：`data.h5` 保存采集数据，`rgb.mp4` 保存图像，`hoi.h5` 保存可选标注。读取时不寻找其他位置的附件。使用 `python scripts/visualize_episode.py EPISODE --info` 查看文件结构和录制截断原因。
 
 ## 核心模块
 
