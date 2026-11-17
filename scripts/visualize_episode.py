@@ -70,8 +70,8 @@ def print_episode_info(episode_path: str, *, hoi: bool = True) -> None:
         data.visititems(describe)
     if hoi and (path / "hoi.h5").is_file():
         print("HOI: hoi.h5")
-        with h5py.File(path / "hoi.h5", "r") as hoi:
-            hoi.visititems(describe)
+        with h5py.File(path / "hoi.h5", "r") as annotations:
+            annotations.visititems(describe)
 
 
 class EpisodeVisualizer:
@@ -209,7 +209,7 @@ class EpisodeVisualizer:
         for _, path, values, labels in self.series:
             log_series(
                 path, values, labels=labels, steps=steps,
-                timestamps_s=self.timestamps_s[:self.frame_count],
+                timestamps_s=self.timestamps_s,
             )
         log_camera_geometry(self.camera_model.color, self.T_xarm_base_from_color)
 
@@ -362,16 +362,12 @@ def main(argv: list[str] | None = None) -> int:
     from dexmani_real.utils.log import configure_logging
 
     configure_logging()
-    pointcloud_config = None
-    if args.point_cloud:
-        pointcloud_config = runtime.pointcloud
-
     viz = EpisodeVisualizer(
         str(episode_path),
         table_plane_path=runtime.environment.table_plane_path,
         max_frames=args.max_frames,
         hoi=not args.no_hoi,
-        pointcloud_config=pointcloud_config,
+        pointcloud_config=runtime.pointcloud if args.point_cloud else None,
         hand_pointcloud_config=runtime.hand_pointcloud,
         hoi_max_joint_gap_s=runtime.execution.hoi_max_joint_gap_s,
     )

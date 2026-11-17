@@ -437,7 +437,7 @@ class RawReader:
         sampling_clock_ns(hz)
         return hz
 
-    def read_timing(self, stop=None) -> np.ndarray:
+    def read_timing(self, stop: int | None = None) -> np.ndarray:
         """读取并校验时间行；周期偏差只诊断，断点以 segment_starts 为准。"""
         rows = self["timing/rows"][:stop]
         control, observation = rows["control_ns"], rows["observation_ns"]
@@ -562,11 +562,8 @@ class RawReader:
                 f"got {divisor!r}"
             )
 
-    @property
-    def timestamps_s(self):
-        return self.read_timestamps_s()
-
-    def read_timestamps_s(self, stop=None):
+    def read_timestamps_s(self, stop: int | None = None) -> np.ndarray:
+        """读取所选前缀相对于首帧的观测时间，默认读取完整时间轴。"""
         stamps = self["timing/rows"].fields("observation_ns")[:stop]
         # 先减整数时钟，避免长时间运行后的浮点精度损失。
         return (stamps - stamps[0]) / 1e9 if stamps.size else np.empty(0, dtype=np.float64)

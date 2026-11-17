@@ -9,6 +9,7 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -365,7 +366,7 @@ def prepare_raw(reader, processing, fields):
                     continue
                 source = reader[name][:]
                 values = np.empty_like(source, dtype=np.float64)
-                for segment, (start, stop) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+                for segment, (start, stop) in enumerate(pairwise(boundaries)):
                     aligned, valid = interpolate_joints(
                         timing[f"{device}_ns"][start:stop], source[start:stop],
                         timing["camera_ns"][start:stop], processing.hoi_max_joint_gap_s,
@@ -461,7 +462,7 @@ def export_zarr(
                 # 整条输入与关闭成功后才提交来源、段边界及摘要。
                 ends.extend((offset + boundaries[1:]).tolist())
                 sources.extend([episode.name] * (len(boundaries) - 1))
-                ranges.extend([[int(a), int(b)] for a, b in zip(boundaries[:-1], boundaries[1:])])
+                ranges.extend([[int(a), int(b)] for a, b in pairwise(boundaries)])
                 if source_count == 0:
                     shared_geometry = digest
                 elif shared_geometry != digest:
