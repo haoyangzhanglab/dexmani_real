@@ -54,6 +54,8 @@ python -m pytest -p no:cacheprovider -q -ra \
 
 Ruckig 0.17.3 的源码包使用旧的 `cmake.targets` 构建配置，构建约束将 scikit-build-core 限制在 0.10 之前；约束只作用于隔离构建，不改变运行时依赖。
 
+2026-11-17 在不继承系统包的新 venv 实测：最小安装的预览、五字段导出通过；继续安装 CPU 回归依赖后，上述测试 **559 passed**，`pip check` 无冲突。已有研究环境的完整测试为 **882 passed / 4 skipped**，四项跳过均为 CUDA 专项。本轮未连接真机，也未运行 GPU 实验。
+
 [CPU workflow](../.github/workflows/cpu.yml) 用一个 job 先检查最小安装与 CLI，再安装回归依赖并执行上面的测试。PR、main 更新和手动触发均会运行。性能基准由研究者在同机运行；共享 CI 机器不作耗时阈值断言。
 
 ## 观测测量复现

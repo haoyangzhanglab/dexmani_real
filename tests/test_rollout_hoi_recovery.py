@@ -249,8 +249,9 @@ def test_prediction_history_overlap_follows_execution_window(env, mode, obs_step
     windows = [rows for rows, _ in env.worker.calls]
     assert len(windows) >= 4
     assert len({id(row) for row in windows[0]}) == 1
-    overlap = [{id(row) for row in a} & {id(row) for row in b} for a, b in zip(windows, windows[1:])]
-    assert all(bool(shared) == (action_steps < obs_steps) for shared in overlap)
+    overlap = [len({id(row) for row in a} & {id(row) for row in b}) for a, b in zip(windows, windows[1:])]
+    expected = {0} if action_steps >= obs_steps else {1} if mode == "sync" else {1, 2}
+    assert set(overlap) == expected
 
 
 @pytest.mark.parametrize("save", [False, True])
