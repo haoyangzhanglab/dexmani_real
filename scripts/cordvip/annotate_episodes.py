@@ -14,7 +14,7 @@ from cordvip_geometry.camera import RGBDFrame
 from cordvip_geometry.tracking import SceneTracker, TrackingConfig, TrackingFailure
 
 from dexmani_real.data.hoi import write_hoi
-from dexmani_real.data.raw import RawReader, require_published_raw
+from dexmani_real.data.raw import RawReader, discover_episode_dirs, require_published_raw
 from dexmani_real.geometry.hoi import load_task_template, task_objects
 
 
@@ -23,11 +23,11 @@ def annotate_episodes(
     tracking_config: TrackingConfig = TrackingConfig(),  # noqa: B008 — 不可变配置可共享。
     overwrite=False,
 ):
-    task = Path(task)
+    task = Path(task).expanduser().resolve()
     tracker = None
 
     for episode in episodes:
-        episode = Path(episode)
+        episode = Path(episode).expanduser()
         if (episode / "hoi.h5").exists() and not overwrite:
             print(f"跳过已有 HOI：{episode}")
             continue
@@ -128,9 +128,10 @@ def track_episode(reader, tracker, names, prompts):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", required=True)
-    parser.add_argument("--episode", type=Path)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("input_root", metavar="INPUT_ROOT", type=Path,
+                        help="一个 Episode，或直接包含 episode_* 子目录的数据目录；相对 cwd，支持 ~")
+    parser.add_argument("--task-dir", type=Path, required=True, help="任务资产目录；相对 cwd，支持 ~")
     parser.add_argument("--overwrite", action="store_true", help="显式重算并原子替换已有 hoi.h5")
     parser.add_argument(
         "--segmentation-interval-frames",
@@ -138,19 +139,9 @@ def main(argv=None):
         default=TrackingConfig().segmentation_interval_frames,
     )
     args = parser.parse_args(argv)
-    if Path(args.task).name != args.task or args.task in (".", ".."):
-        parser.error("非法任务名")
-    task = ROOT / "assets/pointcloud_template/object" / args.task
-    episodes = (
-        [args.episode]
-        if args.episode
-        else sorted((ROOT / "episodes" / args.task).glob("episode_*"))
-    )
-    if not episodes:
-        raise ValueError("没有 Episode")
     annotate_episodes(
-        episodes,
-        task,
+        discover_episode_dirs(args.input_root),
+        args.task_dir,
         overwrite=args.overwrite,
         tracking_config=TrackingConfig(
             segmentation_interval_frames=args.segmentation_interval_frames

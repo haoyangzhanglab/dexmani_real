@@ -21,7 +21,7 @@ def main(argv: list[str] | None = None) -> int:
         nargs="?",
         default=DEFAULT_TASK_NAME,
         help=(
-            "Task name used for recording metadata and episodes/<task_name>/ (unused with --no-record); "
+            "Task label and recording subdirectory <episodes-dir>/<task_name>/ (unused with --no-record); "
             f"default: {DEFAULT_TASK_NAME!r}."
         ),
     )
@@ -30,7 +30,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Enable/disable capture and camera",
     )
     parser.add_argument(
-        "--episodes-dir", default="episodes", help="Capture root directory (default: %(default)s)",
+        "--episodes-dir", default="episodes",
+        help="Capture root directory, relative to cwd; supports ~ (default: %(default)s)",
     )
     parser.add_argument(
         "--max-duration", type=float, default=60.0,

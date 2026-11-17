@@ -31,11 +31,14 @@ flowchart TD
 | VR 采集 / 仅遥操作 | `python scripts/collect_teleop.py TASK` / 加 `--no-record` |
 | 键盘调整姿态 | `python scripts/keyboard_teleop.py` |
 | 查看记录 | `python scripts/visualize_episode.py EPISODE`（`--no-hoi` 绕过标注，`--max-frames N` 按需读取前 N 帧） |
+| 离线调试手部重定向 | `python scripts/preview_hand_retargeting.py EPISODE`（`--no-view` 仅计算统计，`--max-frames N` 限制前缀） |
 | 导出训练数据 | `python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr --fields joint_state action` |
 | 策略评估并录制 | `python scripts/run_policy.py CHECKPOINT --record-raw` |
 | 回放关节目标 | `python scripts/replay_episode.py EPISODE` |
 
 需要手动标记任务成败时使用 [label_episode.py](scripts/label_episode.py)。HOI 数据先完成[物体资产准备与离线标注](docs/object_reconstruction.md)。具体选项见各入口的 `--help`。
+
+手部预览使用 Raw 记录的参数、标定和限位；`--config experiment.py` 仅替换重定向参数。输入要求、记录时间和分段语义见[手部重定向](docs/hand_retargeting.md#离线预览)。
 
 实验配置由 [RealConfig](dexmani_real/config/real.py) 组装。用一个可信本地 Python 文件导出 `CONFIG`，将实际设备、工作空间、运动参数集中保存；采集、部署、导出和回放均可传 `--config experiment.py`。例如下面只改变采集周期，其余配置仍须符合实际设备：
 
@@ -61,11 +64,23 @@ Raw 保留采集时的原始 RGB-D、K、畸变参数及已有外参。Canonical
 
 Zarr 根属性 `task_name` 来自 Raw 的 `meta.task_label`，不受目录名影响；同一产物中的 Raw 必须属于同一任务。
 
+数据与任务资产可以放在仓库外。下面的准备、采样、标注和 HOI 部署共用同一个任务资产目录：
+
+```bash
+python scripts/collect_teleop.py pick --episodes-dir /data/episodes
+python scripts/cordvip/prepare_task.py --task-dir /data/tasks/pick
+python scripts/cordvip/sample_template.py --task-dir /data/tasks/pick
+python scripts/cordvip/annotate_episodes.py /data/episodes/pick --task-dir /data/tasks/pick
+python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick
+```
+
+先在任务目录准备 `task.json` 和对象参考图或米制网格，结构见 [CordViP 实验入口](scripts/cordvip/README.md)。标注输入是单个 Episode，或直接包含 `episode_*` 子目录的数据目录，不递归查找。显式路径支持 `~`，相对路径以 cwd 为准；采集默认写入 cwd 下的 `episodes/<task_name>/`。实验标签不决定 HOI 资产位置，也无需与资产目录名一致；非 HOI 策略不需要任务资产。
+
 `action_space="joint"` 描述采集的绝对关节目标，即使仅导出观测或 `action_ee` 也保持不变。训练通过 `action_key` 选择关节目标 `action` 或经 FK 派生的 `action_ee`。
 
 ## 数据导出
 
-`--fields` 必填，一条命令只发布 `--output` 指定的一份 Zarr，字段集合固定。缺少所选数据或晚发现损坏时整条 Raw 回滚，继续其他采集；全被拒绝时失败，已有输出不覆盖。
+`--fields` 必填，一条命令只发布一份字段集合固定的 Zarr。`--output` 指定输出路径；省略时写入 cwd 下的 `datasets/<输入目录名>.zarr`，单个 Episode 使用其父目录名。目录名只用于输出文件命名，任务标签仍来自 Raw。缺少所选数据或晚发现损坏时整条 Raw 回滚，继续其他采集；全被拒绝时失败，已有输出不覆盖。
 
 HOI 标注独立保存在 `episode/hoi.h5`，默认跳过已有标注，使用 `annotate_episodes.py --overwrite` 明确重算。重算失败保留此前完整文件，不修改 `data.h5` 或 `rgb.mp4`。未选 `object_pointcloud` 时完全不读取 HOI；纯关节导出不需要相机，纯 RGB 不需要深度单位。
 
@@ -105,7 +120,7 @@ Raw 以整个 episode 目录为单位使用：`data.h5` 保存采集数据，`rg
 | 改模型观测 | `runtime/observation.py` 读取并检查来源 → `ObservationBuilder` 组装模型历史；字段依赖在 `FIELD_DEPENDENCIES` 声明 |
 | 改训练数据 | `RawReader` 按需读取并校验输入 → `export.py` 分块派生 → 完整产物发布；失败录制由 `EpisodeRecorder` 向运行层报告 |
 
-直接从 Python 启动策略使用 `PolicySession(runtime, checkpoint, record_raw=True).run()`（从 `dexmani_real.deployment.session` 导入）。输出路径通过 `output_root` 指定。
+直接从 Python 启动策略使用 `PolicySession(runtime, checkpoint, record_raw=True).run()`（从 `dexmani_real.deployment.session` 导入）；HOI 策略还须传 `task_dir="/data/tasks/pick"`。输出路径通过 `output_root` 指定。
 
 主进程持有会话与 XHand I/O；机械臂 SDK、相机、VR 与启用的感知任务运行在子进程；策略推理和录制各有自己的工作线程。设备 SDK 留在驱动层，动作映射只生成目标，实际发送归 `Robot`。新增实验优先修改配置和对应流程，独立算法放入现有几何或感知模块。
 

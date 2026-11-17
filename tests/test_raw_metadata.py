@@ -8,8 +8,48 @@ import numpy as np
 import pytest
 
 from dexmani_real.config.real import RealConfig
-from dexmani_real.data.raw import episode_recording_metadata, robot_recording_parameters
+from dexmani_real.data.raw import (
+    discover_episode_dirs,
+    episode_recording_metadata,
+    robot_recording_parameters,
+)
 from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
+
+
+@pytest.mark.parametrize("input_kind", ["single", "batch", "relative", "home"])
+def test_discover_episode_dirs_uses_only_explicit_root(tmp_path, monkeypatch, input_kind):
+    source = tmp_path / "external/pick"
+    episodes = tuple(source / name for name in ("episode_001", "episode_002"))
+    for episode in episodes:
+        episode.mkdir(parents=True)
+        (episode / "data.h5").touch()
+    # 同名 checkout 数据与更深层数据均不参与发现。
+    (tmp_path / "checkout/episodes/pick/episode_003").mkdir(parents=True)
+    (source / "nested/episode_004").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path / "checkout")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    requested = {
+        "single": episodes[0], "batch": source,
+        "relative": "../external/pick", "home": "~/external/pick",
+    }[input_kind]
+    assert discover_episode_dirs(requested) == (episodes[:1] if input_kind == "single" else episodes)
+
+
+def test_discover_episode_dirs_reports_invalid_or_empty_inputs(tmp_path):
+    with pytest.raises(NotADirectoryError):
+        discover_episode_dirs(tmp_path / "missing")
+    regular_file = tmp_path / "file"
+    regular_file.touch()
+    with pytest.raises(NotADirectoryError):
+        discover_episode_dirs(regular_file)
+    (tmp_path / "nested/episode_001").mkdir(parents=True)
+    with pytest.raises(FileNotFoundError, match="no episode directories"):
+        discover_episode_dirs(tmp_path)
+    unpublished = tmp_path / ".tmp_episode"
+    unpublished.mkdir()
+    (unpublished / "data.h5").touch()
+    with pytest.raises(ValueError, match="unpublished Raw"):
+        discover_episode_dirs(unpublished)
 
 
 @pytest.mark.parametrize("comm_type,selected,excluded", [

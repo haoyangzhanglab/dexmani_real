@@ -6,7 +6,7 @@ HOI（Hand–Object Interaction，手物交互）观测用手部与物体点云�
 
 物体点云来自固定网格表面模板，由 RGB-D 跟踪位姿逐帧变换；手点云来自固定的 link 局部模板，由机械臂和手部关节通过 FK 变换。两者均为 xArm base 坐标系下的米制 float32 XYZ，保留点序和分段。
 
-任务资产位于 `assets/pointcloud_template/object/<task>/`。米制网格确定物体尺度、原点和朝向；任务模板共 1024 点，按表面积分配配额，每对象至少 64 点，最多 16 个对象。新模板先按面积采样 8 倍候选点，再用固定种子和起点的 FPS 选点。手模板沿用各 link 的面积配额与 URDF visual 变换，使用同一采样函数。
+任务资产由 `--task-dir` 显式指定，例如 `/data/tasks/pick/`；任务标签不参与资产路径推导。准备、采样、标注和 HOI 部署共用这一目录，所有显式路径支持 `~`，相对路径以 cwd 为准。米制网格确定物体尺度、原点和朝向；任务模板共 1024 点，按表面积分配配额，每对象至少 64 点，最多 16 个对象。新模板先按面积采样 8 倍候选点，再用固定种子和起点的 FPS 选点。手模板沿用各 link 的面积配额与 URDF visual 变换，使用同一采样函数。
 
 手部 FK 批量收集所需 link placements，再按缓存的点到 link 索引变换表面点，保持模板点序、分段和输出形状。指尖 `fingertip_xyz` 是独立的低维观测，可按策略需要选择。
 
@@ -34,7 +34,7 @@ flowchart LR
 
 1. **准备资产**：[prepare_task.py](../scripts/cordvip/prepare_task.py) 按 `task.json` 分割参考图、通过 Hunyuan3D 重建，再用实测尺寸调整为米制尺度；已有米制网格直接复用。
 2. **生成模板**：[sample_template.py](../scripts/cordvip/sample_template.py) 固定对象顺序、点分段与点序；已有模板直接复用，资产变更后显式重建。
-3. **标注 Raw**：[annotate_episodes.py](../scripts/cordvip/annotate_episodes.py) 跟踪录制的 RGB-D，完成逐帧标注后发布位姿、质量和物体点云。
+3. **标注 Raw**：[annotate_episodes.py](../scripts/cordvip/annotate_episodes.py) 的 `INPUT_ROOT` 接受单个 Episode 或直接包含 `episode_*` 子目录的数据目录；跟踪录制的 RGB-D，完成逐帧标注后发布位姿、质量和物体点云。
 4. **导出数据**：[export_zarr.py](../scripts/export_zarr.py) 读取物体标注，对齐关节并生成手部几何，与所选状态和动作一同导出。
 5. **训练与部署**：在 dexmani_policy 中训练；部署共用任务模板、跟踪器、坐标变换和 FK。
 
@@ -77,6 +77,8 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 Zarr 元数据记录实际使用的处理参数。object `geometry_sha256` 使用有序局部点与 offsets 的固定字节编码，供固定槽接触监督使用，不包括显示名。手模板不计算哈希，但 link 名称仍必须有效映射到 FK。最终接纳的采集共享同一数值模板时记录公共摘要，否则为 `null`。普通策略允许同 schema 的合法模板混用，处理参数差异作为研究记录；固定槽 contact loss 必须有明确共享身份，`null` 不满足该约束。
 
 [visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则，显示手物几何、有效性、逐物体质量及原始来源时差；未计算的质量占位值显示为曲线缺口，隐藏无效物体点云，不可对齐的行保留原始时间位置并隐藏手几何，内部缺口不会阻止其余帧的诊断。
+
+可视化启动前要求展示范围内的 `observation_ns` 严格递增，包括未使用 HOI 的情况。
 
 - `--max-frames N` 只分配展示前缀的状态、有效性和对齐结果；必要时在同一原生段内顺序查找尾部来源时间，仅读取实际需要的左右邻点关节值，精确命中只取该样本。
 - `--no-hoi`（Python 参数 `hoi=False`）完全绕过标注，手部几何使用 Raw 关节；与 `--info` 组合也不打开 HOI 文件。

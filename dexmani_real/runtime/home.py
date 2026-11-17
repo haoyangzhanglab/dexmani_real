@@ -2,7 +2,6 @@
 
 import logging
 import time
-from itertools import pairwise
 
 import numpy as np
 
@@ -74,7 +73,9 @@ def _plan_home(cfg, q, v, hand_q, collision, check):
                 break
             count = round(trajectory.duration * cfg.servo_hz)
             times = np.arange(count + 1) / cfg.servo_hz
-            samples = np.array([trajectory.at_time(t)[0] for t in times])
+            states = [trajectory.at_time(t)[:2] for t in times]
+            samples = np.array([state[0] for state in states])
+            velocities = np.abs([state[1] for state in states])
             samples[-1] = target
             for point in samples:
                 check()
@@ -84,12 +85,10 @@ def _plan_home(cfg, q, v, hand_q, collision, check):
             if reason:
                 break
             # 几何半径传播给出位移上界估计；沿 Ruckig 曲线细分，不线性插值。
-            intervals = list(pairwise(times))
+            intervals = list(zip(times[:-1], times[1:], velocities[:-1], velocities[1:]))
             while intervals:
                 check()
-                a, b = intervals.pop()
-                va = np.abs(trajectory.at_time(a)[1])
-                vb = np.abs(trajectory.at_time(b)[1])
+                a, b, va, vb = intervals.pop()
                 speed = np.minimum(
                     cfg.homing.max_speed_rad_per_s,
                     np.maximum(va, vb)
@@ -98,12 +97,12 @@ def _plan_home(cfg, q, v, hand_q, collision, check):
                 if 2 * np.dot(collision.arm_radii, speed) * (b - a) <= margin / 2:
                     continue
                 mid = (a + b) / 2
-                reason = collision.rejection(
-                    np.asarray(trajectory.at_time(mid)[0]), hand_q
-                )
+                position, mid_velocity, _ = trajectory.at_time(mid)
+                reason = collision.rejection(np.asarray(position), hand_q)
                 if reason:
                     break
-                intervals.extend(((a, mid), (mid, b)))
+                vm = np.abs(mid_velocity)
+                intervals.extend(((a, mid, va, vm), (mid, b, vm, vb)))
             if reason:
                 break
             chunks.append(samples if not chunks else samples[1:])

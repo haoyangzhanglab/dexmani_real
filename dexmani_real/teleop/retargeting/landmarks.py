@@ -133,7 +133,8 @@ class HandCalibration:
         index = np.stack((proximal[1], distal[1]))
         c = index @ geometry.base_directions[1]
         s = index @ np.cross(geometry.base_axes[1], geometry.base_directions[1])
-        x, y = np.sum(c * c - s * s), 2 * np.sum(c * s)
+        x = float(np.sum(c * c - s * s))
+        y = float(2 * np.sum(c * s))
         if np.hypot(x, y) < 1e-12:
             raise HandGeometryRejected("index flexion plane is degenerate")
         angles[1] = 0.5 * np.arctan2(y, x)

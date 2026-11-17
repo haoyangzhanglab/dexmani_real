@@ -27,6 +27,7 @@ from dexmani_real.data.hoi import read_hoi_validity
 from dexmani_real.data.raw import (
     RawDataError,
     RawReader,
+    discover_episode_dirs,
     require_published_raw,
     validate_task_label,
 )
@@ -149,27 +150,6 @@ def canonical_array_specs(fields, processing, camera):
         shapes["depth"] = camera["shape"]
     return {name: (shapes[name], np.dtype({"rgb": np.uint8, "depth": np.uint16}.get(name, np.float32)))
             for name in fields}
-
-
-def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
-    """枚举所有 episode 目录，损坏文件由读取边界直接报错。"""
-    requested_path = Path(input_root).expanduser()
-    root = requested_path.resolve()
-    if not root.is_dir():
-        raise NotADirectoryError(root)
-    if (root / "data.h5").is_file():
-        require_published_raw(requested_path)
-        return (root,)
-    episodes = tuple(
-        sorted(
-            child
-            for child in root.iterdir()
-            if child.is_dir() and child.name.startswith("episode_")
-        )
-    )
-    if not episodes:
-        raise FileNotFoundError(f"no episode directories found in {root}")
-    return episodes
 
 
 def iter_canonical_blocks(

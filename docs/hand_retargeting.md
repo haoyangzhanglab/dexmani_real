@@ -21,4 +21,24 @@
 
 [VR 接收端](../dexmani_real/sensor/vr.py) 提供关键点，[VRController](../dexmani_real/teleop/vr.py) 组合腕部映射与 `HandRetargeter` 输出，再由共享动作映射和遥操作循环提交、录制。重定向模块不直接发送设备命令；求解参考从实测姿态建立，仅在命令提交正常返回后更新。
 
+## 离线预览
+
+使用已有 Raw 独立运行手部算法：
+
+```bash
+python scripts/preview_hand_retargeting.py /data/episodes/pick/episode_001
+python scripts/preview_hand_retargeting.py /data/episodes/pick/episode_001 --config experiments/hand.py
+python scripts/preview_hand_retargeting.py /data/episodes/pick/episode_001 --max-frames 300 --no-view
+```
+
+入口只读取所选前缀的实测手关节、VR landmarks、时间行及段边界，不读取图像或 HOI，不连接设备、不写回数据。路径支持 `~`，相对路径以 cwd 为准。
+
+预览与在线重定向共用 NLopt 求解器，其依赖由 `pip install -e '.[control]'` 安装；仍需已有环境中的 Pinocchio。关键点每次最多读取256行，计算块之间延续同一个求解参考，只有录制段界会重置。返回的关节曲线仍按所选帧数保留。
+
+默认从 `effective_parameters` 恢复完整的 `hand_retargeting`、`hand_retargeting_calibration` 及手部限位。`--config` 加载导出 `CONFIG: RealConfig` 的 Python 文件，仅替换 `hand_retargeting`；标定和限位始终取自 Raw。缺少所需记录或配置错误直接报错。
+
+计算使用记录的 `observation_ns`：段首按实测关节和该行时间 `reset`，只展示参考；后续有效候选以同一行时间 `commit`。拒绝行保留上一参考位置与时间，显示原因并断开候选曲线；段间重置平滑状态。这里的 `commit` 表示离线接受候选，不能证明真实硬件执行成功。
+
+Rerun 在手部局部坐标系对照实测与有效候选的指尖；段首和拒绝行显示保留参考。关节曲线同时保留实测、候选与参考，标出段界及拒绝行，使用时间轴浏览。`--no-view` 不初始化 viewer，仅打印帧数、拒绝原因和求解耗时；耗时只包含 `retarget` 调用。`--max-frames` 限制读取和计算的前缀。
+
 返回[项目架构](../README.md)。

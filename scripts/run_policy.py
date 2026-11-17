@@ -87,6 +87,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--camera-calibration", type=Path, default=None)
     parser.add_argument(
+        "--task-dir", type=Path, default=None,
+        help="HOI task assets directory; required by HOI policies; relative to cwd, supports ~",
+    )
+    parser.add_argument(
         "--record-raw",
         action="store_true",
         help="Enable full Raw recording and evaluation results",
@@ -133,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         record_raw=args.record_raw,
         output_root=args.output,
         camera_calibration_path=args.camera_calibration,
+        task_dir=args.task_dir,
     ).run()
 
 

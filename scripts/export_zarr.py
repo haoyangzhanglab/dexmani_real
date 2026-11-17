@@ -64,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def default_output_path(input_root: Path) -> Path:
+    input_root = input_root.expanduser().resolve()
     output_stem = (
         input_root.parent.name
         if (input_root / "data.h5").is_file()
@@ -92,7 +93,6 @@ def load_processing_config(path: Path | None, fields) -> ExportConfig:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.input_root = args.input_root.expanduser()
     output_path = (
         args.output if args.output is not None else default_output_path(args.input_root)
     )
