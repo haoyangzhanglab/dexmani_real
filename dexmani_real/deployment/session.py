@@ -73,6 +73,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from dexmani_policy.deployment import PolicyInfo
+    from dexmani_real.geometry.camera import CameraSnapshot
 
 
 def session_directory(root: Path) -> Path:
@@ -116,7 +117,7 @@ class PolicySession:
         self.weights, self.inference_steps = weights, inference_steps
         self.info: PolicyInfo
         self.observations: ObservationBuilder
-        self.table_plane_abcd = None
+        self.table_plane_abcd: tuple[float, float, float, float] | None = None
         self.device, self.seed = device, seed
         self.max_duration_s, self.num_episodes = max_duration_s, num_episodes
         self.record_raw = record_raw
@@ -124,7 +125,7 @@ class PolicySession:
                             Path(__file__).resolve().parents[2] / "rollouts" if record_raw else None)
         self.output_dir: Path | None = None
         self.camera_calibration_path = camera_calibration_path
-        self.camera_snapshot = None
+        self.camera_snapshot: CameraSnapshot | None = None
         self.runtime_state = SessionState()
         self.startup_cancel_epoch = self.runtime_state.cancel_epoch
         self.sensors = SensorWorkers()
@@ -163,8 +164,8 @@ class PolicySession:
         write_yaml(payload, self.output_dir / "run_config.yaml")
 
     def save_results(self):
-        if self.episode is not None and self.episode.recorder is not None:
-            self.episode.result.raw = self.episode.recorder.result()
+        if self.episode is not None:
+            self.episode.snapshot_result()
         if self.output_dir is None:
             return
         payload = dict(self.summary, errors=self.errors,
@@ -413,8 +414,7 @@ class PolicySession:
             record_failure("shutdown", exc)
         if self.episode is not None:
             try:
-                recording_closed = self.episode.finish_recording()
-                resources_closed = resources_closed and recording_closed
+                self.episode.finish_recording()
             except BaseException as exc:
                 resources_closed = False
                 record_failure("recording_finalize", exc, episode=True)
@@ -632,9 +632,8 @@ class PolicySession:
             finally:
                 self.episodes.append(episode.result)
             self.finish_episode()
-            result = episode.result
-            raw = episode.recorder.result() if episode.recorder is not None else result.raw
-            level, text = format_recording_result(raw)
+            result = episode.snapshot_result()
+            level, text = format_recording_result(result.raw)
             status = "结束" if self.episode is None else "控制结束，资源收尾未完成"
             logger.info("第 %03d 段%s\nDuration: %.1f s\nEnd reason: %s\nDetails: %s\nSkipped slots: %d",
                         result.index, status, result.duration_s, result.termination_reason,

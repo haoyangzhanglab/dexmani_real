@@ -199,7 +199,7 @@ def test_recording_parameters_and_start_failure_cleanup(teleop, monkeypatch, tmp
     recorder = Mock(
         error=RecordingError("writer failed"),
         start=Mock(side_effect=RecordingError("writer failed")),
-        poll_finish=Mock(return_value=True),
+        finish=Mock(return_value=True),
         result=Mock(return_value=None),
     )
     monkeypatch.setattr(loop_module, "EpisodeRecorder", Mock(return_value=recorder))
@@ -225,8 +225,7 @@ def test_recording_parameters_and_start_failure_cleanup(teleop, monkeypatch, tmp
             hand_retargeting_calibration={"bone_lengths": calibration.bone_lengths.tolist(), "palm_width": .08},
         )
     assert parameters == json.loads(json.dumps(expected, allow_nan=False))
-    recorder.request_finish.assert_called_once()
-    recorder.poll_finish.assert_called_once()
+    recorder.finish.assert_called_once_with(save=True, reason="failed", wait=False)
     teleop.robot.prepare_streaming.assert_not_called()
     teleop.robot.send_action.assert_not_called()
     assert teleop.recorder is None
@@ -352,6 +351,7 @@ def test_rejected_ik_resubmits_previous_command_without_renewing_lease(active_te
     assert teleop.robot.send_action.call_args.args[0] is command
     assert teleop.robot.send_action.call_args.kwargs["expires_ns"] == deadline
     assert teleop.controller.commit.call_args.kwargs["eef_pose"] is pose
+    assert teleop.controller.commit.call_args.kwargs["submit_end_ns"] == clock.now
     assert teleop.last_command is command and teleop.target_deadline_ns == deadline
     assert teleop.pending_termination_reason is None
 

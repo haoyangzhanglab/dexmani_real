@@ -111,8 +111,6 @@ Raw 以整个 episode 目录为单位使用：`data.h5` 保存采集数据，`rg
 
 ### 修改实验时从哪里入手
 
-设计取舍、资源所有权及本轮删减/优化计划见[个人研究工作流与代码简化](docs/research_design.md)。
-
 | 需求 | 代码入口与职责 |
 | --- | --- |
 | 改采集过程 | `scripts/collect_teleop.py` → `teleop/run.py` 装配资源 → `TeleopLoop` 运行示教 |
@@ -127,6 +125,8 @@ Raw 以整个 episode 目录为单位使用：`data.h5` 保存采集数据，`rg
 输入文件、设备反馈、动作提交和资源回收承担各自的校验职责；已建立的内部契约直接复用。命令租约、取消状态、来源时间与录制失败传播分别对应真实的并发和 I/O 问题。重构时按这些行为验证，不以删行或增加抽象层作为目标。
 
 ## 开发验证
+
+最小安装、固定样本预览/导出及 CPU CI 命令见 [CPU 离线环境与回归](docs/offline_cpu.md)。手部梯度验证与提交语义见[手部重定向](docs/hand_retargeting.md#数值验证与提交语义)。
 
 安装本项目与配套 Policy 的测试依赖后运行 `python -m pytest -p no:cacheprovider tests -q`。CUDA 用例需要可用 GPU；无设备测试会使用替身，因此通过不代表真机时序、实际执行误差或模型任务性能已验证。
 
