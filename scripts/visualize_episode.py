@@ -1,5 +1,5 @@
 """离线查看 Raw episode 的观测与点云，或输出数据概要。"""
-# Usage: python scripts/visualize_episode.py episodes/pnp_apple_banana/episode_20261101_165909
+# Usage: python scripts/visualize_episode.py episodes/TASK/episode_001
 # 已有 hoi.h5 时自动叠加物体点云；追加 --info 仅输出数据概要。
 
 from __future__ import annotations
@@ -95,7 +95,6 @@ class EpisodeVisualizer:
             self.timestamps_s = self.reader.timestamps_s
             self.has_hoi = (self.reader.path / "hoi.h5").is_file()
             if self.has_hoi:
-                self.reader.require_fields("object_pointcloud")
                 self.reader["object_pointcloud"]
                 self.hoi_valid = read_hoi_validity(self.reader)
 
@@ -121,8 +120,6 @@ class EpisodeVisualizer:
                 logger.warning("No camera extrinsics: camera point cloud disabled")
             self.pointcloud_processor = None
             self.empty_cloud_count = 0
-            self.pointcloud_processing_ns = 0
-            self.pointcloud_processed_frames = 0
             if pointcloud_config is not None and self.T_xarm_base_from_color is not None:
                 table_plane = load_table_plane(table_plane_path) if pointcloud_config.remove_table else None
                 self.pointcloud_processor = PointCloudProcessor(
@@ -286,20 +283,10 @@ class EpisodeVisualizer:
     def log_pointcloud(self, rgb: np.ndarray, depth: np.ndarray) -> None:
         if self.pointcloud_processor is None:
             return
-        started_ns = time.perf_counter_ns()
         cloud = self.pointcloud_processor.process(depth, rgb)
-        self.pointcloud_processing_ns += time.perf_counter_ns() - started_ns
-        self.pointcloud_processed_frames += 1
         if not len(cloud):
             self.empty_cloud_count += 1
         log_points("pcd", cloud)
-
-    @property
-    def mean_pointcloud_processing_ms(self) -> float | None:
-        """Mean cloud derivation time, excluding depth reads and viewer logging."""
-        if self.pointcloud_processed_frames == 0:
-            return None
-        return self.pointcloud_processing_ns / self.pointcloud_processed_frames / 1e6
 
     def close(self, error: BaseException | None = None) -> None:
         failure = error
@@ -389,12 +376,6 @@ def main(argv: list[str] | None = None) -> int:
                 logger.info("  frame %d/%d", step, viz.frame_count)
         if logged_frames != viz.frame_count:
             raise ValueError(f"RGB missing at frame {logged_frames}")
-        mean_pointcloud_ms = viz.mean_pointcloud_processing_ms
-        if mean_pointcloud_ms is not None:
-            logger.info(
-                "Point-cloud derivation average (excluding RGB-D I/O and rendering): %.2f ms/frame",
-                mean_pointcloud_ms,
-            )
         if viz.empty_cloud_count:
             logger.warning(
                 "%d point-cloud frames were empty and explicitly cleared",
