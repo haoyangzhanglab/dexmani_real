@@ -140,18 +140,20 @@ class Rollout:
             channels.hoi_request.write(episode_id=0, after_ns=ended_ns,
                                        after_sequence=channels.camera_ring.latest_sequence)
 
+    def snapshot_result(self) -> EpisodeResult:
+        """活动 Recorder 提供当前快照，释放后保留最后的完整结果。"""
+        if self.recorder is not None:
+            self.result.raw = self.recorder.result()
+        return self.result
+
     def finish_recording(self, *, wait=True) -> bool:
         """True 仅表示收尾完成；录制成败保留在本段 result 中。"""
         result = self.result
         if self.recorder is not None:
             recorder = self.recorder
-            if wait:
-                recorder.finish(save=not self.discard_requested, reason=result.termination_reason)
-            else:
-                recorder.request_finish(save=not self.discard_requested, reason=result.termination_reason)
-                if not recorder.poll_finish():
-                    return False
-            result.raw = recorder.result()
+            if not recorder.finish(save=not self.discard_requested, reason=result.termination_reason, wait=wait):
+                return False
+            self.snapshot_result()
             # 线程实际退出才释放 owner；失败结果及 staging 路径保留在 result。
             self.recorder = None
             if recorder.error is not None:

@@ -163,8 +163,8 @@ class PolicySession:
         write_yaml(payload, self.output_dir / "run_config.yaml")
 
     def save_results(self):
-        if self.episode is not None and self.episode.recorder is not None:
-            self.episode.result.raw = self.episode.recorder.result()
+        if self.episode is not None:
+            self.episode.snapshot_result()
         if self.output_dir is None:
             return
         payload = dict(self.summary, errors=self.errors,
@@ -632,9 +632,8 @@ class PolicySession:
             finally:
                 self.episodes.append(episode.result)
             self.finish_episode()
-            result = episode.result
-            raw = episode.recorder.result() if episode.recorder is not None else result.raw
-            level, text = format_recording_result(raw)
+            result = episode.snapshot_result()
+            level, text = format_recording_result(result.raw)
             status = "结束" if self.episode is None else "控制结束，资源收尾未完成"
             logger.info("第 %03d 段%s\nDuration: %.1f s\nEnd reason: %s\nDetails: %s\nSkipped slots: %d",
                         result.index, status, result.duration_s, result.termination_reason,

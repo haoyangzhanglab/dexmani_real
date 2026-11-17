@@ -143,12 +143,8 @@ class TeleopLoop:
         recorder = self.recorder
         if recorder is None:
             return True
-        if wait:
-            recorder.finish(save=not self.discard_requested, reason=self.pending_termination_reason)
-        else:
-            recorder.request_finish(save=not self.discard_requested, reason=self.pending_termination_reason)
-            if not recorder.poll_finish():
-                return False
+        if not recorder.finish(save=not self.discard_requested, reason=self.pending_termination_reason, wait=wait):
+            return False
         # 仅收尾完成后释放 owner；pending 或异常仍保留资源。
         self.recorder = None
         request = recorder.finish_request
