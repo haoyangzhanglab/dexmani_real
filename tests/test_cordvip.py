@@ -1085,28 +1085,6 @@ def test_fps_surface_is_fixed_and_improves_coverage():
     assert np.percentile(new, 95) < 0.8 * np.percentile(old, 95)
 
 
-@pytest.mark.parametrize("devices", [("arm",), ("arm", "hand")])
-def test_live_joint_history_matches_offline_interpolation(devices):
-    from collections import deque
-
-    from dexmani_real.robot.system import Robot
-
-    robot = Robot.__new__(Robot)
-    robot.enable_joint_history(0.35, devices=devices)
-    for name in devices:
-        n = 7 if name == "arm" else 12
-        robot.joint_history[name] = deque(
-            [(1_000_000_000, np.zeros(n)), (1_080_000_000, np.ones(n))]
-        )
-    aligned = robot.aligned_joints(1_020_000_000, 0.1)
-    assert set(aligned) == {name + "_qpos" for name in devices}
-    for positions in aligned.values():
-        np.testing.assert_allclose(positions, 0.25)
-    assert robot.aligned_joints(1_090_000_000, 0.1) is None
-    robot.enable_joint_history(0.35, devices=devices)
-    assert robot.aligned_joints(1_020_000_000, 0.1) is None
-
-
 @pytest.fixture
 def recovery_scene(monkeypatch):
     from cordvip_geometry import tracking
@@ -2730,11 +2708,13 @@ def test_multiple_moving_objects_share_one_batch_per_frame(recovery_scene, monke
 @pytest.mark.parametrize("info", [False, True])
 def test_visualizer_can_bypass_corrupt_hoi(annotated_episode, monkeypatch, info):
     import h5py
+
     from scripts import visualize_episode as visual
 
     episode, *_ = annotated_episode
     (episode / "hoi.h5").write_bytes(b"corrupt annotation")
     _disable_viewer(monkeypatch, visual)
+
     def unexpected_hoi(*args, **kwargs):
         raise AssertionError("Raw viewing must not consume HOI")
 
@@ -2768,6 +2748,7 @@ def _disable_viewer(monkeypatch, visual):
 
 def test_visualizer_reads_only_consumed_prefix(annotated_episode, monkeypatch):
     import h5py
+
     from scripts import visualize_episode as visual
 
     episode, *_ = annotated_episode
@@ -2803,6 +2784,7 @@ def test_visualizer_reads_only_consumed_prefix(annotated_episode, monkeypatch):
 @pytest.mark.parametrize("gap", [.08, .079999999])
 def test_scalar_alignment_matches_offline(devices, stamps, target, gap):
     from collections import deque
+
     from dexmani_real.robot.system import Robot
     from dexmani_real.utils.timing import interpolate_joints
 
@@ -2822,12 +2804,12 @@ def test_scalar_alignment_matches_offline(devices, stamps, target, gap):
         assert actual is None
     else:
         assert set(actual) == set(expected)
-        for key in expected:
-            np.testing.assert_allclose(actual[key], expected[key])
+        for key, values in expected.items():
+            np.testing.assert_allclose(actual[key], values)
             actual[key][:] = -999
         again = robot.aligned_joints(target, gap)
-        for key in expected:
-            np.testing.assert_allclose(again[key], expected[key])
+        for key, values in expected.items():
+            np.testing.assert_allclose(again[key], values)
     if "hand" in devices:
         robot.joint_history["hand"].clear()
         assert robot.aligned_joints(target, gap) is None
@@ -2838,6 +2820,7 @@ def test_scalar_alignment_matches_offline(devices, stamps, target, gap):
 @pytest.fixture
 def feedback_robot():
     from threading import Event
+
     from dexmani_real.robot.system import Robot
     from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
 
@@ -2861,7 +2844,7 @@ def feedback_robot():
 
 @pytest.mark.parametrize("fault", ["zero", "reverse", "conflict"])
 def test_joint_feedback_rejects_invalid_history(feedback_robot, fault):
-    robot, frame, feed = feedback_robot
+    robot, _, feed = feedback_robot
     feed(1_000_000_000)
     with pytest.raises(ValueError, match="timestamp|Conflicting"):
         feed(0 if fault == "zero" else 900_000_000 if fault == "reverse" else 1_000_000_000,

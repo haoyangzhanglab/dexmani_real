@@ -316,15 +316,14 @@ def test_hoi_loss_rejects_whole_raw(tmp_path, hoi_episodes, fields):
     root.store.close()
 
 
-@pytest.mark.parametrize("missing", ["object_valid"])
-def test_export_rejects_missing_hoi_validity(tmp_path, hoi_episodes, missing):
+def test_export_rejects_missing_hoi_validity(tmp_path, hoi_episodes):
     source, _, _ = hoi_episodes
     with h5py.File(source / "episode_0/hoi.h5", "r+") as data:
-        del data[f"{missing}"]
+        del data["object_valid"]
     output = tmp_path / "invalid.zarr"
     result = export_zarr(source, output, processing=ExportConfig(), fields=("object_pointcloud",))
     assert result["episode_count"] == 1
-    assert missing in result["rejected_episodes"][0]["reason"]
+    assert "object_valid" in result["rejected_episodes"][0]["reason"]
 
 
 def test_export_rejects_episode_with_no_valid_hoi_rows(tmp_path, hoi_episodes):
@@ -1140,9 +1139,8 @@ def test_hoi_object_valid_input_boundary(hoi_episodes, fault):
         elif fault != "missing":
             shape = (3, 1) if fault == "rows" else (4, 2) if fault == "objects" else (4, 1)
             data.create_dataset("object_valid", data=np.ones(shape, np.uint8 if fault == "dtype" else bool))
-    with RawReader(episode) as reader:
-        with pytest.raises((KeyError, ValueError), match="object_valid"):
-            read_hoi_validity(reader, stop=1)
+    with RawReader(episode) as reader, pytest.raises((KeyError, RawDataError), match="object_valid"):
+        read_hoi_validity(reader, stop=1)
 
 
 def test_prefix_reads_needed_right_neighbor_not_bad_tail(raw_episodes, monkeypatch):

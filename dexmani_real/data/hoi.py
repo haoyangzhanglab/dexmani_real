@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from dexmani_real.config.perception import HOI_NUM_POINTS
-from dexmani_real.data.raw import RawDataError
+from dexmani_real.data.raw import RawDataError, RawReader
 from dexmani_real.geometry.hoi import transform_task_points
 from dexmani_real.utils.io import publish
 from dexmani_real.utils.timing import interpolate_joints, validate_joint_gap
@@ -96,7 +96,10 @@ def write_hoi(
     return path
 
 
-def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand"), stop=None):
+def align_hoi_episode(
+    reader: RawReader, max_gap_s: float, *, devices: tuple[str, ...] = ("arm", "hand"),
+    stop: int | None = None,
+) -> dict[str, np.ndarray]:
     """对齐查看范围；必要时只向同一原生段内读取右邻点，无法对齐处保留 NaN。"""
     validate_joint_gap(max_gap_s)
     timing = reader.read_timing(stop=stop)
@@ -118,8 +121,8 @@ def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand"), stop=None):
             name, clock = f"{device}_qpos", f"{device}_ns"
             stamps = timing[clock][start:selected_end]
             values = reader[name][start:selected_end]
-            neighbors = []
-            index, stamp = selected_end - 1, stamps[-1]
+            neighbors: list[tuple[int, int]] = []
+            index, stamp = int(selected_end) - 1, int(stamps[-1])
             # 顺序查找尾部时钟，只保留各目标真正需要的邻点；长时间重复
             # 反馈或缺少右邻点时，也不加载整段尾部 qpos。
             for target in np.unique(targets[targets > stamp]):
@@ -132,7 +135,10 @@ def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand"), stop=None):
                         raise ValueError(f"Invalid HOI source timestamp: {clock}")
                 if stamp < target:
                     break
-                needed = ((index, stamp),) if stamp == target else ((left_index, left_stamp), (index, stamp))
+                needed = (
+                    ((index, stamp),) if stamp == target
+                    else ((left_index, left_stamp), (index, stamp))
+                )
                 for neighbor in needed:
                     if neighbor[0] >= selected_end and (not neighbors or neighbor[0] > neighbors[-1][0]):
                         neighbors.append(neighbor)
@@ -145,7 +151,7 @@ def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand"), stop=None):
     return joints
 
 
-def read_hoi_validity(reader, stop=None):
+def read_hoi_validity(reader: RawReader, stop: int | None = None) -> np.ndarray:
     """整帧有效性唯一来自所选范围内的逐物体有效性。"""
     import h5py
 
@@ -159,5 +165,5 @@ def read_hoi_validity(reader, stop=None):
         or objects.dtype != bool
         or objects.shape != (reader.num_frames, names.shape[0])
     ):
-        raise ValueError("Invalid HOI object_valid shape/dtype")
+        raise RawDataError("Invalid HOI object_valid shape/dtype")
     return objects[:stop].all(axis=1)
