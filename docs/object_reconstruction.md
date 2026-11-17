@@ -71,7 +71,7 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 
 可选诊断缺失或为 `None` 时保存 NaN 并显示缺口；实际状态判定所需指标仍由 tracker 校验。`mask_source=0` 表示纯深度检查，未计算的 mask 专属指标为 −1；`mask_age_frames` 记录距最近 SAM2 输入的真实相机来源序列差。两条路径均输出 `depth_coverage`；Mask 路径另外检查 Mask 和去遮挡后可见 CAD 的有效深度覆盖率。证据不足、遮挡超时及两帧恢复确认的定义见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)。
 
-无效对象的位姿为 NaN，缺失质量指标可为 NaN。只有全部对象有效时才生成模板点云，否则该帧物体点云全零。读取和写入都要求显式有效性，`object_valid` 与 `valid` 必须成对存在且一致；缺失时直接报错，不推断或迁移。
+无效对象的位姿为 NaN，缺失质量指标可为 NaN。只有全部对象有效时才生成模板点云，否则该帧物体点云全零。读取和写入都要求显式有效性，`object_valid` 与 `valid` 必须成对存在且一致；缺失或不一致时直接报错。
 
 导出必须显式指定 `--fields`；未选物体点云时不打开 HOI。选择物体点云后，缺少文件或必要数据、存在无效帧或无法完整对齐时整条 Raw 拒绝。每个原生连续段对应一个 Zarr episode，并保存一一对应的 `source_episodes` 和 `source_row_ranges`，不额外裁剪或切段。
 

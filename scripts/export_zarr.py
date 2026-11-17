@@ -14,7 +14,6 @@ from dexmani_real.data.export import (
     FIELD_INPUTS,
     ExportConfig,
     export_zarr,
-    resolve_fields,
 )
 from dexmani_real.utils.table_plane import load_table_plane
 
@@ -97,8 +96,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_path = (
         args.output if args.output is not None else default_output_path(args.input_root)
     )
-    fields = resolve_fields(args.fields)
-    processing = load_processing_config(args.config, fields)
+    processing = load_processing_config(args.config, args.fields)
     from dexmani_real.utils.log import configure_logging
 
     configure_logging()
@@ -112,12 +110,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.input_root,
             output_path,
             processing=processing,
-            fields=fields,
+            fields=args.fields,
             exclude=tuple(args.exclude),
             progress_callback=update_progress,
         )
-    print(f"{result['path']}: {result['source_count']} sources, {result['episode_count']} segments, {result['total_frames']} frames", file=sys.stderr)
-    print(f"Rejected {len(result['rejected_episodes'])}; explicitly excluded {len(result['excluded_episodes'])}.", file=sys.stderr)
+    print(
+        f"{result['path']}: {result['source_count']} sources, "
+        f"{result['episode_count']} segments, {result['total_frames']} frames",
+        file=sys.stderr,
+    )
+    print(
+        f"Rejected {len(result['rejected_episodes'])}; "
+        f"explicitly excluded {len(result['excluded_episodes'])}.", file=sys.stderr,
+    )
     return 0
 
 

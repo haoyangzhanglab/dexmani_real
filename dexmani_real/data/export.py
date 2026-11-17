@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import h5py
 import numpy as np
 import zarr
 
@@ -171,7 +172,7 @@ def iter_canonical_blocks(
     reader: RawReader,
     config: ExportConfig,
     *,
-    fields,
+    specs,
     arm_fk,
     hand_fk,
     hand_cloud,
@@ -179,8 +180,8 @@ def iter_canonical_blocks(
     alignment,
 ):
     frames = reader.num_frames
+    fields = specs.keys()
     inputs = {name for field in fields for name in FIELD_INPUTS[field]}
-    specs = canonical_array_specs(fields, config, camera)
     row_bytes = sum(int(np.prod(shape)) * dtype.itemsize for shape, dtype in specs.values())
     if "point_cloud" in fields and "depth" not in fields:
         # 点云逐帧计算，但原始深度仍按块读取；额外计入读取预算。
@@ -265,12 +266,13 @@ def iter_canonical_blocks(
             block[name] = np.broadcast_to(values, (count, values.size))
         if "depth" in fields:
             maps = camera["image_maps"]
-            if maps is None:
-                block["depth"] = raw["depth"]
-            else:
+            if maps is not None:
+                # 点云已消费原始 depth，现在可以复用独占块。
                 for index in range(count):
-                    raw["depth"][index] = remap_image(raw["depth"][index], maps, interpolation=cv2.INTER_NEAREST)
-                block["depth"] = raw["depth"]
+                    raw["depth"][index] = remap_image(
+                        raw["depth"][index], maps, interpolation=cv2.INTER_NEAREST,
+                    )
+            block["depth"] = raw["depth"]
         yield block
         del raw, block
     with raw_input():
@@ -312,14 +314,11 @@ def prepare_raw(reader, processing, fields):
         validate_task_label(reader.meta["task_label"])
         if reader.num_frames <= 0:
             raise RawDataError("episode contains no rows")
-        starts = reader.segment_starts
+        boundaries = np.r_[reader.segment_starts, reader.num_frames]
         timing = reader.read_timing()
         has_object = "object_pointcloud" in fields
         template = None
         if has_object:
-            reader["object_pointcloud"]
-            import h5py
-
             saved = reader.hoi_file["template"]
             if not isinstance(saved, h5py.Group) or any(
                 not isinstance(saved.get(key), h5py.Dataset)
@@ -345,8 +344,6 @@ def prepare_raw(reader, processing, fields):
             "object_pointcloud": "camera_ns",
         }
         clocks = {source_clocks[name] for name in inputs if name in source_clocks}
-        if has_object:
-            clocks.add("camera_ns")
         for clock in clocks:
             stamps = timing[clock]
             if (
@@ -365,7 +362,6 @@ def prepare_raw(reader, processing, fields):
                     continue
                 source = reader[name][:]
                 values = np.empty_like(source, dtype=np.float64)
-                boundaries = np.r_[starts, reader.num_frames]
                 for segment, (start, stop) in enumerate(zip(boundaries[:-1], boundaries[1:])):
                     aligned, valid = interpolate_joints(
                         timing[f"{device}_ns"][start:stop], source[start:stop],
@@ -376,18 +372,18 @@ def prepare_raw(reader, processing, fields):
                         raise RawDataError(f"{device}: unalignable row {row} in segment {segment}")
                     values[start:stop] = aligned
                 alignment[name] = values
-        return template, alignment, export_camera(reader, fields), np.r_[starts, reader.num_frames]
+        return template, alignment, export_camera(reader, fields), boundaries
 
 
 def export_zarr(
     input_root, output_path, *, processing, fields, exclude=(), progress_callback=None
 ):
-    selected_fields = resolve_fields(fields)
-    if "object_pointcloud" in selected_fields and set(selected_fields) & {
+    fields = resolve_fields(fields)
+    if "object_pointcloud" in fields and set(fields) & {
         "joint_state", "eef_pose", "fingertip_xyz", "hand_pointcloud",
     }:
         validate_joint_gap(processing.hoi_max_joint_gap_s)
-    if "point_cloud" in selected_fields:
+    if "point_cloud" in fields:
         processing.pointcloud.validate()
         if processing.pointcloud.remove_table:
             plane = np.asarray(processing.table_plane_abcd, dtype=float)
@@ -397,17 +393,17 @@ def export_zarr(
                 or np.linalg.norm(plane[:3]) == 0
             ):
                 raise ValueError("remove_table=True requires a finite calibrated table plane")
-    if "hand_pointcloud" in selected_fields:
+    if "hand_pointcloud" in fields:
         processing.hand_pointcloud.validate()
     target = Path(output_path).expanduser().absolute()
     if os.path.lexists(target):
         raise FileExistsError(target)
     selected, excluded = select_episodes(input_root, exclude)
-    arm_fk = ArmFK() if ARM_FK_FIELDS.intersection(selected_fields) else None
-    hand_fk = HandFK() if HAND_FK_FIELDS.intersection(selected_fields) else None
+    arm_fk = ArmFK() if ARM_FK_FIELDS.intersection(fields) else None
+    hand_fk = HandFK() if HAND_FK_FIELDS.intersection(fields) else None
     hand_cloud = (
         HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
-        if "hand_pointcloud" in selected_fields
+        if "hand_pointcloud" in fields
         else None
     )
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -426,30 +422,36 @@ def export_zarr(
                     require_published_raw(episode)
                     reader = RawReader(episode)
                 with reader:
-                    template, alignment, camera, boundaries = prepare_raw(reader, processing, selected_fields)
-                    names = selected_fields
+                    template, alignment, camera, boundaries = prepare_raw(reader, processing, fields)
+                    specs = canonical_array_specs(fields, processing, camera)
                     with raw_input():
                         hz = reader.control_hz
                     if root is None:
                         root, arrays = create_store(
                             zarr.DirectoryStore(str(staging)), processing, camera,
-                            fields=names, control_hz=hz, task_name=reader.meta["task_label"],
+                            specs=specs, control_hz=hz, task_name=reader.meta["task_label"],
                             hand_cloud=hand_cloud,
                         )
                     else:
-                        if reader.meta["task_label"] != root.attrs["task_name"] or not np.isclose(1 / hz, root.attrs["dt"], rtol=1e-6, atol=0):
+                        if reader.meta["task_label"] != root.attrs["task_name"] or not np.isclose(
+                            1 / hz, root.attrs["dt"], rtol=1e-6, atol=0,
+                        ):
                             raise RawDataError("task_label or dt mismatch")
-                        if "depth" in names and not depth_scales_match(camera["depth_scale_m"], root.attrs["depth_scale_m_per_unit"]):
+                        if "depth" in fields and not depth_scales_match(
+                            camera["depth_scale_m"], root.attrs["depth_scale_m_per_unit"],
+                        ):
                             raise RawDataError("depth_scale_m_per_unit must be uniform")
-                        specs = canonical_array_specs(names, processing, camera)
                         if any(arrays[name].shape[1:] != shape for name, (shape, _) in specs.items()):
                             raise RawDataError("inconsistent field shape")
                     blocks = iter_canonical_blocks(
-                        reader, processing, fields=names, arm_fk=arm_fk, hand_fk=hand_fk,
+                        reader, processing, specs=specs, arm_fk=arm_fk, hand_fk=hand_fk,
                         hand_cloud=hand_cloud, camera=camera, alignment=alignment,
                     )
                     append_rows(arrays, offset, blocks, reader.num_frames)
-                    digest = geometry_digest(template["points_local"], template["offsets"]) if template is not None else None
+                    digest = (
+                        geometry_digest(template["points_local"], template["offsets"])
+                        if template is not None else None
+                    )
                 # 整条输入与关闭成功后才提交来源、段边界及摘要。
                 ends.extend((offset + boundaries[1:]).tolist())
                 sources.extend([episode.name] * (len(boundaries) - 1))
@@ -473,7 +475,7 @@ def export_zarr(
             raise ValueError(f"all Raw episodes rejected: {rejected}")
         root.attrs["source_episodes"] = sources
         root.attrs["source_row_ranges"] = ranges
-        if "object_pointcloud" in selected_fields:
+        if "object_pointcloud" in fields:
             metadata = root.attrs["data_processing"]
             metadata["object_pointcloud"]["geometry_sha256"] = shared_geometry
             root.attrs["data_processing"] = metadata
@@ -496,8 +498,8 @@ def export_zarr(
             logger.exception("export staging cleanup also failed: %s", staging)
 
 
-def create_store(store, processing, camera, *, fields, control_hz, task_name, hand_cloud):
-    specs = canonical_array_specs(fields, processing, camera)
+def create_store(store, processing, camera, *, specs, control_hz, task_name, hand_cloud):
+    fields = specs.keys()
     root = zarr.group(store=store, overwrite=True)
     root.attrs.update(
         format=CANONICAL_FORMAT,
@@ -546,15 +548,12 @@ def create_store(store, processing, camera, *, fields, control_hz, task_name, ha
 
 
 def append_rows(arrays, offset, blocks, frames):
+    """追加内部生成的块，检查转换后的有限性；写盘错误直接传播。"""
     for array in arrays.values():
         array.resize((offset + frames, *array.shape[1:]))
     count = 0
     for block in blocks:
-        if not block or block.keys() != arrays.keys():
-            raise ValueError("canonical block must contain exactly the selected fields")
         rows = len(next(iter(block.values())))
-        if any(len(values) != rows for values in block.values()):
-            raise ValueError("canonical fields must have equal row counts")
         for name, values in block.items():
             if np.issubdtype(values.dtype, np.floating):
                 valid = np.isfinite(values).reshape(rows, -1).all(axis=1)
@@ -565,8 +564,6 @@ def append_rows(arrays, offset, blocks, frames):
         count += rows
         # 同步写入完成后释放消费者引用，避免与下一块分配重叠。
         del block, values
-    if count != frames:
-        raise ValueError(f"canonical row count mismatch: expected {frames}, wrote {count}")
 
 
 def select_episodes(source, exclude):

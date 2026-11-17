@@ -73,7 +73,7 @@ HOI 标注独立保存在 `episode/hoi.h5`，默认跳过已有标注，使用 `
 
 `data_processing` 是研究记录，普通训练、恢复和部署不要求它相等或存在。`geometry_sha256` 标识有序局部点及 offsets 的数值身份；混合合法几何时公共摘要为 null。只有开启 contact loss 的固定 1024 槽预训练及完整续训要求明确且一致的共享身份。部署分别保存 `training_processing` 与 `actual_processing`，缺少记录为 None。
 
-本次直接采用新格式，不提供旧内嵌 HOI、旧来源缺失数据或模板摘要的迁移与兼容；不会自动改写或清理已有实验文件。
+Raw 以整个 episode 目录为单位使用：`data.h5` 保存采集数据，`rgb.mp4` 保存图像，`hoi.h5` 保存可选标注。读取时不寻找其他位置的附件。
 
 ## 核心模块
 
@@ -101,7 +101,7 @@ HOI 标注独立保存在 `episode/hoi.h5`，默认跳过已有标注，使用 `
 | 改模型观测 | `runtime/observation.py` 读取并检查来源 → `ObservationBuilder` 组装模型历史；字段依赖在 `FIELD_DEPENDENCIES` 声明 |
 | 改训练数据 | `RawReader` 按需读取并校验输入 → `export.py` 分块派生 → 完整产物发布；失败录制由 `EpisodeRecorder` 向运行层报告 |
 
-直接从 Python 启动策略使用 `PolicySession(runtime, checkpoint, record_raw=True).run()`（从 `dexmani_real.deployment.session` 导入）。原 `deployment.run.run_policy` 转发入口已移除；其 `output` 参数在会话入口名为 `output_root`，命令行参数保持不变。
+直接从 Python 启动策略使用 `PolicySession(runtime, checkpoint, record_raw=True).run()`（从 `dexmani_real.deployment.session` 导入）。输出路径通过 `output_root` 指定。
 
 主进程持有会话与 XHand I/O；机械臂 SDK、相机、VR 与启用的感知任务运行在子进程；策略推理和录制各有自己的工作线程。设备 SDK 留在驱动层，动作映射只生成目标，实际发送归 `Robot`。新增实验优先修改配置和对应流程，独立算法放入现有几何或感知模块。
 
