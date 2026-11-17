@@ -2703,6 +2703,7 @@ def test_visualizer_can_bypass_corrupt_hoi(annotated_episode, monkeypatch, info)
     episode, *_ = annotated_episode
     (episode / "hoi.h5").write_bytes(b"corrupt annotation")
     _disable_viewer(monkeypatch, visual)
+    monkeypatch.setattr("dexmani_real.utils.log.configure_logging", lambda: None)
 
     def unexpected_hoi(*args, **kwargs):
         raise AssertionError("Raw viewing must not consume HOI")

@@ -33,14 +33,16 @@ class IKResult:
 
 
 class IKSolver:
-    def __init__(self, constraints, *, target_speed, max_lead, device_speed):
+    def __init__(self, arm, environment, *, target_speed, max_lead, device_speed):
         if not all(
             np.isfinite(v) and v > 0 for v in (target_speed, max_lead, device_speed)
         ):
             raise ValueError("IK speed and lead must be finite and positive")
-        self.constraints = constraints
         self.speed, self.lead = min(target_speed, device_speed), max_lead
-        self.limits = constraints.limits
+        self.limits = np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper))
+        self.workspace = environment.workspace.as_array()
+        tolerance = environment.eef_workspace_tolerance_m
+        self.workspace_with_tolerance = self.workspace + (-tolerance, tolerance)
         self.fk = ArmFK()
         model = self.fk.model
         model_limits = np.column_stack(
@@ -161,5 +163,8 @@ class IKSolver:
         if final @ final > initial_cost + OBJECTIVE_ROUNDOFF * max(1.0, initial_cost):
             raise RuntimeError("IK objective increased")
         pose = self.compute_eef_pose_base(q)
-        reason = self.constraints.endpoint_rejection(position=pose.p)
-        return IKResult(qpos=q.copy() if reason is None else None, reason=reason or "")
+        if np.any(pose.p < self.workspace_with_tolerance[:, 0]) or np.any(
+            pose.p > self.workspace_with_tolerance[:, 1]
+        ):
+            return IKResult(qpos=None, reason="final_eef_workspace")
+        return IKResult(qpos=q.copy())

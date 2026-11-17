@@ -5,7 +5,6 @@ import time
 
 import numpy as np
 
-from dexmani_real.control.constraints import MotionConstraints
 from dexmani_real.control.ik import IKSolver
 from dexmani_real.robot.commands import OperationCancelled, RobotCommand
 from dexmani_real.robot.system import Robot
@@ -77,9 +76,8 @@ class KeyboardTeleop:
         )
 
     def start(self):
-        constraints = MotionConstraints(self.runtime.arm, self.runtime.environment)
         solver = IKSolver(
-            constraints,
+            self.runtime.arm, self.runtime.environment,
             target_speed=np.deg2rad(self.runtime.motion.ik_target_speed_deg_s),
             device_speed=self.runtime.arm.max_joint_velocity_rad_per_s,
             max_lead=np.deg2rad(self.runtime.motion.ik_max_lead_deg),

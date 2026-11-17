@@ -3,7 +3,6 @@
 from scipy.spatial.transform import Rotation
 
 from dexmani_real.control.actions import ActionResult, StartPoseRejected
-from dexmani_real.control.constraints import workspace_start_rejection
 from dexmani_real.geometry.pose import (
     WXYZ_TO_XYZW,
     XYZW_TO_WXYZ,
@@ -30,10 +29,9 @@ class VRController:
         self.clear()
         arm_qpos = self.action_mapper.solver.measured_reference(row.arm["qpos"][0])
         pose = self.action_mapper.solver.compute_eef_pose_base(arm_qpos)
-        workspace = self.action_mapper.solver.constraints.workspace
-        reason = workspace_start_rejection(pose.p, workspace[:, 0] - 1e-9, workspace[:, 1] + 1e-9)
-        if reason is not None:
-            raise StartPoseRejected(reason)
+        workspace = self.action_mapper.solver.workspace
+        if (pose.p < workspace[:, 0] - 1e-9).any() or (pose.p > workspace[:, 1] + 1e-9).any():
+            raise StartPoseRejected("实测末端超出允许的起点范围；请手动就位或调整范围后重试")
         eef_rotation = Rotation.from_quat(pose.q[WXYZ_TO_XYZW])
         wrist_rotation = Rotation.from_quat(row.vr["wrist_quat_wxyz"][WXYZ_TO_XYZW])
         # R_target = A W (A W0)^-1 E0，初始腕姿态映射到实测 EEF 姿态。

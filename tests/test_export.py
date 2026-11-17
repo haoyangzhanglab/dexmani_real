@@ -1060,6 +1060,31 @@ def test_joint_alignment_never_crosses_native_gap(tmp_path, hoi_episodes):
     assert "row 2 in segment 1" in result["rejected_episodes"][0]["reason"]
 
 
+def test_joint_alignment_reads_one_native_segment_at_a_time(tmp_path, hoi_episodes, monkeypatch):
+    source, states, _ = hoi_episodes
+    episode = source / "episode_0"
+    with h5py.File(episode / "data.h5", "r+") as data:
+        del data["timing/segment_starts"]
+        data.create_dataset("timing/segment_starts", data=[0, 2])
+    reads = {"/arm_qpos": [], "/hand_qpos": []}
+    getitem = h5py.Dataset.__getitem__
+
+    def read(dataset, key, *args, **kwargs):
+        if dataset.name in reads:
+            reads[dataset.name].append(key)
+        return getitem(dataset, key, *args, **kwargs)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
+    result = export_zarr(episode, tmp_path / "segments.zarr", processing=ExportConfig(),
+                         fields=("joint_state", "object_pointcloud"))
+    assert not result["rejected_episodes"]
+    assert result["source_count"] == 1 and result["episode_count"] == 2
+    assert reads == {name: [slice(0, 2), slice(2, 4)] for name in reads}
+    root = zarr.open_group(result["path"], mode="r")
+    np.testing.assert_array_equal(root["data/joint_state"][:], states[:4].astype("f4"))
+    np.testing.assert_array_equal(root["meta/episode_ends"][:], [2, 4])
+
+
 def test_rejected_first_source_does_not_set_baselines(tmp_path, complete_episodes, hoi_episodes, monkeypatch):
     from dexmani_real.geometry.hoi import geometry_digest
 

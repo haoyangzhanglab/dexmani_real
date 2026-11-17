@@ -217,17 +217,19 @@ class Rollout:
             self.robot.check()
         return valid
 
-    def read_observations(self) -> tuple[Observation, Observation]:
+    def read_observations(self, *, images=True) -> tuple[Observation, Observation]:
         """共享关节采样；派生模型图像同源，Raw 独立取最新相机帧。"""
         row = read_observation(
             self.sensors.channels,
             self.robot,
-            needs=self.read_needs,
+            needs=self.read_needs if images else replace(self.read_needs, camera_fields=()),
             joint_gap_s=self.execution.hoi_max_joint_gap_s,
         )
         raw = row
         if self.record_raw and (self.observations.needs.hoi or self.observations.needs.point_cloud):
-            camera = read_camera_frame(self.sensors.channels, fields=self.record_needs.camera_fields)
+            camera = read_camera_frame(
+                self.sensors.channels, fields=self.record_needs.camera_fields if images else (),
+            )
             raw = replace(row, camera=camera, hoi=None, observation_timestamp_ns=time.monotonic_ns())
         return row, raw
 
@@ -446,8 +448,8 @@ class Rollout:
             self.robot.check()
             raise OperationCancelled("operation cancelled")
 
-    def sample_observation(self) -> tuple[Observation, Observation]:
-        row, raw = self.read_observations()
+    def sample_observation(self, *, images=True) -> tuple[Observation, Observation]:
+        row, raw = self.read_observations(images=images)
         devices = check_device_feedback(row, self.runtime)
         if devices:
             raise FeedbackUnavailable("device feedback: " + "; ".join(devices))
@@ -580,7 +582,8 @@ class Rollout:
             self._refresh_hoi_hold()
         if self.state == "HOI_HOLD":
             # 即使旧推理未完成，也不能掩盖设备或其他输入故障。
-            row, raw = self.sample_observation()
+            # 暂停不构建模型历史或追加 Raw，读取来源元数据即可检查图像时效。
+            row, raw = self.sample_observation(images=False)
             quality_issue = self.recording_issue(raw) if self.recorder is not None else None
             if quality_issue is not None:
                 self.stop(quality_issue)

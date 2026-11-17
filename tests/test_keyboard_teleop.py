@@ -51,7 +51,7 @@ def test_jog_from_outside_only_accepts_legal_ik_endpoint(outside_m, accepted):
     assert (result.qpos is not None) == accepted
     if accepted:
         endpoint = mapper.solver.compute_eef_pose_base(result.qpos).p
-        assert mapper.solver.constraints.endpoint_rejection(position=endpoint) is None
+        assert np.all(endpoint >= bounds[:, 0]) and np.all(endpoint <= bounds[:, 1])
         assert np.all(np.abs(result.qpos - measured) <= mapper.solver.speed / runtime.keyboard_teleop.control_hz)
         assert np.all(np.abs(result.qpos - measured) <= mapper.solver.lead)
     else:
