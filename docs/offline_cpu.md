@@ -42,6 +42,13 @@ python -m pip install --build-constraint requirements-build.txt \
   --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-cpu.txt
 python -m pip check
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
+
+python -m pytest -p no:cacheprovider -q -ra \
+  tests/test_cordvip.py::test_worker_backend_failure_exits_without_invalid_frame \
+  tests/test_cordvip.py::test_refinement_failure_propagates_without_retry \
+  tests/test_cordvip.py::test_initial_backend_failure_propagates \
+  tests/test_cordvip.py::test_tracking_backend_failure_propagates
+
 python -m pytest -p no:cacheprovider -q -ra \
   tests/test_hand_retargeting.py tests/test_hand_retargeting_preview.py \
   tests/test_hand_cloud.py tests/test_export.py tests/test_raw_metadata.py \
@@ -52,6 +59,8 @@ python -m pytest -p no:cacheprovider -q -ra \
 ```
 
 `requirements-cpu.txt` 明确使用 `+cpu` wheels，不安装 CUDA Torch。配套 Policy 直接安装固定 Git 提交，不读取旁边可能正在修改的工作区。跨仓流水线在临时目录生成小型 Raw、Zarr、训练/恢复 checkpoint，再执行真实 CPU 推理，无需下载预训练权重。
+
+CORDVIP 四组回归使用 Fake 后端，验证 `RuntimeError` 和 `torch.cuda.OutOfMemoryError` 原样传播，不重试、不额外发布 HOI 帧。Worker 测试直接调用函数；CUDA OOM 仅作为异常类型使用，无需 GPU 或模型权重。
 
 Ruckig 0.17.3 的源码包使用旧的 `cmake.targets` 构建配置，构建约束将 scikit-build-core 限制在 0.10 之前；约束只作用于隔离构建，不改变运行时依赖。
 

@@ -41,6 +41,13 @@ jobs:
         run: |
           python -m pip install --build-constraint requirements-build.txt --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-cpu.txt
           python -m pip check
+      - name: CORDVIP backend failure propagation
+        run: >-
+          python -m pytest -p no:cacheprovider -q -ra
+          tests/test_cordvip.py::test_worker_backend_failure_exits_without_invalid_frame
+          tests/test_cordvip.py::test_refinement_failure_propagates_without_retry
+          tests/test_cordvip.py::test_initial_backend_failure_propagates
+          tests/test_cordvip.py::test_tracking_backend_failure_propagates
       - name: Numerical, file and lifecycle regression
         run: >-
           python -m pytest -p no:cacheprovider -q -ra
