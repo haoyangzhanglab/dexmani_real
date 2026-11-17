@@ -1,0 +1,1820 @@
+{
+  "input_sha256": "a5e256f16fe1b6dd07300da8ba220f3a7c3f20e0f147acc1746c4c16c357dcae",
+  "warmup_replays": 2,
+  "threads": 1,
+  "runs": {
+    "baseline": [
+      {
+        "revision": null,
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 864.8555,
+          "p95": 1152.3355000000001
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 160.4595,
+            "p95": 165.534
+          },
+          "objective_construction_us": {
+            "p50": 5.18,
+            "p95": 5.41
+          },
+          "fk_us": {
+            "p50": 8.747,
+            "p95": 9.067
+          },
+          "fk_jacobian_us": {
+            "p50": 28.673,
+            "p95": 29.59525
+          },
+          "objective_gradient_us": {
+            "p50": 65.0365,
+            "p95": 81.307
+          },
+          "objective_value_us": {
+            "p50": 31.489,
+            "p95": 41.212
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262617,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.7450988611543803,
+          "p95": 3.830168436021758
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.15822992362289,
+          "p95": 5.181669545938871
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": null,
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 867.039,
+          "p95": 1152.96125
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 163.295,
+            "p95": 167.6255
+          },
+          "objective_construction_us": {
+            "p50": 5.34,
+            "p95": 5.52
+          },
+          "fk_us": {
+            "p50": 8.8665,
+            "p95": 9.127
+          },
+          "fk_jacobian_us": {
+            "p50": 28.713,
+            "p95": 29.535249999999998
+          },
+          "objective_gradient_us": {
+            "p50": 65.4625,
+            "p95": 81.39699999999999
+          },
+          "objective_value_us": {
+            "p50": 31.719,
+            "p95": 41.3795
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262617,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.7450988611543803,
+          "p95": 3.830168436021758
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.15822992362289,
+          "p95": 5.181669545938871
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": null,
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 863.7529999999999,
+          "p95": 1141.29725
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 161.302,
+            "p95": 165.77225
+          },
+          "objective_construction_us": {
+            "p50": 5.325,
+            "p95": 5.50325
+          },
+          "fk_us": {
+            "p50": 8.847,
+            "p95": 9.0895
+          },
+          "fk_jacobian_us": {
+            "p50": 28.914,
+            "p95": 29.81775
+          },
+          "objective_gradient_us": {
+            "p50": 65.292,
+            "p95": 81.13175000000001
+          },
+          "objective_value_us": {
+            "p50": 31.363500000000002,
+            "p95": 41.0295
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262617,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.7450988611543803,
+          "p95": 3.830168436021758
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.15822992362289,
+          "p95": 5.181669545938871
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": null,
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 861.1935,
+          "p95": 1142.384
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 161.136,
+            "p95": 165.58
+          },
+          "objective_construction_us": {
+            "p50": 5.36,
+            "p95": 5.6
+          },
+          "fk_us": {
+            "p50": 8.666,
+            "p95": 8.9595
+          },
+          "fk_jacobian_us": {
+            "p50": 28.634,
+            "p95": 31.5215
+          },
+          "objective_gradient_us": {
+            "p50": 64.741,
+            "p95": 80.976
+          },
+          "objective_value_us": {
+            "p50": 31.3485,
+            "p95": 41.049499999999995
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262617,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.7450988611543803,
+          "p95": 3.830168436021758
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.15822992362289,
+          "p95": 5.181669545938871
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": null,
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 858.899,
+          "p95": 1170.9765
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 160.55450000000002,
+            "p95": 193.7145
+          },
+          "objective_construction_us": {
+            "p50": 5.229,
+            "p95": 6.21125
+          },
+          "fk_us": {
+            "p50": 8.756,
+            "p95": 9.75625
+          },
+          "fk_jacobian_us": {
+            "p50": 28.643,
+            "p95": 35.4585
+          },
+          "objective_gradient_us": {
+            "p50": 65.372,
+            "p95": 86.34325
+          },
+          "objective_value_us": {
+            "p50": 31.479,
+            "p95": 41.52725
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262617,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.7450988611543803,
+          "p95": 3.830168436021758
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.15822992362289,
+          "p95": 5.181669545938871
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": null,
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 870.7615,
+          "p95": 1152.99575
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 164.562,
+            "p95": 169.96550000000002
+          },
+          "objective_construction_us": {
+            "p50": 5.411,
+            "p95": 5.62
+          },
+          "fk_us": {
+            "p50": 8.917,
+            "p95": 9.257249999999999
+          },
+          "fk_jacobian_us": {
+            "p50": 29.014499999999998,
+            "p95": 31.856749999999998
+          },
+          "objective_gradient_us": {
+            "p50": 66.30850000000001,
+            "p95": 82.8375
+          },
+          "objective_value_us": {
+            "p50": 32.02,
+            "p95": 41.821250000000006
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262617,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.7450988611543803,
+          "p95": 3.830168436021758
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.15822992362289,
+          "p95": 5.181669545938871
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": null,
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 877.2935,
+          "p95": 1157.75475
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 164.34199999999998,
+            "p95": 171.365
+          },
+          "objective_construction_us": {
+            "p50": 5.4,
+            "p95": 5.701
+          },
+          "fk_us": {
+            "p50": 8.917,
+            "p95": 9.29775
+          },
+          "fk_jacobian_us": {
+            "p50": 29.014,
+            "p95": 31.869999999999997
+          },
+          "objective_gradient_us": {
+            "p50": 66.12899999999999,
+            "p95": 83.93625
+          },
+          "objective_value_us": {
+            "p50": 31.89,
+            "p95": 41.843
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262617,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.7450988611543803,
+          "p95": 3.830168436021758
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.15822992362289,
+          "p95": 5.181669545938871
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": null,
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 864.1234999999999,
+          "p95": 1168.28925
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 161.20600000000002,
+            "p95": 180.51725
+          },
+          "objective_construction_us": {
+            "p50": 5.29,
+            "p95": 6.778
+          },
+          "fk_us": {
+            "p50": 8.827,
+            "p95": 10.043249999999999
+          },
+          "fk_jacobian_us": {
+            "p50": 28.5535,
+            "p95": 35.3405
+          },
+          "objective_gradient_us": {
+            "p50": 65.5475,
+            "p95": 84.88900000000001
+          },
+          "objective_value_us": {
+            "p50": 31.519,
+            "p95": 41.916250000000005
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262617,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.7450988611543803,
+          "p95": 3.830168436021758
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.15822992362289,
+          "p95": 5.181669545938871
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": null,
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 929.4655,
+          "p95": 1307.55475
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 162.794,
+            "p95": 167.9255
+          },
+          "objective_construction_us": {
+            "p50": 5.4,
+            "p95": 5.63325
+          },
+          "fk_us": {
+            "p50": 8.816,
+            "p95": 9.107
+          },
+          "fk_jacobian_us": {
+            "p50": 29.004,
+            "p95": 30.086750000000002
+          },
+          "objective_gradient_us": {
+            "p50": 65.9785,
+            "p95": 82.02625
+          },
+          "objective_value_us": {
+            "p50": 31.674,
+            "p95": 41.4595
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262617,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.7450988611543803,
+          "p95": 3.830168436021758
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.15822992362289,
+          "p95": 5.181669545938871
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": null,
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 873.3615,
+          "p95": 1159.94875
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 162.75900000000001,
+            "p95": 167.783
+          },
+          "objective_construction_us": {
+            "p50": 5.39,
+            "p95": 5.593500000000001
+          },
+          "fk_us": {
+            "p50": 9.087,
+            "p95": 9.358
+          },
+          "fk_jacobian_us": {
+            "p50": 29.535,
+            "p95": 30.79525
+          },
+          "objective_gradient_us": {
+            "p50": 66.118,
+            "p95": 82.6665
+          },
+          "objective_value_us": {
+            "p50": 31.84,
+            "p95": 41.648
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262617,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.7450988611543803,
+          "p95": 3.830168436021758
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.15822992362289,
+          "p95": 5.181669545938871
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      }
+    ],
+    "candidate": [
+      {
+        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 801.988,
+          "p95": 1050.239
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 163.6255,
+            "p95": 168.47424999999998
+          },
+          "objective_construction_us": {
+            "p50": 5.5,
+            "p95": 5.79825
+          },
+          "fk_us": {
+            "p50": 8.8115,
+            "p95": 9.1295
+          },
+          "fk_jacobian_us": {
+            "p50": 28.794,
+            "p95": 30.61975
+          },
+          "objective_gradient_us": {
+            "p50": 59.6115,
+            "p95": 74.50425
+          },
+          "objective_value_us": {
+            "p50": 24.436,
+            "p95": 31.965
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262306,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.745098861154583,
+          "p95": 3.8301684359956676
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.1582299236229074,
+          "p95": 5.181669545939415
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 809.3720000000001,
+          "p95": 1058.01925
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 164.452,
+            "p95": 170.10525
+          },
+          "objective_construction_us": {
+            "p50": 5.53,
+            "p95": 5.761
+          },
+          "fk_us": {
+            "p50": 9.036,
+            "p95": 9.367
+          },
+          "fk_jacobian_us": {
+            "p50": 29.355,
+            "p95": 30.42125
+          },
+          "objective_gradient_us": {
+            "p50": 60.317,
+            "p95": 74.97575
+          },
+          "objective_value_us": {
+            "p50": 24.857,
+            "p95": 32.2225
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262306,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.745098861154583,
+          "p95": 3.8301684359956676
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.1582299236229074,
+          "p95": 5.181669545939415
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 801.512,
+          "p95": 1052.93375
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 161.9275,
+            "p95": 166.9145
+          },
+          "objective_construction_us": {
+            "p50": 5.41,
+            "p95": 5.581
+          },
+          "fk_us": {
+            "p50": 8.836,
+            "p95": 9.087
+          },
+          "fk_jacobian_us": {
+            "p50": 29.164,
+            "p95": 30.57025
+          },
+          "objective_gradient_us": {
+            "p50": 60.082,
+            "p95": 75.13
+          },
+          "objective_value_us": {
+            "p50": 24.525,
+            "p95": 32.085
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262306,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.745098861154583,
+          "p95": 3.8301684359956676
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.1582299236229074,
+          "p95": 5.181669545939415
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 806.832,
+          "p95": 1057.03925
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 163.846,
+            "p95": 168.89775
+          },
+          "objective_construction_us": {
+            "p50": 5.5,
+            "p95": 5.73325
+          },
+          "fk_us": {
+            "p50": 9.157,
+            "p95": 9.488
+          },
+          "fk_jacobian_us": {
+            "p50": 29.1145,
+            "p95": 30.28625
+          },
+          "objective_gradient_us": {
+            "p50": 60.303,
+            "p95": 75.3735
+          },
+          "objective_value_us": {
+            "p50": 24.5905,
+            "p95": 32.16
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262306,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.745098861154583,
+          "p95": 3.8301684359956676
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.1582299236229074,
+          "p95": 5.181669545939415
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 802.383,
+          "p95": 1061.02725
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 162.57299999999998,
+            "p95": 183.37975
+          },
+          "objective_construction_us": {
+            "p50": 5.44,
+            "p95": 7.1205
+          },
+          "fk_us": {
+            "p50": 8.816,
+            "p95": 9.613
+          },
+          "fk_jacobian_us": {
+            "p50": 28.804,
+            "p95": 34.49925
+          },
+          "objective_gradient_us": {
+            "p50": 61.5145,
+            "p95": 79.769
+          },
+          "objective_value_us": {
+            "p50": 25.086,
+            "p95": 32.7935
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262306,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.745098861154583,
+          "p95": 3.8301684359956676
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.1582299236229074,
+          "p95": 5.181669545939415
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 828.7729999999999,
+          "p95": 1132.8835
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 161.68200000000002,
+            "p95": 169.34125
+          },
+          "objective_construction_us": {
+            "p50": 5.36,
+            "p95": 5.851
+          },
+          "fk_us": {
+            "p50": 8.777,
+            "p95": 9.192
+          },
+          "fk_jacobian_us": {
+            "p50": 28.5585,
+            "p95": 31.113
+          },
+          "objective_gradient_us": {
+            "p50": 59.631,
+            "p95": 76.022
+          },
+          "objective_value_us": {
+            "p50": 24.435,
+            "p95": 32.03725
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262306,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.745098861154583,
+          "p95": 3.8301684359956676
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.1582299236229074,
+          "p95": 5.181669545939415
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 814.321,
+          "p95": 1064.87675
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 164.397,
+            "p95": 170.32825
+          },
+          "objective_construction_us": {
+            "p50": 5.48,
+            "p95": 5.761
+          },
+          "fk_us": {
+            "p50": 8.9415,
+            "p95": 9.227
+          },
+          "fk_jacobian_us": {
+            "p50": 29.0995,
+            "p95": 30.472250000000003
+          },
+          "objective_gradient_us": {
+            "p50": 60.643,
+            "p95": 76.05975000000001
+          },
+          "objective_value_us": {
+            "p50": 25.027,
+            "p95": 32.656000000000006
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262306,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.745098861154583,
+          "p95": 3.8301684359956676
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.1582299236229074,
+          "p95": 5.181669545939415
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 798.4010000000001,
+          "p95": 1085.883
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 161.537,
+            "p95": 168.75775000000002
+          },
+          "objective_construction_us": {
+            "p50": 5.37,
+            "p95": 6.0185
+          },
+          "fk_us": {
+            "p50": 8.746,
+            "p95": 9.187
+          },
+          "fk_jacobian_us": {
+            "p50": 28.579,
+            "p95": 31.5815
+          },
+          "objective_gradient_us": {
+            "p50": 59.516000000000005,
+            "p95": 75.33525
+          },
+          "objective_value_us": {
+            "p50": 24.476,
+            "p95": 31.99175
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262306,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.745098861154583,
+          "p95": 3.8301684359956676
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.1582299236229074,
+          "p95": 5.181669545939415
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 801.572,
+          "p95": 1055.6065
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 161.3865,
+            "p95": 167.012
+          },
+          "objective_construction_us": {
+            "p50": 5.37,
+            "p95": 5.67275
+          },
+          "fk_us": {
+            "p50": 8.716,
+            "p95": 9.019499999999999
+          },
+          "fk_jacobian_us": {
+            "p50": 28.473,
+            "p95": 29.72025
+          },
+          "objective_gradient_us": {
+            "p50": 59.0655,
+            "p95": 74.19325
+          },
+          "objective_value_us": {
+            "p50": 24.2405,
+            "p95": 31.79425
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262306,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.745098861154583,
+          "p95": 3.8301684359956676
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.1582299236229074,
+          "p95": 5.181669545939415
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      },
+      {
+        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
+        "source_sha256": {
+          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
+          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
+          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
+          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
+        },
+        "config": {
+          "calibration_samples": 25,
+          "calibration_timeout_s": 5.0,
+          "calibration_max_relative_mad": 0.1,
+          "bone_length_tolerance": 0.35,
+          "huber_delta_m": 0.02,
+          "shape_weight": 0.25,
+          "tip_weight": 2.0,
+          "proximal_direction_weight": 2.0,
+          "direction_weight": 1.0,
+          "direction_huber_delta": 0.3,
+          "pinch_weight": 8.0,
+          "pinch_start_m": 0.03,
+          "pinch_full_m": 0.015,
+          "damping_s": 0.002,
+          "smoothing_tau_s": 0.02,
+          "max_joint_speed_rad_s": 4.0,
+          "max_evaluations": 50,
+          "max_solve_time_s": 0.025
+        },
+        "frames": 397,
+        "calls": 396,
+        "retarget_us": {
+          "p50": 804.513,
+          "p95": 1056.66325
+        },
+        "evaluations": {
+          "p50": 10.0,
+          "p95": 14.0
+        },
+        "evaluations_total": 4038,
+        "rejected": [],
+        "components": {
+          "targets_us": {
+            "p50": 162.163,
+            "p95": 166.8785
+          },
+          "objective_construction_us": {
+            "p50": 5.441,
+            "p95": 5.6835
+          },
+          "fk_us": {
+            "p50": 8.916,
+            "p95": 9.22725
+          },
+          "fk_jacobian_us": {
+            "p50": 28.834,
+            "p95": 29.99625
+          },
+          "objective_gradient_us": {
+            "p50": 60.007000000000005,
+            "p95": 74.8775
+          },
+          "objective_value_us": {
+            "p50": 24.611,
+            "p95": 32.04
+          }
+        },
+        "tip_rmse_mm": {
+          "p50": 3.6326127311262306,
+          "p95": 8.108069576244153
+        },
+        "direction_mean_deg": {
+          "p50": 2.745098861154583,
+          "p95": 3.8301684359956676
+        },
+        "active_pinch_mean_error_mm": {
+          "p50": 3.1582299236229074,
+          "p95": 5.181669545939415
+        },
+        "active_pinch_frames": 95,
+        "environment": {
+          "python": "3.10.20",
+          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+          "packages": {
+            "numpy": "1.26.4",
+            "pin": "2.7.0",
+            "nlopt": "2.7.1"
+          }
+        }
+      }
+    ]
+  },
+  "comparison": {
+    "max_command_difference_rad": 7.999156892424253e-13,
+    "paired_speedup_percent": {
+      "p50": [
+        7.269133398585071,
+        6.651027231762341,
+        7.205879458595222,
+        6.312344438270834,
+        6.580051903658046,
+        4.822043693939159,
+        7.178042468113577,
+        7.605683678316799,
+        13.759897489471095,
+        7.883161783522629
+      ],
+      "p95": [
+        8.859963092345946,
+        8.234621935472674,
+        7.74237386447747,
+        7.470758519026877,
+        9.389535144385896,
+        1.7443472796842552,
+        8.022251690178784,
+        7.0535828349015395,
+        19.268657775133313,
+        8.904315815677199
+      ]
+    }
+  }
+}

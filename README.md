@@ -128,6 +128,8 @@ Raw 以整个 episode 目录为单位使用：`data.h5` 保存采集数据，`rg
 
 ## 开发验证
 
+可实际执行的最小安装、固定样本预览/导出及 CPU CI 命令见 [CPU 离线环境与回归](docs/offline_cpu.md)。手部梯度验证、同输入交错性能对照见[手部重定向](docs/hand_retargeting.md#固定样本与性能对照)。
+
 安装本项目与配套 Policy 的测试依赖后运行 `python -m pytest -p no:cacheprovider tests -q`。CUDA 用例需要可用 GPU；无设备测试会使用替身，因此通过不代表真机时序、实际执行误差或模型任务性能已验证。
 
 ## 主题文档

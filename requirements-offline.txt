@@ -1,0 +1,6 @@
+# Linux x86_64 / Python 3.10；无设备、GPU、Policy 或 viewer 的离线入口。
+-e .
+numpy==1.26.4
+opencv-python==4.9.0.80
+pin==2.7.0
+nlopt==2.7.1

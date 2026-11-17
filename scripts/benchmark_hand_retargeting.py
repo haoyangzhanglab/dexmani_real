@@ -37,6 +37,10 @@ def measure(root, episode, warmup):
         starts = set(reader.segment_starts)
     solver = HandRetargeter(config, limits)
     solver.calibration = calibration
+    if not len(times) or not np.isfinite(measured).all():
+        raise ValueError("benchmark requires nonempty finite measured joints")
+    if not np.isfinite(points[[i for i in range(len(times)) if i not in starts]]).all():
+        raise ValueError("benchmark landmarks contain nonfinite values outside segment starts")
     for _ in range(warmup + 1):
         elapsed, evaluations, rejected = [], [], []
         commands, references, intervals = [], [], []
@@ -149,7 +153,7 @@ def main():
             result = subprocess.run(
                 [sys.executable, str(Path(__file__).resolve()), str(episode), "--worker",
                  "--candidate", str(roots[name]), "--warmup", str(args.warmup)],
-                env=environment, check=True, capture_output=True, text=True,
+                env=environment, check=True, stdout=subprocess.PIPE, text=True,
             )
             run = json.loads(result.stdout)
             command = np.asarray(run.pop("commands"))
