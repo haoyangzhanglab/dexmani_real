@@ -59,6 +59,92 @@ def raw_episodes(tmp_path):
     return source, np.concatenate(states), np.concatenate(actions)
 
 
+@pytest.mark.parametrize("stop", [None, 0, 1, 3, -1, 10])
+def test_raw_reader_observation_prefix(raw_episodes, monkeypatch, stop):
+    source, *_ = raw_episodes
+    episode = source / "episode_0"
+    with h5py.File(episode / "data.h5", "r+") as data:
+        rows = data["timing/rows"][:]
+        rows["observation_ns"] = 2**60 + np.array([0, 1, 3, 7], dtype=np.int64)
+        data["timing/rows"][:] = rows
+    original = h5py.Dataset.__getitem__
+    reads = []
+
+    def read(dataset, key, **kwargs):
+        if dataset.name == "/timing/rows":
+            assert key == slice(None, stop)
+            assert kwargs["new_dtype"].names == ("observation_ns",)
+            reads.append(key)
+        return original(dataset, key, **kwargs)
+
+    with RawReader(episode) as reader:
+        np.testing.assert_array_equal(reader.read_timing(stop=stop), rows[:stop])
+        monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
+        timestamps = reader.read_timestamps_s(stop=stop)
+    assert reads == [slice(None, stop)]
+    assert timestamps.ndim == 1 and timestamps.dtype == np.float64
+    np.testing.assert_array_equal(timestamps, np.array([0., 1e-9, 3e-9, 7e-9])[:stop])
+
+
+@pytest.mark.parametrize("method", ["read_timing", "read_timestamps_s"])
+@pytest.mark.parametrize("stop", [None, 3])
+@pytest.mark.parametrize("offsets,bad_row", [
+    ([0, 10, 10, 30], 2),
+    ([0, 10, 9, 30], 2),
+    ([0, 0, 0, 0], 1),
+    ([30, 20, 10, 0], 1),
+])
+def test_raw_reader_rejects_invalid_observation_clock(raw_episodes, method, stop, offsets, bad_row):
+    source, *_ = raw_episodes
+    episode = source / "episode_0"
+    with h5py.File(episode / "data.h5", "r+") as data:
+        rows = data["timing/rows"][:]
+        # 保持 observation 晚于 control，单独触发 observation 单调性检查。
+        rows["observation_ns"] = 2_000_000_000 + np.array(offsets, dtype=np.int64)
+        data["timing/rows"][:] = rows
+    with RawReader(episode) as reader, pytest.raises(ValueError) as error:
+        getattr(reader, method)(stop=stop)
+    assert str(error.value) == (
+        f"Raw {episode.resolve()}: observation_clock_not_increasing at row {bad_row}"
+    )
+
+
+@pytest.mark.parametrize("stamps,stop,expected", [
+    ([100, 110, 120, 120], 3, [0., 1e-8, 2e-8]),
+    ([100, 110, 120, 119], 3, [0., 1e-8, 2e-8]),
+    ([2**63 - 2, 2**63 - 1, -(2**63), -(2**63) + 1], 2, [0., 1e-9]),
+])
+def test_raw_reader_observation_clock_checks_only_selected_prefix(raw_episodes, stamps, stop, expected):
+    source, *_ = raw_episodes
+    episode = source / "episode_0"
+    with h5py.File(episode / "data.h5", "r+") as data:
+        rows = data["timing/rows"][:]
+        rows["observation_ns"] = stamps
+        data["timing/rows"][:] = rows
+    with RawReader(episode) as reader:
+        np.testing.assert_array_equal(reader.read_timestamps_s(stop=stop), expected)
+        with pytest.raises(ValueError, match=f"observation_clock_not_increasing at row {stop}"):
+            reader.read_timestamps_s()
+
+
+@pytest.mark.parametrize("control,observation,detail,bad_row", [
+    ([0, -1, 2, 3], [4, 4, 4, 4], "invalid_control_or_observation_clock", 1),
+    ([0, 1, 2, 3], [4, 4, 4, 2], "invalid_control_or_observation_clock", 3),
+    ([0, 1, 1, 3], [4, 4, 4, 4], "control_clock_not_increasing", 2),
+    ([0, 2, 1, 3], [4, 4, 4, 4], "control_clock_not_increasing", 2),
+])
+def test_raw_reader_timing_validation_order(raw_episodes, control, observation, detail, bad_row):
+    source, *_ = raw_episodes
+    episode = source / "episode_0"
+    with h5py.File(episode / "data.h5", "r+") as data:
+        rows = data["timing/rows"][:]
+        rows["control_ns"], rows["observation_ns"] = control, observation
+        data["timing/rows"][:] = rows
+    with RawReader(episode) as reader, pytest.raises(ValueError) as error:
+        reader.read_timing()
+    assert str(error.value) == f"Raw {episode.resolve()}: {detail} at row {bad_row}"
+
+
 @pytest.mark.parametrize(
     ("shape", "dtype"),
     [((4, 2, 3), np.uint16), ((4, 2, 2), np.float32)],

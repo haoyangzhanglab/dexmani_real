@@ -503,12 +503,19 @@ class RawReader:
         for bad, detail, offset in (
             ((control < 0) | (observation < control), "invalid_control_or_observation_clock", 0),
             (np.diff(control) <= 0, "control_clock_not_increasing", 1),
-            (np.diff(observation) <= 0, "observation_clock_not_increasing", 1),
         ):
             indices = np.flatnonzero(bad)
             if len(indices):
                 raise ValueError(f"Raw {self.path}: {detail} at row {int(indices[0]) + offset}")
+        self._validate_observation_clock(observation)
         return rows
+
+    def _validate_observation_clock(self, stamps: np.ndarray) -> None:
+        indices = np.flatnonzero(stamps[1:] <= stamps[:-1])
+        if len(indices):
+            raise ValueError(
+                f"Raw {self.path}: observation_clock_not_increasing at row {int(indices[0]) + 1}"
+            )
 
     @property
     def segment_starts(self) -> np.ndarray:
@@ -614,8 +621,9 @@ class RawReader:
             )
 
     def read_timestamps_s(self, stop: int | None = None) -> np.ndarray:
-        """读取所选前缀相对于首帧的观测时间，默认读取完整时间轴。"""
+        """校验观测时间前缀严格递增，并返回相对首帧的秒数。"""
         stamps = self["timing/rows"].fields("observation_ns")[:stop]
+        self._validate_observation_clock(stamps)
         # 先减整数时钟，避免长时间运行后的浮点精度损失。
         return (stamps - stamps[0]) / 1e9 if stamps.size else np.empty(0, dtype=np.float64)
 

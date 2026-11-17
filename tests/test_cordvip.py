@@ -2785,6 +2785,30 @@ def test_visualizer_can_bypass_corrupt_hoi(annotated_episode, monkeypatch, info)
         visual.main([arg for arg in args if arg != "--no-hoi"])
 
 
+@pytest.mark.parametrize("step_ns", [0, -1])
+@pytest.mark.parametrize("mode", ["disabled", "missing"])
+def test_visualizer_rejects_invalid_observation_clock_without_hoi(
+    annotated_episode, monkeypatch, step_ns, mode,
+):
+    import h5py
+    import rerun as rr
+
+    from scripts import visualize_episode as visual
+
+    episode, *_ = annotated_episode
+    if mode == "missing":
+        (episode / "hoi.h5").unlink()
+    with h5py.File(episode / "data.h5", "r+") as data:
+        rows = data["timing/rows"][:]
+        rows["observation_ns"][1] = rows["observation_ns"][0] + step_ns
+        data["timing/rows"][:] = rows
+    monkeypatch.setattr(rr, "init", lambda *a, **kw: pytest.fail("started display with invalid clock"))
+    monkeypatch.setattr(rr, "disconnect", lambda *a, **kw: None)
+    with pytest.raises(ValueError) as error:
+        visual.EpisodeVisualizer(str(episode), hoi=mode != "disabled", table_plane_path=None)
+    assert str(error.value) == f"Raw {episode.resolve()}: observation_clock_not_increasing at row 1"
+
+
 def _disable_viewer(monkeypatch, visual):
     import rerun as rr
     for name in ("init", "send_blueprint", "disconnect", "log", "set_time_sequence", "set_time_seconds"):
