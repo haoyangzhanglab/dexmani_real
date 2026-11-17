@@ -114,26 +114,33 @@ def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand"), stop=None):
             break
         selected_end = min(end, count)
         targets = timing["camera_ns"][start:selected_end]
-        latest_target = targets.max()
         for device in devices:
             name, clock = f"{device}_qpos", f"{device}_ns"
             stamps = timing[clock][start:selected_end]
-            extra_stamps = []
-            stamp = stamps[-1]
-            source_end = selected_end
-            # 相机可能比本行关节更新；只消费直到覆盖最晚目标的第一个样本。
-            while source_end < end and stamp < latest_target:
-                row = reader["timing/rows"][source_end]
-                stamp = int(row[clock])
-                if stamp <= 0 or stamp > row["observation_ns"]:
-                    raise ValueError(f"Invalid HOI source timestamp: {clock}")
-                extra_stamps.append(stamp)
-                source_end += 1
-            if extra_stamps:
+            values = reader[name][start:selected_end]
+            neighbors = []
+            index, stamp = selected_end - 1, stamps[-1]
+            # 顺序查找尾部时钟，只保留各目标真正需要的邻点；长时间重复
+            # 反馈或缺少右邻点时，也不加载整段尾部 qpos。
+            for target in np.unique(targets[targets > stamp]):
+                while index + 1 < end and stamp < target:
+                    left_index, left_stamp = index, stamp
+                    index += 1
+                    row = reader["timing/rows"][index]
+                    stamp = int(row[clock])
+                    if stamp <= 0 or stamp < left_stamp or stamp > row["observation_ns"]:
+                        raise ValueError(f"Invalid HOI source timestamp: {clock}")
+                if stamp < target:
+                    break
+                needed = ((index, stamp),) if stamp == target else ((left_index, left_stamp), (index, stamp))
+                for neighbor in needed:
+                    if neighbor[0] >= selected_end and (not neighbors or neighbor[0] > neighbors[-1][0]):
+                        neighbors.append(neighbor)
+            if neighbors:
+                indices, extra_stamps = zip(*neighbors)
                 stamps = np.r_[stamps, extra_stamps]
-            positions, _ = interpolate_joints(
-                stamps, reader[name][start:source_end], targets, max_gap_s,
-            )
+                values = np.concatenate((values, reader[name][list(indices)]))
+            positions, _ = interpolate_joints(stamps, values, targets, max_gap_s)
             joints[name][start:selected_end] = positions
     return joints
 

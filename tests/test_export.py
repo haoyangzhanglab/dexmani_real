@@ -1102,15 +1102,16 @@ def test_segment_group_corruption_rejects_only_that_raw(tmp_path, raw_episodes):
 
 @pytest.mark.parametrize("starts,gap", [([0], .1), ([0], .01), ([0, 1], .1)])
 @pytest.mark.parametrize("stop", [1, 2, 3])
-def test_hoi_prefix_matches_full_alignment(raw_episodes, starts, gap, stop):
+@pytest.mark.parametrize("delay_ns", [20_000_000, 100_000_000])
+def test_hoi_prefix_matches_full_alignment(raw_episodes, starts, gap, stop, delay_ns):
     from dexmani_real.data.hoi import align_hoi_episode
 
     source, *_ = raw_episodes
     episode = source / "episode_0"
     with h5py.File(episode / "data.h5", "r+") as data:
         rows = data["timing/rows"][:]
-        rows["arm_ns"] -= 20_000_000
-        rows["hand_ns"] -= 30_000_000
+        rows["arm_ns"] -= delay_ns
+        rows["hand_ns"] -= delay_ns + 10_000_000
         data["timing/rows"][:] = rows
         del data["timing/segment_starts"]
         data.create_dataset("timing/segment_starts", data=starts)
@@ -1119,7 +1120,7 @@ def test_hoi_prefix_matches_full_alignment(raw_episodes, starts, gap, stop):
         prefix = align_hoi_episode(reader, gap, stop=stop)
         for key in full:
             np.testing.assert_allclose(prefix[key], full[key][:stop], equal_nan=True)
-        if starts == [0] and gap == .1:
+        if starts == [0] and (gap == .1 or delay_ns == 100_000_000):
             assert np.isfinite(prefix["arm_qpos"][0]).all()
         else:
             assert np.isnan(prefix["arm_qpos"][0]).all()
@@ -1168,8 +1169,8 @@ def test_prefix_reads_needed_right_neighbor_not_bad_tail(raw_episodes, monkeypat
 
     def read(dataset, key, **kwargs):
         if dataset.name in {"/arm_qpos", "/hand_qpos"}:
-            assert key == slice(0, 3)
-            reads.append(dataset.name)
+            assert key == slice(0, 1) or key == [1, 2]
+            reads.append((dataset.name, key))
         if dataset.name == "/timing/rows":
             assert key in (slice(None, 1), 1, 2)
         return original(dataset, key, **kwargs)
@@ -1179,4 +1180,40 @@ def test_prefix_reads_needed_right_neighbor_not_bad_tail(raw_episodes, monkeypat
         prefix = align_hoi_episode(reader, .1, stop=1)
         for key in prefix:
             np.testing.assert_allclose(prefix[key], expected[key][:1], equal_nan=True)
-    assert reads == ["/arm_qpos", "/hand_qpos"]
+    assert reads == [(name, key) for name in ("/arm_qpos", "/hand_qpos")
+                     for key in (slice(0, 1), [1, 2])]
+
+
+@pytest.mark.parametrize("case", ["missing", "interpolate", "exact"])
+def test_prefix_skips_unneeded_stale_joint_values(raw_episodes, monkeypatch, case):
+    from dexmani_real.data.hoi import align_hoi_episode
+
+    source, *_ = raw_episodes
+    episode = source / "episode_0"
+    with h5py.File(episode / "data.h5", "r+") as data:
+        rows = data["timing/rows"][:]
+        for device in ("arm", "hand"):
+            rows[f"{device}_ns"] = 980_000_000
+            if case != "missing":
+                rows[f"{device}_ns"][3] = 1_000_000_000 if case == "exact" else 1_080_000_000
+            data[f"{device}_qpos"][:] = 0
+        data["timing/rows"][:] = rows
+    with RawReader(episode) as reader:
+        expected = align_hoi_episode(reader, .1)
+    with h5py.File(episode / "data.h5", "r+") as data:
+        for device in ("arm", "hand"):
+            data[f"{device}_qpos"][1] = np.nan
+            if case == "exact":
+                data[f"{device}_qpos"][2] = np.nan
+    original = h5py.Dataset.__getitem__
+
+    def read(dataset, key, **kwargs):
+        if dataset.name in {"/arm_qpos", "/hand_qpos"}:
+            assert key == slice(0, 1) or (case == "interpolate" and key == [2, 3]) or (case == "exact" and key == [3])
+        return original(dataset, key, **kwargs)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
+    with RawReader(episode) as reader:
+        actual = align_hoi_episode(reader, .1, stop=1)
+        for key in actual:
+            np.testing.assert_allclose(actual[key], expected[key][:1], equal_nan=True)
