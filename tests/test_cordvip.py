@@ -2699,6 +2699,9 @@ def test_visualizer_can_bypass_corrupt_hoi(annotated_episode, monkeypatch, info)
     import h5py
 
     from scripts import visualize_episode as visual
+    from dexmani_real.utils import log
+
+    monkeypatch.setattr(log, "configure_logging", lambda: None)
 
     episode, *_ = annotated_episode
     (episode / "hoi.h5").write_bytes(b"corrupt annotation")
