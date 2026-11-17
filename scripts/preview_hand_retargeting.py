@@ -142,11 +142,13 @@ def show_preview(result: dict, fk, episode_name: str) -> None:
             rr.log("events", rr.TextLog(f"row {index}: reset to measured pose; reference only"))
         elif is_rejected:
             rr.log("events", rr.TextLog(f"row {index}: rejected: {reason}", level="WARN"))
+        # 成功候选已成为参考，避免重叠绘制相同的指尖。
+        target_kind = "reference" if is_start or is_rejected else "candidate"
         for kind, color in (
             ("measured", [70, 160, 255]), ("candidate", [255, 170, 50]), ("reference", [170, 170, 170]),
         ):
             points = None
-            if kind != "candidate" or not (is_start or is_rejected):
+            if kind == "measured" or kind == target_kind:
                 qpos = result[f"{kind}_qpos"][index]
                 points = fk.forward(qpos, fk.fingertip_frame_ids)[:, :3, 3]
             log_points(f"hand/{kind}/fingertips", points, colors=color, radii=0.004)

@@ -984,10 +984,12 @@ def test_bad_camera_metadata_rejects_only_that_raw(tmp_path, complete_episodes, 
 
 
 @pytest.mark.parametrize("fields", [("rgb", "depth"), ("joint_state",)])
-def test_export_cli_matches_api(tmp_path, complete_episodes, hoi_episodes, monkeypatch, fields):
+def test_export_cli_matches_api(tmp_path, complete_episodes, monkeypatch, fields):
     from dexmani_real.config.perception import PointCloudConfig
+    from dexmani_real.utils import log
     from scripts import export_zarr as cli
 
+    monkeypatch.setattr(log, "configure_logging", lambda: None)
     config = ExportConfig(pointcloud=PointCloudConfig(
         remove_table=False, workspace=(-1., -1., 0., 1., 1., 2.),
     ))
@@ -1004,6 +1006,28 @@ def test_export_cli_matches_api(tmp_path, complete_episodes, hoi_episodes, monke
     np.testing.assert_array_equal(actual["meta/episode_ends"][:], expected["meta/episode_ends"][:])
     for name in actual["data"]:
         np.testing.assert_array_equal(actual["data"][name][:], expected["data"][name][:])
+
+
+@pytest.mark.parametrize("input_form", ["task_cwd", "episode_cwd", "home"])
+def test_export_cli_default_output_uses_resolved_input(raw_episodes, tmp_path, monkeypatch, input_form):
+    from dexmani_real.utils import log
+    from scripts import export_zarr as cli
+
+    source, _, _ = raw_episodes
+    monkeypatch.setattr(log, "configure_logging", lambda: None)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    working_dir = {
+        "task_cwd": source, "episode_cwd": source / "episode_0", "home": tmp_path,
+    }[input_form]
+    monkeypatch.chdir(working_dir)
+    requested = f"~/{source.name}" if input_form == "home" else "."
+    assert cli.main([requested, "--fields", "joint_state"]) == 0
+    output = working_dir / "datasets" / f"{source.name}.zarr"
+    root = zarr.open_group(str(output), mode="r")
+    assert root.attrs["task_name"] == "recorded_task"
+    expected = ["episode_0"] if input_form == "episode_cwd" else ["episode_0", "episode_1"]
+    assert root.attrs["source_episodes"] == expected
+    root.store.close()
 
 
 def test_export_requires_explicit_fields(tmp_path, raw_episodes):
