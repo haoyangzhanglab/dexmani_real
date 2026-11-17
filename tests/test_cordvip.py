@@ -180,13 +180,16 @@ def test_duplicate_camera_frame_and_tracking_failure():
     assert not valid[2, 0] and np.isnan(poses[2]).all()
 
 
-def test_offline_requires_camera_extrinsics(monkeypatch):
+@pytest.mark.parametrize("missing,reason", [
+    ("T_xarm_base_from_color", "相机外参"), ("depth_scale_m", "深度单位"),
+])
+def test_offline_requires_rgbd_geometry(monkeypatch, missing, reason):
     reader = FakeRawReader()
     camera = reader.read_camera()
-    camera.T_xarm_base_from_color = None
+    setattr(camera, missing, None)
     monkeypatch.setattr(reader, "read_camera", lambda: camera)
 
-    with pytest.raises(ValueError, match="相机外参"):
+    with pytest.raises(ValueError, match=reason):
         script("annotate_episodes").track_episode(
             reader, None, ["apple"], {"apple": "apple"}
         )
@@ -382,6 +385,50 @@ def test_hoi_explicit_recompute_preserves_raw_and_reader_snapshot(annotated_epis
             np.testing.assert_allclose(new_reader["object_pointcloud"][:], old_cloud + [0.25, 0, 0], atol=2e-7)
             assert new_reader.hoi_file["valid"][:].all()
     assert {name: (episode / name).read_bytes() for name in raw_before} == raw_before
+
+
+@pytest.mark.parametrize("kind", ["scalar", "group"])
+def test_hoi_validity_reports_malformed_object_names(annotated_episode, kind):
+    import h5py
+    from dexmani_real.data.hoi import read_hoi_validity
+    from dexmani_real.data.raw import RawDataError, RawReader
+
+    episode, *_ = annotated_episode
+    with h5py.File(episode / "hoi.h5", "r+") as data:
+        del data["template/object_names"]
+        if kind == "scalar":
+            data["template/object_names"] = "apple"
+        else:
+            group = data.create_group("template/object_names")
+            group.create_group("apple")
+            group.create_group("banana")
+    with RawReader(episode) as reader, pytest.raises(RawDataError, match="template/object_names"):
+        read_hoi_validity(reader)
+
+
+def test_truncation_diagnostic_does_not_control_segment_acceptance(annotated_episode, caplog):
+    import h5py
+    from dexmani_real.data.raw import RawReader
+
+    episode, *_ = annotated_episode
+    with h5py.File(episode / "data.h5", "r+") as data:
+        data["meta"].attrs["recording_truncated_reason"] = ["queue_full", "user_stop"]
+    with RawReader(episode) as reader:
+        np.testing.assert_array_equal(reader.segment_starts, [0])
+    assert "queue_full" in caplog.text
+
+
+def test_viewer_rejects_missing_depth_units_before_starting_display(annotated_episode, monkeypatch):
+    import h5py
+    import rerun as rr
+    from scripts.visualize_episode import EpisodeVisualizer
+
+    episode, *_ = annotated_episode
+    with h5py.File(episode / "data.h5", "r+") as data:
+        data["meta"].attrs["camera_payload_mode"] = "rgb"
+    monkeypatch.setattr(rr, "init", lambda *a, **kw: pytest.fail("started display without depth units"))
+    with pytest.raises(ValueError, match="深度单位"):
+        EpisodeVisualizer(str(episode), table_plane_path=None)
 
 
 def test_geometry_digest_uses_ordered_numeric_values():

@@ -275,14 +275,14 @@ def test_processing_records_differences_without_rejecting(info, capsys):
     runtime = RealConfig()
     saved = {"point_cloud": processing_metadata(runtime.pointcloud)}
     info = replace(info, data_processing=saved)
-    assert collect_data_processing(info, runtime, None, None) == saved
+    assert collect_data_processing(info, runtime) == saved
     changed = replace(runtime, pointcloud=replace(runtime.pointcloud, num_points=17))
-    assert collect_data_processing(info, changed, None, None) == {
+    assert collect_data_processing(info, changed) == {
         "point_cloud": processing_metadata(changed.pointcloud),
     }
     assert "处理参数差异 point_cloud" in capsys.readouterr().out
     without_record = replace(info, data_processing=None)
-    assert collect_data_processing(without_record, runtime, None, None) == saved
+    assert collect_data_processing(without_record, runtime) == saved
     assert without_record.data_processing is None
     assert "未记录" in capsys.readouterr().out
 
@@ -326,3 +326,21 @@ def test_rtc_warmup_preserves_rng_and_episode_reset(fail):
         assert torch.equal(first, second)
     finally:
         worker.close().result()
+
+
+def test_deployment_processing_does_not_hash_geometry(info, monkeypatch, capsys):
+    from dexmani_real.deployment.preflight import collect_data_processing
+
+    def unexpected_hash(*args):
+        raise AssertionError("ordinary deployment does not consume geometry hashes")
+
+    monkeypatch.setattr("dexmani_real.geometry.hoi.geometry_digest", unexpected_hash)
+    info = replace(info, observation_fields=("hand_pointcloud", "object_pointcloud"),
+                   data_processing={
+                       "hand_pointcloud": {"num_points": 1024},
+                       "object_pointcloud": {"geometry_sha256": "a" * 64, "max_joint_gap_s": .10},
+                   })
+    actual = collect_data_processing(info, RealConfig())
+    assert actual == {"hand_pointcloud": {"num_points": 1024},
+                      "object_pointcloud": {"max_joint_gap_s": .10}}
+    assert capsys.readouterr().out == ""

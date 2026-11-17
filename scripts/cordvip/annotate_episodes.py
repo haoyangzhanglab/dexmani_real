@@ -63,6 +63,8 @@ def track_episode(reader, tracker, names, prompts):
     camera = reader.read_camera()
     if camera.T_xarm_base_from_color is None:
         raise ValueError("HOI 必须有 Raw 中记录的相机外参")
+    if camera.depth_scale_m is None:
+        raise ValueError("HOI 必须有 Raw 中记录的深度单位")
 
     frames = reader.num_frames
     if frames == 0:

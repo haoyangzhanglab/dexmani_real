@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""通过键盘控制 xArm7/XHand；--no-hand 保留固定手姿态的几何检查。"""
+"""键盘点动机械臂与显式 HOME；--no-hand 不连接灵巧手。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--config", type=Path, default=None, help="Trusted Python experiment file exporting CONFIG: RealConfig"
     )
-    parser.add_argument("--no-hand", action="store_true", help="不连接灵巧手；几何检查仍使用配置的固定手姿态")
+    parser.add_argument("--no-hand", action="store_true", help="不连接灵巧手；保留机械臂 Jog，组合 HOME 不可用")
     args = parser.parse_args(argv)
 
     runtime = load_config(args.config)

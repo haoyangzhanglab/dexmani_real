@@ -112,9 +112,7 @@ class EpisodeRecorder:
 
     def mark_gap(self):
         self.pending_segment_start = True
-        if self.recording_truncated_reason is None:
-            self.recording_truncated_reason = "control_slots_skipped"
-            logger.warning("控制调度跳槽；下一行开始新的连续区间。")
+        logger.info("录制间断；下一行开始新的连续区间。")
 
     def result(self):
         """仅报告最后可观察的结果，pending 不推断线程之后的结局。"""
