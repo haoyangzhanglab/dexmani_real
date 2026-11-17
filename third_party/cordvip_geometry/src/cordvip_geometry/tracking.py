@@ -2,6 +2,7 @@
 
 import logging
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from numbers import Real
 from pathlib import Path
@@ -311,14 +312,21 @@ class SceneTracker:
             torch.cuda.synchronize()
 
     def initialize(self, frame: RGBDFrame, prompts: dict[str, str]) -> SceneResult:
+        if set(prompts) != set(self.trackers) or any(
+            not isinstance(prompt, str) or all(
+                char.isspace() or unicodedata.category(char).startswith("P")
+                for char in prompt
+            )
+            for prompt in prompts.values()
+        ):
+            raise ValueError("Prompts must be nonempty text for every object")
         self.prompts = {
             name: prompt.strip().lower().rstrip(". ")
             for name, prompt in prompts.items()
         }
         normalized = list(self.prompts.values())
         if (
-            set(prompts) != set(self.trackers)
-            or not all(normalized)
+            not all(normalized)
             or len(set(normalized)) != len(normalized)
         ):
             raise ValueError("Prompts must uniquely identify every object")

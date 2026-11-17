@@ -152,10 +152,12 @@ def solve_samples(
     result = solve_hand_eye(eef, markers)
     worst_sample_id = used_ids[result.worst_sample]
     if not result.quality_ok:
-        raise ValueError(
-            f"hand-eye quality failed: {result.position_rms_mm:.3f} mm / "
+        print(
+            f"警告：hand-eye residual exceeds empirical thresholds: {result.position_rms_mm:.3f} mm / "
             f"{result.rotation_rms_deg:.3f} deg; worst sample ID {worst_sample_id}"
         )
+    for sample_id, position, rotation in zip(used_ids, result.position_errors_mm, result.rotation_errors_deg):
+        print(f"sample {sample_id}: residual {position:.3f} mm / {rotation:.3f} deg")
     save_camera_calibration(result.T_base_from_camera, serial, output)
     print(f"{result.method}: samples={len(used_ids)}; "
           f"RMS={result.position_rms_mm:.3f} mm / {result.rotation_rms_deg:.3f} deg; "

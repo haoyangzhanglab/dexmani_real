@@ -69,10 +69,12 @@ class EnvironmentConfig:
     table_plane_path: str | None = TABLE_PLANE_RELATIVE_PATH
 
     def validate(self) -> None:
-        if type(self.home_model_confirmed) is not bool:
-            raise ValueError("home_model_confirmed must be an explicit boolean")
         self.workspace.as_array()
         if not isfinite(self.eef_workspace_tolerance_m) or self.eef_workspace_tolerance_m < 0:
             raise ValueError("eef_workspace_tolerance_m must be finite and non-negative")
+
+    def validate_home(self) -> None:
+        if type(self.home_model_confirmed) is not bool:
+            raise ValueError("home_model_confirmed must be an explicit boolean")
         for box in self.static_boxes:
             box.validate()

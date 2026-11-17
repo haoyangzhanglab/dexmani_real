@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import resource
@@ -13,7 +12,6 @@ import stat
 import subprocess
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -326,7 +324,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config(args.config).hand
         if args.print_config:
-            print(json.dumps({"hand": asdict(config)}, ensure_ascii=False, indent=2, allow_nan=False))
+            print(config)
             return 0
         return run_hardware_session(config, finger_id=args.finger_id, read_only=args.read_only)
     except (OSError, TypeError, ValueError) as exc:

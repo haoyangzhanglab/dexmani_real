@@ -1,7 +1,6 @@
 """HOI 任务资产、固定表面采样与坐标变换。"""
 
 import json
-import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +14,7 @@ def task_objects(task):
     objects = json.loads((task / "task.json").read_text())["objects"]
     if not objects:
         raise ValueError("任务必须包含非空且不重复的对象")
-    names_by_prompt: dict[str, str] = {}
+    names = set()
     for obj in objects:
         name = obj["name"]
         if (
@@ -25,20 +24,10 @@ def task_objects(task):
             or Path(name).name != name
         ):
             raise ValueError(f"非法对象名：{name!r}")
-        if name in names_by_prompt.values():
+        if name in names:
             raise ValueError(f"重复对象名：{name!r}")
-        prompt = obj.setdefault("prompt", name)
-        if not isinstance(prompt, str) or all(
-            char.isspace() or unicodedata.category(char).startswith("P") for char in prompt
-        ):
-            raise ValueError(f"{name}: Prompt 必须是非空字符串，且不能仅含空白或标点")
-        # 与跟踪器的标签匹配规则一致。
-        normalized = prompt.strip().lower().rstrip(". ")
-        if normalized in names_by_prompt:
-            raise ValueError(
-                f"对象 {names_by_prompt[normalized]!r} 与 {name!r} 的 Prompt 冲突：{prompt!r}"
-            )
-        names_by_prompt[normalized] = name
+        names.add(name)
+        obj.setdefault("prompt", name)
     return objects
 
 
@@ -130,14 +119,13 @@ def sample_surface_points(mesh, num_points, seed=0):
     return dense[ids]
 
 
-def template_digest(points, offsets, names):
-    """按实际点序、分段和名称标识模板，不依赖资产路径或 NPZ 容器。"""
+def geometry_digest(points, offsets):
+    """有序点及分段的数值身份：小端 float32/int64、C 顺序，不包含显示名。"""
     import hashlib
 
     digest = hashlib.sha256()
     for values, dtype in ((points, "<f4"), (offsets, "<i8")):
         array = np.asarray(values, dtype=dtype)
-        digest.update(json.dumps(array.shape).encode())
-        digest.update(array.tobytes())
-    digest.update(json.dumps(list(names), ensure_ascii=False).encode("utf-8"))
+        digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
+        digest.update(array.tobytes(order="C"))
     return digest.hexdigest()

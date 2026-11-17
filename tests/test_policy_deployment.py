@@ -252,6 +252,7 @@ def test_hoi_warmup_commits_only_successful_uncancelled_result(fault):
                 index=index,
                 output_dir=None,
                 record_raw=False,
+                effective_parameters={},
             )
             rollout.start_observation = lambda *a, **kw: object()
             if fault != "none":
@@ -267,19 +268,23 @@ def test_hoi_warmup_commits_only_successful_uncancelled_result(fault):
         worker.close().result()
 
 
-def test_processing_rejects_mismatched_or_missing_metadata(info):
-    from dexmani_real.deployment.preflight import check_data_processing
+def test_processing_records_differences_without_rejecting(info, capsys):
+    from dexmani_real.deployment.preflight import collect_data_processing
     from dexmani_real.perception.pointcloud import processing_metadata
 
     runtime = RealConfig()
     saved = {"point_cloud": processing_metadata(runtime.pointcloud)}
     info = replace(info, data_processing=saved)
-    assert check_data_processing(info, runtime, None, None) == saved
+    assert collect_data_processing(info, runtime, None, None) == saved
     changed = replace(runtime, pointcloud=replace(runtime.pointcloud, num_points=17))
-    with pytest.raises(ValueError, match="data_processing mismatch"):
-        check_data_processing(info, changed, None, None)
-    with pytest.raises(ValueError, match="missing data_processing"):
-        check_data_processing(replace(info, data_processing={}), runtime, None, None)
+    assert collect_data_processing(info, changed, None, None) == {
+        "point_cloud": processing_metadata(changed.pointcloud),
+    }
+    assert "处理参数差异 point_cloud" in capsys.readouterr().out
+    without_record = replace(info, data_processing=None)
+    assert collect_data_processing(without_record, runtime, None, None) == saved
+    assert without_record.data_processing is None
+    assert "未记录" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("fail", [False, True])

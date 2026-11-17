@@ -1,16 +1,15 @@
 """真机策略评估；--print-config 仅打印配置，不连接设备。"""
 # Usage: python scripts/run_policy.py CHECKPOINT
-# HOI 需求由 Checkpoint 自动识别，任务与模板信息必须匹配。
+# HOI 需求由 Checkpoint 自动识别。
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import sys
-from dataclasses import asdict
 from pathlib import Path
+from pprint import pprint
 
 from dexmani_real.config.deployment import (
     DEFAULT_MAX_RUNNING_S,
@@ -31,6 +30,10 @@ def nonnegative_int(raw: str) -> int:
     if value < 0:
         raise argparse.ArgumentTypeError("must be a non-negative integer")
     return value
+
+
+def duration_budget(raw: str) -> float | None:
+    return None if raw.lower() == "none" else float(raw)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,11 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-duration",
         dest="max_running_s",
-        type=float,
+        type=duration_budget,
         default=DEFAULT_MAX_RUNNING_S,
         help=(
             "per-episode cooperative duration budget from the actual episode start "
-            f"(default: {DEFAULT_MAX_RUNNING_S:g} seconds)"
+            f"(default: {DEFAULT_MAX_RUNNING_S:g} seconds); none runs until user stop or failure"
         ),
     )
     parser.add_argument(
@@ -113,8 +116,7 @@ def main(argv: list[str] | None = None) -> int:
 
     runtime = load_config(args.config)
     if args.print_config:
-        declared = {name: asdict(getattr(runtime, name)) for name in POLICY_RUNTIME_SECTIONS}
-        print(json.dumps(declared, ensure_ascii=False, indent=2, allow_nan=False))
+        pprint({name: getattr(runtime, name) for name in POLICY_RUNTIME_SECTIONS}, sort_dicts=False)
         return 0
 
     from dexmani_real.deployment.session import PolicySession

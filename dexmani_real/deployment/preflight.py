@@ -113,9 +113,9 @@ def resolve_hoi_inputs(info):
     return task, load_task_template(task)
 
 
-def check_data_processing(info, runtime, observations, hoi_inputs):
-    """只核对模型消费的特征处理；现场标定另在 run_config 记录。"""
-    from dexmani_real.geometry.hoi import template_digest
+def collect_data_processing(info, runtime, observations, hoi_inputs):
+    """记录实际使用的特征处理；已知训练差异仅供实验记录。"""
+    from dexmani_real.geometry.hoi import geometry_digest
     from dexmani_real.perception.pointcloud import processing_metadata
 
     actual = {}
@@ -124,19 +124,24 @@ def check_data_processing(info, runtime, observations, hoi_inputs):
     if "hand_pointcloud" in info.observation_fields:
         actual["hand_pointcloud"] = dict(
             num_points=runtime.hand_pointcloud.num_points,
-            template_sha256=observations.hand_cloud.template_sha256,
+            geometry_sha256=observations.hand_cloud.geometry_sha256,
         )
     if hoi_inputs is not None:
         template = hoi_inputs[1]
         actual["object_pointcloud"] = dict(
-            template_sha256=template_digest(
-                template["points_local"], template["offsets"], template["object_names"]
+            geometry_sha256=geometry_digest(
+                template["points_local"], template["offsets"]
             ),
-            max_joint_gap_s=runtime.execution.hoi_max_joint_gap_s,
         )
+        if set(info.observation_fields) & {
+            "hand_pointcloud", "joint_state", "fingertip_xyz", "eef_pose",
+        }:
+            actual["object_pointcloud"]["max_joint_gap_s"] = runtime.execution.hoi_max_joint_gap_s
+    if info.data_processing is None:
+        print("训练处理参数：未记录；本次实际参数单独保存。")
+        return actual
     for name, values in actual.items():
-        if name not in info.data_processing:
-            raise ValueError(f"Checkpoint missing data_processing: {name}")
-        if values != info.data_processing[name]:
-            raise ValueError(f"Checkpoint data_processing mismatch: {name}")
+        training = info.data_processing.get(name)
+        if values != training:
+            print(f"处理参数差异 {name}: training={training!r}; actual={values!r}")
     return actual

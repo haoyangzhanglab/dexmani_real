@@ -135,11 +135,11 @@ class Robot:
         self._read_initial_state(cancel_requested=cancelled)
 
     def reset_tactile_sensors(self, *, cancel_epoch, cancel_requested) -> dict[int, int]:
+        """cancel_requested 负责设备故障轮询；此处补充停止与取消上下文。"""
         if self.hand is None:
             raise RobotError("XHand unavailable for tactile reset")
 
         def cancelled():
-            self.check()
             return bool(
                 cancel_requested()
                 or self.runtime_state.cancel_epoch != cancel_epoch

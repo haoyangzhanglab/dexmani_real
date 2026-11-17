@@ -99,7 +99,7 @@ def read_observation(channels, robot, *, needs: ObservationNeeds, joint_gap_s=0.
             camera = read_camera_frame(channels, fields=needs.camera_fields)
     vr_result = channels.vr_ring.read() if needs.vr else None
     aligned_joints = None
-    if needs.hoi_joint_devices and hoi is not None:
+    if needs.hoi_joint_devices and hoi is not None and hoi["valid"]:
         aligned_joints = robot.aligned_joints(int(hoi["timestamp_ns"]), joint_gap_s)
     return Observation(
         arm=state.arm,

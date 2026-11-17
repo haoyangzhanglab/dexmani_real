@@ -6,10 +6,11 @@ import argparse
 import math
 import time
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 
 from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
-from dexmani_real.config.sensor import VRConfig
+from dexmani_real.config.real import load_config
 from dexmani_real.sensor.vr import iter_vr_events
 from dexmani_real.utils.vr_heading import (
     collect_headings,
@@ -64,8 +65,10 @@ def main(argv: list[str] | None = None) -> int:
         help=f"collection duration (s), default: {DEFAULT_DURATION_S}",
     )
     parser.add_argument(
-        "--port", type=int, default=VRConfig.port, help=f"VR TCP port, default: {VRConfig.port}"
+        "--port", type=int, default=None, help="Override CONFIG.vr.port"
     )
+    parser.add_argument("--config", type=Path, help="Trusted Python experiment file exporting CONFIG: RealConfig")
+    parser.add_argument("--print-config", action="store_true", help="Print declared VR config without connecting")
     parser.add_argument(
         "--ref",
         choices=["wrist", "head"],
@@ -78,6 +81,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    vr_config = load_config(args.config).vr
+    if args.port is not None:
+        vr_config = replace(vr_config, port=args.port)
+    if args.print_config:
+        print(vr_config)
+        return 0
+
     if not math.isfinite(args.duration) or args.duration <= 0:
         parser.error("--duration must be a positive finite number of seconds")
 
@@ -89,10 +99,9 @@ def main(argv: list[str] | None = None) -> int:
     print("VR Heading Calibration")
     print(f"  reference:  {ref_label}")
     print(f"  duration:   {args.duration}s")
-    print(f"  port:       {args.port}")
+    print(f"  port:       {vr_config.port}")
     print("=" * 55)
 
-    vr_config = VRConfig(port=args.port)
     vr_config.validate()
     from dexmani_real.utils.log import configure_logging
 

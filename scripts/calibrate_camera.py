@@ -5,8 +5,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from dexmani_real.config.calibration_data import CAMERAS_PATH
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -16,7 +14,7 @@ def main(argv: list[str] | None = None) -> int:
     collect.add_argument("--output", type=Path, required=True, help="尚不存在的采样目录")
     solve = commands.add_parser("solve", help="从已保存样本离线求解，不连接设备")
     solve.add_argument("samples", type=Path, help="collect 输出目录")
-    solve.add_argument("--output", type=Path, default=CAMERAS_PATH, help="质量合格后按真实 serial 更新外参 JSON")
+    solve.add_argument("--output", type=Path, required=True, help="候选外参 JSON；通过 --camera-calibration 显式采用")
     solve.add_argument("--exclude", type=int, action="append", default=[], metavar="SAMPLE_ID",
                        help="剔除原始 sample ID，可重复指定；本批次不存在的 ID 忽略")
     args = parser.parse_args(argv)

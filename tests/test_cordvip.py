@@ -197,7 +197,8 @@ def test_existing_or_invalid_episode_never_writes(monkeypatch, tmp_path, has_hoi
     module = script("annotate_episodes")
     reader = FakeRawReader()
     if has_hoi:
-        reader.data_file["hoi"] = object()
+        (tmp_path / "episode").mkdir()
+        (tmp_path / "episode/hoi.h5").touch()
 
     monkeypatch.setattr(module, "RawReader", lambda path: reader)
     monkeypatch.setattr(
@@ -222,9 +223,6 @@ def test_existing_or_invalid_episode_never_writes(monkeypatch, tmp_path, has_hoi
 
     monkeypatch.setattr(module, "write_hoi", write)
     if has_hoi:
-        monkeypatch.setattr(
-            module, "read_hoi_validity", lambda reader: np.ones(3, bool)
-        )
         module.annotate_episodes([tmp_path / "episode"], tmp_path)
     else:
         with pytest.raises(ValueError, match="invalid raw input"):
@@ -250,9 +248,7 @@ def test_template_and_raw_roundtrip(tmp_path):
     original = (task / "hoi/template.npz").read_bytes()
     module.sample_template(task)
     assert (task / "hoi/template.npz").read_bytes() == original
-    path = tmp_path / "data.h5"
-    with h5py.File(path, "w") as data:
-        data.create_dataset("timing/rows", data=np.arange(129))
+    path = tmp_path / "hoi.h5"
     poses = np.tile(np.eye(4), (129, 1, 1, 1))
     poses[1, 0, 0, 3] = 1
     poses[128, 0, 1, 3] = 2
@@ -266,13 +262,12 @@ def test_template_and_raw_roundtrip(tmp_path):
         object_valid=np.ones((len(poses), 1), bool),
     )
     with h5py.File(path, "r") as data:
-        assert "_hoi_staging" not in data
-        assert set(data["hoi/template"]) == {"points_local", "offsets", "object_names"}
+        assert set(data["template"]) == {"points_local", "offsets", "object_names"}
         np.testing.assert_array_equal(
-            data["hoi/template/object_names"].asstr()[:], template["object_names"],
+            data["template/object_names"].asstr()[:], template["object_names"],
         )
-        np.testing.assert_array_equal(data["hoi/template/offsets"][:], template["offsets"])
-        points = data["hoi/object_pointcloud"][:]
+        np.testing.assert_array_equal(data["template/offsets"][:], template["offsets"])
+        points = data["object_pointcloud"][:]
         np.testing.assert_allclose(points[0], template["points_local"])
         np.testing.assert_allclose(
             points[1], template["points_local"] + [1, 0, 0], atol=1e-7
@@ -280,6 +275,143 @@ def test_template_and_raw_roundtrip(tmp_path):
         np.testing.assert_allclose(
             points[128], template["points_local"] + [0, 2, 0], atol=2e-7
         )
+
+
+@pytest.fixture
+def annotated_episode(task_template):
+    from dexmani_real.data.hoi import write_hoi
+    from dexmani_real.data.raw import RawWriter, camera_metadata
+    from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
+    from dexmani_real.geometry.hoi import load_task_template
+    from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
+    from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
+
+    episode = task_template / "episode"
+    episode.mkdir()
+    camera = CameraSnapshot(
+        None, CameraIntrinsics(32, 32, 500, 500, 16, 16, "none", (0.0,) * 5),
+        0.001, np.eye(4),
+    )
+    writer = RawWriter(episode, control_hz=20)
+    writer.open(dict(collection_source="policy", task_label="test", **camera_metadata(camera)))
+    try:
+        for index in range(3):
+            stamp = 1_000_000_000 + index * 50_000_000
+            arm, hand = np.zeros(1, ARM_STATE_DTYPE), np.zeros(1, HAND_STATE_DTYPE)
+            arm["timestamp_ns"] = hand["timestamp_ns"] = stamp
+            hand["tactile_aggregate_timestamp_ns"] = hand["tactile_dense_timestamp_ns"] = stamp
+            row = SimpleNamespace(
+                arm=arm, hand=hand, control_timestamp_ns=stamp, observation_timestamp_ns=stamp,
+                camera=dict(timestamp_ns=stamp, ring_sequence=index + 1,
+                            rgb=np.full((32, 32, 3), 90, np.uint8),
+                            depth=np.full((32, 32), 600, np.uint16)),
+            )
+            writer.append_frame(row, SimpleNamespace(arm_qpos=np.zeros(7), hand_qpos=np.zeros(12)))
+        writer.finish("user_stop")
+    finally:
+        writer.close()
+    template = load_task_template(task_template)
+    kwargs = dict(
+        quality=[[{"iou": 1.0}, {"iou": None}], [{}, {}], [{"iou": 0.5}, {}]],
+        object_valid=np.ones((3, 2), bool), tracking_config={},
+    )
+    poses = np.tile(np.eye(4), (3, 2, 1, 1))
+    write_hoi(episode / "hoi.h5", template, poses, np.eye(4), **kwargs)
+    return episode, template, poses, kwargs
+
+
+@pytest.mark.parametrize("failure", ["compute", "write", "close", "replace"])
+def test_hoi_replacement_failure_keeps_published_files(annotated_episode, monkeypatch, failure):
+    import h5py
+    from dexmani_real.data import hoi
+
+    episode, template, poses, kwargs = annotated_episode
+    before = {name: (episode / name).read_bytes() for name in ("data.h5", "rgb.mp4", "hoi.h5")}
+
+    def fail(*args, **kwargs):
+        raise OSError(f"failed {failure}")
+
+    if failure == "compute":
+        monkeypatch.setattr(hoi, "transform_task_points", fail)
+    elif failure == "write":
+        monkeypatch.setattr(h5py.Group, "create_dataset", fail)
+    elif failure == "close":
+        original_close = h5py.File.close
+
+        def close(file):
+            temporary = file.id.valid and ".hoi.h5.tmp-" in file.filename
+            original_close(file)
+            if temporary:
+                fail()
+
+        monkeypatch.setattr(h5py.File, "close", close)
+    else:
+        monkeypatch.setattr(hoi.os, "replace", fail)
+    with pytest.raises(OSError, match=f"failed {failure}"):
+        hoi.write_hoi(episode / "hoi.h5", template, poses, np.eye(4), overwrite=True, **kwargs)
+    assert not list(episode.glob(".hoi.h5.tmp-*"))
+    assert {name: (episode / name).read_bytes() for name in before} == before
+
+
+def test_hoi_explicit_recompute_preserves_raw_and_reader_snapshot(annotated_episode, monkeypatch):
+    from dexmani_real.data.hoi import write_hoi
+    from dexmani_real.data.raw import RawReader
+
+    episode, template, poses, kwargs = annotated_episode
+    raw_before = {name: (episode / name).read_bytes() for name in ("data.h5", "rgb.mp4")}
+    with pytest.raises(FileExistsError):
+        write_hoi(episode / "hoi.h5", template, poses, np.eye(4), **kwargs)
+    assert not list(episode.glob(".hoi.h5.tmp-*"))
+    module = script("annotate_episodes")
+    pose = np.eye(4)
+    pose[0, 3] = 0.25
+    result = SceneResult(
+        {name: pose for name in template["object_names"]},
+        {name: {} for name in template["object_names"]},
+        {name: True for name in template["object_names"]},
+    )
+    tracker = SimpleNamespace(config=TrackingConfig(), initialize=lambda *a: result, track=lambda *a: result)
+    monkeypatch.setattr(module, "SceneTracker", lambda *a, **kw: tracker)
+    with RawReader(episode) as old_reader:
+        old_cloud = old_reader["object_pointcloud"][:]
+        quality = old_reader.hoi_file["quality/iou"][:]
+        assert np.isnan(quality[0, 1]) and np.isnan(quality[1]).all()
+        module.annotate_episodes([episode], episode.parent, overwrite=True)
+        np.testing.assert_array_equal(old_reader["object_pointcloud"][:], old_cloud)
+        with RawReader(episode) as new_reader:
+            np.testing.assert_allclose(new_reader["object_pointcloud"][:], old_cloud + [0.25, 0, 0], atol=2e-7)
+            assert new_reader.hoi_file["valid"][:].all()
+    assert {name: (episode / name).read_bytes() for name in raw_before} == raw_before
+
+
+def test_geometry_digest_uses_ordered_numeric_values():
+    from dexmani_real.geometry.hoi import geometry_digest
+
+    points = np.arange(24, dtype=np.float32).reshape(8, 3)
+    offsets = np.array([0, 4, 8], np.int64)
+    expected = geometry_digest(points, offsets)
+    assert expected == geometry_digest(points.astype(">f4"), offsets.astype(">i8"))
+    assert expected == geometry_digest(np.asfortranarray(points), offsets)
+    assert expected != geometry_digest(points[::-1], offsets)
+    assert expected != geometry_digest(points + 1, offsets)
+    assert expected != geometry_digest(points, [0, 3, 8])
+
+
+@pytest.mark.parametrize("prompts", [[None, "apple"], ["...", "apple"], [" APPLE. ", "apple"]])
+def test_prompt_checks_belong_to_tracker(task_template, prompts):
+    import json
+    from cordvip_geometry.tracking import SceneTracker
+    from dexmani_real.geometry.hoi import load_task_template
+
+    names = ["banana", "apple"]
+    (task_template / "task.json").write_text(json.dumps({
+        "objects": [{"name": name, "prompt": prompt} for name, prompt in zip(names, prompts)],
+    }))
+    assert list(load_task_template(task_template)["object_names"]) == names
+    tracker = SceneTracker.__new__(SceneTracker)
+    tracker.trackers = dict.fromkeys(names)
+    with pytest.raises(ValueError, match="Prompts"):
+        tracker.initialize(None, dict(zip(names, prompts)))
 
 
 def test_batched_template_transform():
@@ -1056,14 +1188,12 @@ def test_invalid_hoi_storage_requires_explicit_validity(tmp_path):
 
     from dexmani_real.data.hoi import read_hoi_validity, write_hoi
 
-    path = tmp_path / "data.h5"
+    path = tmp_path / "hoi.h5"
     template = dict(
         points_local=np.ones((1024, 3), np.float32),
         offsets=[0, 1024],
         object_names=["apple"],
     )
-    with h5py.File(path, "w") as data:
-        data.create_dataset("timing/rows", data=np.arange(3))
     poses = np.tile(np.eye(4), (3, 1, 1, 1))
     write_hoi(
         path,
@@ -1075,13 +1205,13 @@ def test_invalid_hoi_storage_requires_explicit_validity(tmp_path):
         object_valid=np.array([[True], [False], [True]]),
     )
     with h5py.File(path, "r+") as data:
-        reader = SimpleNamespace(data_file=data, num_frames=3)
+        reader = SimpleNamespace(hoi_file=data, num_frames=3)
         np.testing.assert_array_equal(read_hoi_validity(reader), [True, False, True])
-        assert np.isnan(data["hoi/object_pose_camera"][1]).all()
-        assert not data["hoi/object_pointcloud"][1].any()
-        assert data["hoi/object_pointcloud"][2].all()
-        del data["hoi/valid"]
-        del data["hoi/object_valid"]
+        assert np.isnan(data["object_pose_camera"][1]).all()
+        assert not data["object_pointcloud"][1].any()
+        assert data["object_pointcloud"][2].all()
+        del data["valid"]
+        del data["object_valid"]
         with pytest.raises(KeyError, match="valid"):
             read_hoi_validity(reader)
 
@@ -1539,28 +1669,16 @@ def test_pose_gate_tolerates_float32_rotation_noise(recovery_scene, monkeypatch)
     assert all(scene.track(frame).valid.values())
 
 
-def test_annotator_rejects_existing_hoi_without_validity(monkeypatch, tmp_path):
-    import h5py
-
+def test_annotator_skips_existing_file_without_loading_inputs(monkeypatch, tmp_path):
     module = script("annotate_episodes")
-    with h5py.File(tmp_path / "data.h5", "w") as data:
-        data.create_dataset("timing/rows", data=np.arange(3))
-        data.create_dataset(
-            "hoi/object_pointcloud", data=np.zeros((3, 1024, 3), np.float32)
-        )
-    monkeypatch.setattr(
-        module, "load_task_template", lambda task: {"object_names": ["apple"]}
-    )
-    monkeypatch.setattr(
-        module, "task_objects", lambda task: [{"name": "apple", "prompt": "apple"}]
-    )
+    (tmp_path / "hoi.h5").write_bytes(b"do not inspect or change")
     monkeypatch.setattr(
         module,
-        "SceneTracker",
-        lambda *args, **kwargs: pytest.fail("unexpected model load"),
+        "RawReader",
+        lambda *args, **kwargs: pytest.fail("unexpected Raw read"),
     )
-    with pytest.raises(KeyError, match="valid"):
-        module.annotate_episodes([tmp_path], tmp_path)
+    module.annotate_episodes([tmp_path], tmp_path / "unused_task")
+    assert (tmp_path / "hoi.h5").read_bytes() == b"do not inspect or change"
 
 
 def test_viewer_keeps_joint_alignment_separate_from_object_validity(monkeypatch):
@@ -1581,7 +1699,7 @@ def test_viewer_keeps_joint_alignment_separate_from_object_validity(monkeypatch)
     viewer.reader = {"timing/rows": [{"camera_ns": 1, "arm_ns": 1, "hand_ns": 1}]}
 
     class Reader(dict):
-        data_file = {"hoi/quality": {}}
+        hoi_file = {"quality": {}}
 
     viewer.reader = Reader(viewer.reader)
     viewer.log_hoi_diagnostics(0, viewer.hoi_alignment)
@@ -1718,9 +1836,7 @@ def test_mixed_quality_hdf5_is_finite(recovery_scene, tmp_path):
         scene.track(frame),
     ]
     names = list(masks)
-    path = tmp_path / "data.h5"
-    with h5py.File(path, "w") as data:
-        data.create_dataset("timing/rows", data=np.arange(3))
+    path = tmp_path / "hoi.h5"
     write_hoi(
         path,
         dict(
@@ -1735,13 +1851,13 @@ def test_mixed_quality_hdf5_is_finite(recovery_scene, tmp_path):
         object_valid=np.ones((3, 2), bool),
     )
     with h5py.File(path, "r") as data:
-        assert json.loads(data["hoi"].attrs["tracking_config"]) == asdict(scene.config)
-        for values in data["hoi/quality"].values():
+        assert json.loads(data.attrs["tracking_config"]) == asdict(scene.config)
+        for values in data["quality"].values():
             assert np.isfinite(values[:]).all()
-        np.testing.assert_array_equal(data["hoi/quality/mask_source"][:, 0], [1, 0, 1])
-        assert data["hoi/object_pointcloud"].shape == (3, 1024, 3)
+        np.testing.assert_array_equal(data["quality/mask_source"][:, 0], [1, 0, 1])
+        assert data["object_pointcloud"].shape == (3, 1024, 3)
         np.testing.assert_array_equal(
-            data["hoi/quality/depth_coverage"][:], np.full((3, 2), 0.75)
+            data["quality/depth_coverage"][:], np.full((3, 2), 0.75)
         )
 
 
@@ -1843,7 +1959,7 @@ def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_
         data.create_dataset("timing/rows", data=timing)
         data.create_dataset("timing/segment_starts", data=np.array([0], np.int64))
     write_hoi(
-        episode / "data.h5",
+        episode / "hoi.h5",
         template,
         poses,
         base,
@@ -1851,9 +1967,9 @@ def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_
         object_valid=validity,
         tracking_config={},
     )
-    with h5py.File(episode / "data.h5", "r") as data:
-        offline_cloud = data["hoi/object_pointcloud"][:]
-        np.testing.assert_array_equal(data["hoi/valid"][:], expected_valid)
+    with h5py.File(episode / "hoi.h5", "r") as data:
+        offline_cloud = data["object_pointcloud"][:]
+        np.testing.assert_array_equal(data["valid"][:], expected_valid)
         assert not offline_cloud[~np.array(expected_valid)].any()
     output = tmp_path / "train.zarr"
     with pytest.raises(ValueError, match="all Raw episodes rejected"):
@@ -1993,8 +2109,8 @@ def test_viewer_marks_unmeasured_quality_as_missing():
     )
 
     class Reader(dict):
-        data_file = {
-            "hoi/quality": {
+        hoi_file = {
+            "quality": {
                 "iou": np.array([[-1.0, 0.75]]),
                 "mask_source": np.array([[0.0, 1.0]]),
                 "depth_fraction": np.array([[0.8, 0.9]]),

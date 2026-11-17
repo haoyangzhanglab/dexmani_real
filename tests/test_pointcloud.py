@@ -194,20 +194,18 @@ def test_identity_image_grid_reuses_input(model, coeffs):
 @pytest.mark.parametrize("distorted", [False, True])
 @pytest.mark.parametrize("output_hw", [(480, 640), (224, 320)])
 def test_real_cloud_policy_projection_on_pinhole_grid(distorted, output_hw):
-    import json
-    from pathlib import Path
     import cv2
     import torch
+    from scipy.spatial.transform import Rotation
     from dexmani_real.geometry.camera import camera_extrinsic_cv, init_undistort_maps, remap_image
     from dexmani_policy.agents.obs_encoder.pointcloud.camera_projection import project_to_image
     from dexmani_policy.agents.obs_encoder.rgb.image_processor import ImageProcessor
 
-    calibration_path = Path(__file__).parents[1] / "dexmani_real/config/calibration_data/cameras.json"
-    record = next(iter(json.loads(calibration_path.read_text()).values()))
-    capture = record["calibration_capture"]
-    K = np.asarray(capture["intrinsics"])
-    D = np.asarray(capture["distortion"]) if distorted else np.zeros(5)
-    T = np.asarray(record["T_base_from_camera"])
+    K = np.array([[610., 0, 319.5], [0, 612., 239.5], [0, 0, 1]])
+    D = np.array([.05, .01, .001, -.001, .002]) if distorted else np.zeros(5)
+    T = np.eye(4)
+    T[:3, :3] = Rotation.from_euler("xyz", [.2, -.4, .3]).as_matrix()
+    T[:3, 3] = [.25, -.35, .8]
     camera = CameraIntrinsics(640, 480, K[0, 0], K[1, 1], K[0, 2], K[1, 2], "brown_conrady", tuple(D))
     y, x = np.indices((480, 640))
     rgb = np.stack((x // 4, y // 3, (x + y) // 5), axis=-1).astype(np.uint8)

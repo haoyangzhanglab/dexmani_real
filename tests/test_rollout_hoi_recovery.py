@@ -184,9 +184,10 @@ def env(monkeypatch, record_raw):
         action_mapper=SimpleNamespace(map_joint=lambda arm, hand: SimpleNamespace(
             arm_qpos=arm, hand_qpos=hand, rejection_reason=None)),
         model=worker, max_running_s=60, index=7, output_dir=None, record_raw=record_raw,
+        effective_parameters={},
     )
     rollout.recorder = recorder if record_raw else None
-    rollout.started_ns = rollout.next_step_ns = clock.now
+    rollout.started_ns = clock.now
     rollout.run_deadline_ns = clock.now + 60_000_000_000
 
     def publish(valid=True):
@@ -310,7 +311,7 @@ def test_complete_recovery_and_exact_action_boundary(env, mode, record_raw):
     assert env.worker.reset_count == 1
     env.advance()
     env.rollout.step()
-    assert env.rollout.state == "RUNNING" and env.rollout.hoi_recovery_started_ns is None
+    assert env.rollout.state == "RUNNING"
     assert not env.robot.sent[-1][1].arm_hold
     if record_raw:
         assert len(env.recorder.rows) == 1 and env.recorder.rows[0][1] is not None
@@ -340,9 +341,8 @@ def test_old_future_exception_propagates(env):
         env.rollout.step()
 
 
-def test_repeated_occlusion_keeps_timeout_and_gap(env):
+def test_repeated_occlusion_keeps_gap_and_recovers_after_five_seconds(env):
     enter_hold(env)
-    started = env.rollout.hoi_recovery_started_ns
     env.advance()
     env.rollout.step()
     env.advance()
@@ -350,18 +350,50 @@ def test_repeated_occlusion_keeps_timeout_and_gap(env):
     old = env.worker.future
     env.advance(0.1, False)
     env.rollout.step()
-    assert env.rollout.state == "HOI_HOLD" and env.rollout.hoi_recovery_started_ns == started
+    assert env.rollout.state == "HOI_HOLD"
     old.set_result(np.ones((20, 19)))
     env.advance()
     env.rollout.step()
     assert env.rollout.state == "RESUMING" and not env.rollout.history
     assert env.recorder.gaps == 1
-    env.advance(5)
+    env.advance(6)
     env.rollout.step()
-    assert env.rollout.result.termination_details == "hoi_recovery_timeout"
-    assert env.channels.hoi_request.data["episode_id"] == 0
-    assert env.state.stop_signal.is_set()
+    assert not env.rollout.finished and env.rollout.state == "RESUMING"
     assert not env.recorder.rows
+    env.worker.complete()
+    env.advance()
+    env.rollout.step()
+    assert env.rollout.state == "RUNNING" and not env.robot.sent[-1][1].arm_hold
+    assert env.recorder.gaps == 1
+
+
+@pytest.mark.parametrize("unbounded", [False, True])
+def test_hold_uses_total_episode_budget(env, unbounded):
+    if unbounded:
+        env.rollout.run_deadline_ns = None
+    enter_hold(env)
+    env.advance(61, False)
+    env.rollout.step()
+    if unbounded:
+        assert not env.rollout.finished and env.rollout.state == "HOI_HOLD"
+        assert all(command.arm_hold for _, command, _ in env.robot.sent)
+    else:
+        assert env.rollout.result.termination_details == "duration_timeout"
+        assert env.rollout.result.termination_reason == "duration_complete"
+    assert not env.recorder.rows
+
+
+def test_invalid_hoi_skips_alignment_but_checks_required_recording(env, monkeypatch):
+    from unittest.mock import Mock
+
+    aligned = Mock(wraps=env.robot.aligned_joints)
+    monkeypatch.setattr(env.robot, "aligned_joints", aligned)
+    enter_hold(env)
+    aligned.assert_not_called()
+    env.channels.camera_ring.data = None
+    env.rollout.step()
+    aligned.assert_not_called()
+    assert env.rollout.finished
 
 
 @pytest.mark.parametrize("failure", ["arm", "hand", "missing", "send"])
@@ -440,7 +472,7 @@ def test_scheduler_skips_to_current_slot(env):
     assert len(env.worker.calls) == 1
 
 
-@pytest.mark.parametrize("cause", ["timeout", "operator", "estop", "duration", "worker"])
+@pytest.mark.parametrize("cause", ["operator", "estop", "duration", "worker"])
 def test_run_cleanup_and_precedence(env, cause):
     enter_hold(env)
     env.rollout.prepare = lambda poll: None
@@ -465,7 +497,7 @@ def test_run_cleanup_and_precedence(env, cause):
         env.rollout.run(poll_operator=poll)
     assert env.robot.stops == 1 and env.state.stop_signal.is_set()
     assert env.channels.hoi_request.data["episode_id"] == 0
-    expected = dict(timeout="cancelled", operator="operator", estop="estop",
+    expected = dict(operator="operator", estop="estop",
                     duration="duration_complete", worker="failed")
     assert env.rollout.result.termination_reason == expected[cause]
 
@@ -545,7 +577,7 @@ def test_recovery_before_submission_does_not_record(env, failure):
             env.state.request_stop()
             return original(arm, hand)
         if failure == "timeout":
-            env.advance(5)
+            env.advance(60)
             return original(arm, hand)
         if failure == "rejected":
             return SimpleNamespace(arm_qpos=None, hand_qpos=None, rejection_reason="unreachable")
@@ -554,7 +586,7 @@ def test_recovery_before_submission_does_not_record(env, failure):
     env.rollout.action_mapper.map_joint = mapping
     if failure in {"rejected", "timeout"}:
         env.rollout.step()
-        expected = "action_rejected: unreachable" if failure == "rejected" else "hoi_recovery_timeout"
+        expected = "action_rejected: unreachable" if failure == "rejected" else "duration_timeout"
         assert env.rollout.result.termination_details == expected
     else:
         error = OperationCancelled if failure == "cancelled" else ValueError
@@ -617,23 +649,23 @@ def test_second_recovery_interval_marks_new_gap(env):
     env.advance(0.05, False)
     env.rollout.step()
     assert env.recorder.gaps == 2
-    assert env.rollout.hoi_recovery_started_ns == env.clock.now
+    assert env.rollout.state == "HOI_HOLD"
 
 
 @pytest.mark.parametrize("record_raw", [True, False], ids=["raw", "no_raw"])
-def test_slow_submission_does_not_extend_recovery(env, record_raw):
+def test_slow_submission_does_not_extend_episode_budget(env, record_raw):
     ready_to_send(env)
     original = env.robot.send_action
 
     def send(command, **kwargs):
         original(command, **kwargs)
-        env.advance(5)
+        env.advance(60)
 
     env.robot.send_action = send
     env.rollout.prepare = lambda poll: None
     env.rollout.run(poll_operator=lambda **kwargs: None)
-    assert env.rollout.result.termination_details == "hoi_recovery_timeout"
-    assert env.rollout.result.termination_reason == "cancelled"
+    assert env.rollout.result.termination_details == "duration_timeout"
+    assert env.rollout.result.termination_reason == "duration_complete"
     assert env.rollout.state == "RESUMING"
     assert env.rollout.cursor == 0
     assert env.rollout.prev_action is None

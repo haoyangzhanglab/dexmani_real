@@ -33,11 +33,11 @@ python scripts/generate_hand_template.py --overwrite
 
 ## 离线标注
 
-`annotate_episodes.py` 默认处理任务下所有已发布 Raw，也可用 `--episode <目录>` 指定单段。标注需要任务模板及 Raw 中的相机外参，校验并跳过已有 HOI 的 Raw，完成逐帧标注后写入基座坐标系下的米制 float32 点云；相同相机序列复用位姿、质量和有效性。遮挡、丢失和两帧恢复确认期间标为无效，后续新观测继续跟踪或恢复；时间间隔与 Mask 年龄使用 Raw 中真实相机时间和来源序列。
+`annotate_episodes.py` 默认处理任务下所有已发布 Raw，也可用 `--episode <目录>` 指定一条采集。标注需要任务模板及 Raw 中的相机外参，已有 `hoi.h5` 时直接跳过；显式传入 `--overwrite` 重算。完成逐帧标注后写入基座坐标系下的米制 float32 点云；相同相机序列复用位姿、质量和有效性。遮挡、丢失和两帧恢复确认期间标为无效，后续新观测继续跟踪或恢复；时间间隔与 Mask 年龄使用 Raw 中真实相机时间和来源序列。
 
 每个 `prompt` 须在去畸变后的首帧匹配唯一候选，缺失或歧义会使初始化失败，后续新帧重试。`instance` 仅用于参考图选择，不用于跟踪初始化。
 
-标注在 `/hoi` 中记录位姿、质量、有效性、模板和坐标变换，命令不会覆盖已有标注。Python 调用 `annotate_episodes(..., tracking_config=...)` 可调整跟踪配置，参数见后端的[质量检查](../../third_party/cordvip_geometry/README.md#质量检查)和[遮挡恢复](../../third_party/cordvip_geometry/README.md#遮挡恢复)。
+标注保存在独立 `episode/hoi.h5` 的根目录，包括位姿、质量、有效性、模板和坐标变换。`data.h5` 和 `rgb.mp4` 只读。写入同目录临时文件并成功关闭后才发布；重算失败保留此前完整标注。Python 调用 `annotate_episodes(..., tracking_config=..., overwrite=True)` 可调整跟踪配置并重算，参数见后端的[质量检查](../../third_party/cordvip_geometry/README.md#质量检查)和[遮挡恢复](../../third_party/cordvip_geometry/README.md#遮挡恢复)。
 
 ## 分割间隔
 
@@ -45,6 +45,6 @@ python scripts/generate_hand_template.py --overwrite
 
 ## 导出与查看
 
-使用 `scripts/export_zarr.py` 导出训练数据，使用 `scripts/visualize_episode.py` 查看点云与质量指标。联合导出物体点云和关节/FK 观测时，会按相机来源时间插值所需设备的关节，前后反馈最大间隔由 `execution.hoi_max_joint_gap_s` 指定，默认 0.10 秒。关节对齐只裁去连续区间不可对齐的首尾，内部缺口报错。随后过滤感知无效行，观测与动作同步选择，并将有效连续区间分别导出为训练 episode，避免训练窗口跨越遮挡缺口。
+使用 `scripts/export_zarr.py --fields ...` 显式选择一份输出的字段，使用 `scripts/visualize_episode.py` 查看点云与质量指标。仅选择 `object_pointcloud` 时读取 HOI；联合选择关节/FK 观测时按相机来源时间在原生连续段内对齐关节，前后反馈最大间隔由 `execution.hoi_max_joint_gap_s` 指定，默认 0.10 秒。每个 `timing/segment_starts` 区间成为一个训练 episode；不裁首尾、不按质量另切段。任一所选数据或对齐失败都拒绝整条 Raw，其余 Raw 继续导出。同源段在训练与验证之间按原始采集分组，避免泄漏。
 
 数据表示与时间对齐见[物体重建与 HOI](../../docs/object_reconstruction.md)，后端安装与接口见 [cordvip_geometry](../../third_party/cordvip_geometry/README.md)。

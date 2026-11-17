@@ -13,7 +13,7 @@ sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 from cordvip_geometry.camera import RGBDFrame
 from cordvip_geometry.tracking import SceneTracker, TrackingConfig, TrackingFailure
 
-from dexmani_real.data.hoi import read_hoi_validity, write_hoi
+from dexmani_real.data.hoi import write_hoi
 from dexmani_real.data.raw import RawReader, require_published_raw
 from dexmani_real.geometry.hoi import load_task_template, task_objects
 
@@ -21,25 +21,24 @@ from dexmani_real.geometry.hoi import load_task_template, task_objects
 def annotate_episodes(
     episodes, task, *,
     tracking_config: TrackingConfig = TrackingConfig(),  # noqa: B008 — 不可变配置可共享。
+    overwrite=False,
 ):
     task = Path(task)
-    template = load_task_template(task)
-    names = template["object_names"]
-    by_name = {obj["name"]: obj for obj in task_objects(task)}
-    mesh_paths = {name: task / name / "mesh/mesh_m.obj" for name in names}
-    prompts = {name: by_name[name]["prompt"] for name in names}
     tracker = None
 
     for episode in episodes:
         episode = Path(episode)
+        if (episode / "hoi.h5").exists() and not overwrite:
+            print(f"跳过已有 HOI：{episode}")
+            continue
         require_published_raw(episode)
         with RawReader(episode) as reader:
-            if "hoi" in reader.data_file:
-                reader["object_pointcloud"]
-                read_hoi_validity(reader)
-                print(f"跳过已有 HOI：{episode}")
-                continue
             if tracker is None:
+                template = load_task_template(task)
+                names = template["object_names"]
+                by_name = {obj["name"]: obj for obj in task_objects(task)}
+                mesh_paths = {name: task / name / "mesh/mesh_m.obj" for name in names}
+                prompts = {name: by_name[name]["prompt"] for name in names}
                 tracker = SceneTracker(
                     mesh_paths, workspace=ROOT, config=tracking_config
                 )
@@ -48,13 +47,14 @@ def annotate_episodes(
             )
 
         write_hoi(
-            episode / "data.h5",
+            episode / "hoi.h5",
             template,
             poses,
             base_from_camera,
             quality=quality,
             object_valid=valid,
             tracking_config=asdict(tracker.config),
+            overwrite=overwrite,
         )
         print(f"{episode}: 已写入 HOI，{len(poses)} 帧")
 
@@ -129,6 +129,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", required=True)
     parser.add_argument("--episode", type=Path)
+    parser.add_argument("--overwrite", action="store_true", help="显式重算并原子替换已有 hoi.h5")
     parser.add_argument(
         "--segmentation-interval-frames",
         type=int,
@@ -148,6 +149,7 @@ def main(argv=None):
     annotate_episodes(
         episodes,
         task,
+        overwrite=args.overwrite,
         tracking_config=TrackingConfig(
             segmentation_interval_frames=args.segmentation_interval_frames
         ),
