@@ -31,11 +31,14 @@ flowchart TD
 | VR 采集 / 仅遥操作 | `python scripts/collect_teleop.py TASK` / 加 `--no-record` |
 | 键盘调整姿态 | `python scripts/keyboard_teleop.py` |
 | 查看记录 | `python scripts/visualize_episode.py EPISODE`（`--no-hoi` 绕过标注，`--max-frames N` 按需读取前 N 帧） |
+| 离线调试手部重定向 | `python scripts/preview_hand_retargeting.py EPISODE`（`--no-view` 仅计算统计，`--max-frames N` 限制前缀） |
 | 导出训练数据 | `python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr --fields joint_state action` |
 | 策略评估并录制 | `python scripts/run_policy.py CHECKPOINT --record-raw` |
 | 回放关节目标 | `python scripts/replay_episode.py EPISODE` |
 
 需要手动标记任务成败时使用 [label_episode.py](scripts/label_episode.py)。HOI 数据先完成[物体资产准备与离线标注](docs/object_reconstruction.md)。具体选项见各入口的 `--help`。
+
+手部预览默认恢复 Raw 中的重定向参数、标定和限位；`python scripts/preview_hand_retargeting.py EPISODE --config experiment.py` 仅替换重定向参数。它按记录时间离线求解，不连接设备，不读图像或 HOI，也不写回数据。分段与拒绝行的语义见[手部重定向](docs/hand_retargeting.md)。
 
 实验配置由 [RealConfig](dexmani_real/config/real.py) 组装。用一个可信本地 Python 文件导出 `CONFIG`，将实际设备、工作空间、运动参数集中保存；采集、部署、导出和回放均可传 `--config experiment.py`。例如下面只改变采集周期，其余配置仍须符合实际设备：
 
