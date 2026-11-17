@@ -2796,3 +2796,95 @@ def test_visualizer_reads_only_consumed_prefix(annotated_episode, monkeypatch):
         viewer.close()
     assert {name for name, _ in reads} == {"/arm_qpos", "/hand_qpos", "/object_valid", "/timing/rows"}
 
+
+@pytest.mark.parametrize("devices", [("arm",), ("arm", "hand")])
+@pytest.mark.parametrize("stamps", [[], [100_000_000], [100_000_000, 180_000_000, 300_000_000]])
+@pytest.mark.parametrize("target", [90_000_000, 100_000_000, 120_000_000, 180_000_000, 240_000_000, 310_000_000])
+@pytest.mark.parametrize("gap", [.08, .079999999])
+def test_scalar_alignment_matches_offline(devices, stamps, target, gap):
+    from collections import deque
+    from dexmani_real.robot.system import Robot
+    from dexmani_real.utils.timing import interpolate_joints
+
+    robot = Robot.__new__(Robot)
+    robot.enable_joint_history(.35, devices=devices)
+    expected = {}
+    for name in devices:
+        width = 7 if name == "arm" else 12
+        positions = np.arange(len(stamps) * width, dtype=float).reshape(-1, width)
+        robot.joint_history[name] = deque(zip(stamps, positions.copy()))
+        if stamps:
+            q, valid = interpolate_joints(stamps, positions, [target], gap)
+            if valid[0]:
+                expected[name + "_qpos"] = q[0]
+    actual = robot.aligned_joints(target, gap)
+    if not expected:
+        assert actual is None
+    else:
+        assert set(actual) == set(expected)
+        for key in expected:
+            np.testing.assert_allclose(actual[key], expected[key])
+            actual[key][:] = -999
+        again = robot.aligned_joints(target, gap)
+        for key in expected:
+            np.testing.assert_allclose(again[key], expected[key])
+    if "hand" in devices:
+        robot.joint_history["hand"].clear()
+        assert robot.aligned_joints(target, gap) is None
+    robot.enable_joint_history(.35, devices=devices)
+    assert robot.aligned_joints(target, gap) is None
+
+
+@pytest.fixture
+def feedback_robot():
+    from threading import Event
+    from dexmani_real.robot.system import Robot
+    from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
+
+    robot = Robot.__new__(Robot)
+    robot.runtime_state = SimpleNamespace(stop_signal=Event())
+    robot.check = lambda: None
+    robot.read_hand = lambda: None
+    robot._check_hand_feedback = lambda: None
+    frame = np.zeros(1, ARM_STATE_DTYPE)
+    robot.read_state = lambda: SimpleNamespace(arm=frame, hand=None)
+    robot.enable_joint_history(.1, devices=("arm",))
+
+    def feed(stamp, value=0):
+        frame["timestamp_ns"] = stamp
+        frame["qpos"] = value
+        robot.feedback_next_ns = 0
+        robot.service_feedback()
+
+    return robot, frame, feed
+
+
+@pytest.mark.parametrize("fault", ["zero", "reverse", "conflict"])
+def test_joint_feedback_rejects_invalid_history(feedback_robot, fault):
+    robot, frame, feed = feedback_robot
+    feed(1_000_000_000)
+    with pytest.raises(ValueError, match="timestamp|Conflicting"):
+        feed(0 if fault == "zero" else 900_000_000 if fault == "reverse" else 1_000_000_000,
+             1 if fault == "conflict" else 0)
+    assert robot.runtime_state.stop_signal.is_set()
+    assert len(robot.joint_history["arm"]) == 1
+
+
+def test_joint_feedback_duplicates_cropping_and_segments(feedback_robot):
+    robot, frame, feed = feedback_robot
+    feed(1_000_000_000)
+    feed(1_000_000_000)
+    assert len(robot.joint_history["arm"]) == 1
+    assert robot.joint_history["arm"][0][0] == int(frame["timestamp_ns"][0])
+    for index in range(1, 6):
+        feed(1_000_000_000 + index * 40_000_000, index)
+    # 1.1 s 窗口边界仍可使用 1.08 s 的左邻点。
+    assert robot.joint_history["arm"][0][0] == 1_080_000_000
+    np.testing.assert_allclose(robot.aligned_joints(1_100_000_000, .04)["arm_qpos"], 2.5)
+    result = robot.aligned_joints(1_200_000_000, .04)
+    result["arm_qpos"][:] = -10
+    np.testing.assert_array_equal(frame["qpos"], 5)
+    frame["qpos"] = -20
+    np.testing.assert_array_equal(robot.aligned_joints(1_200_000_000, .04)["arm_qpos"], 5)
+    robot.enable_joint_history(.1, devices=("arm",))
+    assert robot.aligned_joints(1_100_000_000, .04) is None
