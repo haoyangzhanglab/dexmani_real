@@ -6,7 +6,7 @@ import argparse
 import json
 from dataclasses import fields
 from pathlib import Path
-from time import perf_counter_ns
+from time import perf_counter
 
 import numpy as np
 
@@ -54,8 +54,7 @@ def preview_episode(
             raise ValueError("episode must contain at least one row")
         config, limits, calibration = read_recorded_parameters(reader, config_path)
         timestamps = reader.read_timing(stop=count)["observation_ns"]
-        starts = reader.segment_starts
-        starts = starts[starts < count]
+        starts = {int(start) for start in reader.segment_starts if start < count}
         measured = reader["hand_qpos"][:count]
         landmarks = reader["vr_landmarks"][:count]
         if not np.isfinite(measured).all():
@@ -64,22 +63,20 @@ def preview_episode(
 
     retargeter = HandRetargeter(config, limits)
     retargeter.calibration = calibration
-    candidates = np.full((count, 12), np.nan)
+    candidates = np.full(measured.shape, np.nan)
     references = np.empty_like(candidates)
-    solve_times = np.full(count, np.nan)
+    solve_times = []
     reasons = [None] * count
-    segment_start = np.zeros(count, dtype=bool)
-    segment_start[starts] = True
     for index, timestamp in enumerate(timestamps):
         timestamp = int(timestamp)
-        if segment_start[index]:
+        if index in starts:
             retargeter.reset(measured[index], timestamp_ns=timestamp)
         else:
             if not np.isfinite(landmarks[index]).all():
                 raise ValueError(f"Raw vr_landmarks contains nonfinite values at row {index}")
-            before = perf_counter_ns()
+            before = perf_counter()
             candidate = retargeter.retarget(landmarks[index], timestamp_ns=timestamp)
-            solve_times[index] = (perf_counter_ns() - before) / 1e9
+            solve_times.append(perf_counter() - before)
             if candidate is None:
                 reasons[index] = retargeter.rejection_reason
             else:
@@ -91,7 +88,7 @@ def preview_episode(
     result = {
         "observation_ns": timestamps, "segment_starts": starts,
         "measured_qpos": measured, "candidate_qpos": candidates, "reference_qpos": references,
-        "rejection_reasons": reasons, "solve_times_s": solve_times,
+        "rejection_reasons": reasons, "solve_times_s": np.asarray(solve_times),
     }
     if view:
         show_preview(result, retargeter.fk, episode_name)
@@ -114,7 +111,9 @@ def show_preview(result: dict, fk, episode_name: str) -> None:
             rrb.Tabs(contents=[
                 rrb.TimeSeriesView(
                     origin="/qpos", name=joint,
-                    contents=[f"/qpos/{kind}/{index}" for kind in ("measured", "candidate", "reference")],
+                    contents=[
+                        f"/qpos/{kind}/{index}" for kind in ("measured", "candidate", "reference")
+                    ],
                 )
                 for index, joint in enumerate(XHAND_SDK_JOINT_NAMES)
             ]),
@@ -128,49 +127,57 @@ def show_preview(result: dict, fk, episode_name: str) -> None:
     for kind in ("measured", "candidate", "reference"):
         log_series(
             f"qpos/{kind}", result[f"{kind}_qpos"], steps=steps, timestamps_s=seconds,
-            labels=[f"{kind} (rad)" for _ in XHAND_SDK_JOINT_NAMES],
+            labels=[f"{kind} (rad)"] * len(XHAND_SDK_JOINT_NAMES),
         )
-    starts = set(result["segment_starts"])
+    starts = result["segment_starts"]
     for index, second in enumerate(seconds):
         rr.set_time_sequence("step", index)
         rr.set_time_seconds("time", float(second))
         reason = result["rejection_reasons"][index]
-        rr.log("status/segment_start", rr.Scalar(int(index in starts)))
-        rr.log("status/rejected", rr.Scalar(int(reason is not None)))
-        if index in starts:
+        is_start = index in starts
+        is_rejected = reason is not None
+        rr.log("status/segment_start", rr.Scalar(int(is_start)))
+        rr.log("status/rejected", rr.Scalar(int(is_rejected)))
+        if is_start:
             rr.log("events", rr.TextLog(f"row {index}: reset to measured pose; reference only"))
-        elif reason is not None:
+        elif is_rejected:
             rr.log("events", rr.TextLog(f"row {index}: rejected: {reason}", level="WARN"))
         for kind, color in (
             ("measured", [70, 160, 255]), ("candidate", [255, 170, 50]), ("reference", [170, 170, 170]),
         ):
-            qpos = result[f"{kind}_qpos"][index]
-            points = fk.forward(qpos, fk.fingertip_frame_ids)[:, :3, 3] if np.isfinite(qpos).all() else None
+            points = None
+            if kind != "candidate" or not (is_start or is_rejected):
+                qpos = result[f"{kind}_qpos"][index]
+                points = fk.forward(qpos, fk.fingertip_frame_ids)[:, :3, 3]
             log_points(f"hand/{kind}/fingertips", points, colors=color, radii=0.004)
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("episode", metavar="EPISODE", help="Raw episode directory; relative paths use cwd.")
+    parser.add_argument("episode", metavar="EPISODE", help="Raw 目录；相对 cwd，支持 ~")
     parser.add_argument(
-        "--config", help="Python RealConfig: replace only hand_retargeting; calibration and limits remain recorded. "
-        "Without this option, use the complete recorded hand_retargeting parameters.",
+        "--config",
+        help="导出 CONFIG: RealConfig 的 Python 文件；仅替换 hand_retargeting，标定和限位仍取自 Raw",
     )
-    parser.add_argument("--max-frames", type=int, help="Read and compute only the first N rows.")
-    parser.add_argument("--no-view", action="store_true", help="Compute and print statistics without initializing Rerun.")
+    parser.add_argument("--max-frames", type=int, help="只读取并计算前 N 行")
+    parser.add_argument("--no-view", action="store_true", help="仅计算并打印统计，不初始化 Rerun")
     args = parser.parse_args(argv)
     result = preview_episode(
         args.episode, config_path=args.config, max_frames=args.max_frames, view=not args.no_view,
     )
-    rejected = [(index, reason) for index, reason in enumerate(result["rejection_reasons"]) if reason is not None]
+    rejected = [
+        (index, reason) for index, reason in enumerate(result["rejection_reasons"])
+        if reason is not None
+    ]
     print(f"Frames: {len(result['observation_ns'])}; rejected: {len(rejected)}")
     for index, reason in rejected:
         print(f"  Rejected row {index}: {reason}")
     times_ms = result["solve_times_s"] * 1000
-    times_ms = times_ms[np.isfinite(times_ms)]
     if len(times_ms):
-        print(f"Solve time ({len(times_ms)} calls, ms): mean={times_ms.mean():.3f}, "
-              f"p95={np.percentile(times_ms, 95):.3f}, max={times_ms.max():.3f}")
+        print(
+            f"Solve time ({len(times_ms)} calls, ms): mean={times_ms.mean():.3f}, "
+            f"p95={np.percentile(times_ms, 95):.3f}, max={times_ms.max():.3f}"
+        )
     else:
         print("Solve time: no samples (only segment reference rows selected)")
     return 0

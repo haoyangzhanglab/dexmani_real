@@ -1,6 +1,6 @@
 # CordViP 实验入口
 
-从仓库根目录运行，使用 `real_robot` 环境。用 `--task-dir` 显式指定包含 `task.json`、对象目录和 `hoi/template.npz` 的任务资产目录，可以放在仓库外。所有显式路径支持 `~`，相对路径以 cwd 为准。
+从仓库根目录运行，使用 `real_robot` 环境。用 `--task-dir` 显式指定任务资产目录，可以放在仓库外；先准备 `task.json` 和对象输入，再生成 `hoi/template.npz`。所有显式路径支持 `~`，相对路径以 cwd 为准。
 
 ```bash
 python scripts/cordvip/prepare_task.py --task-dir /data/tasks/pick

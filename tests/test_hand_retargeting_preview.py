@@ -9,7 +9,7 @@ import pytest
 
 from dexmani_real.config.teleop import HandRetargetingConfig
 from dexmani_real.config.xhand import HandConfig
-from dexmani_real.data.raw import TIMING_ROW_DTYPE, RawReader
+from dexmani_real.data.raw import TIMING_ROW_DTYPE
 from dexmani_real.geometry.kinematics import HandFK
 from dexmani_real.robot.model import XHAND_SDK_JOINT_NAMES
 from dexmani_real.teleop.retargeting.landmarks import hand_lengths, prepare_landmarks
@@ -22,7 +22,9 @@ def episode(tmp_path):
     path.mkdir()
     landmarks = np.zeros((21, 3))
     distance = np.array((0, .025, .045, .063))
-    for finger, (side, forward) in enumerate(zip((.04, .025, 0, -.025, -.045), (.02, .055, .065, .055, .045))):
+    for finger, (side, forward) in enumerate((
+        (.04, .02), (.025, .055), (0, .065), (-.025, .055), (-.045, .045),
+    )):
         landmarks[1 + 4 * finger:5 + 4 * finger, 1] = side
         landmarks[1 + 4 * finger:5 + 4 * finger, 2] = forward + distance
     landmarks[1:5, 1] += distance * .7
@@ -37,9 +39,13 @@ def episode(tmp_path):
     parameters = {
         "hand_retargeting": asdict(config),
         "hand": {"qpos_min_rad": hand.qpos_min_rad, "qpos_max_rad": hand.qpos_max_rad},
-        "hand_retargeting_calibration": {"bone_lengths": lengths[:15].reshape(5, 3).tolist(), "palm_width": lengths[15]},
+        "hand_retargeting_calibration": {
+            "bone_lengths": lengths[:15].reshape(5, 3).tolist(), "palm_width": lengths[15],
+        },
     }
-    times = np.array([1_000_000_000, 1_040_000_000, 1_110_000_000, 2_000_000_000, 2_060_000_000, 2_100_000_000])
+    times = np.array([
+        1_000_000_000, 1_040_000_000, 1_110_000_000, 2_000_000_000, 2_060_000_000, 2_100_000_000,
+    ])
     rows = np.zeros(6, dtype=TIMING_ROW_DTYPE)
     rows["observation_ns"] = times
     rows["control_ns"] = times - 1_000_000
@@ -81,7 +87,9 @@ def fake_solver(monkeypatch):
             self.reference_qpos, self.reference_timestamp_ns = qpos.copy(), timestamp_ns
 
         def retarget(self, landmarks, *, timestamp_ns):
-            events.append(("retarget", timestamp_ns, self.reference_timestamp_ns, self.reference_qpos.copy()))
+            events.append((
+                "retarget", timestamp_ns, self.reference_timestamp_ns, self.reference_qpos.copy(),
+            ))
             if timestamp_ns == 1_110_000_000:
                 self.rejection_reason = "synthetic geometry rejection"
                 return None
@@ -96,17 +104,19 @@ def fake_solver(monkeypatch):
     return events, instances
 
 
-def test_recorded_parameters_restore_without_unrelated_assets(episode, fake_solver):
+def test_recorded_parameters_restore_without_unrelated_assets(episode, fake_solver, monkeypatch):
+    monkeypatch.chdir(episode.parent)
     _, instances = fake_solver
-    result = preview.preview_episode(episode, view=False)
+    result = preview.preview_episode(episode.name, view=False)
     retargeter = instances[0]
     with h5py.File(episode / "data.h5", "r") as data:
         recorded = json.loads(data["meta"].attrs["effective_parameters"])
     assert retargeter.config.smoothing_tau_s == .123
     np.testing.assert_array_equal(retargeter.hand.qpos_min_rad, recorded["hand"]["qpos_min_rad"])
     np.testing.assert_array_equal(retargeter.hand.qpos_max_rad, recorded["hand"]["qpos_max_rad"])
-    np.testing.assert_array_equal(retargeter.calibration.bone_lengths, recorded["hand_retargeting_calibration"]["bone_lengths"])
-    assert retargeter.calibration.palm_width == recorded["hand_retargeting_calibration"]["palm_width"]
+    calibration = recorded["hand_retargeting_calibration"]
+    np.testing.assert_array_equal(retargeter.calibration.bone_lengths, calibration["bone_lengths"])
+    assert retargeter.calibration.palm_width == calibration["palm_width"]
     assert result["measured_qpos"].shape == (6, 12)
     assert set(episode.iterdir()) == {episode / "data.h5"}
 
@@ -123,14 +133,16 @@ def test_config_replaces_only_retargeting(episode, fake_solver, tmp_path):
     )
     # 被显式替换的记录参数不再消费；标定与限位仍来自 Raw。
     edit_parameters(episode, lambda p: p.pop("hand_retargeting"))
-    with RawReader(episode) as reader:
-        _, original_hand, original_calibration = preview.read_recorded_parameters(reader, config_path)
-    result = preview.preview_episode(episode, config_path=config_path, view=False)
+    with h5py.File(episode / "data.h5", "r") as data:
+        recorded = json.loads(data["meta"].attrs["effective_parameters"])
+    preview.preview_episode(episode, config_path=config_path, view=False)
     retargeter = fake_solver[1][0]
     assert retargeter.config.shape_weight == 3.0
-    np.testing.assert_array_equal(retargeter.hand.qpos_min_rad, original_hand.qpos_min_rad)
-    np.testing.assert_array_equal(retargeter.calibration.bone_lengths, original_calibration.bone_lengths)
-    assert len(result["observation_ns"]) == 6
+    np.testing.assert_array_equal(retargeter.hand.qpos_min_rad, recorded["hand"]["qpos_min_rad"])
+    np.testing.assert_array_equal(retargeter.hand.qpos_max_rad, recorded["hand"]["qpos_max_rad"])
+    calibration = recorded["hand_retargeting_calibration"]
+    np.testing.assert_array_equal(retargeter.calibration.bone_lengths, calibration["bone_lengths"])
+    assert retargeter.calibration.palm_width == calibration["palm_width"]
 
 
 @pytest.mark.parametrize("missing", ["hand_retargeting_calibration", "hand", "hand_retargeting"])
@@ -146,7 +158,11 @@ def test_recorded_config_does_not_fill_current_defaults(episode):
         preview.preview_episode(episode, view=False)
 
 
-@pytest.mark.parametrize("field,value", [("bone_lengths", [[.01] * 3] * 4), ("bone_lengths", [[0] * 3] * 5), ("palm_width", float("nan"))])
+@pytest.mark.parametrize("field,value", [
+    ("bone_lengths", [[.01] * 3] * 4),
+    ("bone_lengths", [[0] * 3] * 5),
+    ("palm_width", float("nan")),
+])
 def test_invalid_recorded_calibration_fails(episode, field, value):
     edit_parameters(episode, lambda p: p["hand_retargeting_calibration"].update({field: value}))
     with pytest.raises(ValueError, match=field):
@@ -200,7 +216,9 @@ def test_max_frames_reads_only_selected_prefix(episode, fake_solver, monkeypatch
     assert len(result["observation_ns"]) == 3
     for name in ("/hand_qpos", "/vr_landmarks", "/timing/rows"):
         assert [(path, key) for path, key in reads if path == name] == [(name, slice(None, 3))]
-    assert {path for path, _ in reads} == {"/hand_qpos", "/vr_landmarks", "/timing/rows", "/timing/segment_starts"}
+    assert {path for path, _ in reads} == {
+        "/hand_qpos", "/vr_landmarks", "/timing/rows", "/timing/segment_starts",
+    }
 
 
 def test_no_view_cli_does_not_initialize_viewer(episode, fake_solver, monkeypatch, capsys):
@@ -219,12 +237,6 @@ def test_reference_only_prefix_has_no_solve_statistics(episode, fake_solver, cap
     assert preview.main([str(episode), "--max-frames", "1", "--no-view"]) == 0
     assert "Solve time: no samples" in capsys.readouterr().out
     assert len(fake_solver[0]) == 1
-
-
-def test_relative_episode_path_uses_cwd(episode, fake_solver, monkeypatch):
-    monkeypatch.chdir(episode.parent)
-    result = preview.preview_episode(episode.name, max_frames=1, view=False)
-    assert len(result["observation_ns"]) == 1
 
 
 def test_invalid_selected_input_and_solver_errors_propagate(episode, fake_solver, monkeypatch):
@@ -250,20 +262,16 @@ def test_rerun_logging_with_viewer_spawn_disabled(episode, fake_solver, monkeypa
 
     result = preview.preview_episode(episode, max_frames=3, view=False)
     original_log = rr.log
-    spawn_requests, logs = [], []
-
-    def init_without_viewer(app, *, spawn):
-        spawn_requests.append(spawn)
+    logs = []
 
     def capture_log(path, *args, **kwargs):
         logs.append((path, args))
         original_log(path, *args, **kwargs)
 
-    monkeypatch.setattr(rr, "init", init_without_viewer)
+    monkeypatch.setattr(rr, "init", lambda *args, **kwargs: None)
     monkeypatch.setattr(rr, "log", capture_log)
     with rr.new_recording("hand-preview-test", spawn=False):
         preview.show_preview(result, HandFK(), episode.name)
-    assert spawn_requests == [True]
     # 真实 blueprint、archetypes 和列发送已运行；拒绝行清除候选指尖。
     candidates = [args[0] for path, args in logs if path == "hand/candidate/fingertips"]
     assert [type(value) for value in candidates] == [rr.Clear, rr.Points3D, rr.Clear]

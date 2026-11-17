@@ -34,11 +34,9 @@ flowchart LR
 
 1. **准备资产**：[prepare_task.py](../scripts/cordvip/prepare_task.py) 按 `task.json` 分割参考图、通过 Hunyuan3D 重建，再用实测尺寸调整为米制尺度；已有米制网格直接复用。
 2. **生成模板**：[sample_template.py](../scripts/cordvip/sample_template.py) 固定对象顺序、点分段与点序；已有模板直接复用，资产变更后显式重建。
-3. **标注 Raw**：[annotate_episodes.py](../scripts/cordvip/annotate_episodes.py) 跟踪录制的 RGB-D，完成逐帧标注后发布位姿、质量和物体点云。
+3. **标注 Raw**：[annotate_episodes.py](../scripts/cordvip/annotate_episodes.py) 的 `INPUT_ROOT` 接受单个 Episode 或直接包含 `episode_*` 子目录的数据目录；跟踪录制的 RGB-D，完成逐帧标注后发布位姿、质量和物体点云。
 4. **导出数据**：[export_zarr.py](../scripts/export_zarr.py) 读取物体标注，对齐关节并生成手部几何，与所选状态和动作一同导出。
 5. **训练与部署**：在 dexmani_policy 中训练；部署共用任务模板、跟踪器、坐标变换和 FK。
-
-完整命令见 [CordViP 实验入口](../scripts/cordvip/README.md)。标注使用 `annotate_episodes.py INPUT_ROOT --task-dir /data/tasks/pick`，`INPUT_ROOT` 可以是单个 Episode，或直接包含 `episode_*` 子目录的数据目录；不递归搜索或回退到仓库数据。部署使用 `run_policy.py CHECKPOINT --task-dir /data/tasks/pick`。仓库路径仍用于加载代码与模型权重。
 
 ## 跟踪与时间对齐
 
