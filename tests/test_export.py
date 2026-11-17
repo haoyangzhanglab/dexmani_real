@@ -906,6 +906,43 @@ def test_malformed_raw_is_skipped(tmp_path, complete_episodes, bad_index, fault,
     assert not list(tmp_path.glob(".clean.zarr.tmp-*"))
 
 
+@pytest.mark.parametrize("fields", [("point_cloud",), ("point_cloud", "rgb")])
+def test_unsupported_distortion_rejects_only_that_raw(tmp_path, complete_episodes, fields):
+    import shutil
+
+    from dexmani_real.config.perception import PointCloudConfig
+
+    source = complete_episodes
+    shutil.copytree(source / "episode_1", source / "episode_2")
+    config = ExportConfig(pointcloud=PointCloudConfig(
+        remove_table=False, workspace=(-1., -1., 0., 1., 1., 2.),
+    ))
+    reference = tmp_path / "reference.zarr"
+    export_zarr(source, reference, processing=config, fields=fields)
+    bad = source / "episode_1"
+    with h5py.File(bad / "data.h5", "r+") as data:
+        data["meta"].attrs["camera_color_distortion_model"] = "unsupported_model"
+
+    output = tmp_path / "clean.zarr"
+    result = export_zarr(source, output, processing=config, fields=fields)
+    assert result["path"] == str(output) and output.is_dir()
+    assert result["source_count"] == result["episode_count"] == 2
+    assert result["total_frames"] == 7
+    assert result["rejected_episodes"] == [{
+        "episode": bad.name,
+        "reason": "unsupported camera distortion model 'unsupported_model'",
+    }]
+    root = zarr.open_group(str(output), mode="r")
+    baseline = zarr.open_group(str(reference), mode="r")
+    assert root.attrs["source_episodes"] == ["episode_0", "episode_2"]
+    assert root.attrs["source_row_ranges"] == [[0, 4], [0, 3]]
+    np.testing.assert_array_equal(root["meta/episode_ends"][:], [4, 7])
+    assert set(root["data"]) == set(fields)
+    for name in fields:
+        assert len(root["data"][name]) == 7
+        np.testing.assert_array_equal(root["data"][name][:], baseline["data"][name][:][np.r_[0:4, 7:10]])
+
+
 @pytest.mark.parametrize("names,valid", [
     (json.dumps(XARM7_JOINT_NAMES), True),
     (np.bytes_(json.dumps(XARM7_JOINT_NAMES)), True),

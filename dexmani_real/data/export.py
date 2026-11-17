@@ -35,6 +35,7 @@ from dexmani_real.geometry.camera import (
     init_undistort_maps,
     parse_camera_matrix,
     remap_image,
+    validate_distortion_model,
 )
 from dexmani_real.geometry.hoi import geometry_digest, validate_task_template
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
@@ -114,6 +115,8 @@ def export_camera(reader, fields):
             camera["depth_scale_m"] = snapshot.depth_scale_m
         if names & {"rgb", "depth"}:
             camera["image_maps"] = init_undistort_maps(snapshot.color)
+        elif "point_cloud" in names:
+            validate_distortion_model(snapshot.color.distortion_model)
     if "camera_intrinsic" in names:
         if snapshot is not None:
             matrix = snapshot.color.matrix(dtype=np.float32)
