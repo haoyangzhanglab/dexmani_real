@@ -7,18 +7,18 @@ import numpy as np
 
 @dataclass(frozen=True)
 class RGBDFrame:
-    """彩色相机像素网格上的米制 RGB-D。"""
+    """彩色相机像素网格上的米制 RGB-D，携带真实来源序列和纳秒时间。"""
 
     rgb: np.ndarray
     depth_m: np.ndarray
     K: np.ndarray
     distortion_model: str
     distortion_coeffs: tuple[float, float, float, float, float]
-    source_sequence: int | None = None
-    timestamp_ns: int | None = None
+    source_sequence: int
+    timestamp_ns: int
 
     @classmethod
-    def from_camera(cls, camera, camera_row, *, source_sequence=None):
+    def from_camera(cls, camera, camera_row, *, source_sequence):
         """复用 CameraSnapshot 标定，将运行时相机行转为米制帧。"""
         return cls(
             rgb=camera_row["rgb"],
@@ -29,7 +29,7 @@ class RGBDFrame:
             distortion_model=camera.color.distortion_model,
             distortion_coeffs=camera.color.distortion_coeffs,
             source_sequence=source_sequence,
-            timestamp_ns=camera_row.get("timestamp_ns"),
+            timestamp_ns=camera_row["timestamp_ns"],
         )
 
 

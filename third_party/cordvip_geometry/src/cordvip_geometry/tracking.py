@@ -1,8 +1,6 @@
 """结合可见轮廓与实测深度的多物体位姿跟踪。"""
 
 import logging
-import time
-import unicodedata
 from dataclasses import dataclass, field
 from numbers import Real
 from pathlib import Path
@@ -17,6 +15,7 @@ from .foundationpose import (
     track_objects,
 )
 from .mesh import MeshRaycaster, load_mesh
+from .segmentation import SAM2Segmenter, normalize_prompt
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -253,7 +252,7 @@ def pose_motion(previous, current, tracker, dt, config):
 
 
 class SceneTracker:
-    source_sequence: int | None
+    source_sequence: int
     timestamp_ns: int
 
     def __init__(
@@ -265,7 +264,6 @@ class SceneTracker:
     ):
         import torch
 
-        from .segmentation import SAM2Segmenter
         from .weights import DEFAULT_MODELS_DIR, resolve_sam_model
 
         self.config = config
@@ -312,23 +310,13 @@ class SceneTracker:
             torch.cuda.synchronize()
 
     def initialize(self, frame: RGBDFrame, prompts: dict[str, str]) -> SceneResult:
-        if set(prompts) != set(self.trackers) or any(
-            not isinstance(prompt, str) or all(
-                char.isspace() or unicodedata.category(char).startswith("P")
-                for char in prompt
-            )
-            for prompt in prompts.values()
-        ):
-            raise ValueError("Prompts must be nonempty text for every object")
+        if set(prompts) != set(self.trackers):
+            raise ValueError("Prompts must cover every object")
         self.prompts = {
-            name: prompt.strip().lower().rstrip(". ")
+            name: normalize_prompt(prompt).removesuffix(".")
             for name, prompt in prompts.items()
         }
-        normalized = list(self.prompts.values())
-        if (
-            not all(normalized)
-            or len(set(normalized)) != len(normalized)
-        ):
+        if len(set(self.prompts.values())) != len(self.prompts):
             raise ValueError("Prompts must uniquely identify every object")
         self.states = dict.fromkeys(self.trackers, "TRACKING")
         self.next_retry = dict.fromkeys(self.trackers, 0)
@@ -362,12 +350,9 @@ class SceneTracker:
         rgb, depth_m = self.rectifier.apply(frame.rgb, frame.depth_m)
         self.directions = camera_rays(depth_m.shape, frame.K, PIXEL_STRIDE)
 
-        try:
-            candidates = self.segmenter.detect(
-                rgb, ". ".join(self.prompts.values()) + "."
-            )
-        except RuntimeError as error:
-            raise TrackingFailure(f"Initial detection: {error}") from error
+        candidates = self.segmenter.detect(
+            rgb, ". ".join(self.prompts.values()) + "."
+        )
         boxes = {}
         for name in self.trackers:
             try:
@@ -375,10 +360,7 @@ class SceneTracker:
             except TrackingFailure as error:
                 raise TrackingFailure(f"{name}: {error}") from error
 
-        try:
-            masks = self.segmenter.initialize(rgb, boxes)
-        except RuntimeError as error:
-            raise TrackingFailure(f"Initial segmentation: {error}") from error
+        masks = self.segmenter.initialize(rgb, boxes)
         result = self._estimate(rgb, depth_m, frame.K, masks, first=True)
         if not all(result.valid.values()):
             raise TrackingFailure(str(result.failures))
@@ -401,25 +383,17 @@ class SceneTracker:
         return self._estimate(rgb, depth_m, frame.K, None, first=False)
 
     def _set_frame_time(self, frame: RGBDFrame, *, first: bool) -> None:
-        stamp = (
-            time.monotonic_ns()
-            if frame.timestamp_ns is None
-            else int(frame.timestamp_ns)
-        )
-        sequence = None if frame.source_sequence is None else int(frame.source_sequence)
-        if stamp <= 0 or (sequence is not None and sequence <= 0):
+        stamp = int(frame.timestamp_ns)
+        sequence = int(frame.source_sequence)
+        if stamp <= 0 or sequence <= 0:
             raise ValueError("Camera timestamp and source sequence must be positive")
         self.frame_dt_s = 0.0 if first else (stamp - self.timestamp_ns) / 1e9
-        self.source_frame_gap = 0 if first else 1
+        self.source_frame_gap = 0 if first else sequence - self.source_sequence
         if not first:
             if self.frame_dt_s < 0:
                 raise ValueError("Camera timestamp moved backwards")
-            if sequence is not None and self.source_sequence is not None:
-                self.source_frame_gap = int(sequence - self.source_sequence)
-                if self.source_frame_gap <= 0:
-                    raise ValueError(
-                        "SceneTracker requires a new camera source sequence"
-                    )
+            if self.source_frame_gap <= 0:
+                raise ValueError("SceneTracker requires a new camera source sequence")
         self.timestamp_ns = stamp
         self.source_sequence = sequence
 
@@ -472,14 +446,8 @@ class SceneTracker:
             )
         return rendered, motion, continuous
 
-    def _refresh_masks(self, rgb, previous):
-        try:
-            masks = self.segmenter.track(rgb)
-        except RuntimeError:
-            # 事件刷新可能在 refinement 之后发生；共享状态错误仍须终止实例。
-            for name, tracker in self.trackers.items():
-                tracker.estimator.pose_last = previous[name]
-            raise
+    def _refresh_masks(self, rgb):
+        masks = self.segmenter.track(rgb)
         self.last_sam_frame = self.frame_index
         self.last_sam_sequence = self.source_sequence
         return masks
@@ -511,7 +479,6 @@ class SceneTracker:
         sampled = depth_m[::PIXEL_STRIDE, ::PIXEL_STRIDE]
 
         def reject(name, error):
-            self.trackers[name].estimator.pose_last = previous[name]
             verdicts[name] = "LOST"
             result.failures[name] = str(error)
 
@@ -538,7 +505,7 @@ class SceneTracker:
                 >= self.config.segmentation_interval_frames
             )
         ):
-            masks = self._refresh_masks(rgb, previous)
+            masks = self._refresh_masks(rgb)
 
         def evaluate(name, pose, mask):
             if name not in pose_checks:
@@ -558,12 +525,9 @@ class SceneTracker:
                 metrics, verdict = pose_quality(
                     mask[::PIXEL_STRIDE, ::PIXEL_STRIDE], sampled, rendered, self.config
                 )
-            mask_age = self.frame_index - self.last_sam_frame
-            if self.source_sequence is not None and self.last_sam_sequence is not None:
-                mask_age = int(self.source_sequence - self.last_sam_sequence)
             metrics.update(
                 mask_source=int(mask is not None),
-                mask_age_frames=mask_age,
+                mask_age_frames=self.source_sequence - self.last_sam_sequence,
                 dt_s=self.frame_dt_s,
                 source_frame_gap=self.source_frame_gap,
                 **motion,
@@ -603,13 +567,8 @@ class SceneTracker:
                 if np.count_nonzero(valid) < self.config.min_depth_pixels:
                     raise TrackingFailure("insufficient segmented depth")
                 pose = self.trackers[name].register(rgb, depth_m, K, mask)
-            except RuntimeError as error:
-                reject(name, error)
-                return False
-            registered.add(name)
-            try:
+                registered.add(name)
                 if evaluate(name, pose, mask) != "VALID":
-                    self.trackers[name].estimator.pose_last = previous[name]
                     return False
             except TrackingFailure as error:
                 reject(name, error)
@@ -621,39 +580,13 @@ class SceneTracker:
             for name in active:
                 register(name, masks.get(name))
         elif active:
-            seeds = {
-                name: (
-                    self.pending_pose[name][1] if name in confirming else previous[name]
-                )
-                for name in active
-            }
             for name, tracker in active.items():
-                tracker.estimator.pose_last = seeds[name]
-            try:
-                candidates = track_objects(active, rgb, depth_m, K, self.frame_cache)
-            except RuntimeError as error:
-                for name, tracker in active.items():
-                    tracker.estimator.pose_last = seeds[name]
-                candidates = {}
-                if len(active) == 1:
-                    reject(next(iter(active)), error)
-                else:
-                    logger.warning(
-                        "FoundationPose batch failed; isolating objects", exc_info=True
-                    )
-                    # 多对象失败才需隔离；Pending 使用自己的临时初值。
-                    for name, tracker in active.items():
-                        try:
-                            candidates.update(
-                                track_objects(
-                                    {name: tracker}, rgb, depth_m, K, self.frame_cache
-                                )
-                            )
-                        except RuntimeError as error:
-                            reject(name, error)
+                if name in confirming:
+                    tracker.estimator.pose_last = self.pending_pose[name][1]
+            candidates = track_objects(active, rgb, depth_m, K, self.frame_cache)
             check_candidates()
             if masks is None and any(verdicts[name] != "VALID" for name in candidates):
-                masks = self._refresh_masks(rgb, previous)
+                masks = self._refresh_masks(rgb)
                 # 更近的深度先触发当前 Mask，再决定它是否属于前景遮挡。
                 check_candidates()
 
@@ -662,42 +595,32 @@ class SceneTracker:
                 self.next_retry[name] = (
                     self.frame_index + self.config.recovery_retry_interval_frames
                 )
-            try:
-                detections = self.segmenter.detect(
-                    rgb,
-                    ". ".join(self.prompts[name] for name in due) + ".",
-                    self.config.recovery_box_threshold,
-                    self.config.recovery_text_threshold,
-                )
-                boxes = {}
-                for name in due:
-                    try:
-                        boxes[name] = self._match_box(detections, self.prompts[name])
-                    except TrackingFailure as error:
-                        reject(name, error)
-                recovered_masks = (
-                    self.segmenter.segment_boxes(rgb, boxes) if boxes else {}
-                )
-            except RuntimeError as error:
-                for name in due:
+            detections = self.segmenter.detect(
+                rgb,
+                ". ".join(self.prompts[name] for name in due) + ".",
+                self.config.recovery_box_threshold,
+                self.config.recovery_text_threshold,
+            )
+            boxes = {}
+            for name in due:
+                try:
+                    boxes[name] = self._match_box(detections, self.prompts[name])
+                except TrackingFailure as error:
                     reject(name, error)
-                recovered_masks = {}
+            recovered_masks = (
+                self.segmenter.segment_boxes(rgb, boxes) if boxes else {}
+            )
             corrections = {
                 name: mask
                 for name, mask in recovered_masks.items()
                 if register(name, mask)
             }
             if corrections:
-                try:
-                    masks = self.segmenter.correct_masks(corrections)
-                except RuntimeError:
-                    for name, tracker in self.trackers.items():
-                        tracker.estimator.pose_last = previous[name]
-                    raise
+                masks = self.segmenter.correct_masks(corrections)
                 # 校正可能改变任意对象的可见边界；复用各候选的 CAD 深度复查。
                 check_candidates()
 
-        # Mask 合并后才提交状态；只有确认过的当前观测进入 poses。
+        # Mask 合并后统一提交或恢复内部位姿；只有确认过的当前观测进入 poses。
         for name, tracker in self.trackers.items():
             state = self.states[name]
             verdict = verdicts[name]

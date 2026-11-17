@@ -10,7 +10,7 @@ from .mesh import simplify_mesh
 
 
 class TrackingFailure(RuntimeError):
-    """当前观测无法通过跟踪或注册，允许后续帧重试。"""
+    """当前观测的匹配、深度或位姿证据不足，允许后续帧重试；后端异常直接传播。"""
 
 
 def prepare_tracking_frame(rgb, depth_m, intrinsics, render_size, cache):

@@ -1,6 +1,7 @@
 """Grounded-SAM2 检测、单图分割与有界历史视频跟踪。"""
 
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -37,10 +38,12 @@ def prune_state(state, frame_index, history_frames):
 
 
 def normalize_prompt(text):
-    if not isinstance(text, str) or not text.strip().rstrip(". "):
-        raise ValueError("Provide a nonempty object description")
-    text = text.strip().lower()
-    return text if text.endswith(".") else text + "."
+    """统一检测与跟踪的描述格式，拒绝空白或纯标点输入。"""
+    if not isinstance(text, str) or all(
+        char.isspace() or unicodedata.category(char).startswith("P") for char in text
+    ):
+        raise ValueError("Prompts must contain nonempty object descriptions")
+    return text.strip().lower().rstrip(". ") + "."
 
 
 def normalized_rgb_table(device):

@@ -22,7 +22,7 @@ python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick
 | --- | --- |
 | `prepare_task.py` | 复用已有米制网格；其余对象共用模型完成分割、重建，保存 `mesh/mesh_m.obj` 和 `reconstruction/` 中间结果。 |
 | `sample_template.py` | 按网格表面积分配配额，8 倍候选点经 FPS 选取 1024 个点，每对象至少 64 点，最多 16 个对象，保存到 `hoi/template.npz`。 |
-| `annotate_episodes.py` | 跟踪已发布 Raw 的 RGB-D，完成逐帧标注后写入点云、位姿、质量和固定模板；暂时跟踪丢失记录无效帧并继续恢复，输入或文件错误直接报错。 |
+| `annotate_episodes.py` | 跟踪已发布 Raw 的 RGB-D，将点云、位姿、有效性、质量和模板写入 `hoi.h5`。 |
 
 米制网格保留源物体原点和朝向；模板固定对象顺序、点分段和点序，在线与离线共用。已有任务模板直接复用；修改物体 Mesh、手部 URDF 或 Visual Mesh 后，显式重建对应模板：
 
@@ -37,18 +37,18 @@ python scripts/generate_hand_template.py --overwrite
 
 ## 离线标注
 
-`annotate_episodes.py INPUT_ROOT --task-dir TASK_DIR` 接受一个含 `data.h5` 的 Episode，或直接包含 `episode_*` 子目录的数据目录；仅处理指定目录，不递归查找，也不从任务标签推导数据路径。无效路径或空目录直接报错。标注需要任务模板及 Raw 中的相机外参，已有 `hoi.h5` 时直接跳过；显式传入 `--overwrite` 重算。完成逐帧标注后写入基座坐标系下的米制 float32 点云；相同相机序列复用位姿、质量和有效性。遮挡、丢失和两帧恢复确认期间标为无效，后续新观测继续跟踪或恢复；时间间隔与 Mask 年龄使用 Raw 中真实相机时间和来源序列。
+`annotate_episodes.py INPUT_ROOT --task-dir TASK_DIR` 接受一个含 `data.h5` 的 Episode，或直接包含 `episode_*` 子目录的数据目录，只处理这一层目录。标注需要任务模板及 Raw 中的相机外参，已有 `hoi.h5` 时跳过；使用 `--overwrite` 重算。
 
 每个 `prompt` 须在去畸变后的首帧匹配唯一候选，缺失或歧义会使初始化失败，后续新帧重试。`instance` 仅用于参考图选择，不用于跟踪初始化。
 
-标注保存在独立 `episode/hoi.h5` 的根目录，包括位姿、质量、有效性、模板和坐标变换。`data.h5` 和 `rgb.mp4` 只读。写入同目录临时文件并成功关闭后才发布；重算失败保留此前完整标注。Python 调用 `annotate_episodes(..., tracking_config=..., overwrite=True)` 可调整跟踪配置并重算，参数见后端的[质量检查](../../third_party/cordvip_geometry/README.md#质量检查)和[遮挡恢复](../../third_party/cordvip_geometry/README.md#遮挡恢复)。
+遮挡或丢失时记录无效帧并继续恢复；模型、输入或文件错误直接报错，重算失败保留此前完整标注。Python 调用 `annotate_episodes(..., tracking_config=..., overwrite=True)` 可调整跟踪配置，参数见后端的[质量检查](../../third_party/cordvip_geometry/README.md#质量检查)和[遮挡恢复](../../third_party/cordvip_geometry/README.md#遮挡恢复)。
 
 ## 分割间隔
 
-离线标注通过 `--segmentation-interval-frames` 调整活动对象的 SAM2 最大处理帧间隔，默认 2；设为 1 时逐帧分割。在线 worker 的 `tracking_config` 参数接收相同配置。两者均仅对新的相机序列推进处理计数；来源序列的跳跃不补造 SAM2 图像。深度质量不通过、对象恢复到期或正在确认恢复时提前刷新；全部对象 LOST 时等待恢复到期。具体规则见[事件触发分割](../../third_party/cordvip_geometry/README.md#事件触发分割)。
+`--segmentation-interval-frames` 设置活动对象的 SAM2 最大处理帧间隔，默认 2，设为 1 时逐帧分割。在线 worker 通过 `tracking_config` 接收相同配置；质量异常和恢复时提前刷新，规则见[事件触发分割](../../third_party/cordvip_geometry/README.md#事件触发分割)。
 
 ## 导出与查看
 
-使用 `scripts/export_zarr.py --fields ...` 显式选择一份输出的字段，使用 `scripts/visualize_episode.py` 查看点云与质量指标。仅选择 `object_pointcloud` 时读取 HOI；联合选择关节/FK 观测时按相机来源时间在原生连续段内对齐关节，前后反馈最大间隔由 `execution.hoi_max_joint_gap_s` 指定，默认 0.10 秒。每个 `timing/segment_starts` 区间成为一个训练 episode；不裁首尾、不按质量另切段。任一所选数据或对齐失败都拒绝整条 Raw，其余 Raw 继续导出。同源段在训练与验证之间按原始采集分组，避免泄漏。
+使用 `scripts/export_zarr.py --fields ...` 显式选择输出字段，使用 `scripts/visualize_episode.py` 查看点云与质量指标。导出包含 `object_pointcloud` 时读取 HOI，并按相机来源时间对齐所选关节和 FK 观测；存在无效帧或无法完整对齐的 Raw 会被拒绝。同源段在训练与验证之间按原始采集分组。
 
 数据表示与时间对齐见[物体重建与 HOI](../../docs/object_reconstruction.md)，后端安装与接口见 [cordvip_geometry](../../third_party/cordvip_geometry/README.md)。

@@ -59,12 +59,13 @@ def print_episode_info(episode_path: str, *, hoi: bool = True) -> None:
     print(f"Task outcome: {read_episode_outcome(path)['outcome']}")
     print(f"RGB file exists: {(path / 'rgb.mp4').is_file()}")
     with h5py.File(path / "data.h5", "r") as data:
-        if "meta" in data:
-            for name, value in data["meta"].attrs.items():
-                print(f"  {name}: {value}")
+        for name, value in data["meta"].attrs.items():
+            print(f"  {name}: {value}")
+
         def describe(name, obj):
             if isinstance(obj, h5py.Dataset):
                 print(f"  {name}: shape={obj.shape}, dtype={obj.dtype}")
+
         data.visititems(describe)
     if hoi and (path / "hoi.h5").is_file():
         print("HOI: hoi.h5")
