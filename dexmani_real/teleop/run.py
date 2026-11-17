@@ -62,7 +62,7 @@ def run_teleop(
             raise ValueError("max_duration_s must be finite and positive")
         runtime.camera.validate()
     recording_dir = (
-        Path(__file__).resolve().parents[2] / episodes_dir / task_name if record else None
+        Path(episodes_dir).expanduser().resolve() / task_name if record else None
     )
     if not runtime.hand.enabled and record:
         raise ValueError("hand-disabled operation cannot record episodes")

@@ -20,6 +20,8 @@ flowchart LR
 
 Checkpoint 描述模型的观测字段、动作、RGB 预处理和控制周期；[RealConfig](../dexmani_real/config/real.py) 与本地标定提供设备、传感器和运动限制等实验设置。执行周期和每次执行的动作步数默认取自 Checkpoint，也可由实验配置指定。部署先解析这些信息，再按实际需要启动传感器和感知模块。
 
+HOI 策略必须显式提供任务资产目录：`python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick`；Python 使用 `PolicySession(runtime, checkpoint, task_dir="/data/tasks/pick").run()`。该目录与离线准备、模板采样及标注共用，支持 `~`，相对路径以 cwd 为准。Checkpoint 的 `task_name` 保留实验标签含义，不参与资产路径推导，也无需与目录名一致。缺失目录或模板错误在连接设备前报告。非 HOI 策略不要求、也不读取任务资产；`--print-config` 仅检查声明配置。已有 `run_config.yaml` 记录实际使用的 `task_dir`。
+
 场景点云使用 `RealConfig.pointcloud`，手表面点云使用 `RealConfig.hand_pointcloud`。指尖 FK 与数据导出共用机器人模型中的固定五指顺序（thumb、index、middle、ring、pinky）。普通策略允许调整合法采样与几何参数进行研究，处理记录的差异不会阻止部署，部署不计算或比较模板摘要；这不保证调整后的任务表现。模型实际输入输出形状、动作单位、坐标和本地模板合法性仍须满足消费者要求。部署分别保存 `training_processing` 与 `actual_processing`，已知差异会显示，缺少训练研究记录则为 None。现场相机与桌面标定使用当前值。
 
 所有策略 RGB 在进入观测历史前按 [Canonical 图像几何](../README.md#实验流程)矫正为针孔图像，包括不请求相机参数的纯 RGB 策略。映射在相机配置时初始化，同一来源序号复用最近的矫正结果；Policy 继续使用针孔投影及 resize 坐标变换。Raw 录制和点云取色仍使用原始 RGB-D，已有 XYZ 和来源时间不变。

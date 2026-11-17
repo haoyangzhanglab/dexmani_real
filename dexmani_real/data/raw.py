@@ -442,6 +442,27 @@ def require_published_raw(path):
         raise ValueError(f"unpublished Raw: {requested}")
 
 
+def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
+    """枚举所有 episode 目录，损坏文件由读取边界直接报错。"""
+    requested_path = Path(input_root).expanduser()
+    root = requested_path.resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(root)
+    if (root / "data.h5").is_file():
+        require_published_raw(requested_path)
+        return (root,)
+    episodes = tuple(
+        sorted(
+            child
+            for child in root.iterdir()
+            if child.is_dir() and child.name.startswith("episode_")
+        )
+    )
+    if not episodes:
+        raise FileNotFoundError(f"no episode directories found in {root}")
+    return episodes
+
+
 class RawReader:
     def __init__(self, episode_path: str | Path):
         import h5py

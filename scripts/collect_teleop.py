@@ -30,7 +30,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Enable/disable capture and camera",
     )
     parser.add_argument(
-        "--episodes-dir", default="episodes", help="Capture root directory (default: %(default)s)",
+        "--episodes-dir", default="episodes",
+        help="Capture root directory, relative to cwd; supports ~ (default: %(default)s)",
     )
     parser.add_argument(
         "--max-duration", type=float, default=60.0,

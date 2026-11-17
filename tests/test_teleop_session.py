@@ -26,6 +26,38 @@ from dexmani_real.teleop import run as run_module
 from dexmani_real.teleop.loop import TeleopLoop
 
 
+@pytest.mark.parametrize("episodes_dir", ["captures", "~/captures"])
+def test_collection_directory_is_resolved_from_cwd_or_home(tmp_path, monkeypatch, episodes_dir):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state = SessionState(stop_signal=threading.Event(), emergency_signal=threading.Event())
+    monkeypatch.setattr(run_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(run_module, "SessionState", lambda: state)
+    monkeypatch.setattr(run_module.mp, "get_context", Mock())
+    monkeypatch.setattr(run_module, "load_vr_transform", Mock())
+    monkeypatch.setattr(run_module, "ActionMapper", Mock())
+    monkeypatch.setattr(run_module, "build_hand_retargeter", Mock())
+    monkeypatch.setattr(run_module, "VRController", Mock())
+    monkeypatch.setattr(run_module, "SensorChannels", Mock())
+    monkeypatch.setattr(run_module, "SensorWorkers", Mock())
+    robot = Mock()
+    monkeypatch.setattr(run_module, "Robot", robot)
+    monkeypatch.setattr(run_module, "Keyboard", Mock(return_value=Mock(bindings={})))
+    monkeypatch.setattr(run_module, "AudioFeedback", Mock())
+    monkeypatch.setattr(run_module, "snapshot_camera_parameters", Mock())
+    monkeypatch.setattr(run_module, "initialize_teleop", Mock())
+    monkeypatch.setattr(run_module, "close_runtime", Mock())
+    loop = Mock(session_failed=False)
+    loop.run.side_effect = state.request_quit
+    constructor = Mock(return_value=loop)
+    monkeypatch.setattr(run_module, "TeleopLoop", constructor)
+    assert run_module.run_teleop(
+        RealConfig(), record=True, episodes_dir=episodes_dir, max_duration_s=10, task_name="experiment_label",
+    ) == 0
+    assert constructor.call_args.kwargs["recording_dir"] == tmp_path / "captures/experiment_label"
+    assert constructor.call_args.kwargs["task_label"] == "experiment_label"
+
+
 @pytest.fixture
 def teleop():
     runtime = RealConfig()

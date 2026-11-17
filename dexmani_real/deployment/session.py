@@ -94,6 +94,7 @@ class PolicySession:
         self, runtime, policy, *, weights=None, inference_steps=None, output_root=None,
         device="cuda:0", seed=0, max_duration_s: float | None = DEFAULT_MAX_DURATION_S,
         num_episodes=DEFAULT_NUM_EPISODES, record_raw=False, camera_calibration_path=None,
+        task_dir=None,
     ):
         # 实验预算在分配会话资源前校验；CLI 和直接 Python 调用共用此入口。
         if max_duration_s is not None:
@@ -111,6 +112,7 @@ class PolicySession:
             camera_calibration_path = Path(camera_calibration_path).expanduser().resolve()
 
         self.runtime, self.policy = runtime, policy
+        self.task_dir = task_dir
         self.weights, self.inference_steps = weights, inference_steps
         self.info: PolicyInfo
         self.observations: ObservationBuilder
@@ -156,6 +158,7 @@ class PolicySession:
                                  if self.table_plane_abcd is not None else None),
             "num_episodes": self.num_episodes, "max_duration_s": self.max_duration_s,
             "record_raw": self.record_raw,
+            "task_dir": (str(self.hoi_inputs[0]) if self.hoi_inputs is not None else None),
         }
         write_yaml(payload, self.output_dir / "run_config.yaml")
 
@@ -215,7 +218,7 @@ class PolicySession:
         )
         self.model.load()
         self.info = self.wait_model()
-        self.hoi_inputs = resolve_hoi_inputs(self.info)
+        self.hoi_inputs = resolve_hoi_inputs(self.info, self.task_dir)
         declared_execution = self.runtime.execution
         self.runtime = resolve_deployment_config(self.info, self.runtime)
         self.observations = ObservationBuilder(self.info, self.runtime)

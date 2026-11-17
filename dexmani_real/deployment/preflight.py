@@ -96,7 +96,7 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     return runtime
 
 
-def resolve_hoi_inputs(info):
+def resolve_hoi_inputs(info, task_dir):
     """解析并加载 HOI 任务模板；模板错误在设备连接前失败。"""
     from pathlib import Path
 
@@ -104,12 +104,10 @@ def resolve_hoi_inputs(info):
         return None
     if "point_cloud" in info.observation_fields:
         raise ValueError("HOI 与 point_cloud 不支持混合输入")
-    name = info.task_name
-    if not name or Path(name).name != name or name in (".", ".."):
-        raise ValueError("非法任务名")
-    root = Path(__file__).resolve().parents[2]
+    if task_dir is None:
+        raise ValueError("HOI policy requires explicit task_dir (--task-dir)")
     from dexmani_real.geometry.hoi import load_task_template
-    task = root / "assets/pointcloud_template/object" / name
+    task = Path(task_dir).expanduser().resolve()
     return task, load_task_template(task)
 
 

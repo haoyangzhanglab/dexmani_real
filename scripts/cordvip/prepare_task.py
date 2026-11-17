@@ -17,7 +17,7 @@ from dexmani_real.geometry.hoi import task_objects
 
 
 def prepare_task(task):
-    task = Path(task)
+    task = Path(task).expanduser().resolve()
     objects = []
     for obj in task_objects(task):
         mesh_path = task / obj["name"] / "mesh/mesh_m.obj"
@@ -103,13 +103,12 @@ def prepare_task(task):
         print(f"已保存米制 Mesh：{directory}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", required=True)
-    args = parser.parse_args()
-    if Path(args.task).name != args.task or args.task in (".", ".."):
-        parser.error("非法任务名")
-    prepare_task(ROOT / "assets/pointcloud_template/object" / args.task)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--task-dir", type=Path, required=True, help="任务资产目录；相对 cwd，支持 ~")
+    args = parser.parse_args(argv)
+    prepare_task(args.task_dir)
+    return 0
 
 
 if __name__ == "__main__":
