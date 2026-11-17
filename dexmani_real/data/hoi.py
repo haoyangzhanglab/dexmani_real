@@ -58,7 +58,6 @@ def write_hoi(
             data.attrs["tracking_config"] = json.dumps(tracking_config)
             data.create_dataset("object_pose_camera", data=poses)
             data.create_dataset("object_valid", data=object_valid)
-            data.create_dataset("valid", data=valid)
             data.create_dataset("base_from_camera", data=base_from_camera)
             saved_template = data.create_group("template")
             for key, value in template.items():
@@ -97,46 +96,61 @@ def write_hoi(
     return path
 
 
-def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand")):
-    """为可视化对齐各原始区间；无法对齐的行保留 NaN，不筛行或生成 episode。"""
+def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand"), stop=None):
+    """对齐查看范围；必要时只向同一原生段内读取右邻点，无法对齐处保留 NaN。"""
     validate_joint_gap(max_gap_s)
-    timing = reader.read_timing()
+    timing = reader.read_timing(stop=stop)
+    count = len(timing)
     for key in ("camera_ns", *(f"{device}_ns" for device in devices)):
         if np.any(timing[key] <= 0) or np.any(timing[key] > timing["observation_ns"]):
             raise ValueError(f"Invalid HOI source timestamp: {key}")
     joints = {
-        f"{device}_qpos": np.empty(reader[f"{device}_qpos"].shape) for device in devices
+        f"{device}_qpos": np.empty((count, *reader[f"{device}_qpos"].shape[1:]))
+        for device in devices
     }
     boundaries = np.r_[reader.segment_starts, reader.num_frames]
     for start, end in pairwise(boundaries):
+        if start >= count:
+            break
+        selected_end = min(end, count)
+        targets = timing["camera_ns"][start:selected_end]
+        latest_target = targets.max()
         for device in devices:
-            name = f"{device}_qpos"
+            name, clock = f"{device}_qpos", f"{device}_ns"
+            stamps = timing[clock][start:selected_end]
+            extra_stamps = []
+            stamp = stamps[-1]
+            source_end = selected_end
+            # 相机可能比本行关节更新；只消费直到覆盖最晚目标的第一个样本。
+            while source_end < end and stamp < latest_target:
+                row = reader["timing/rows"][source_end]
+                stamp = int(row[clock])
+                if stamp <= 0 or stamp > row["observation_ns"]:
+                    raise ValueError(f"Invalid HOI source timestamp: {clock}")
+                extra_stamps.append(stamp)
+                source_end += 1
+            if extra_stamps:
+                stamps = np.r_[stamps, extra_stamps]
             positions, _ = interpolate_joints(
-                timing[f"{device}_ns"][start:end], reader[name][start:end],
-                timing["camera_ns"][start:end], max_gap_s,
+                stamps, reader[name][start:source_end], targets, max_gap_s,
             )
-            joints[name][start:end] = positions
+            joints[name][start:selected_end] = positions
     return joints
 
 
-def read_hoi_validity(reader):
-    """读取显式有效性，缺失字段由读取边界报错。"""
+def read_hoi_validity(reader, stop=None):
+    """整帧有效性唯一来自所选范围内的逐物体有效性。"""
     import h5py
 
     data = reader.hoi_file
-    valid = np.asarray(data["valid"])
-    objects = np.asarray(data["object_valid"])
+    objects = data["object_valid"]
     names = data["template/object_names"]
     if not isinstance(names, h5py.Dataset) or names.ndim != 1:
         raise RawDataError("HOI template/object_names must be a one-dimensional dataset")
-    count = names.shape[0]
     if (
-        valid.dtype != bool
+        not isinstance(objects, h5py.Dataset)
         or objects.dtype != bool
-        or valid.shape != (reader.num_frames,)
-        or objects.shape != (reader.num_frames, count)
+        or objects.shape != (reader.num_frames, names.shape[0])
     ):
-        raise ValueError("Invalid HOI validity shape/dtype")
-    if not np.array_equal(valid, objects.all(axis=1)):
-        raise ValueError("Inconsistent HOI validity")
-    return valid
+        raise ValueError("Invalid HOI object_valid shape/dtype")
+    return objects[:stop].all(axis=1)

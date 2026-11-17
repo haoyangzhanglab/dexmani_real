@@ -383,7 +383,7 @@ def test_hoi_explicit_recompute_preserves_raw_and_reader_snapshot(annotated_epis
         np.testing.assert_array_equal(old_reader["object_pointcloud"][:], old_cloud)
         with RawReader(episode) as new_reader:
             np.testing.assert_allclose(new_reader["object_pointcloud"][:], old_cloud + [0.25, 0, 0], atol=2e-7)
-            assert new_reader.hoi_file["valid"][:].all()
+            assert new_reader.hoi_file["object_valid"][:].all()
     assert {name: (episode / name).read_bytes() for name in raw_before} == raw_before
 
 
@@ -1238,26 +1238,28 @@ def test_invalid_hoi_storage_requires_explicit_validity(tmp_path):
     path = tmp_path / "hoi.h5"
     template = dict(
         points_local=np.ones((1024, 3), np.float32),
-        offsets=[0, 1024],
-        object_names=["apple"],
+        offsets=[0, 512, 1024],
+        object_names=["apple", "pear"],
     )
-    poses = np.tile(np.eye(4), (3, 1, 1, 1))
+    poses = np.tile(np.eye(4), (3, 2, 1, 1))
     write_hoi(
         path,
         template,
         poses,
         np.eye(4),
-        quality=[[{"iou": 1}], [{}], [{"iou": 1}]],
+        quality=[[{"iou": 1}, {}], [{}, {}], [{"iou": 1}, {}]],
         tracking_config={},
-        object_valid=np.array([[True], [False], [True]]),
+        object_valid=np.array([[True, True], [True, False], [True, True]]),
     )
     with h5py.File(path, "r+") as data:
         reader = SimpleNamespace(hoi_file=data, num_frames=3)
         np.testing.assert_array_equal(read_hoi_validity(reader), [True, False, True])
-        assert np.isnan(data["object_pose_camera"][1]).all()
+        assert np.isnan(data["object_pose_camera"][1, 1]).all()
+        assert np.isfinite(data["object_pose_camera"][1, 0]).all()
+        np.testing.assert_array_equal(read_hoi_validity(reader, stop=2), [True, False])
         assert not data["object_pointcloud"][1].any()
         assert data["object_pointcloud"][2].all()
-        del data["valid"]
+        assert "valid" not in data
         del data["object_valid"]
         with pytest.raises(KeyError, match="valid"):
             read_hoi_validity(reader)
@@ -2016,7 +2018,7 @@ def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_
     )
     with h5py.File(episode / "hoi.h5", "r") as data:
         offline_cloud = data["object_pointcloud"][:]
-        np.testing.assert_array_equal(data["valid"][:], expected_valid)
+        np.testing.assert_array_equal(data["object_valid"][:].all(axis=1), expected_valid)
         assert not offline_cloud[~np.array(expected_valid)].any()
     output = tmp_path / "train.zarr"
     with pytest.raises(ValueError, match="all Raw episodes rejected"):
@@ -2723,3 +2725,74 @@ def test_multiple_moving_objects_share_one_batch_per_frame(recovery_scene, monke
         assert result.poses["apple"][0, 3] == step * 0.01
         assert result.poses["banana"][0, 3] == step * 0.02
     assert calls == [["apple", "banana"]] * 3
+
+
+@pytest.mark.parametrize("info", [False, True])
+def test_visualizer_can_bypass_corrupt_hoi(annotated_episode, monkeypatch, info):
+    import h5py
+    from scripts import visualize_episode as visual
+
+    episode, *_ = annotated_episode
+    (episode / "hoi.h5").write_bytes(b"corrupt annotation")
+    _disable_viewer(monkeypatch, visual)
+    def unexpected_hoi(*args, **kwargs):
+        raise AssertionError("Raw viewing must not consume HOI")
+
+    monkeypatch.setattr(visual, "align_hoi_episode", unexpected_hoi)
+    monkeypatch.setattr(visual, "read_hoi_validity", unexpected_hoi)
+    monkeypatch.setattr(visual.EpisodeVisualizer, "log_hoi_diagnostics", unexpected_hoi)
+    opened = []
+    original = h5py.File
+
+    def open_file(path, *args, **kwargs):
+        opened.append(Path(path).name)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(h5py, "File", open_file)
+    args = [str(episode), "--no-hoi", "--max-frames", "1", "--no-point-cloud"]
+    if info:
+        args.append("--info")
+    assert visual.main(args) == 0
+    assert "hoi.h5" not in opened
+    with pytest.raises(OSError):
+        visual.main([arg for arg in args if arg != "--no-hoi"])
+
+
+def _disable_viewer(monkeypatch, visual):
+    import rerun as rr
+    for name in ("init", "send_blueprint", "disconnect", "log", "set_time_sequence", "set_time_seconds"):
+        monkeypatch.setattr(rr, name, lambda *a, **kw: None)
+    for name in ("log_rgbd", "log_series", "log_camera_geometry", "log_points"):
+        monkeypatch.setattr(visual, name, lambda *a, **kw: None)
+
+
+def test_visualizer_reads_only_consumed_prefix(annotated_episode, monkeypatch):
+    import h5py
+    from scripts import visualize_episode as visual
+
+    episode, *_ = annotated_episode
+    with h5py.File(episode / "data.h5", "r+") as data:
+        data["arm_qpos"][2] = np.nan
+        rows = data["timing/rows"][:]
+        rows["control_ns"][2] = -1
+        data["timing/rows"][:] = rows
+    _disable_viewer(monkeypatch, visual)
+    original = h5py.Dataset.__getitem__
+    reads = []
+
+    def read(dataset, key, **kwargs):
+        if dataset.name in {"/arm_qpos", "/hand_qpos", "/object_valid", "/timing/rows"}:
+            reads.append((dataset.name, key))
+            assert (isinstance(key, slice) and key.stop == 1) or key == 0
+        return original(dataset, key, **kwargs)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
+    viewer = visual.EpisodeVisualizer(str(episode), table_plane_path=None, max_frames=1)
+    try:
+        assert len(viewer.timestamps_s) == len(viewer.hoi_valid) == 1
+        assert all(len(q) == 1 for q in viewer.hoi_alignment.values())
+        viewer.log_step(0, next(viewer.reader.iter_rgb_frames()))
+    finally:
+        viewer.close()
+    assert {name for name, _ in reads} == {"/arm_qpos", "/hand_qpos", "/object_valid", "/timing/rows"}
+
