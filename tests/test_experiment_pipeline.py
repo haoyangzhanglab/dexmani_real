@@ -1,5 +1,6 @@
 """当前生产者到分组训练、恢复及 CPU 推理的跨仓数值链路。"""
 
+import json
 from contextlib import closing
 from types import SimpleNamespace
 
@@ -8,9 +9,15 @@ import pytest
 import torch
 import zarr
 
+from dexmani_real.config.real import RealConfig
 from dexmani_real.data.export import ExportConfig, export_zarr
 from dexmani_real.data.hoi import write_hoi
-from dexmani_real.data.raw import RawWriter, camera_metadata
+from dexmani_real.data.raw import (
+    RawReader,
+    RawWriter,
+    episode_recording_metadata,
+    robot_recording_parameters,
+)
 from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
 from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
@@ -41,15 +48,22 @@ def test_current_raw_to_grouped_policy_resume(tmp_path):
         None, CameraIntrinsics(32, 32, 500, 500, 16, 16, "none", (0.,) * 5),
         .001, np.eye(4),
     )
-    template = dict(
-        points_local=np.random.default_rng(4).uniform(-.01, .01, (1024, 3)).astype("f4"),
-        offsets=np.array([0, 1024]), object_names=np.array(["object"]),
-    )
+    parameters = {
+        **robot_recording_parameters(RealConfig()),
+        "policy": {"task_name": "pick_apple_messy"},
+        "max_duration_s": 60.,
+        "actual_processing": {},
+    }
+    metadata = episode_recording_metadata(camera, parameters, tactile_reset={})
+    template = {
+        "points_local": np.random.default_rng(4).uniform(-.01, .01, (1024, 3)).astype("f4"),
+        "offsets": np.array([0, 1024]), "object_names": np.array(["object"]),
+    }
     for capture in range(3):
         episode = source / f"episode_{capture}"
         episode.mkdir(parents=True)
         writer = RawWriter(episode, control_hz=20)
-        writer.open(dict(collection_source="policy", task_label="pick_apple_messy", **camera_metadata(camera)))
+        writer.open(dict(metadata, collection_source="policy_rollout", task_label="pick_apple_messy"))
         try:
             for index in range(8):
                 stamp = 1_000_000_000 + index * 50_000_000 + (500_000_000 if index >= 4 else 0)
@@ -60,15 +74,25 @@ def test_current_raw_to_grouped_policy_resume(tmp_path):
                 hand["qpos"] = (index + capture) * .02
                 row = SimpleNamespace(
                     arm=arm, hand=hand, control_timestamp_ns=stamp, observation_timestamp_ns=stamp,
-                    camera=dict(timestamp_ns=stamp, ring_sequence=index + 1,
-                                rgb=np.full((32, 32, 3), 90 + index, np.uint8),
-                                depth=np.full((32, 32), 600, np.uint16)),
+                    camera={
+                        "timestamp_ns": stamp, "ring_sequence": index + 1,
+                        "rgb": np.full((32, 32, 3), 90 + index, np.uint8),
+                        "depth": np.full((32, 32), 600, np.uint16),
+                    },
                 )
                 command = SimpleNamespace(arm_qpos=arm["qpos"][0] + .01, hand_qpos=hand["qpos"][0] + .01)
                 writer.append_frame(row, command, segment_start=index == 4)
-            writer.finish("user_stop")
+            writer.finish("operator")
         finally:
             writer.close()
+        with RawReader(episode) as reader:
+            assert reader.meta["effective_parameters"] == metadata["effective_parameters"]
+            recorded = json.loads(reader.meta["effective_parameters"])
+            for key, value in recorded["camera"].items():
+                np.testing.assert_equal(reader.meta[key], value)
+            assert recorded["tactile_reset"] == {}
+            assert reader.meta["collection_source"] == "policy_rollout"
+            assert reader.meta["termination_reason"] == "operator"
         poses = np.tile(np.eye(4), (8, 1, 1, 1))
         poses[:, 0, 2, 3] = .5 + np.arange(8) * .001
         write_hoi(episode / "hoi.h5", template, poses, np.eye(4),

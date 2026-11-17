@@ -14,11 +14,11 @@ from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.calibration_data import CAMERAS_PATH
 from dexmani_real.config.deployment import (
-    DEFAULT_MAX_RUNNING_S,
+    DEFAULT_MAX_DURATION_S,
     DEFAULT_NUM_EPISODES,
 )
 from dexmani_real.control.actions import ActionMapper
-from dexmani_real.data.raw import camera_metadata
+from dexmani_real.data.raw import camera_metadata, robot_recording_parameters
 from dexmani_real.data.recorder import format_recording_result
 from dexmani_real.deployment.inference import (
     MODEL_SHUTDOWN_TIMEOUT_S,
@@ -27,11 +27,11 @@ from dexmani_real.deployment.inference import (
 )
 from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import (
-    resolve_deployment_config,
     collect_data_processing,
+    resolve_deployment_config,
     resolve_hoi_inputs,
 )
-from dexmani_real.deployment.rollout import Rollout, utc_now
+from dexmani_real.deployment.rollout import EpisodeResult, Rollout, utc_now
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import (
     FeedbackUnavailable,
@@ -92,16 +92,16 @@ def session_directory(root: Path) -> Path:
 class PolicySession:
     def __init__(
         self, runtime, policy, *, weights=None, inference_steps=None, output_root=None,
-        device="cuda:0", seed=0, max_running_s=DEFAULT_MAX_RUNNING_S,
+        device="cuda:0", seed=0, max_duration_s: float | None = DEFAULT_MAX_DURATION_S,
         num_episodes=DEFAULT_NUM_EPISODES, record_raw=False, camera_calibration_path=None,
     ):
         # 实验预算在分配会话资源前校验；CLI 和直接 Python 调用共用此入口。
-        if max_running_s is not None:
-            if isinstance(max_running_s, bool):
-                raise TypeError("max_running_s must be a finite positive number or None")
-            max_running_s = float(max_running_s)
-            if not math.isfinite(max_running_s) or max_running_s <= 0:
-                raise ValueError("max_running_s must be finite and positive")
+        if max_duration_s is not None:
+            if isinstance(max_duration_s, bool):
+                raise TypeError("max_duration_s must be a finite positive number or None")
+            max_duration_s = float(max_duration_s)
+            if not math.isfinite(max_duration_s) or max_duration_s <= 0:
+                raise ValueError("max_duration_s must be finite and positive")
         if num_episodes is not None:
             if type(num_episodes) is not int:
                 raise TypeError("num_episodes must be a positive integer or None")
@@ -116,11 +116,11 @@ class PolicySession:
         self.observations: ObservationBuilder
         self.table_plane_abcd = None
         self.device, self.seed = device, seed
-        self.max_running_s, self.num_episodes = max_running_s, num_episodes
+        self.max_duration_s, self.num_episodes = max_duration_s, num_episodes
         self.record_raw = record_raw
         self.output_root = (Path(output_root) if output_root is not None else
                             Path(__file__).resolve().parents[2] / "rollouts" if record_raw else None)
-        self.output_dir = None
+        self.output_dir: Path | None = None
         self.camera_calibration_path = camera_calibration_path
         self.camera_snapshot = None
         self.runtime_state = SessionState()
@@ -135,8 +135,9 @@ class PolicySession:
         )
         self.robot: Robot | None = None
         self.model: PolicyWorker | None = None
-        self.episode = None
-        self.episodes, self.errors = [], []
+        self.episode: Rollout | None = None
+        self.episodes: list[EpisodeResult] = []
+        self.errors: list[dict[str, str]] = []
         self.summary = {"started_utc": utc_now(), "ended_utc": None, "termination_reason": None}
 
     def save_run_config(self):
@@ -153,7 +154,7 @@ class PolicySession:
             "table_plane_abcd": self.table_plane_abcd,
             "table_plane_path": (str(resolve_table_plane_path(self.runtime.environment.table_plane_path))
                                  if self.table_plane_abcd is not None else None),
-            "num_episodes": self.num_episodes, "max_duration_s": self.max_running_s,
+            "num_episodes": self.num_episodes, "max_duration_s": self.max_duration_s,
             "record_raw": self.record_raw,
         }
         write_yaml(payload, self.output_dir / "run_config.yaml")
@@ -250,20 +251,9 @@ class PolicySession:
         self.effective_parameters = {
             "policy": policy_parameters,
             "seed": self.seed, "device": self.device,
-            "max_duration_s": self.max_running_s,
+            "max_duration_s": self.max_duration_s,
             "execution": execution,
-            "arm": {name: getattr(runtime.arm, name) for name in (
-                "ip", "collision_sensitivity", "tcp_load_mass_kg", "tcp_load_cog_mm",
-                "joint_limit_lower", "joint_limit_upper", "max_joint_velocity_deg_per_s",
-                "max_joint_acceleration_deg_per_s2", "max_joint_jerk_deg_per_s3", "servo_hz",
-                "feedback_hz", "feedback_max_age_s", "standstill_position_tolerance_rad",
-                "standstill_velocity_tolerance_rad_s",
-            )},
-            "hand": {name: getattr(runtime.hand, name) for name in (
-                "enabled", "comm_type", "device_name", "device_id", "qpos_min_rad", "qpos_max_rad",
-                "kp", "ki", "kd", "tor_max", "feedback_max_age_s",
-                "baudrate" if runtime.hand.comm_type == "serial" else "ethercat_slave_position",
-            )},
+            **robot_recording_parameters(runtime),
         }
         if self.info.action_mode == "eef":
             self.effective_parameters.update(
@@ -294,7 +284,7 @@ class PolicySession:
             f"control_dt_s={self.runtime.execution.control_dt_s:g} "
             f"({'Checkpoint' if declared_execution.control_dt_s is None else 'RealConfig'})"
         )
-        duration = f"{self.max_running_s:g} s" if self.max_running_s is not None else "直到用户停止或真实失败"
+        duration = f"{self.max_duration_s:g} s" if self.max_duration_s is not None else "直到用户停止或真实失败"
         print(f"评估：{self.num_episodes if self.num_episodes is not None else '不限'} 轮 | 每轮预算 {duration} | 输入：{', '.join(self.info.observation_fields)}")
         for name, field in (("pointcloud", "point_cloud"), ("hand_pointcloud", "hand_pointcloud")):
             if field in self.info.observation_fields:
@@ -629,7 +619,7 @@ class PolicySession:
                 robot=self.robot, sensors=self.sensors, observations=self.observations,
                 read_needs=self.read_needs, record_needs=self.record_needs,
                 action_mapper=self.action_mapper, model=self.model,
-                max_running_s=self.max_running_s,
+                max_duration_s=self.max_duration_s,
                 index=len(self.episodes) + 1, output_dir=self.output_dir, record_raw=self.record_raw,
                 effective_parameters={**self.effective_parameters, "actual_processing": self.actual_processing},
                 camera_snapshot=self.camera_snapshot,

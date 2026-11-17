@@ -3,7 +3,7 @@
 import json
 import threading
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,14 +12,17 @@ import pytest
 
 from dexmani_real.config.real import RealConfig
 from dexmani_real.control.actions import ActionResult
+from dexmani_real.data.raw import camera_metadata, robot_recording_parameters
 from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
+from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.geometry.pose import Pose
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import SensorWorkers
 from dexmani_real.runtime.state import SessionState
-from dexmani_real.teleop import loop as loop_module, run as run_module
+from dexmani_real.teleop import loop as loop_module
+from dexmani_real.teleop import run as run_module
 from dexmani_real.teleop.loop import TeleopLoop
 
 
@@ -73,7 +76,6 @@ def control_row(teleop):
     return loop_module.read_observation(
         teleop.sensors.channels, teleop.robot, needs=teleop.capture_needs,
     )
-
 
 
 def test_two_episodes_stop_clear_and_restart(teleop):
@@ -145,17 +147,23 @@ def test_revoked_start_does_not_enter_or_cleanup_episode(teleop):
     assert teleop.episode_cancel_epoch is None
 
 
-def test_partial_recorder_start_is_finished_before_return(teleop, monkeypatch, tmp_path):
+@pytest.mark.parametrize("retargeting", [False, True])
+def test_recording_parameters_and_start_failure_cleanup(teleop, monkeypatch, tmp_path, retargeting):
     teleop.recording_dir = tmp_path
-    teleop.robot.hand.tactile_reset_metadata = {}
+    teleop.camera_snapshot = CameraSnapshot(
+        "camera-123", CameraIntrinsics(16, 16, 20., 20., 8., 8., "none", (0.,) * 5), .001, np.eye(4),
+    )
+    teleop.robot.hand.tactile_reset_metadata = {
+        "hand_tactile_reset_time_ns": 123456789, "hand_tactile_reset_result": {2: 0},
+    }
     teleop.controller.rotation.as_matrix.return_value = np.eye(3)
-    teleop.controller.hand_retargeter = None
+    calibration = SimpleNamespace(bone_lengths=np.arange(20) / 100, palm_width=.08)
+    teleop.controller.hand_retargeter = SimpleNamespace(calibration=calibration) if retargeting else None
     teleop.runtime = replace(
         teleop.runtime, arm=replace(teleop.runtime.arm, homing=object()),
         environment=replace(teleop.runtime.environment, home_model_confirmed=object(), static_boxes=(object(),)),
         execution=replace(teleop.runtime.execution, rtc_guidance_cap=object()),
     )
-    monkeypatch.setattr(loop_module, "camera_metadata", lambda *args: {})
     recorder = Mock(
         error=RecordingError("writer failed"),
         start=Mock(side_effect=RecordingError("writer failed")),
@@ -164,12 +172,27 @@ def test_partial_recorder_start_is_finished_before_return(teleop, monkeypatch, t
     )
     monkeypatch.setattr(loop_module, "EpisodeRecorder", Mock(return_value=recorder))
     teleop.run_episode(teleop.runtime_state.cancel_epoch)
-    metadata = recorder.start.call_args.kwargs["metadata"]
-    parameters = json.loads(metadata["effective_parameters"])
-    assert "homing" not in parameters["arm"]
-    assert "home_model_confirmed" not in parameters["environment"]
-    assert "execution" not in parameters
-    assert parameters["vr_to_robot_rotation"] == np.eye(3).tolist()
+    parameters = json.loads(recorder.start.call_args.kwargs["metadata"]["effective_parameters"])
+    runtime = teleop.runtime
+    expected = {
+        **robot_recording_parameters(runtime),
+        "teleop": asdict(runtime.teleop), "max_duration_s": 10,
+        "motion": asdict(runtime.motion),
+        "environment": {
+            "workspace": asdict(runtime.environment.workspace),
+            "eef_workspace_tolerance_m": runtime.environment.eef_workspace_tolerance_m,
+        },
+        "camera_config": asdict(runtime.camera),
+        "vr": asdict(runtime.vr), "vr_to_robot_rotation": np.eye(3).tolist(),
+        "camera": camera_metadata(teleop.camera_snapshot),
+        "tactile_reset": teleop.robot.hand.tactile_reset_metadata,
+    }
+    if retargeting:
+        expected.update(
+            hand_retargeting=asdict(runtime.hand_retargeting),
+            hand_retargeting_calibration={"bone_lengths": calibration.bone_lengths.tolist(), "palm_width": .08},
+        )
+    assert parameters == json.loads(json.dumps(expected, allow_nan=False))
     recorder.request_finish.assert_called_once()
     recorder.poll_finish.assert_called_once()
     teleop.robot.prepare_streaming.assert_not_called()

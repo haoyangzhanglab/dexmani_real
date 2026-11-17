@@ -1,21 +1,25 @@
 """在线 HOI 恢复的控制契约；不加载模型或连接设备。"""
 
 from concurrent.futures import Future
+from copy import deepcopy
 from dataclasses import replace
 from threading import Event
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
 
 from dexmani_real.config.deployment import ExecutionConfig
 from dexmani_real.config.real import RealConfig
+from dexmani_real.data.raw import episode_recording_metadata
 from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
 from dexmani_real.deployment import rollout as rollout_module
 from dexmani_real.deployment.inference import PolicyWorker
 from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.rollout import Rollout
 from dexmani_real.deployment.schedule import ActionChunk, Prediction
+from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.robot.commands import (
     COMMAND_LEASE_NS,
     FeedbackUnavailable,
@@ -160,7 +164,7 @@ def env(monkeypatch, record_raw):
     state = SessionState(stop_signal=Event(), emergency_signal=Event())
     robot = FakeRobot(clock, state)
     channels = SimpleNamespace(
-        hoi_request=FakeRing(dict(episode_id=7, after_ns=1, after_sequence=0)),
+        hoi_request=FakeRing({"episode_id": 7, "after_ns": 1, "after_sequence": 0}),
         hoi_ring=FakeRing(None), camera_ring=FakeRing(None),
     )
     runtime = RealConfig(execution=ExecutionConfig(control_dt_s=0.05, action_steps=8))
@@ -183,22 +187,21 @@ def env(monkeypatch, record_raw):
         record_needs=record_needs,
         action_mapper=SimpleNamespace(map_joint=lambda arm, hand: SimpleNamespace(
             arm_qpos=arm, hand_qpos=hand, rejection_reason=None)),
-        model=worker, max_running_s=60, index=7, output_dir=None, record_raw=record_raw,
+        model=worker, max_duration_s=60, index=7, output_dir=None, record_raw=record_raw,
         effective_parameters={},
     )
     rollout.recorder = recorder if record_raw else None
     rollout.started_ns = clock.now
-    rollout.run_deadline_ns = clock.now + 60_000_000_000
 
     def publish(valid=True):
-        channels.camera_ring.data = dict(
-            timestamp_ns=clock.now, rgb=np.zeros((2, 2, 3), np.uint8),
-            depth=np.ones((2, 2), np.uint16),
-        )
-        channels.hoi_ring.data = dict(
-            episode_id=7, timestamp_ns=clock.now, source_camera_sequence=1,
-            valid=valid, object_pointcloud=np.full((4, 3), clock.now, dtype=float),
-        )
+        channels.camera_ring.data = {
+            "timestamp_ns": clock.now, "rgb": np.zeros((2, 2, 3), np.uint8),
+            "depth": np.ones((2, 2), np.uint16),
+        }
+        channels.hoi_ring.data = {
+            "episode_id": 7, "timestamp_ns": clock.now, "source_camera_sequence": 1,
+            "valid": valid, "object_pointcloud": np.full((4, 3), clock.now, dtype=float),
+        }
 
     def advance(seconds=0.05, valid=True):
         clock.now += round(seconds * 1e9)
@@ -251,6 +254,61 @@ def test_initial_registration_waits(env):
     assert polls == 4
     assert env.channels.hoi_request.data["episode_id"] == 7
     assert not env.channels.hoi_request.writes
+
+
+@pytest.mark.parametrize("writer_fails", [False, True])
+def test_preparation_records_parameters_and_starts_budget(env, monkeypatch, tmp_path, writer_fails):
+    rollout = env.rollout
+    rollout.started_ns = 0
+    rollout.output_dir = tmp_path
+    rollout.policy_info.task_name = "test"
+    rollout.camera_snapshot = CameraSnapshot(
+        "camera-123", CameraIntrinsics(16, 16, 20., 20., 8., 8., "none", (0.,) * 5), .001, np.eye(4),
+    )
+    rollout.effective_parameters = {
+        "policy": {"task_name": "test"},
+        "actual_processing": {"object_pointcloud": {"max_joint_gap_s": .1}},
+    }
+    original = deepcopy(rollout.effective_parameters)
+    env.robot.hand = SimpleNamespace(tactile_reset_metadata={
+        "hand_tactile_reset_time_ns": 123456789, "hand_tactile_reset_result": {2: 0},
+    })
+
+    def poll():
+        env.channels.camera_ring.latest_sequence += 1
+        # 准备耗时超过 60 秒，也不能提前消耗正式运行预算。
+        env.advance(61)
+        env.channels.hoi_ring.data["source_camera_sequence"] = env.channels.camera_ring.latest_sequence
+        assert rollout.started_ns == 0
+        assert not rollout.duration_expired()
+
+    env.worker.warmed_up = False
+    env.worker.warmup = lambda *a, **kw: poll()
+    env.robot.prepare_streaming = Mock(side_effect=lambda *a, **kw: env.state.stop_signal.clear())
+    failure = RecordingError("writer failed")
+    recorder = Mock(start=Mock(side_effect=failure if writer_fails else None))
+    constructor = Mock(return_value=recorder)
+    monkeypatch.setattr(rollout_module, "EpisodeRecorder", constructor)
+
+    if writer_fails:
+        with pytest.raises(RecordingError) as caught:
+            rollout.prepare(poll)
+        assert caught.value is failure
+        env.robot.prepare_streaming.assert_not_called()
+    else:
+        rollout.prepare(poll)
+        env.robot.prepare_streaming.assert_called_once()
+        assert rollout.started_ns == env.clock.now
+        assert not rollout.duration_expired()
+    assert env.worker.warmed_up
+    constructor.assert_called_once_with(tmp_path, control_hz=20.)
+    recorder.start.assert_called_once_with(
+        task_label="test", episode_name="episode_007", collection_source="policy_rollout",
+        metadata=episode_recording_metadata(
+            rollout.camera_snapshot, original, tactile_reset=env.robot.hand.tactile_reset_metadata,
+        ),
+    )
+    assert rollout.effective_parameters == original
 
 
 def test_hold_clears_context_and_refreshes_measured_hand(env):
@@ -370,7 +428,7 @@ def test_repeated_occlusion_keeps_gap_and_recovers_after_five_seconds(env):
 @pytest.mark.parametrize("unbounded", [False, True])
 def test_hold_uses_total_episode_budget(env, unbounded):
     if unbounded:
-        env.rollout.run_deadline_ns = None
+        env.rollout.max_duration_ns = None
     enter_hold(env)
     env.advance(61, False)
     env.rollout.step()
@@ -383,9 +441,27 @@ def test_hold_uses_total_episode_budget(env, unbounded):
     assert not env.recorder.rows
 
 
-def test_invalid_hoi_skips_alignment_but_checks_required_recording(env, monkeypatch):
-    from unittest.mock import Mock
+@pytest.mark.parametrize("operator_stop", [False, True])
+def test_duration_boundary_and_finished_episode(env, operator_stop):
+    rollout = env.rollout
+    env.clock.now = rollout.started_ns + rollout.max_duration_ns - 1
+    assert not rollout.duration_expired()
+    assert not rollout.finished
+    if operator_stop:
+        rollout.stop("operator input", run_end_reason=RunEndReason.OPERATOR)
+    env.clock.now += 1
+    assert rollout.duration_expired() is (not operator_stop)
+    assert rollout.result.termination_reason == ("operator" if operator_stop else "duration_complete")
+    assert env.state.stop_signal.is_set()
+    result = deepcopy(rollout.result)
+    requests = len(env.channels.hoi_request.writes)
+    env.advance(60)
+    assert not rollout.duration_expired()
+    assert rollout.result == result
+    assert len(env.channels.hoi_request.writes) == requests
 
+
+def test_invalid_hoi_skips_alignment_but_checks_required_recording(env, monkeypatch):
     aligned = Mock(wraps=env.robot.aligned_joints)
     monkeypatch.setattr(env.robot, "aligned_joints", aligned)
     enter_hold(env)
@@ -488,7 +564,7 @@ def test_run_cleanup_and_precedence(env, cause):
             env.state.request_emergency_stop()
             env.rollout.stop("operator input", run_end_reason=RunEndReason.ESTOP)
         elif cause == "duration":
-            env.rollout.run_deadline_ns = env.clock.now
+            env.clock.now = env.rollout.started_ns + env.rollout.max_duration_ns
 
     if cause == "worker":
         with pytest.raises(RobotError, match="worker exited"):
@@ -497,8 +573,10 @@ def test_run_cleanup_and_precedence(env, cause):
         env.rollout.run(poll_operator=poll)
     assert env.robot.stops == 1 and env.state.stop_signal.is_set()
     assert env.channels.hoi_request.data["episode_id"] == 0
-    expected = dict(operator="operator", estop="estop",
-                    duration="duration_complete", worker="failed")
+    expected = {
+        "operator": "operator", "estop": "estop",
+        "duration": "duration_complete", "worker": "failed",
+    }
     assert env.rollout.result.termination_reason == expected[cause]
 
 
@@ -555,8 +633,8 @@ def test_recording_failure_preserves_submission_error(env, resuming):
     assert env.rollout.state == ("RESUMING" if resuming else "RUNNING")
     assert env.rollout.result.termination_reason == "failed"
     assert env.rollout.result.errors == [
-        dict(stage="recording_append", exception_type="RecordingError", message="append failed"),
-        dict(stage="control", exception_type="RobotError", message="submission failed"),
+        {"stage": "recording_append", "exception_type": "RecordingError", "message": "append failed"},
+        {"stage": "control", "exception_type": "RobotError", "message": "submission failed"},
     ]
     assert env.robot.stops == 1 and env.state.stop_signal.is_set()
 
@@ -775,7 +853,6 @@ def test_published_recording_gap_is_a_segment_not_truncation(tmp_path):
     from dexmani_real.data.export import ExportConfig, export_zarr
     from dexmani_real.data.raw import RawReader, camera_metadata
     from dexmani_real.data.recorder import format_recording_result
-    from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
     from dexmani_real.robot.commands import RobotCommand
     from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
     from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
@@ -795,8 +872,10 @@ def test_published_recording_gap_is_a_segment_not_truncation(tmp_path):
             row = Observation(
                 arm=arm, hand=hand, vr=None, point_cloud=None,
                 observation_timestamp_ns=stamp, control_timestamp_ns=stamp,
-                camera=dict(timestamp_ns=stamp, ring_sequence=index + 1,
-                            rgb=np.full((16, 16, 3), 100, np.uint8), depth=np.full((16, 16), 500, np.uint16)),
+                camera={
+                    "timestamp_ns": stamp, "ring_sequence": index + 1,
+                    "rgb": np.full((16, 16, 3), 100, np.uint8), "depth": np.full((16, 16), 500, np.uint16),
+                },
             )
             assert recorder.append(row, RobotCommand(arm_qpos=np.zeros(7), hand_qpos=np.zeros(12))) is None
     finally:
@@ -913,7 +992,6 @@ def test_session_shutdown_keeps_order_and_error_precedence(env, monkeypatch, fai
 
 @pytest.mark.parametrize("pending", ["recorder", "model", None], ids=["recorder", "model", "complete"])
 def test_episode_finalization_releases_only_completed_resources(env, monkeypatch, tmp_path, pending):
-    from unittest.mock import Mock
     from dexmani_real.deployment import session as session_module
 
     monkeypatch.setattr(session_module, "SessionState", lambda: env.state)

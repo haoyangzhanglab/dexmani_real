@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 DEFAULT_NUM_EPISODES = 20
-DEFAULT_MAX_RUNNING_S = 60.0
+DEFAULT_MAX_DURATION_S = 60.0
 
 
 @dataclass(frozen=True)

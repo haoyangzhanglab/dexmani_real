@@ -1,6 +1,5 @@
 """遥操作控制循环与单段示教录制。"""
 
-import json
 import logging
 import sys
 import time
@@ -9,7 +8,7 @@ from dataclasses import asdict
 
 from dexmani_real.control.actions import StartPoseRejected
 from dexmani_real.control.ik import IKReferenceError
-from dexmani_real.data.raw import camera_metadata
+from dexmani_real.data.raw import episode_recording_metadata, robot_recording_parameters
 from dexmani_real.data.recorder import (
     EpisodeRecorder,
     RecordingError,
@@ -260,33 +259,19 @@ class TeleopLoop:
             if self.start_observation() is None or self.preparation_interrupted():
                 return False
             if self.recording_dir is not None:
-                metadata = camera_metadata(self.camera_snapshot)
                 runtime = self.runtime
                 effective_parameters = {
                     "teleop": asdict(runtime.teleop),
                     "max_duration_s": self.max_duration_s,
-                    "arm": {name: getattr(runtime.arm, name) for name in (
-                        "ip", "collision_sensitivity", "tcp_load_mass_kg", "tcp_load_cog_mm",
-                        "joint_limit_lower", "joint_limit_upper", "max_joint_velocity_deg_per_s",
-                        "max_joint_acceleration_deg_per_s2", "max_joint_jerk_deg_per_s3", "servo_hz",
-                        "feedback_hz", "feedback_max_age_s", "standstill_position_tolerance_rad",
-                        "standstill_velocity_tolerance_rad_s",
-                    )},
-                    "hand": {name: getattr(runtime.hand, name) for name in (
-                        "enabled", "comm_type", "device_name", "device_id", "qpos_min_rad", "qpos_max_rad",
-                        "kp", "ki", "kd", "tor_max", "feedback_max_age_s",
-                        "baudrate" if runtime.hand.comm_type == "serial" else "ethercat_slave_position",
-                    )},
+                    **robot_recording_parameters(runtime),
                     "motion": asdict(runtime.motion),
                     "environment": {
                         "workspace": asdict(runtime.environment.workspace),
                         "eef_workspace_tolerance_m": runtime.environment.eef_workspace_tolerance_m,
                     },
-                    "camera": metadata.copy(),
                     "camera_config": asdict(runtime.camera),
                     "vr": asdict(runtime.vr),
                     "vr_to_robot_rotation": self.controller.rotation.as_matrix().tolist(),
-                    "tactile_reset": self.robot.hand.tactile_reset_metadata,
                 }
                 retargeter = self.controller.hand_retargeter
                 if retargeter is not None:
@@ -296,7 +281,10 @@ class TeleopLoop:
                         "bone_lengths": calibration.bone_lengths.tolist(),
                         "palm_width": calibration.palm_width,
                     }
-                metadata["effective_parameters"] = json.dumps(effective_parameters, allow_nan=False)
+                metadata = episode_recording_metadata(
+                    self.camera_snapshot, effective_parameters,
+                    tactile_reset=self.robot.hand.tactile_reset_metadata,
+                )
                 self.recorder = EpisodeRecorder(
                     self.recording_dir, control_hz=self.runtime.teleop.control_hz,
                 )

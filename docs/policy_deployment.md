@@ -74,7 +74,7 @@ HOI 暂停及恢复预测等待期间不追加 Raw 行；尝试提交恢复动�
 
 Raw 保留连续区间边界，每个原生连续段导出为一个训练 episode；关节对齐与采样窗口不跨 gap，同源各段共同进入训练或验证集。一条 Raw 的任一所选数据或段损坏时，整条回滚。物理回放仍只执行所选原始区间，运行前需将机器人就位到该区间的起始姿态。等待预测时尚无动作的记录不会自动补成旧动作。
 
-Raw 的 `effective_parameters` 只保存实际使用的控制、算法和本次推理参数，加上实际相机与触觉复位结果。静态 `run_config.yaml` 与动态 `session_result.json` 分别保存；未执行的 HOME 配置和未启用的 RTC 参数不会进入普通录制准入。
+`run_config.yaml` 的 `effective_parameters` 保存本次会话实际使用的硬件、执行和策略参数，`effective_camera`、训练处理参数与实际处理参数单独记录。每个 Raw Episode 在会话参数上加入 `actual_processing`、该段相机信息和触觉复位结果，再保存为 JSON 字符串；相机信息同时保留在 Raw 顶层。共同硬件白名单与 Episode 元数据组装由 [raw.py](../dexmani_real/data/raw.py) 维护，未使用的 HOME 和 RTC 配置不进入记录。运行结果单独写入 `session_result.json`。
 
 任务成败可通过 [label_episode.py](../scripts/label_episode.py) 离线标注，与控制结束原因和录制保存结果分别记录。
 
@@ -88,7 +88,9 @@ Raw 的 `effective_parameters` 只保存实际使用的控制、算法和本次�
 2. **RESUMING**：当前 episode 的新鲜 HOI、关节对齐及其他必需输入全部有效，且旧预测已回收后，使用新的有效观测重建历史。首帧沿用正常启动的历史填充方式，首个预测调用策略的 `reset_episode()`，将推理随机数生成器重置到 `--seed` 指定的种子，不重复预热模型。
 3. **RUNNING**：首条新策略动作发送成功、整轮预算未到期并完成控制记账后恢复运行；提交前再次检查 HOI。此前再次遮挡则回到 HOLD，同一次录制间断不重复标记。
 
-运行与恢复共用整轮总预算，默认从实际开始运行起计 60 秒，CLI 用 `--max-duration` 覆盖；`--max-duration none`（Python 为 `None`）表示直到用户停止或真实失败。HOI 等待计入总预算，不设独立恢复期限。总预算到期通过正常停止路径结束本段，`termination_details` 为 `duration_timeout`。暂停不重置总时长或控制时钟，不补跑过去的控制槽；下一控制时刻由启动时间、最后控制槽和固定周期派生。启动、首帧、暖机及关闭的期限仍保留。
+每轮默认运行预算 60 秒，CLI 用 `--max-duration` 覆盖，Python 入口使用 `PolicySession(..., max_duration_s=...)`；CLI 的 `none` 与 Python 的 `None` 表示直到用户停止或真实失败。计时从准备完成并取得运动授权后开始，初始观测等待、模型预热、Recorder 初始化和设备准备不消耗运行预算。启动、观测、预热及关闭仍有各自等待期限。
+
+运行期间按启动时间与预算直接判断是否到期，推理等待、动作提交、HOI HOLD 和 RESUMING 都计入同一预算。恢复不会重新计时；总预算到期沿正常停止路径结束本段，`termination_details` 为 `duration_timeout`。暂停不重置控制时钟，也不补跑过去的控制槽；下一控制时刻由启动时间、最后控制槽和固定周期派生。
 
 整个恢复区间保留同一 HOI 请求、Worker、模型和 Raw Episode。设备反馈、其他必需模态或录制失败仍沿用原停止路径；操作员结束和急停始终有效。
 

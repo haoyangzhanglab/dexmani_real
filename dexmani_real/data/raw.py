@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -28,6 +29,8 @@ from dexmani_real.utils.timing import sampling_clock_ns
 if TYPE_CHECKING:
     import av
     import h5py
+
+    from dexmani_real.config.real import RealConfig
 
 logger = logging.getLogger(__name__)
 
@@ -156,9 +159,9 @@ def encode_timing_row(row):
     )
 
 
-def camera_metadata(camera: CameraSnapshot):
+def camera_metadata(camera: CameraSnapshot) -> dict[str, object]:
     color = camera.color
-    values = {
+    values: dict[str, object] = {
         "camera_payload_mode": "rgb" if camera.depth_scale_m is None else "depth_to_color_aligned_rgbd",
         "camera_color_width": color.width,
         "camera_color_height": color.height,
@@ -173,6 +176,41 @@ def camera_metadata(camera: CameraSnapshot):
     if camera.T_xarm_base_from_color is not None:
         values["camera_T_xarm_base_from_color"] = camera.T_xarm_base_from_color.reshape(-1).tolist()
     return values
+
+
+def robot_recording_parameters(runtime: RealConfig) -> dict[str, dict[str, object]]:
+    """提取 Arm/Hand 的录制参数白名单。"""
+    return {
+        "arm": {name: getattr(runtime.arm, name) for name in (
+            "ip", "collision_sensitivity", "tcp_load_mass_kg", "tcp_load_cog_mm",
+            "joint_limit_lower", "joint_limit_upper", "max_joint_velocity_deg_per_s",
+            "max_joint_acceleration_deg_per_s2", "max_joint_jerk_deg_per_s3", "servo_hz",
+            "feedback_hz", "feedback_max_age_s", "standstill_position_tolerance_rad",
+            "standstill_velocity_tolerance_rad_s",
+        )},
+        "hand": {name: getattr(runtime.hand, name) for name in (
+            "enabled", "comm_type", "device_name", "device_id", "qpos_min_rad", "qpos_max_rad",
+            "kp", "ki", "kd", "tor_max", "feedback_max_age_s",
+            "baudrate" if runtime.hand.comm_type == "serial" else "ethercat_slave_position",
+        )},
+    }
+
+
+def episode_recording_metadata(
+    camera_snapshot: CameraSnapshot,
+    effective_parameters: Mapping[str, object],
+    *,
+    tactile_reset: Mapping[str, object],
+) -> dict[str, object]:
+    """合并本段相机与触觉复位信息，不修改调用方的实验参数。"""
+    camera = camera_metadata(camera_snapshot)
+    parameters = {
+        **effective_parameters,
+        "camera": camera.copy(),
+        "tactile_reset": tactile_reset,
+    }
+    camera["effective_parameters"] = json.dumps(parameters, allow_nan=False)
+    return camera
 
 
 def positive_metadata_scalar(meta, key):

@@ -2,7 +2,7 @@
 
 import importlib.util
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -11,9 +11,11 @@ from unittest.mock import Mock
 import pytest
 from dexmani_policy.deployment.metadata import PolicyInfo
 
-from dexmani_real.config.deployment import DEFAULT_MAX_RUNNING_S, DEFAULT_NUM_EPISODES
+from dexmani_real.config.deployment import DEFAULT_MAX_DURATION_S, DEFAULT_NUM_EPISODES
 from dexmani_real.config.real import RealConfig
+from dexmani_real.data.raw import camera_metadata, robot_recording_parameters
 from dexmani_real.deployment import session
+from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
 from dexmani_real.runtime.state import SessionState
 
 
@@ -38,11 +40,11 @@ def policy_session(monkeypatch):
 
 
 @pytest.mark.parametrize("name,value,error", [
-    ("max_running_s", True, TypeError),
-    ("max_running_s", 0, ValueError),
-    ("max_running_s", -1, ValueError),
-    ("max_running_s", float("nan"), ValueError),
-    ("max_running_s", float("inf"), ValueError),
+    ("max_duration_s", True, TypeError),
+    ("max_duration_s", 0, ValueError),
+    ("max_duration_s", -1, ValueError),
+    ("max_duration_s", float("nan"), ValueError),
+    ("max_duration_s", float("inf"), ValueError),
     ("num_episodes", True, TypeError),
     ("num_episodes", 1.0, TypeError),
     ("num_episodes", 0, ValueError),
@@ -61,7 +63,7 @@ def test_session_defaults_and_explicit_unbounded_budget(monkeypatch, tmp_path):
     runtime = RealConfig()
     configured = session.PolicySession(runtime, "policy.pt")
     assert configured.runtime is runtime and configured.policy == "policy.pt"
-    assert configured.max_running_s == DEFAULT_MAX_RUNNING_S
+    assert configured.max_duration_s == DEFAULT_MAX_DURATION_S
     assert configured.num_episodes == DEFAULT_NUM_EPISODES
     assert configured.weights is configured.inference_steps is None
     assert configured.device == "cuda:0" and configured.seed == 0
@@ -71,10 +73,10 @@ def test_session_defaults_and_explicit_unbounded_budget(monkeypatch, tmp_path):
 
     monkeypatch.chdir(tmp_path)
     unlimited = session.PolicySession(
-        runtime, "policy.pt", num_episodes=None, max_running_s=None,
+        runtime, "policy.pt", num_episodes=None, max_duration_s=None,
         camera_calibration_path="camera.json", record_raw=True,
     )
-    assert unlimited.max_running_s is unlimited.num_episodes is None
+    assert unlimited.max_duration_s is unlimited.num_episodes is None
     assert unlimited.camera_calibration_path == tmp_path / "camera.json"
     assert unlimited.output_root == Path(session.__file__).resolve().parents[2] / "rollouts"
 
@@ -99,11 +101,11 @@ def test_cli_calls_session_directly(monkeypatch, tmp_path):
     ]) == 7
     args, kwargs = constructor.call_args
     assert args == (RealConfig(), "policy.pt")
-    assert kwargs == dict(
-        weights="raw", inference_steps=3, device="cpu", seed=9,
-        num_episodes=2, max_running_s=1.5, record_raw=True, output_root=tmp_path,
-        camera_calibration_path=Path("camera.json"),
-    )
+    assert kwargs == {
+        "weights": "raw", "inference_steps": 3, "device": "cpu", "seed": 9,
+        "num_episodes": 2, "max_duration_s": 1.5, "record_raw": True, "output_root": tmp_path,
+        "camera_calibration_path": Path("camera.json"),
+    }
     constructor.return_value.run.assert_called_once_with()
 
 
@@ -120,7 +122,7 @@ def test_cli_accepts_unbounded_duration(monkeypatch):
     constructor.return_value.run.return_value = 0
     monkeypatch.setattr(session, "PolicySession", constructor)
     assert load_cli().main(["policy.pt", "--max-duration", "none"]) == 0
-    assert constructor.call_args.kwargs["max_running_s"] is None
+    assert constructor.call_args.kwargs["max_duration_s"] is None
 
 
 @pytest.mark.parametrize("script", ["run_policy.py", "collect_teleop.py", "tools/control_xhand.py"])
@@ -138,7 +140,9 @@ def test_declared_config_does_not_require_json_values(tmp_path, capsys, script):
     assert "object at" in capsys.readouterr().out
 
 
-def test_policy_records_only_used_parameters(monkeypatch, tmp_path, policy_info):
+@pytest.mark.parametrize("action_mode", ["joint", "eef"])
+@pytest.mark.parametrize("record_raw", [False, True])
+def test_policy_records_only_used_parameters(monkeypatch, tmp_path, policy_info, action_mode, record_raw):
     runtime = RealConfig()
     runtime = replace(runtime, arm=replace(runtime.arm, homing=object()),
                       hand=replace(runtime.hand, home_tor_max=object()),
@@ -146,20 +150,47 @@ def test_policy_records_only_used_parameters(monkeypatch, tmp_path, policy_info)
                       environment=replace(runtime.environment, home_model_confirmed=object(), static_boxes=(object(),)))
     monkeypatch.setattr(session, "SessionState", lambda: SessionState(stop_signal=Event(), emergency_signal=Event()))
     monkeypatch.setattr(session, "PolicyWorker", Mock())
-    configured = session.PolicySession(runtime, "policy.pt", device="cpu", output_root=tmp_path)
+    monkeypatch.setattr(session, "SensorChannels", Mock())
+    policy_info = replace(
+        policy_info, action_mode=action_mode, control_action_dim=19 if action_mode == "joint" else 21,
+    )
+    configured = session.PolicySession(
+        runtime, "policy.pt", device="cpu", seed=7, max_duration_s=12,
+        output_root=tmp_path, record_raw=record_raw,
+    )
     configured.keyboard = Mock(check_health=Mock(return_value=True))
     configured.wait_model = lambda: policy_info
     configured.prepare_resources()
     parameters = configured.effective_parameters
-    assert parameters["execution"] == dict(mode="sync", control_dt_s=.05, action_steps=4)
-    assert "homing" not in parameters["arm"] and "home_tor_max" not in parameters["hand"]
-    assert "environment" not in parameters and "camera_config" not in parameters
-    assert "data_processing" not in parameters["policy"]
-    json.dumps(parameters, allow_nan=False)
+    expected_policy = asdict(policy_info)
+    expected_policy.pop("data_processing")
+    expected = {
+        **robot_recording_parameters(configured.runtime),
+        "policy": expected_policy, "seed": 7, "device": "cpu", "max_duration_s": 12.,
+        "execution": {"mode": "sync", "control_dt_s": .05, "action_steps": 4},
+    }
+    if action_mode == "eef":
+        expected.update(
+            motion=asdict(runtime.motion),
+            environment={
+                "workspace": asdict(runtime.environment.workspace),
+                "eef_workspace_tolerance_m": runtime.environment.eef_workspace_tolerance_m,
+            },
+        )
+    effective_camera = None
+    if record_raw:
+        expected["camera_config"] = asdict(runtime.camera)
+        configured.camera_snapshot = CameraSnapshot(
+            "camera-123", CameraIntrinsics(16, 16, 20., 20., 8., 8., "none", (0.,) * 5), .001, None,
+        )
+        effective_camera = {"camera_T_xarm_base_from_color": None, **camera_metadata(configured.camera_snapshot)}
+    assert parameters == expected
     configured.save_run_config()
     import yaml
 
     saved = yaml.safe_load((configured.output_dir / "run_config.yaml").read_text())
+    assert saved["effective_parameters"] == json.loads(json.dumps(expected, allow_nan=False))
+    assert saved["effective_camera"] == effective_camera
     assert saved["training_processing"] is None
     assert saved["actual_processing"] == {}
     assert "data_processing" not in saved
@@ -185,7 +216,7 @@ def test_vr_calibration_uses_config_and_explicit_port(tmp_path, capsys, port):
 
 
 def test_model_load_failure_precedes_device_allocation(policy_session, monkeypatch):
-    import dexmani_policy.deployment as deployment
+    from dexmani_policy import deployment
 
     failure = ValueError("checkpoint load failed")
     monkeypatch.setattr(deployment, "load_policy", Mock(side_effect=failure))
@@ -210,7 +241,7 @@ def test_model_load_failure_precedes_device_allocation(policy_session, monkeypat
 
 
 def test_sensor_startup_cancel_reaches_session_cleanup(policy_session, policy_info, monkeypatch):
-    import dexmani_policy.deployment as deployment
+    from dexmani_policy import deployment
 
     configured = policy_session
     info = replace(policy_info, observation_fields=("rgb",))

@@ -248,7 +248,7 @@ def test_hoi_warmup_commits_only_successful_uncancelled_result(fault):
                 sensors=sensors,
                 action_mapper=None,
                 model=worker,
-                max_running_s=1,
+                max_duration_s=1,
                 index=index,
                 output_dir=None,
                 record_raw=False,

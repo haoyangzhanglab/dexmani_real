@@ -12,7 +12,7 @@ from pathlib import Path
 from pprint import pprint
 
 from dexmani_real.config.deployment import (
-    DEFAULT_MAX_RUNNING_S,
+    DEFAULT_MAX_DURATION_S,
     DEFAULT_NUM_EPISODES,
     POLICY_RUNTIME_SECTIONS,
 )
@@ -68,12 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-duration",
-        dest="max_running_s",
+        dest="max_duration_s",
         type=duration_budget,
-        default=DEFAULT_MAX_RUNNING_S,
+        default=DEFAULT_MAX_DURATION_S,
         help=(
             "per-episode cooperative duration budget from the actual episode start "
-            f"(default: {DEFAULT_MAX_RUNNING_S:g} seconds); none runs until user stop or failure"
+            f"(default: {DEFAULT_MAX_DURATION_S:g} seconds); none runs until user stop or failure"
         ),
     )
     parser.add_argument(
@@ -129,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         seed=args.seed,
         num_episodes=args.num_episodes,
-        max_running_s=args.max_running_s,
+        max_duration_s=args.max_duration_s,
         record_raw=args.record_raw,
         output_root=args.output,
         camera_calibration_path=args.camera_calibration,

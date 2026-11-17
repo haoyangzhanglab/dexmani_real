@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 import time
@@ -14,7 +13,7 @@ from typing import Literal, cast
 import numpy as np
 
 from dexmani_real.control.ik import IKReferenceError
-from dexmani_real.data.raw import camera_metadata
+from dexmani_real.data.raw import episode_recording_metadata
 from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
 from dexmani_real.deployment.schedule import (
     ActionChunk,
@@ -71,7 +70,7 @@ class Rollout:
     def __init__(
         self, runtime_state, runtime, policy_info, *, episode_cancel_epoch: int, robot,
         observations, read_needs: ObservationNeeds, record_needs: ObservationNeeds,
-        sensors, action_mapper, model, max_running_s,
+        sensors, action_mapper, model, max_duration_s: float | None,
         index, output_dir, record_raw, effective_parameters, camera_snapshot=None,
     ):
         self.runtime_state = runtime_state
@@ -93,14 +92,13 @@ class Rollout:
         self.result = EpisodeResult(index)
         self.camera_snapshot = camera_snapshot
         self.effective_parameters = effective_parameters
-        self.max_duration_ns = int(max_running_s * 1e9) if max_running_s is not None else None
+        self.max_duration_ns = int(max_duration_s * 1e9) if max_duration_s is not None else None
         self.episode_cancel_epoch = episode_cancel_epoch
         self.history: deque[dict[str, np.ndarray]] = deque(maxlen=policy_info.n_obs_steps)
         self.plan: ActionChunk | None = None
         self.query: Prediction | None = None
         self.cursor = 0
         self.preparation_issue: str | None = None
-        self.run_deadline_ns: int | None = None
         self.last_slot = -1
         self.dt_ns = round(self.execution.control_dt_s * 1e9)
         self.started_ns = 0
@@ -137,7 +135,6 @@ class Rollout:
         )
         self.result.termination_details = detail
         self._clear_policy_context()
-        self.run_deadline_ns = None
         if self.observations.needs.hoi:
             channels = self.sensors.channels
             channels.hoi_request.write(episode_id=0, after_ns=ended_ns,
@@ -317,12 +314,10 @@ class Rollout:
             raise OperationCancelled("cancelled before recorder start")
         if self.record_raw:
             self.recorder = EpisodeRecorder(self.output_dir, control_hz=1 / self.execution.control_dt_s)
-            metadata = camera_metadata(self.camera_snapshot)
-            metadata["effective_parameters"] = json.dumps({
-                **self.effective_parameters,
-                "camera": metadata.copy(),
-                "tactile_reset": self.robot.hand.tactile_reset_metadata,
-            }, allow_nan=False)
+            metadata = episode_recording_metadata(
+                self.camera_snapshot, self.effective_parameters,
+                tactile_reset=self.robot.hand.tactile_reset_metadata,
+            )
             self.recorder.start(
                 task_label=self.policy_info.task_name,
                 episode_name=f"episode_{self.result.index:03d}", collection_source="policy_rollout", metadata=metadata,
@@ -350,9 +345,6 @@ class Rollout:
             self.robot.check()
             raise OperationCancelled("final admission declined")
         self.started_ns = started_ns
-        self.run_deadline_ns = (
-            self.started_ns + self.max_duration_ns if self.max_duration_ns is not None else None
-        )
         self.result.started_utc = utc_now()
         logger.info("Policy control loop started; waiting for the first prediction")
 
@@ -474,7 +466,12 @@ class Rollout:
         return True
 
     def duration_expired(self):
-        if self.run_deadline_ns is not None and time.monotonic_ns() >= self.run_deadline_ns:
+        if (
+            self.started_ns
+            and not self.finished
+            and self.max_duration_ns is not None
+            and time.monotonic_ns() >= self.started_ns + self.max_duration_ns
+        ):
             self.stop("duration_timeout", run_end_reason=RunEndReason.DURATION_COMPLETE)
             return True
         return False
@@ -543,9 +540,8 @@ class Rollout:
         if self.state == "HOI_HOLD":
             return
         # 首条恢复动作提交前的再次遮挡仍属于同一个恢复区间。
-        if self.state == "RUNNING":
-            if self.recorder is not None:
-                self.recorder.mark_gap()
+        if self.state == "RUNNING" and self.recorder is not None:
+            self.recorder.mark_gap()
         self.state = "HOI_HOLD"
         self._clear_policy_context()
         self.next_hoi_hold_ns = 0
