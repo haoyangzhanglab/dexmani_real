@@ -716,6 +716,7 @@ def test_real_recorder_preserves_raw_source_and_segment_boundary(env, tmp_path, 
 
     ready_to_send(env)
     assert recorder.queue.empty() and recorder.pending_segment_start
+    assert recorder.recording_truncated_reason is None
     env.channels.camera_ring.latest_sequence = 2
     observed_ns = env.clock.now
     env.channels.camera_ring.data["timestamp_ns"] = observed_ns - 10_000_000
@@ -728,7 +729,7 @@ def test_real_recorder_preserves_raw_source_and_segment_boundary(env, tmp_path, 
             raise RobotError("submission failed")
         original(command, **kwargs)
         if outcome == "timeout":
-            env.advance(5)
+            env.advance(60)
 
     env.robot.send_action = send
     if outcome == "failure":
@@ -743,6 +744,9 @@ def test_real_recorder_preserves_raw_source_and_segment_boundary(env, tmp_path, 
     assert raw.camera["timestamp_ns"] == observed_ns - 10_000_000
     assert raw.observation_timestamp_ns == raw.control_timestamp_ns == observed_ns
     assert recorder.queue.empty() and not recorder.pending_segment_start
+    assert recorder.recording_truncated_reason is None
+    if outcome == "timeout":
+        assert env.rollout.result.termination_details == "duration_timeout"
 
     if outcome == "success":
         env.advance()
@@ -750,6 +754,64 @@ def test_real_recorder_preserves_raw_source_and_segment_boundary(env, tmp_path, 
         _, command, segment_start = recorder.queue.get_nowait()
         assert command is not None and not segment_start
         assert recorder.queue.empty()
+
+
+def test_recording_queue_full_keeps_termination_reason_after_gap(env, tmp_path):
+    recorder = EpisodeRecorder(tmp_path, control_hz=20)
+    recorder.is_recording = True
+    _, raw = env.rollout.read_observations()
+    for _ in range(recorder.queue.maxsize):
+        assert recorder.append(raw) is None
+    recorder.mark_gap()
+    assert recorder.append(raw) == "recording_queue_full"
+    assert not recorder.is_recording
+    recorder.mark_gap()
+    assert recorder.result()["recording_truncated_reason"] == "recording_queue_full"
+
+
+def test_published_recording_gap_is_a_segment_not_truncation(tmp_path):
+    import logging
+
+    from dexmani_real.data.export import ExportConfig, export_zarr
+    from dexmani_real.data.raw import RawReader, camera_metadata
+    from dexmani_real.data.recorder import format_recording_result
+    from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
+    from dexmani_real.robot.commands import RobotCommand
+    from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
+    from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
+    from dexmani_real.runtime.observation import Observation
+
+    camera = CameraSnapshot(None, CameraIntrinsics(16, 16, 20, 20, 8, 8, "none", (0.,) * 5), .001, None)
+    recorder = EpisodeRecorder(tmp_path, control_hz=20)
+    recorder.start(task_label="test", collection_source="policy_rollout", metadata=camera_metadata(camera))
+    try:
+        for index in range(2):
+            if index:
+                recorder.mark_gap()
+            stamp = 1_000_000_000 + index * 500_000_000
+            arm, hand = np.zeros(1, ARM_STATE_DTYPE), np.zeros(1, HAND_STATE_DTYPE)
+            arm["timestamp_ns"] = hand["timestamp_ns"] = stamp
+            hand["tactile_aggregate_timestamp_ns"] = hand["tactile_dense_timestamp_ns"] = stamp
+            row = Observation(
+                arm=arm, hand=hand, vr=None, point_cloud=None,
+                observation_timestamp_ns=stamp, control_timestamp_ns=stamp,
+                camera=dict(timestamp_ns=stamp, ring_sequence=index + 1,
+                            rgb=np.full((16, 16, 3), 100, np.uint8), depth=np.full((16, 16), 500, np.uint16)),
+            )
+            assert recorder.append(row, RobotCommand(arm_qpos=np.zeros(7), hand_qpos=np.zeros(12))) is None
+    finally:
+        recorder.finish(save=True, reason="operator")
+    result = recorder.result()
+    assert result["status"] == "published" and result["recording_truncated_reason"] is None
+    level, description = format_recording_result(result)
+    assert level == logging.INFO and "保存成功" in description
+    with RawReader(result["path"]) as reader:
+        np.testing.assert_array_equal(reader.segment_starts, [0, 1])
+        assert reader.meta["termination_reason"] == "operator"
+        assert "recording_truncated_reason" not in reader.meta
+        assert len(list(reader.iter_rgb_frames())) == 2
+    exported = export_zarr(result["path"], tmp_path / "segmented.zarr", fields=("joint_state",), processing=ExportConfig())
+    assert exported["source_count"] == 1 and exported["episode_count"] == 2
 
 
 def test_eef_resume_uses_measured_reference(env):

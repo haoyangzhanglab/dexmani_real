@@ -114,6 +114,8 @@ class EpisodeVisualizer:
             if max_frames is not None:
                 self.frame_count = min(self.frame_count, max_frames)
             self.camera_model = self.reader.read_camera()
+            if self.camera_model.depth_scale_m is None:
+                raise ValueError("RGB-D 可视化必须有 Raw 中记录的深度单位")
             self.image_maps = init_undistort_maps(self.camera_model.color)
             self.T_xarm_base_from_color = self.camera_model.T_xarm_base_from_color
             if pointcloud_config is not None and self.T_xarm_base_from_color is None:

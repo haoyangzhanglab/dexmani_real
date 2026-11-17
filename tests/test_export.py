@@ -680,8 +680,6 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
 
     from dexmani_real.config.real import RealConfig
     from dexmani_real.deployment.preflight import collect_data_processing
-    from dexmani_real.geometry.kinematics import HandFK
-    from dexmani_real.perception.hand_cloud import HandPointCloud
 
     output = tmp_path / "source.zarr"
     with h5py.File(complete_episodes / "episode_0/data.h5", "r+") as data:
@@ -728,20 +726,12 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
         observation_fields=("hand_pointcloud", "object_pointcloud"),
         data_processing=restored.effective_config["data_processing"],
     )
-    observations = SimpleNamespace(
-        hand_cloud=HandPointCloud(HandFK(), runtime.hand_pointcloud.num_points)
-    )
-    with h5py.File(complete_episodes / "episode_0/hoi.h5", "r") as raw:
-        saved = raw["template"]
-        template = {
-            "points_local": saved["points_local"][:],
-            "offsets": saved["offsets"][:],
-            "object_names": saved["object_names"].asstr()[:],
-        }
-    assert collect_data_processing(info, runtime, observations, (None, template)) == info.data_processing
-    template["points_local"][0, 0] += 0.01
-    actual = collect_data_processing(info, runtime, observations, (None, template))
-    assert actual["object_pointcloud"]["geometry_sha256"] != info.data_processing["object_pointcloud"]["geometry_sha256"]
+    assert collect_data_processing(info, runtime) == {
+        "hand_pointcloud": {"num_points": runtime.hand_pointcloud.num_points},
+        "object_pointcloud": {"max_joint_gap_s": runtime.execution.hoi_max_joint_gap_s},
+    }
+    assert "geometry_sha256" in info.data_processing["object_pointcloud"]
+    assert "geometry_sha256" not in info.data_processing["hand_pointcloud"]
 
 
 @pytest.mark.parametrize("invalid", [
@@ -949,7 +939,7 @@ def test_bad_camera_metadata_rejects_only_that_raw(tmp_path, complete_episodes, 
     with h5py.File(bad / "data.h5", "r+") as data:
         data["meta"].attrs[key] = value
     output = tmp_path / "clean.zarr"
-    result = export_zarr(source, output, processing=ExportConfig(), fields=("joint_state", "rgb"))
+    result = export_zarr(source, output, processing=ExportConfig(), fields=("joint_state", "rgb", "depth"))
     assert [item["episode"] for item in result["rejected_episodes"]] == [bad.name]
     assert result["episode_count"] == 2
     root = zarr.open_group(str(output), mode="r")
@@ -1011,10 +1001,12 @@ def test_scalar_metadata_errors_are_local_to_raw(tmp_path, complete_episodes, ke
 
 
 @pytest.mark.parametrize("depth_scale", [None, "bad", [np.nan]])
-def test_rgb_does_not_require_depth_scale(tmp_path, complete_episodes, depth_scale):
+def test_rgb_ignores_unused_camera_metadata(tmp_path, complete_episodes, depth_scale):
     for episode in complete_episodes.iterdir():
         with h5py.File(episode / "data.h5", "r+") as data:
             del data["meta"].attrs["depth_scale"]
+            del data["meta"].attrs["camera_payload_mode"]
+            data["meta"].attrs["camera_serial"] = [1, 2]
             if depth_scale is not None:
                 data["meta"].attrs["depth_scale"] = depth_scale
     result = export_zarr(complete_episodes, tmp_path / "rgb.zarr", processing=ExportConfig(), fields=("rgb",))

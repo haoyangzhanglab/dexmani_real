@@ -218,7 +218,7 @@ class PolicySession:
         declared_execution = self.runtime.execution
         self.runtime = resolve_deployment_config(self.info, self.runtime)
         self.observations = ObservationBuilder(self.info, self.runtime)
-        self.actual_processing = collect_data_processing(self.info, self.runtime, self.observations, self.hoi_inputs)
+        self.actual_processing = collect_data_processing(self.info, self.runtime)
         self.record_needs = RAW_RECORDING_NEEDS if self.record_raw else ObservationNeeds()
         model_needs = self.observations.needs
         self.sensor_needs = model_needs.union(self.record_needs)

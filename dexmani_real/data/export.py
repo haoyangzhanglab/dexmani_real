@@ -408,8 +408,12 @@ def export_zarr(
     )
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent))
-    root = arrays = None
-    ends, sources, ranges, rejected = [], [], [], []
+    root = None
+    arrays: dict[str, zarr.Array] = {}
+    ends: list[int] = []
+    sources: list[str] = []
+    ranges: list[list[int]] = []
+    rejected: list[dict[str, str]] = []
     source_count = 0
     shared_geometry = None
     try:
@@ -430,7 +434,6 @@ def export_zarr(
                         root, arrays = create_store(
                             zarr.DirectoryStore(str(staging)), processing, camera,
                             specs=specs, control_hz=hz, task_name=reader.meta["task_label"],
-                            hand_cloud=hand_cloud,
                         )
                     else:
                         if reader.meta["task_label"] != root.attrs["task_name"] or not np.isclose(
@@ -462,16 +465,17 @@ def export_zarr(
                     shared_geometry = None
                 source_count += 1
             except RawDataError as exc:
-                if arrays is not None:
+                if arrays:
                     for array in arrays.values():
                         array.resize((offset, *array.shape[1:]))
                     if not ends:
                         shutil.rmtree(staging)
                         staging.mkdir()
-                        root = arrays = None
+                        root = None
+                        arrays = {}
                 rejected.append({"episode": episode.name, "reason": str(exc)})
                 logger.warning("Rejected Raw %s: %s", episode, exc)
-        if not ends:
+        if root is None:
             raise ValueError(f"all Raw episodes rejected: {rejected}")
         root.attrs["source_episodes"] = sources
         root.attrs["source_row_ranges"] = ranges
@@ -498,7 +502,7 @@ def export_zarr(
             logger.exception("export staging cleanup also failed: %s", staging)
 
 
-def create_store(store, processing, camera, *, specs, control_hz, task_name, hand_cloud):
+def create_store(store, processing, camera, *, specs, control_hz, task_name):
     fields = specs.keys()
     root = zarr.group(store=store, overwrite=True)
     root.attrs.update(
@@ -525,7 +529,6 @@ def create_store(store, processing, camera, *, specs, control_hz, task_name, han
     if "hand_pointcloud" in fields:
         metadata["hand_pointcloud"] = {
             "num_points": processing.hand_pointcloud.num_points,
-            "geometry_sha256": hand_cloud.geometry_sha256,
         }
     if "object_pointcloud" in fields:
         metadata["object_pointcloud"] = {"geometry_sha256": None}

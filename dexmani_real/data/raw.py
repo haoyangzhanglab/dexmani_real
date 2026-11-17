@@ -183,9 +183,6 @@ def positive_metadata_scalar(meta, key):
 
 
 def decode_camera_metadata(meta, *, include_depth=True, include_extrinsics=True) -> CameraSnapshot:
-    mode = meta["camera_payload_mode"]
-    if not isinstance(mode, str) or mode not in {"rgb", "depth_to_color_aligned_rgbd"}:
-        raise ValueError(f"Unsupported Raw camera payload: {mode!r}")
     model = meta["camera_color_distortion_model"]
     if not isinstance(model, str):
         raise ValueError("camera_color_distortion_model must be a string")
@@ -210,9 +207,13 @@ def decode_camera_metadata(meta, *, include_depth=True, include_extrinsics=True)
             label="camera_T_xarm_base_from_color",
         )
     scale = None
-    if include_depth and mode == "depth_to_color_aligned_rgbd":
-        scale = positive_metadata_scalar(meta, "depth_scale")
-    return CameraSnapshot(meta.get("camera_serial"), color, scale, transform)
+    if include_depth:
+        mode = meta["camera_payload_mode"]
+        if not isinstance(mode, str) or mode not in {"rgb", "depth_to_color_aligned_rgbd"}:
+            raise ValueError(f"Unsupported Raw camera payload: {mode!r}")
+        if mode == "depth_to_color_aligned_rgbd":
+            scale = positive_metadata_scalar(meta, "depth_scale")
+    return CameraSnapshot(None, color, scale, transform)
 
 
 class _VideoWriter:
@@ -470,7 +471,7 @@ class RawReader:
                 or np.any(starts >= self.num_frames)):
             raise ValueError(f"Raw {self.path}: invalid timing/segment_starts")
         reason = self.meta.get("recording_truncated_reason")
-        if reason:
+        if reason is not None:
             logger.warning("%s: %s；按已记录的连续区间使用。", self.path, reason)
         return starts
 
@@ -566,10 +567,6 @@ class RawReader:
         stamps = self["timing/rows"].fields("observation_ns")[:]
         # 先减整数时钟，避免长时间运行后的浮点精度损失。
         return (stamps - stamps[0]) / 1e9 if stamps.size else np.empty(0, dtype=np.float64)
-
-    @property
-    def dt(self):
-        return 1.0 / self.control_hz
 
     def iter_rgb_frames(self):
         import av

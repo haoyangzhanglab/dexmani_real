@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from dexmani_real.config.perception import HOI_NUM_POINTS
+from dexmani_real.data.raw import RawDataError
 from dexmani_real.geometry.hoi import transform_task_points
 from dexmani_real.utils.io import publish
 from dexmani_real.utils.timing import interpolate_joints, validate_joint_gap
@@ -120,10 +121,15 @@ def align_hoi_episode(reader, max_gap_s, *, devices=("arm", "hand")):
 
 def read_hoi_validity(reader):
     """读取显式有效性，缺失字段由读取边界报错。"""
+    import h5py
+
     data = reader.hoi_file
     valid = np.asarray(data["valid"])
     objects = np.asarray(data["object_valid"])
-    count = len(data["template/object_names"])
+    names = data["template/object_names"]
+    if not isinstance(names, h5py.Dataset) or names.ndim != 1:
+        raise RawDataError("HOI template/object_names must be a one-dimensional dataset")
+    count = names.shape[0]
     if (
         valid.dtype != bool
         or objects.dtype != bool

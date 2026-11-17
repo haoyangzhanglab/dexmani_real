@@ -113,9 +113,8 @@ def resolve_hoi_inputs(info):
     return task, load_task_template(task)
 
 
-def collect_data_processing(info, runtime, observations, hoi_inputs):
+def collect_data_processing(info, runtime):
     """记录实际使用的特征处理；已知训练差异仅供实验记录。"""
-    from dexmani_real.geometry.hoi import geometry_digest
     from dexmani_real.perception.pointcloud import processing_metadata
 
     actual = {}
@@ -124,24 +123,20 @@ def collect_data_processing(info, runtime, observations, hoi_inputs):
     if "hand_pointcloud" in info.observation_fields:
         actual["hand_pointcloud"] = dict(
             num_points=runtime.hand_pointcloud.num_points,
-            geometry_sha256=observations.hand_cloud.geometry_sha256,
         )
-    if hoi_inputs is not None:
-        template = hoi_inputs[1]
-        actual["object_pointcloud"] = dict(
-            geometry_sha256=geometry_digest(
-                template["points_local"], template["offsets"]
-            ),
-        )
-        if set(info.observation_fields) & {
-            "hand_pointcloud", "joint_state", "fingertip_xyz", "eef_pose",
-        }:
-            actual["object_pointcloud"]["max_joint_gap_s"] = runtime.execution.hoi_max_joint_gap_s
+    if "object_pointcloud" in info.observation_fields and set(info.observation_fields) & {
+        "hand_pointcloud", "joint_state", "fingertip_xyz", "eef_pose",
+    }:
+        actual["object_pointcloud"] = {
+            "max_joint_gap_s": runtime.execution.hoi_max_joint_gap_s,
+        }
     if info.data_processing is None:
         print("训练处理参数：未记录；本次实际参数单独保存。")
         return actual
     for name, values in actual.items():
-        training = info.data_processing.get(name)
+        training = {
+            key: info.data_processing.get(name, {}).get(key) for key in values
+        }
         if values != training:
             print(f"处理参数差异 {name}: training={training!r}; actual={values!r}")
     return actual
