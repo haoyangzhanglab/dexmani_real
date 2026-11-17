@@ -29,6 +29,30 @@ HOME_RESULTS = (
 )
 
 
+def test_default_keyboard_period_passes_preflight(monkeypatch):
+    allocated = RuntimeError("device allocation reached")
+    monkeypatch.setattr(keyboard, "Robot", Mock(side_effect=allocated))
+    session = keyboard.KeyboardTeleop(RealConfig())
+    with pytest.raises(RuntimeError) as raised:
+        session.run()
+    assert raised.value is allocated
+    assert session.period_ns == 33_333_333
+
+
+@pytest.mark.parametrize("hz,period_ns", [(2., 500_000_000), (4., 250_000_000)])
+def test_keyboard_control_period_must_fit_target_lease(monkeypatch, hz, period_ns):
+    robot = Mock(side_effect=AssertionError("unexpected device allocation"))
+    monkeypatch.setattr(keyboard, "Robot", robot)
+    runtime = RealConfig()
+    runtime = replace(runtime, keyboard_teleop=replace(runtime.keyboard_teleop, control_hz=hz))
+    with pytest.raises(
+        ValueError,
+        match=rf"keyboard_teleop.control_hz.*{period_ns} ns.*keyboard_teleop.target_max_age_s.*250000000 ns",
+    ):
+        keyboard.KeyboardTeleop(runtime).run()
+    robot.assert_not_called()
+
+
 @pytest.mark.parametrize("outside_m,accepted", [(0.001, True), (0.020, False)])
 def test_jog_from_outside_only_accepts_legal_ik_endpoint(outside_m, accepted):
     from dexmani_real.control.actions import ActionMapper
@@ -120,10 +144,10 @@ def teleop(monkeypatch, caplog):
     state = session.runtime_state = SessionState(
         stop_signal=threading.Event(), emergency_signal=threading.Event(),
     )
-    session.jog_config = runtime.keyboard_teleop
-    session.jog = CartesianJog(None, session.jog_config, (None, None))
+    config = runtime.keyboard_teleop
+    session.jog = CartesianJog(None, config, (None, None))
     session.jog.ik_reference = object()
-    session.period_ns = keyboard.sampling_clock_ns(session.jog_config.control_hz)
+    session.period_ns = keyboard.sampling_clock_ns(config.control_hz)
     session.tick_due_ns = clock.now_ns - session.period_ns
     session.keys = Keyboard(
         bindings={"q": state.request_quit}, estop_callback=state.request_emergency_stop,
@@ -179,7 +203,7 @@ def test_home_prepares_jog_once_and_next_tick_runs(teleop, caplog, home_error):
     command = arm.io.publish_goal.call_args.args[0]
     assert command.arm_hold and command.hand_qpos is None
     assert arm.io.publish_goal.call_args.kwargs["expires_ns"] == (
-        clock.now_ns + int(session.jog_config.target_max_age_s * 1e9)
+        clock.now_ns + int(session.runtime.keyboard_teleop.target_max_age_s * 1e9)
     )
     assert session.tick_due_ns == clock.now_ns + session.period_ns
     assert caplog.messages.count("Keyboard jog ready") == 1

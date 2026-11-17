@@ -64,7 +64,8 @@ if result.valid["apple"]:
 | `failures` | 无效对象的失败原因或等待重试状态。 |
 
 - 每段调用 `initialize()`，复用模型并重置位姿、视频状态及场景缓存。
-- 同一段内相机参数和图像尺寸须保持固定。
+- 同一段内相机参数和图像尺寸须保持固定。RGB 和 depth 必须匹配同一彩色相机网格。
+- `RGBDRectifier` 按 `distortion_model` 与 `distortion_coeffs` 初始化，可接受带 `distortion.` 前缀的模型名。`none` 直接返回输入的 RGB 和 depth，`brown_conrady` 在系数非零时建立映射。映射对 RGB 使用双线性采样，对深度使用最近邻采样，越界填零。
 - 初始化时检测匹配、深度或候选位姿不满足要求，抛出 `TrackingFailure`，后续新帧重试初始化；全部对象注册成功后才进入正常跟踪。
 - 跟踪期逐对象返回有效性。观测不足进入 OCCLUDED，充分几何矛盾或非法候选位姿进入 LOST。检测、分割、注册或跟踪的后端异常（包括 CUDA OOM）直接传播，调用方终止运行并停止使用该实例。
 
@@ -165,7 +166,7 @@ SAM2 在初始化、周期到期、候选深度质量不通过、恢复注册或
 
 连续性指标与对称变换处理见 [Object Symmetry](#object-symmetry)。`max_translation_speed_m_s`、`max_rotation_speed_rad_s` 默认 `None`，只记录变化量；配置实测上限后才启用硬门控，余量由深度容差和物体直径换算。遮挡时参考最后可靠位姿，恢复确认时参考 Pending，均使用对应的真实时间间隔。
 
-在线发布、离线存储和训练过滤见[主项目说明](../../docs/object_reconstruction.md#标注导出与回放)。
+在线发布、离线存储和训练过滤见[主项目说明](../../docs/object_reconstruction.md#标注与查看)。
 
 ## 推理实现
 
@@ -192,4 +193,4 @@ Hunyuan3D 重建使用分层体积解码、完整 attention 和 Marching Cubes�
 
 表面模板采样由主项目 `geometry/hoi.py` 负责，后端不依赖主项目或 fpsample。
 
-任务流程见 [实验入口](../../scripts/cordvip/README.md)，主项目表示见 [物体重建与 HOI](../../docs/object_reconstruction.md)。
+任务命令与资产结构见[主项目实验流程](../../docs/object_reconstruction.md#实验流程)。

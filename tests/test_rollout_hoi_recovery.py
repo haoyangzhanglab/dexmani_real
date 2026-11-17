@@ -1020,20 +1020,21 @@ def test_recorder_finish_keeps_first_intent_and_publishes_only_after_exit(tmp_pa
     recorder.thread = Thread(target=released.wait)
     recorder.thread.start()
     try:
-        assert not recorder.finish(save=save, reason="operator", wait=False)
-        assert not recorder.finish(save=not save, reason="quit", wait=False)
+        assert recorder.finish(save=save, reason="operator", wait=False) is None
+        assert recorder.finish(save=not save, reason="quit", wait=False) is None
         assert recorder.result()["status"] == "pending"
         assert staging.exists() and not (tmp_path / "episode_test").exists()
     finally:
         released.set()
         recorder.thread.join(timeout=2)
-    assert recorder.finish(save=not save, reason="quit")
+    request = recorder.finish(save=not save, reason="quit")
+    assert request is not None and request.save == save and request.reason == "operator"
     result = recorder.result()
     assert result["status"] == ("published" if save else "not_published")
     assert not staging.exists()
     assert (tmp_path / "episode_test").exists() == save
     # 最终结果可重复读取；重复收尾不会改变首个处置意图。
-    assert recorder.finish(save=not save, reason="quit")
+    assert recorder.finish(save=not save, reason="quit") is request
     assert recorder.result() == result
 
 
@@ -1046,7 +1047,7 @@ def test_recorder_finish_timeout_keeps_live_owner_and_staging(tmp_path, monkeypa
     recorder.staging_path = tmp_path / ".tmp_pending"
     recorder.staging_path.mkdir()
     recorder.thread = Mock(is_alive=Mock(return_value=True))
-    assert not recorder.finish(save=True, reason="operator", wait=False)
+    assert recorder.finish(save=True, reason="operator", wait=False) is None
     clock.now += recorder_module.RECORDER_STOP_TIMEOUT_S + 1
     with pytest.raises(TimeoutError, match="writer did not exit"):
         recorder.finish(save=True, reason="quit", wait=False)
@@ -1080,7 +1081,7 @@ def test_writer_and_close_errors_keep_causes_and_staging(
     writer.close.assert_called_once()
     assert "first write failure" in caplog.text and "later close failure" in caplog.text
     if reported_type is RecordingError:
-        assert recorder.finish(save=True, reason="failed")
+        assert recorder.finish(save=True, reason="failed") is not None
         assert isinstance(recorder.error.__cause__, OSError)
     else:
         with pytest.raises(reported_type):

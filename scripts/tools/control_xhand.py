@@ -9,7 +9,6 @@ import os
 import resource
 import signal
 import stat
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -29,7 +28,6 @@ from dexmani_real.utils.log import configure_logging
 
 logger = logging.getLogger("dexmani_real.tools.control_xhand")
 
-HARDWARE_WORKER_ARG = "--_xhand-hardware-worker"
 FEEDBACK_POLL_INTERVAL_S = 0.01
 CONVERGENCE_SAMPLES = 3
 ACTION_TIMEOUT_S = 2.0  # 独立诊断动作预算，不使用组合 HOME 的运动参数。
@@ -204,6 +202,7 @@ def validate_serial_port(serial_port: str) -> None:
 
 
 def run_hardware_session(config: HandConfig, *, finger_id: int, read_only: bool) -> int:
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     config.validate()
     if not config.enabled:
         raise ValueError("hand.enabled=False; enable the hand in CONFIG.hand first")
@@ -264,37 +263,6 @@ def run_hardware_session(config: HandConfig, *, finger_id: int, read_only: bool)
     return result or (128 + interrupted_signal if interrupted_signal is not None else 0)
 
 
-def run_isolated_hardware_session(argv: list[str]) -> int:
-    command = [sys.executable, str(Path(__file__).resolve()), *argv, HARDWARE_WORKER_ARG]
-    # 终端信号只由父进程转发一次，避免同组子进程重复接收 Ctrl+C。
-    worker = subprocess.Popen(command, start_new_session=True)
-
-    def forward_interrupt(signum, _):
-        try:
-            worker.send_signal(signum)
-        except ProcessLookupError:
-            pass
-
-    previous_handlers = {
-        signum: signal.signal(signum, forward_interrupt)
-        for signum in (signal.SIGINT, signal.SIGTERM)
-    }
-    try:
-        returncode = worker.wait()
-    finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
-    if returncode < 0:
-        signal_name = signal.strsignal(-returncode)
-        print(
-            f"\nXHand SDK worker terminated by {signal_name}; hardware stop is unconfirmed.\n"
-            "Check hand power, wiring, device permissions and port ownership.",
-            file=sys.stderr,
-        )
-        return 1
-    return returncode
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -308,19 +276,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--print-config", action="store_true", help="打印手部配置，不连接硬件"
     )
-    parser.add_argument(
-        HARDWARE_WORKER_ARG,
-        dest="xhand_hardware_worker",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
-    # 普通运行只在硬件子进程加载一次 Python 配置，避免重复执行配置文件。
-    if not args.print_config and not args.xhand_hardware_worker:
-        return run_isolated_hardware_session(argv)
-    if args.xhand_hardware_worker:
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     try:
         config = load_config(args.config).hand
         if args.print_config:

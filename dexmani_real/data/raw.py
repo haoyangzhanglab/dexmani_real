@@ -202,15 +202,14 @@ def episode_recording_metadata(
     *,
     tactile_reset: Mapping[str, object],
 ) -> dict[str, object]:
-    """合并本段相机与触觉复位信息，不修改调用方的实验参数。"""
-    camera = camera_metadata(camera_snapshot)
+    """相机标定存于顶层，实验参数与本段触觉复位结果存于 JSON。"""
+    metadata = camera_metadata(camera_snapshot)
     parameters = {
         **effective_parameters,
-        "camera": camera.copy(),
         "tactile_reset": tactile_reset,
     }
-    camera["effective_parameters"] = json.dumps(parameters, allow_nan=False)
-    return camera
+    metadata["effective_parameters"] = json.dumps(parameters, allow_nan=False)
+    return metadata
 
 
 def positive_metadata_scalar(meta, key):
@@ -435,10 +434,8 @@ class RawWriter:
             self.timing_rows = None
 
 
-def require_published_raw(path):
-    requested = Path(path).expanduser()
-    resolved = requested.resolve()
-    if any(candidate.name.startswith(".tmp_") for candidate in (requested, resolved)):
+def _check_raw_published(requested: Path, resolved: Path) -> None:
+    if requested.name.startswith(".tmp_") or resolved.name.startswith(".tmp_"):
         raise ValueError(f"unpublished Raw: {requested}")
 
 
@@ -449,7 +446,7 @@ def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
     if not root.is_dir():
         raise NotADirectoryError(root)
     if (root / "data.h5").is_file():
-        require_published_raw(requested_path)
+        _check_raw_published(requested_path, root)
         return (root,)
     episodes = tuple(
         sorted(
@@ -469,6 +466,7 @@ class RawReader:
 
         requested_path = Path(episode_path).expanduser()
         self.path = requested_path.resolve()
+        _check_raw_published(requested_path, self.path)
         self.rgb_path = self.path / "rgb.mp4"
         self.video_container: av.container.InputContainer | None = None
         self.dataset_cache: dict[str, h5py.Dataset] = {}

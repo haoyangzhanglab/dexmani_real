@@ -330,22 +330,16 @@ class SceneTracker:
         self._set_frame_time(frame, first=True)
         self.last_sam_sequence = self.source_sequence
         self.frame_signature = (
-            frame.depth_m.shape,
             frame.K.copy(),
             frame.distortion_model,
-            np.asarray(frame.distortion_coeffs).copy(),
+            tuple(frame.distortion_coeffs),
         )
         self.frame_cache: dict[str, Any] = {}
         for tracker in self.trackers.values():
             tracker.estimator.pose_last = None
 
-        if frame.distortion_model.removeprefix("distortion.") not in {
-            "none",
-            "brown_conrady",
-        }:
-            raise ValueError(f"Unsupported distortion model: {frame.distortion_model}")
         self.rectifier = RGBDRectifier(
-            frame.depth_m.shape, frame.K, frame.distortion_coeffs
+            frame.depth_m.shape, frame.K, frame.distortion_model, frame.distortion_coeffs
         )
         rgb, depth_m = self.rectifier.apply(frame.rgb, frame.depth_m)
         self.directions = camera_rays(depth_m.shape, frame.K, PIXEL_STRIDE)
@@ -367,16 +361,13 @@ class SceneTracker:
         return result
 
     def track(self, frame: RGBDFrame) -> SceneResult:
-        shape, K, model, coeffs = self.frame_signature
+        K, model, coeffs = self.frame_signature
         if (
-            frame.depth_m.shape != shape
-            or not np.array_equal(frame.K, K)
+            not np.array_equal(frame.K, K)
             or frame.distortion_model != model
-            or not np.array_equal(frame.distortion_coeffs, coeffs)
+            or tuple(frame.distortion_coeffs) != coeffs
         ):
             raise ValueError("Camera parameters changed within episode")
-        if frame.rgb.shape != (*shape, 3):
-            raise ValueError("RGB grid changed within episode")
         rgb, depth_m = self.rectifier.apply(frame.rgb, frame.depth_m)
         self._set_frame_time(frame, first=False)
         self.frame_index += 1

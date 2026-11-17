@@ -49,15 +49,19 @@ def camera_rays(shape, intrinsics, pixel_stride):
 class RGBDRectifier:
     """固定相机的去畸变映射，初始化一次。"""
 
-    def __init__(self, shape, intrinsics, distortion):
+    def __init__(self, shape, intrinsics, distortion_model, distortion_coeffs):
+        model = distortion_model.removeprefix("distortion.")
+        if model not in {"none", "brown_conrady"}:
+            raise ValueError(f"Unsupported distortion model: {distortion_model}")
+        height, width = shape
+        self.shape = (height, width)
         self.maps = None
-        if np.any(distortion):
+        if model == "brown_conrady" and np.any(distortion_coeffs):
             import cv2
 
-            height, width = shape
             self.maps = cv2.initUndistortRectifyMap(
                 intrinsics,
-                np.asarray(distortion),
+                np.asarray(distortion_coeffs),
                 np.eye(3),
                 intrinsics,
                 (width, height),
@@ -65,6 +69,8 @@ class RGBDRectifier:
             )
 
     def apply(self, rgb, depth_m):
+        if depth_m.shape != self.shape or rgb.shape != (*self.shape, 3):
+            raise ValueError("RGB-D frame must match the rectifier grid")
         if self.maps is None:
             return rgb, depth_m
         import cv2

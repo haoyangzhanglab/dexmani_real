@@ -24,6 +24,7 @@ from dexmani_real.runtime.state import SessionState
 from dexmani_real.teleop import loop as loop_module
 from dexmani_real.teleop import run as run_module
 from dexmani_real.teleop.loop import TeleopLoop
+from dexmani_real.utils.timing import sampling_clock_ns
 
 
 @pytest.mark.parametrize("episodes_dir", ["captures", "~/captures"])
@@ -56,6 +57,21 @@ def test_collection_directory_is_resolved_from_cwd_or_home(tmp_path, monkeypatch
     ) == 0
     assert constructor.call_args.kwargs["recording_dir"] == tmp_path / "captures/experiment_label"
     assert constructor.call_args.kwargs["task_label"] == "experiment_label"
+    assert constructor.call_args.kwargs["control_dt_ns"] == 62_500_000
+
+
+@pytest.mark.parametrize("hz,period_ns", [(2., 500_000_000), (4., 250_000_000)])
+def test_vr_control_period_must_fit_target_lease(monkeypatch, hz, period_ns):
+    robot = Mock(side_effect=AssertionError("unexpected device allocation"))
+    monkeypatch.setattr(run_module, "Robot", robot)
+    runtime = RealConfig()
+    runtime = replace(runtime, teleop=replace(runtime.teleop, control_hz=hz))
+    with pytest.raises(
+        ValueError,
+        match=rf"teleop.control_hz.*{period_ns} ns.*teleop.target_max_age_s.*250000000 ns",
+    ):
+        run_module.run_teleop(runtime, record=False, episodes_dir="unused", max_duration_s=10)
+    robot.assert_not_called()
 
 
 @pytest.fixture
@@ -88,6 +104,7 @@ def teleop():
     controller = Mock(compute_target=Mock(return_value=ActionResult(np.zeros(7), None)))
     loop = TeleopLoop(
         state, runtime, robot, task_label="test", controller=controller,
+        control_dt_ns=sampling_clock_ns(runtime.teleop.control_hz),
         sensors=SensorWorkers(SimpleNamespace(vr_ring=vr_ring)),
         recording_dir=None, max_duration_s=10, keyboard=keys, audio=Mock(),
     )
@@ -199,12 +216,15 @@ def test_recording_parameters_and_start_failure_cleanup(teleop, monkeypatch, tmp
     recorder = Mock(
         error=RecordingError("writer failed"),
         start=Mock(side_effect=RecordingError("writer failed")),
-        finish=Mock(return_value=True),
+        finish=Mock(return_value=SimpleNamespace(save=True, reason="failed")),
         result=Mock(return_value=None),
     )
     monkeypatch.setattr(loop_module, "EpisodeRecorder", Mock(return_value=recorder))
     teleop.run_episode(teleop.runtime_state.cancel_epoch)
-    parameters = json.loads(recorder.start.call_args.kwargs["metadata"]["effective_parameters"])
+    metadata = recorder.start.call_args.kwargs["metadata"]
+    parameters = json.loads(metadata["effective_parameters"])
+    camera = camera_metadata(teleop.camera_snapshot)
+    assert {key: metadata[key] for key in camera} == camera
     runtime = teleop.runtime
     expected = {
         **robot_recording_parameters(runtime),
@@ -216,7 +236,6 @@ def test_recording_parameters_and_start_failure_cleanup(teleop, monkeypatch, tmp
         },
         "camera_config": asdict(runtime.camera),
         "vr": asdict(runtime.vr), "vr_to_robot_rotation": np.eye(3).tolist(),
-        "camera": camera_metadata(teleop.camera_snapshot),
         "tactile_reset": teleop.robot.hand.tactile_reset_metadata,
     }
     if retargeting:

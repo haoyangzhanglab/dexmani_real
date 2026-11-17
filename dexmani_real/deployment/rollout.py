@@ -156,10 +156,10 @@ class Rollout:
         result = self.result
         if self.recorder is not None:
             recorder = self.recorder
-            if not call(
+            if call(
                 self.profiler, "recorder_finish_call_ms", recorder.finish,
                 save=not self.discard_requested, reason=result.termination_reason, wait=wait,
-            ):
+            ) is None:
                 return False
             self.snapshot_result()
             # 线程实际退出才释放 owner；失败结果及 staging 路径保留在 result。
@@ -486,6 +486,7 @@ class Rollout:
         return row, raw
 
     def update_history(self, row):
+        """收集有效控制采样。跳槽推进时钟，历史可跨越该间断。"""
         issues = call(
             self.profiler, "check_observation_ms", check_observation,
             row, self.runtime, self.observations.needs,
@@ -687,6 +688,7 @@ class Rollout:
                 if self.duration_expired():
                     return
                 self.poll_model()
+                # 本 tick 固定选中的目标。映射后仍校验来源时效和 async 预测窗口。
                 action = self.select_action(slot)
                 if action is None:
                     return

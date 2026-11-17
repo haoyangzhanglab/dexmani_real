@@ -146,6 +146,27 @@ def test_non_hoi_policy_does_not_read_task_assets(policy_session, policy_info, m
     assert policy_session.hoi_inputs is None
 
 
+@pytest.mark.parametrize("explicit,dt,period_ns", [
+    (False, 5., 5_000_000_000),
+    (True, 5., 5_000_000_000),
+    (True, 2. - .25e-9, 2_000_000_000),
+])
+def test_resolved_period_must_fit_policy_lease(policy_session, policy_info, monkeypatch, explicit, dt, period_ns):
+    policy_info = replace(policy_info, observation_fields=("object_pointcloud",))
+    if explicit:
+        runtime = policy_session.runtime
+        policy_session.runtime = replace(runtime, execution=replace(runtime.execution, control_dt_s=dt))
+    else:
+        policy_info = replace(policy_info, control_dt_s=dt)
+    policy_session.wait_model = lambda: policy_info
+    monkeypatch.setattr(session, "PolicyWorker", Mock())
+    robot = Mock(side_effect=AssertionError("unexpected device allocation"))
+    monkeypatch.setattr(session, "Robot", robot)
+    with pytest.raises(ValueError, match=rf"execution.control_dt_s.*{period_ns} ns.*command lease.*2000000000 ns"):
+        policy_session.prepare_resources()
+    robot.assert_not_called()
+
+
 @pytest.mark.parametrize("path_form", ["relative", "home"])
 def test_hoi_session_uses_explicit_task_and_records_path(
     policy_session, policy_info, monkeypatch, tmp_path, path_form,
@@ -185,7 +206,7 @@ def test_cli_accepts_unbounded_duration(monkeypatch):
     assert constructor.call_args.kwargs["max_duration_s"] is None
 
 
-@pytest.mark.parametrize("script", ["run_policy.py", "collect_teleop.py", "tools/control_xhand.py"])
+@pytest.mark.parametrize("script", ["run_policy.py", "collect_teleop.py"])
 def test_declared_config_does_not_require_json_values(tmp_path, capsys, script):
     path = tmp_path / "experiment.py"
     path.write_text(

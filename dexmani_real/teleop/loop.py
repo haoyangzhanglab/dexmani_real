@@ -37,7 +37,7 @@ from dexmani_real.runtime.observation import (
 from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S, RunEndReason
 from dexmani_real.utils.log import error_detail
 from dexmani_real.utils.profile import call
-from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
+from dexmani_real.utils.timing import next_tick_ns
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ class TeleopLoop:
         runtime,
         robot,
         *,
+        control_dt_ns: int,
         task_label,
         sensors,
         controller,
@@ -76,13 +77,13 @@ class TeleopLoop:
 
         self.episode_cancel_epoch: int | None = None  # None 表示当前无活动段；Recorder 仍可能在收尾。
         self.next_tick_ns = None
-        self.control_dt_ns = sampling_clock_ns(runtime.teleop.control_hz)
+        self.control_dt_ns = control_dt_ns
 
-        self.recorder = None
-        self.episode_deadline_ns = None
+        self.recorder: EpisodeRecorder | None = None
+        self.episode_deadline_ns: int | None = None
         self.discard_requested = False
         self.pending_termination_reason = None
-        self.termination_details = []
+        self.termination_details: list[dict[str, str]] = []
         self.session_failed = False  # 新段会重置结束状态，会话失败保留到退出。
 
     def record_error(self, stage, exc):
@@ -147,14 +148,14 @@ class TeleopLoop:
         recorder = self.recorder
         if recorder is None:
             return True
-        if not call(
+        request = call(
             self.profiler, "recorder_finish_call_ms", recorder.finish,
             save=not self.discard_requested, reason=self.pending_termination_reason, wait=wait,
-        ):
+        )
+        if request is None:
             return False
         # 仅收尾完成后释放 owner；pending 或异常仍保留资源。
         self.recorder = None
-        request = recorder.finish_request
         if recorder.error is not None:
             self.termination_details.append(error_detail("recording", recorder.error))
             self.request_episode_end("recording_failed", run_end_reason=RunEndReason.FAILED)

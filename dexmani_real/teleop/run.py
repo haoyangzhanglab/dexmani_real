@@ -21,7 +21,7 @@ from dexmani_real.runtime.lifecycle import (
     SensorWorkers,
     close_runtime,
 )
-from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
+from dexmani_real.runtime.preflight import validate_robot_config, validate_xhand_target_rate
 from dexmani_real.runtime.state import SessionState
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.sensor.vr import run_vr
@@ -30,7 +30,7 @@ from dexmani_real.teleop.loop import TeleopLoop
 from dexmani_real.teleop.vr import VRController
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.profile import call
-from dexmani_real.utils.timing import sample_is_fresh
+from dexmani_real.utils.timing import sample_is_fresh, sampling_clock_ns
 from dexmani_real.utils.vr_heading import load_vr_transform
 
 logger = logging.getLogger(__name__)
@@ -51,8 +51,16 @@ def run_teleop(
     configure_logging()
     validate_robot_config(runtime)
     runtime.environment.validate()
-    validate_control_rate(runtime, runtime.teleop.control_hz)
+    period_ns = sampling_clock_ns(runtime.teleop.control_hz)
+    if runtime.hand.enabled:
+        validate_xhand_target_rate(runtime.teleop.control_hz)
     runtime.teleop.validate()
+    lease_ns = int(runtime.teleop.target_max_age_s * 1e9)
+    if period_ns >= lease_ns:
+        raise ValueError(
+            f"teleop.control_hz gives a {period_ns} ns period, which must be "
+            f"shorter than the teleop.target_max_age_s command lease ({lease_ns} ns)"
+        )
     runtime.vr.validate()
     if record:
         validate_task_label(task_name)
@@ -115,6 +123,7 @@ def run_teleop(
                 runtime_state,
                 runtime,
                 robot,
+                control_dt_ns=period_ns,
                 task_label=task_name,
                 sensors=sensors,
                 controller=controller,

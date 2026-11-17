@@ -222,9 +222,9 @@ class PolicySession:
         )
         self.model.load()
         self.info = self.wait_model()
-        self.hoi_inputs = resolve_hoi_inputs(self.info, self.task_dir)
         declared_execution = self.runtime.execution
         self.runtime = resolve_deployment_config(self.info, self.runtime)
+        self.hoi_inputs = resolve_hoi_inputs(self.info, self.task_dir)
         if self.profiler is not None:
             self.profiler.configure(self.runtime, control_hz=1 / self.runtime.execution.control_dt_s,
                                     mode=self.runtime.execution.mode)

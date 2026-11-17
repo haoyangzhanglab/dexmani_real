@@ -143,15 +143,54 @@ def test_fixed_surface_and_quota():
     assert points.dtype == np.float32
 
 
-def test_rectification_and_camera_z():
+@pytest.mark.parametrize("model,k1", [
+    ("none", .25),
+    ("distortion.none", .25),
+    ("brown_conrady", 0.),
+    ("distortion.brown_conrady", 0.),
+])
+def test_rectification_identity(model, k1):
     K = np.array([[100.0, 0, 16], [0, 100.0, 16], [0, 0, 1.0]])
     rgb = np.zeros((32, 32, 3), np.uint8)
     depth = np.ones((32, 32), np.float32)
-    r, d = RGBDRectifier(depth.shape, K, np.zeros(5)).apply(rgb, depth)
+    r, d = RGBDRectifier(depth.shape, K, model, (k1, 0., 0., 0., 0.)).apply(rgb, depth)
     assert r is rgb and d is depth
+
+
+@pytest.mark.parametrize("model", ["brown_conrady", "distortion.brown_conrady"])
+def test_brown_rectification_resamples_rgb_and_depth(model):
+    K = np.array([[10., 0., 16.], [0., 10., 16.], [0., 0., 1.]])
+    depth = np.broadcast_to(np.arange(1, 33, dtype=np.float32), (32, 32)).copy()
+    rgb = np.repeat((depth * 4).astype(np.uint8)[..., None], 3, axis=-1)
+    r, d = RGBDRectifier(depth.shape, K, model, (.25, 0., 0., 0., 0.)).apply(rgb, depth)
+    # k1 = 0.25 将 (22, 16) 映射到源图像的 (22.54, 16)。
+    assert rgb[16, 22, 0] < r[16, 22, 0] < rgb[16, 23, 0]
+    assert d[16, 22] == depth[16, 23]
+    assert not r[16, 31].any() and d[16, 31] == 0
+
+
+def test_rectification_rejects_unsupported_model_with_zero_coefficients():
+    with pytest.raises(ValueError, match="Unsupported distortion model: kannala_brandt4"):
+        RGBDRectifier((32, 32), np.eye(3), "kannala_brandt4", np.zeros(5))
+
+
+@pytest.mark.parametrize("model", ["none", "brown_conrady"])
+def test_rectification_rejects_mismatched_grids(model):
+    K = np.array([[10., 0., 16.], [0., 10., 16.], [0., 0., 1.]])
+    rgb = np.zeros((32, 32, 3), dtype=np.uint8)
+    depth = np.ones((32, 32), dtype=np.float32)
+    rectifier = RGBDRectifier(depth.shape, K, model, (.25, 0., 0., 0., 0.))
+    with pytest.raises(ValueError, match="RGB-D frame must match the rectifier grid"):
+        rectifier.apply(rgb[:-1], depth)
+    with pytest.raises(ValueError, match="RGB-D frame must match the rectifier grid"):
+        rectifier.apply(rgb, depth[:-1])
+
+
+def test_camera_rays_preserve_camera_z():
+    K = np.array([[100.0, 0, 16], [0, 100.0, 16], [0, 0, 1.0]])
     pose = np.eye(4)
     pose[2, 3] = 1
-    rays = camera_rays(depth.shape, K, 2)[[8, 7], [8, 8]]
+    rays = camera_rays((32, 32), K, 2)[[8, 7], [8, 8]]
     z = MeshRaycaster(trimesh.creation.box(extents=(0.08, 0.1, 0.12))).render(
         rays, pose
     )

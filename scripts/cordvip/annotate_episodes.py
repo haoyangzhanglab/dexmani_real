@@ -14,7 +14,7 @@ from cordvip_geometry.camera import RGBDFrame
 from cordvip_geometry.tracking import SceneTracker, TrackingConfig, TrackingFailure
 
 from dexmani_real.data.hoi import write_hoi
-from dexmani_real.data.raw import RawReader, discover_episode_dirs, require_published_raw
+from dexmani_real.data.raw import RawReader, discover_episode_dirs
 from dexmani_real.geometry.hoi import load_task_template, task_objects
 
 
@@ -31,7 +31,6 @@ def annotate_episodes(
         if (episode / "hoi.h5").exists() and not overwrite:
             print(f"跳过已有 HOI：{episode}")
             continue
-        require_published_raw(episode)
         with RawReader(episode) as reader:
             if tracker is None:
                 template = load_task_template(task)

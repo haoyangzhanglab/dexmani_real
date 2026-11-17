@@ -9,6 +9,7 @@ import pytest
 
 from dexmani_real.config.real import RealConfig
 from dexmani_real.data.raw import (
+    RawReader,
     discover_episode_dirs,
     episode_recording_metadata,
     robot_recording_parameters,
@@ -50,6 +51,10 @@ def test_discover_episode_dirs_reports_invalid_or_empty_inputs(tmp_path):
     (unpublished / "data.h5").touch()
     with pytest.raises(ValueError, match="unpublished Raw"):
         discover_episode_dirs(unpublished)
+    alias = tmp_path / "episode_pending"
+    alias.symlink_to(unpublished, target_is_directory=True)
+    with pytest.raises(ValueError, match="unpublished Raw"):
+        RawReader(alias)
 
 
 @pytest.mark.parametrize("comm_type,selected,excluded", [
@@ -102,7 +107,7 @@ def camera_snapshot():
 def test_episode_metadata_preserves_camera_and_input(camera_snapshot, full_camera, tactile_reset):
     if not full_camera:
         camera_snapshot = replace(camera_snapshot, serial=None, depth_scale_m=None, T_xarm_base_from_color=None)
-    effective = {"policy": {"weights": "raw"}, "arm": {"ip": "robot"}}
+    effective = {"policy": {"weights": "raw"}, "arm": {"ip": "robot"}, "camera_config": {"fps": 30}}
     original = deepcopy(effective)
     metadata = episode_recording_metadata(camera_snapshot, effective, tactile_reset=tactile_reset)
     parameters = json.loads(metadata.pop("effective_parameters"))
@@ -121,7 +126,7 @@ def test_episode_metadata_preserves_camera_and_input(camera_snapshot, full_camer
         )
     assert metadata == expected_camera
     assert parameters == {
-        **original, "camera": expected_camera, "tactile_reset": json.loads(json.dumps(tactile_reset)),
+        **original, "tactile_reset": json.loads(json.dumps(tactile_reset)),
     }
     assert effective == original
 

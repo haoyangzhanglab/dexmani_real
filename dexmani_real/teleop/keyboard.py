@@ -16,10 +16,7 @@ from dexmani_real.runtime.home import (
 from dexmani_real.runtime.jog import CartesianJog
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime
-from dexmani_real.runtime.preflight import (
-    jog_bounds,
-    validate_robot_config,
-)
+from dexmani_real.runtime.preflight import validate_robot_config
 from dexmani_real.runtime.state import SessionState
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
@@ -35,7 +32,21 @@ class KeyboardTeleop:
         configure_logging()
         validate_robot_config(self.runtime)
         self.runtime.environment.validate()
-        self.bounds = jog_bounds(self.runtime)
+        config = self.runtime.keyboard_teleop
+        config.validate()
+        self.period_ns = sampling_clock_ns(config.control_hz)
+        lease_ns = int(config.target_max_age_s * 1e9)
+        if self.period_ns >= lease_ns:
+            raise ValueError(
+                f"keyboard_teleop.control_hz gives a {self.period_ns} ns period, which must be "
+                f"shorter than the keyboard_teleop.target_max_age_s command lease ({lease_ns} ns)"
+            )
+        workspace = self.runtime.environment.workspace.as_array()
+        margin = config.workspace_command_margin_m
+        lower, upper = workspace[:, 0] + margin, workspace[:, 1] - margin
+        if np.any(lower >= upper):
+            raise ValueError("keyboard workspace command margin leaves no interior workspace")
+        self.bounds = lower, upper
         self.runtime_state = SessionState()
         self.robot = Robot(
             self.runtime.arm, self.runtime.hand, runtime_state=self.runtime_state,
@@ -45,7 +56,6 @@ class KeyboardTeleop:
             estop_callback=self.runtime_state.request_emergency_stop,
             bindings={'q': self.runtime_state.request_quit},
         )
-        self.jog_config = self.runtime.keyboard_teleop
         clean = False
         shutdown_clean = False
         try:
@@ -82,7 +92,7 @@ class KeyboardTeleop:
             device_speed=self.runtime.arm.max_joint_velocity_rad_per_s,
             max_lead=np.deg2rad(self.runtime.motion.ik_max_lead_deg),
         )
-        self.jog = CartesianJog(solver, self.jog_config, self.bounds)
+        self.jog = CartesianJog(solver, self.runtime.keyboard_teleop, self.bounds)
         startup_epoch = self.runtime_state.cancel_epoch
         self.keys.start()
         if not self.keys.check_health():
@@ -98,7 +108,6 @@ class KeyboardTeleop:
             "Jog is ready. Release jog keys to brake and hold. "
             "Workspace rejection brakes and holds; invalid references end the session."
         )
-        self.period_ns = sampling_clock_ns(self.jog_config.control_hz)
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
 
     def prepare_jog(self, cancel_epoch):
@@ -108,7 +117,7 @@ class KeyboardTeleop:
             raise OperationCancelled("jog cancelled during preparation")
         self.robot.send_action(
             RobotCommand(arm_hold=True),
-            expires_ns=time.monotonic_ns() + int(self.jog_config.target_max_age_s * 1e9),
+            expires_ns=time.monotonic_ns() + int(self.runtime.keyboard_teleop.target_max_age_s * 1e9),
         )
         logger.info("Keyboard jog ready")
 

@@ -8,11 +8,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dexmani_real.data.raw import (
-    RawReader,
-    require_published_raw,
-)
-from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
+from dexmani_real.data.raw import RawReader
+from dexmani_real.runtime.preflight import validate_robot_config, validate_xhand_target_rate
 
 if TYPE_CHECKING:
     from dexmani_real.config.real import RealConfig
@@ -36,7 +33,6 @@ def load_trajectory(episode_path: str | Path, runtime: RealConfig, *, segment: i
     validate_robot_config(runtime)
     if not runtime.hand.enabled:
         raise ValueError("replay requires XHand")
-    require_published_raw(episode_path)
     with RawReader(episode_path) as reader:
         reader.read_timing()
         starts = reader.segment_starts
@@ -53,7 +49,7 @@ def load_trajectory(episode_path: str | Path, runtime: RealConfig, *, segment: i
             raise ValueError(f"select one continuous segment with --segment (zero-based): {choices}")
         start, end = int(starts[segment]), int(ends[segment])
         hz = reader.control_hz
-        validate_control_rate(runtime, hz)
+        validate_xhand_target_rate(hz)
         arrays = []
         for field, lower, upper in (
             (

@@ -7,7 +7,9 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.deployment import ExecutionConfig
-from dexmani_real.runtime.preflight import validate_control_rate, validate_robot_config
+from dexmani_real.robot.commands import COMMAND_LEASE_NS
+from dexmani_real.runtime.preflight import validate_robot_config, validate_xhand_target_rate
+from dexmani_real.utils.timing import validate_joint_gap
 
 if TYPE_CHECKING:
     from dexmani_real.config.real import RealConfig
@@ -19,27 +21,25 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
     if execution.mode == "rtc" and not info.supports_rtc:
         raise NotImplementedError("Policy does not support RTC")
 
-    if "object_pointcloud" in info.observation_fields and set(info.observation_fields) & {
-        "hand_pointcloud",
-        "joint_state",
-        "fingertip_xyz",
-        "eef_pose",
-    }:
-        from dexmani_real.utils.timing import validate_joint_gap
-
-        validate_joint_gap(execution.hoi_max_joint_gap_s)
     if "object_pointcloud" in info.observation_fields:
+        if {"hand_pointcloud", "joint_state", "fingertip_xyz", "eef_pose"}.intersection(info.observation_fields):
+            validate_joint_gap(execution.hoi_max_joint_gap_s)
         age = execution.hoi_max_age_s
         if type(age) not in (int, float) or not math.isfinite(age) or age <= 0:
             raise ValueError("hoi_max_age_s requires a finite positive value")
 
     dt = execution.control_dt_s
     if (
-        dt is None or type(dt) not in (int, float)
-        or not math.isfinite(dt * 1e9)
-        or int(dt * 1e9) <= 0
+        (type(dt) is not int and type(dt) is not float)
+        or not 1 <= dt * 1e9 < math.inf
     ):
         raise ValueError(f"execution.control_dt_s must be finite, positive and at least 1 ns; got {dt!r}")
+    period_ns = round(dt * 1e9)
+    if period_ns >= COMMAND_LEASE_NS:
+        raise ValueError(
+            f"execution.control_dt_s gives a {period_ns} ns period, which must be "
+            f"shorter than the policy command lease ({COMMAND_LEASE_NS} ns)"
+        )
     prediction_steps = info.future_steps
     action_steps = execution.action_steps
     if type(action_steps) is not int or not 1 <= action_steps <= prediction_steps:
@@ -92,7 +92,7 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     validate_robot_config(runtime)
     if info.action_mode == "eef":
         runtime.environment.validate()
-    validate_control_rate(runtime, 1.0 / cast(float, execution.control_dt_s))
+    validate_xhand_target_rate(1.0 / cast(float, execution.control_dt_s))
     return runtime
 
 

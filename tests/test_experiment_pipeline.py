@@ -1,6 +1,5 @@
 """当前生产者到分组训练、恢复及 CPU 推理的跨仓数值链路。"""
 
-import json
 from contextlib import closing
 from types import SimpleNamespace
 
@@ -54,7 +53,11 @@ def test_current_raw_to_grouped_policy_resume(tmp_path):
         "max_duration_s": 60.,
         "actual_processing": {},
     }
-    metadata = episode_recording_metadata(camera, parameters, tactile_reset={})
+    metadata = dict(
+        episode_recording_metadata(camera, parameters, tactile_reset={}),
+        collection_source="policy_rollout",
+        task_label="pick_apple_messy",
+    )
     template = {
         "points_local": np.random.default_rng(4).uniform(-.01, .01, (1024, 3)).astype("f4"),
         "offsets": np.array([0, 1024]), "object_names": np.array(["object"]),
@@ -63,7 +66,7 @@ def test_current_raw_to_grouped_policy_resume(tmp_path):
         episode = source / f"episode_{capture}"
         episode.mkdir(parents=True)
         writer = RawWriter(episode, control_hz=20)
-        writer.open(dict(metadata, collection_source="policy_rollout", task_label="pick_apple_messy"))
+        writer.open(metadata)
         try:
             for index in range(8):
                 stamp = 1_000_000_000 + index * 50_000_000 + (500_000_000 if index >= 4 else 0)
@@ -85,22 +88,26 @@ def test_current_raw_to_grouped_policy_resume(tmp_path):
             writer.finish("operator")
         finally:
             writer.close()
-        with RawReader(episode) as reader:
-            assert reader.meta["effective_parameters"] == metadata["effective_parameters"]
-            recorded = json.loads(reader.meta["effective_parameters"])
-            for key, value in recorded["camera"].items():
-                np.testing.assert_equal(reader.meta[key], value)
-            assert recorded["tactile_reset"] == {}
-            assert reader.meta["collection_source"] == "policy_rollout"
-            assert reader.meta["termination_reason"] == "operator"
         poses = np.tile(np.eye(4), (8, 1, 1, 1))
         poses[:, 0, 2, 3] = .5 + np.arange(8) * .001
         write_hoi(episode / "hoi.h5", template, poses, np.eye(4),
                   quality=[[{}]] * 8, object_valid=np.ones((8, 1), bool), tracking_config={})
+    with RawReader(source / "episode_0") as reader:
+        recorded = reader.read_camera()
+        assert recorded.color == camera.color
+        assert recorded.depth_scale_m == camera.depth_scale_m
+        np.testing.assert_array_equal(recorded.T_xarm_base_from_color, camera.T_xarm_base_from_color)
     output = tmp_path / "training.zarr"
     result = export_zarr(source, output, processing=ExportConfig(),
                          fields=("rgb", "joint_state", "action", "hand_pointcloud", "object_pointcloud"))
     assert (result["source_count"], result["episode_count"], result["total_frames"]) == (3, 6, 24)
+    data = zarr.open_group(str(output), mode="r")
+    assert data.attrs["source_episodes"] == [f"episode_{capture}" for capture in range(3) for _ in range(2)]
+    assert data.attrs["source_row_ranges"] == [[0, 4], [4, 8]] * 3
+    np.testing.assert_array_equal(data["meta/episode_ends"][:], np.arange(4, 25, 4))
+    samples = (np.arange(3)[:, None] + np.arange(8)).ravel()
+    np.testing.assert_allclose(data["data/action"][:, :7], np.repeat((samples * .01 + .01)[:, None], 7, axis=1))
+    np.testing.assert_allclose(data["data/action"][:, 7:], np.repeat((samples * .02 + .01)[:, None], 12, axis=1))
     cfg = load_config("cordvip", [
         f"zarr_path={output}", "training.device=cpu", "horizon=4", "n_obs_steps=2", "n_action_steps=2",
         "agent.down_dims=[16,32]", "agent.diffusion_step_embed_dim=16", "agent.num_inference_steps=2",
@@ -120,7 +127,6 @@ def test_current_raw_to_grouped_policy_resume(tmp_path):
     try:
         torch.set_num_threads(1)
         run_smoke(cfg, tmp_path / "run", max_updates=1, resume_updates=1)
-        data = zarr.open_group(str(output), mode="r")
         with closing(load_policy(tmp_path / "run", device="cpu")) as runtime:
             observation = {key: data[f"data/{key}"][:2] for key in runtime.info.observation_fields}
             prediction = runtime.predict(observation)

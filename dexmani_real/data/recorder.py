@@ -220,8 +220,8 @@ class EpisodeRecorder:
             self.profiler.count("recording_truncations")
         return quality_issue
 
-    def finish(self, *, save, reason, wait=True) -> bool:
-        """停止接纳新行并收尾；False 表示仍在写入，录制成败由 result 报告。"""
+    def finish(self, *, save, reason, wait=True) -> _FinishRequest | None:
+        """收尾完成后返回首次处置请求，仍在写入时返回 None。成败由 result 报告。"""
         try:
             self.is_recording = False
             # 首次请求固定处置意图和整个等待预算；反复轮询不能延长 deadline。
@@ -235,15 +235,15 @@ class EpisodeRecorder:
                 if remaining <= 0:
                     raise TimeoutError("recording writer did not exit before the deadline")
                 if not wait:
-                    return False
+                    return None
                 # 中断 join 可能误报活线程已退出，不能据此发布文件。
                 time.sleep(min(0.005, remaining))
             # 线程退出后才判定最终结果；close 的程序错误不能被 I/O 失败掩盖。
             if isinstance(self.error, RecordingError):
-                return True
+                return request
             self.check_error()
             if self.staging_path is None:
-                return True
+                return request
             try:
                 if request.save and self.written_frames > 0:
                     destination = self.staging_path.with_name(self.staging_path.name.removeprefix(".tmp_"))
@@ -263,7 +263,7 @@ class EpisodeRecorder:
                 self.store_error(exc)
                 if not isinstance(self.error, RecordingError):
                     raise
-            return True
+            return request
         finally:
             if self.profiler is not None and not self.writer_pending and self._profile_finish_ns is not None:
                 self.profiler.sample("recorder_finish_elapsed_ms",

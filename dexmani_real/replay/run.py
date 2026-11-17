@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 def run_replay(episode_path: str | Path, runtime: RealConfig, *, segment: int | None = None) -> None:
     """起点读取一次姿态；播放和留驻通过公共设备服务处理 I/O 与停止。"""
     trajectory = load_trajectory(episode_path, runtime, segment=segment)
+    period_ns = round(1e9 / trajectory.control_hz)
     state = SessionState()
     epoch = state.cancel_epoch
     robot = keyboard = None
@@ -94,7 +95,7 @@ def run_replay(episode_path: str | Path, runtime: RealConfig, *, segment: int | 
             last_row = i == len(trajectory) - 1
             row_deadline_ns = time.monotonic_ns()
             if not last_row:
-                row_deadline_ns += round(1e9 / trajectory.control_hz)
+                row_deadline_ns += period_ns
             robot.service_feedback()
             check_input(robot, keyboard)
             submit_now_ns = time.monotonic_ns()
