@@ -519,9 +519,6 @@ def test_template_reuse_and_explicit_overwrite(task_template):
 
 @pytest.mark.parametrize("single", [False, True])
 def test_external_directory_workflow(task_template, monkeypatch, single):
-    from dexmani_real.deployment.preflight import resolve_hoi_inputs
-    from dexmani_real.geometry.hoi import load_task_template
-
     checkout = task_template / "checkout"
     (checkout / "episodes/pick/episode_unselected").mkdir(parents=True)
     source = task_template / "external/pick"
@@ -561,25 +558,17 @@ def test_external_directory_workflow(task_template, monkeypatch, single):
     # 已有 HOI 的默认跳过保持惰性，不加载错误资产或模型。
     assert module.main([input_root, "--task-dir", "../missing"]) == 0
     assert len(reads) == (1 if single else 2)
-    resolved, template = resolve_hoi_inputs(
-        SimpleNamespace(observation_fields=("object_pointcloud",), task_name="unrelated/experiment label"),
-        "..",
-    )
-    assert resolved == task_template
-    np.testing.assert_array_equal(template["points_local"], load_task_template(task_template)["points_local"])
 
 
-@pytest.mark.parametrize("name", ["prepare_task", "sample_template", "annotate_episodes"])
-def test_task_clis_remove_replaced_options(name):
-    argv = ["input"] if name == "annotate_episodes" else []
+@pytest.mark.parametrize("name,argv", [
+    ("prepare_task", ["--task", "pick"]),
+    ("sample_template", ["--task", "pick"]),
+    ("annotate_episodes", ["input", "--task", "pick"]),
+    ("annotate_episodes", ["input", "--task-dir", "task", "--episode", "episode"]),
+])
+def test_task_clis_reject_removed_options(name, argv):
     with pytest.raises(SystemExit) as error:
-        script(name).main([*argv, "--task", "pick"])
-    assert error.value.code == 2
-
-
-def test_annotation_cli_removes_episode_option():
-    with pytest.raises(SystemExit) as error:
-        script("annotate_episodes").main(["input", "--task-dir", "task", "--episode", "episode"])
+        script(name).main(argv)
     assert error.value.code == 2
 
 

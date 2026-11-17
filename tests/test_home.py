@@ -63,22 +63,20 @@ def test_real_ruckig_references_and_each_sample_evaluated_once(monkeypatch):
     ))
     q = np.asarray(cfg.home_qpos) + [.2, -.1, .2, -.1, .1, -.15, .1]
     v = np.zeros(7)
-    calculate = home.calculate_home_segment
-    trajectory = calculate(cfg, q, v, np.asarray(cfg.home_qpos))
+    trajectory = home.calculate_home_segment(cfg, q, v, np.asarray(cfg.home_qpos))
     times = np.arange(round(trajectory.duration * cfg.servo_hz) + 1) / cfg.servo_hz
     expected = np.array([trajectory.at_time(t)[0] for t in times])
     expected[-1] = cfg.home_qpos
     calls = []
 
-    class CountedTrajectory:
-        def __getattr__(self, name):
-            return getattr(trajectory, name)
+    def at_time(t):
+        calls.append(t)
+        return trajectory.at_time(t)
 
-        def at_time(self, t):
-            calls.append(t)
-            return trajectory.at_time(t)
-
-    monkeypatch.setattr(home, "calculate_home_segment", lambda *args: CountedTrajectory())
+    sampled = SimpleNamespace(
+        duration=trajectory.duration, profiles=trajectory.profiles, at_time=at_time,
+    )
+    monkeypatch.setattr(home, "calculate_home_segment", lambda *args: sampled)
     collision = CollisionProbe()
     actual = home._plan_home(cfg, q, v, np.zeros(12), collision, lambda: None)
     np.testing.assert_array_equal(actual, expected)

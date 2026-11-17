@@ -38,7 +38,7 @@ flowchart TD
 
 需要手动标记任务成败时使用 [label_episode.py](scripts/label_episode.py)。HOI 数据先完成[物体资产准备与离线标注](docs/object_reconstruction.md)。具体选项见各入口的 `--help`。
 
-手部预览默认恢复 Raw 中的重定向参数、标定和限位；`python scripts/preview_hand_retargeting.py EPISODE --config experiment.py` 仅替换重定向参数。它按记录时间离线求解，不连接设备，不读图像或 HOI，也不写回数据。分段与拒绝行的语义见[手部重定向](docs/hand_retargeting.md)。
+手部预览使用 Raw 记录的参数、标定和限位；`--config experiment.py` 仅替换重定向参数。输入要求、记录时间和分段语义见[手部重定向](docs/hand_retargeting.md#离线预览)。
 
 实验配置由 [RealConfig](dexmani_real/config/real.py) 组装。用一个可信本地 Python 文件导出 `CONFIG`，将实际设备、工作空间、运动参数集中保存；采集、部署、导出和回放均可传 `--config experiment.py`。例如下面只改变采集周期，其余配置仍须符合实际设备：
 
@@ -71,7 +71,6 @@ python scripts/collect_teleop.py pick --episodes-dir /data/episodes
 python scripts/cordvip/prepare_task.py --task-dir /data/tasks/pick
 python scripts/cordvip/sample_template.py --task-dir /data/tasks/pick
 python scripts/cordvip/annotate_episodes.py /data/episodes/pick --task-dir /data/tasks/pick
-python scripts/cordvip/annotate_episodes.py /data/episodes/pick/episode_001 --task-dir /data/tasks/pick
 python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick
 ```
 
