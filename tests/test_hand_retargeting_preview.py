@@ -272,9 +272,11 @@ def test_rerun_logging_with_viewer_spawn_disabled(episode, fake_solver, monkeypa
     monkeypatch.setattr(rr, "log", capture_log)
     with rr.new_recording("hand-preview-test", spawn=False):
         preview.show_preview(result, HandFK(), episode.name)
-    # 真实 blueprint、archetypes 和列发送已运行；拒绝行清除候选指尖。
+    # 候选与保留参考互斥显示；同时运行真实 blueprint、archetypes 和列发送。
     candidates = [args[0] for path, args in logs if path == "hand/candidate/fingertips"]
     assert [type(value) for value in candidates] == [rr.Clear, rr.Points3D, rr.Clear]
+    references = [args[0] for path, args in logs if path == "hand/reference/fingertips"]
+    assert [type(value) for value in references] == [rr.Points3D, rr.Clear, rr.Points3D]
     assert any(path == "events" and isinstance(args[0], rr.TextLog) for path, args in logs)
 
 

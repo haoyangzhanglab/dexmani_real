@@ -304,6 +304,7 @@ def test_model_load_failure_precedes_device_allocation(policy_session, monkeypat
 def test_sensor_startup_cancel_reaches_session_cleanup(policy_session, policy_info, monkeypatch):
     from dexmani_policy import deployment
 
+    monkeypatch.setattr(session, "configure_logging", lambda: None)
     configured = policy_session
     info = replace(policy_info, observation_fields=("rgb",))
     model = Mock(info=info)

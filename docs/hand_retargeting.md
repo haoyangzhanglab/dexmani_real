@@ -37,6 +37,6 @@ python scripts/preview_hand_retargeting.py /data/episodes/pick/episode_001 --max
 
 计算使用记录的 `observation_ns`：段首按实测关节和该行时间 `reset`，只展示参考；后续有效候选以同一行时间 `commit`。拒绝行保留上一参考位置与时间，显示原因并断开候选曲线；段间重置平滑状态。这里的 `commit` 表示离线接受候选，不能证明真实硬件执行成功。
 
-Rerun 在手部局部坐标系对照实测、候选与参考的指尖和关节曲线，标出段界及拒绝行，使用其时间轴浏览。`--no-view` 不初始化 viewer，仅打印帧数、拒绝原因和求解耗时；耗时只包含 `retarget` 调用。`--max-frames` 限制读取和计算的前缀。
+Rerun 在手部局部坐标系对照实测与有效候选的指尖；段首和拒绝行显示保留参考。关节曲线同时保留实测、候选与参考，标出段界及拒绝行，使用时间轴浏览。`--no-view` 不初始化 viewer，仅打印帧数、拒绝原因和求解耗时；耗时只包含 `retarget` 调用。`--max-frames` 限制读取和计算的前缀。
 
 返回[项目架构](../README.md)。

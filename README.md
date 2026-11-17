@@ -80,7 +80,7 @@ python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick
 
 ## 数据导出
 
-`--fields` 必填，一条命令只发布 `--output` 指定的一份 Zarr，字段集合固定。缺少所选数据或晚发现损坏时整条 Raw 回滚，继续其他采集；全被拒绝时失败，已有输出不覆盖。
+`--fields` 必填，一条命令只发布一份字段集合固定的 Zarr。`--output` 指定输出路径；省略时写入 cwd 下的 `datasets/<输入目录名>.zarr`，单个 Episode 使用其父目录名。目录名只用于输出文件命名，任务标签仍来自 Raw。缺少所选数据或晚发现损坏时整条 Raw 回滚，继续其他采集；全被拒绝时失败，已有输出不覆盖。
 
 HOI 标注独立保存在 `episode/hoi.h5`，默认跳过已有标注，使用 `annotate_episodes.py --overwrite` 明确重算。重算失败保留此前完整文件，不修改 `data.h5` 或 `rgb.mp4`。未选 `object_pointcloud` 时完全不读取 HOI；纯关节导出不需要相机，纯 RGB 不需要深度单位。
 

@@ -21,7 +21,7 @@ def main(argv: list[str] | None = None) -> int:
         nargs="?",
         default=DEFAULT_TASK_NAME,
         help=(
-            "Task name used for recording metadata and episodes/<task_name>/ (unused with --no-record); "
+            "Task label and recording subdirectory <episodes-dir>/<task_name>/ (unused with --no-record); "
             f"default: {DEFAULT_TASK_NAME!r}."
         ),
     )
