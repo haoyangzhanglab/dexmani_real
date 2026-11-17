@@ -30,7 +30,7 @@ flowchart TD
 | 查看采集配置（不连接设备） | `python scripts/collect_teleop.py TASK --print-config` |
 | VR 采集 / 仅遥操作 | `python scripts/collect_teleop.py TASK` / 加 `--no-record` |
 | 键盘调整姿态 | `python scripts/keyboard_teleop.py` |
-| 查看记录 | `python scripts/visualize_episode.py EPISODE` |
+| 查看记录 | `python scripts/visualize_episode.py EPISODE`（`--no-hoi` 绕过标注，`--max-frames N` 按需读取前 N 帧） |
 | 导出训练数据 | `python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr --fields joint_state action` |
 | 策略评估并录制 | `python scripts/run_policy.py CHECKPOINT --record-raw` |
 | 回放关节目标 | `python scripts/replay_episode.py EPISODE` |

@@ -306,7 +306,6 @@ def test_hoi_loss_rejects_whole_raw(tmp_path, hoi_episodes, fields):
     source, _, _ = hoi_episodes
     with h5py.File(source / "episode_1/hoi.h5", "r+") as data:
         data["object_valid"][1, 0] = False
-        data["valid"][1] = False
         data["object_pointcloud"][1] = np.nan
     output = tmp_path / "filtered.zarr"
     export_zarr(source, output, processing=ExportConfig(), fields=fields)
@@ -317,7 +316,7 @@ def test_hoi_loss_rejects_whole_raw(tmp_path, hoi_episodes, fields):
     root.store.close()
 
 
-@pytest.mark.parametrize("missing", ["valid", "object_valid"])
+@pytest.mark.parametrize("missing", ["object_valid"])
 def test_export_rejects_missing_hoi_validity(tmp_path, hoi_episodes, missing):
     source, _, _ = hoi_episodes
     with h5py.File(source / "episode_0/hoi.h5", "r+") as data:
@@ -331,7 +330,6 @@ def test_export_rejects_missing_hoi_validity(tmp_path, hoi_episodes, missing):
 def test_export_rejects_episode_with_no_valid_hoi_rows(tmp_path, hoi_episodes):
     source, _, _ = hoi_episodes
     with h5py.File(source / "episode_0/hoi.h5", "r+") as data:
-        data["valid"][:] = False
         data["object_valid"][:] = False
     output = tmp_path / "empty.zarr"
     result = export_zarr(source, output, processing=ExportConfig(), fields=("object_pointcloud",))
@@ -743,7 +741,6 @@ def test_unselected_hoi_is_not_opened(tmp_path, hoi_episodes, invalid, monkeypat
         if invalid == "missing_cloud":
             del data["object_pointcloud"]
         elif invalid == "invalid_flag":
-            data["valid"][0] = False
             data["object_valid"][0] = False
         elif invalid == "nonfinite":
             data["object_pointcloud"][-1, 0, 0] = np.nan
@@ -1101,3 +1098,122 @@ def test_segment_group_corruption_rejects_only_that_raw(tmp_path, raw_episodes):
     assert "segment_starts must be a dataset" in result["rejected_episodes"][0]["reason"]
     root = zarr.open_group(result["path"], mode="r")
     np.testing.assert_array_equal(root["data/joint_state"][:], states[4:].astype("f4"))
+
+
+@pytest.mark.parametrize("starts,gap", [([0], .1), ([0], .01), ([0, 1], .1)])
+@pytest.mark.parametrize("stop", [1, 2, 3])
+@pytest.mark.parametrize("delay_ns", [20_000_000, 100_000_000])
+def test_hoi_prefix_matches_full_alignment(raw_episodes, starts, gap, stop, delay_ns):
+    from dexmani_real.data.hoi import align_hoi_episode
+
+    source, *_ = raw_episodes
+    episode = source / "episode_0"
+    with h5py.File(episode / "data.h5", "r+") as data:
+        rows = data["timing/rows"][:]
+        rows["arm_ns"] -= delay_ns
+        rows["hand_ns"] -= delay_ns + 10_000_000
+        data["timing/rows"][:] = rows
+        del data["timing/segment_starts"]
+        data.create_dataset("timing/segment_starts", data=starts)
+    with RawReader(episode) as reader:
+        full = align_hoi_episode(reader, gap)
+        prefix = align_hoi_episode(reader, gap, stop=stop)
+        for key in full:
+            np.testing.assert_allclose(prefix[key], full[key][:stop], equal_nan=True)
+        if starts == [0] and (gap == .1 or delay_ns == 100_000_000):
+            assert np.isfinite(prefix["arm_qpos"][0]).all()
+        else:
+            assert np.isnan(prefix["arm_qpos"][0]).all()
+
+
+@pytest.mark.parametrize("fault", ["missing", "dtype", "rows", "objects", "group"])
+def test_hoi_object_valid_input_boundary(hoi_episodes, fault):
+    from dexmani_real.data.hoi import read_hoi_validity
+
+    source, *_ = hoi_episodes
+    episode = source / "episode_0"
+    with h5py.File(episode / "hoi.h5", "r+") as data:
+        assert "valid" not in data
+        del data["object_valid"]
+        if fault == "group":
+            data.create_group("object_valid")
+        elif fault != "missing":
+            shape = (3, 1) if fault == "rows" else (4, 2) if fault == "objects" else (4, 1)
+            data.create_dataset("object_valid", data=np.ones(shape, np.uint8 if fault == "dtype" else bool))
+    with RawReader(episode) as reader:
+        with pytest.raises((KeyError, ValueError), match="object_valid"):
+            read_hoi_validity(reader, stop=1)
+
+
+def test_prefix_reads_needed_right_neighbor_not_bad_tail(raw_episodes, monkeypatch):
+    from dexmani_real.data.hoi import align_hoi_episode
+
+    source, *_ = raw_episodes
+    episode = source / "episode_0"
+    with h5py.File(episode / "data.h5", "r+") as data:
+        rows = data["timing/rows"][:]
+        for device in ("arm", "hand"):
+            rows[f"{device}_ns"] -= 20_000_000
+            rows[f"{device}_ns"][1] = rows[f"{device}_ns"][0]
+            data[f"{device}_qpos"][1] = data[f"{device}_qpos"][0]
+        data["timing/rows"][:] = rows
+    with RawReader(episode) as reader:
+        expected = align_hoi_episode(reader, .1)
+    with h5py.File(episode / "data.h5", "r+") as data:
+        data["arm_qpos"][3] = np.nan
+        data["hand_qpos"][3] = np.nan
+        rows["arm_ns"][3] = rows["camera_ns"][3] = 0
+        data["timing/rows"][:] = rows
+    original = h5py.Dataset.__getitem__
+    reads = []
+
+    def read(dataset, key, **kwargs):
+        if dataset.name in {"/arm_qpos", "/hand_qpos"}:
+            assert key == slice(0, 1) or key == [1, 2]
+            reads.append((dataset.name, key))
+        if dataset.name == "/timing/rows":
+            assert key in (slice(None, 1), 1, 2)
+        return original(dataset, key, **kwargs)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
+    with RawReader(episode) as reader:
+        prefix = align_hoi_episode(reader, .1, stop=1)
+        for key in prefix:
+            np.testing.assert_allclose(prefix[key], expected[key][:1], equal_nan=True)
+    assert reads == [(name, key) for name in ("/arm_qpos", "/hand_qpos")
+                     for key in (slice(0, 1), [1, 2])]
+
+
+@pytest.mark.parametrize("case", ["missing", "interpolate", "exact"])
+def test_prefix_skips_unneeded_stale_joint_values(raw_episodes, monkeypatch, case):
+    from dexmani_real.data.hoi import align_hoi_episode
+
+    source, *_ = raw_episodes
+    episode = source / "episode_0"
+    with h5py.File(episode / "data.h5", "r+") as data:
+        rows = data["timing/rows"][:]
+        for device in ("arm", "hand"):
+            rows[f"{device}_ns"] = 980_000_000
+            if case != "missing":
+                rows[f"{device}_ns"][3] = 1_000_000_000 if case == "exact" else 1_080_000_000
+            data[f"{device}_qpos"][:] = 0
+        data["timing/rows"][:] = rows
+    with RawReader(episode) as reader:
+        expected = align_hoi_episode(reader, .1)
+    with h5py.File(episode / "data.h5", "r+") as data:
+        for device in ("arm", "hand"):
+            data[f"{device}_qpos"][1] = np.nan
+            if case == "exact":
+                data[f"{device}_qpos"][2] = np.nan
+    original = h5py.Dataset.__getitem__
+
+    def read(dataset, key, **kwargs):
+        if dataset.name in {"/arm_qpos", "/hand_qpos"}:
+            assert key == slice(0, 1) or (case == "interpolate" and key == [2, 3]) or (case == "exact" and key == [3])
+        return original(dataset, key, **kwargs)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
+    with RawReader(episode) as reader:
+        actual = align_hoi_episode(reader, .1, stop=1)
+        for key in actual:
+            np.testing.assert_allclose(actual[key], expected[key][:1], equal_nan=True)

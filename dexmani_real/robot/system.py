@@ -2,6 +2,7 @@
 
 import logging
 import time
+from bisect import bisect_left
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
@@ -23,7 +24,7 @@ from dexmani_real.robot.model import (
 )
 from dexmani_real.robot.xhand.feedback import XHandFeedback
 from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S
-from dexmani_real.utils.timing import interpolate_joints, next_tick_ns, sample_is_fresh
+from dexmani_real.utils.timing import next_tick_ns, sample_is_fresh
 
 logger = logging.getLogger(__name__)
 
@@ -80,11 +81,20 @@ class Robot:
         for name, history in self.joint_history.items():
             if not history:
                 return None
-            stamps, positions = zip(*history)
-            q, valid = interpolate_joints(stamps, positions, [timestamp_ns], max_gap_s)
-            if not valid[0]:
+            right = bisect_left(history, timestamp_ns, key=lambda sample: sample[0])
+            if right == len(history):
                 return None
-            result[name + "_qpos"] = q[0]
+            hi, q_hi = history[right]
+            if hi == timestamp_ns:
+                q = q_hi.copy()
+            else:
+                if right == 0:
+                    return None
+                lo, q_lo = history[right - 1]
+                if hi - lo > max_gap_s * 1e9:
+                    return None
+                q = q_lo + ((timestamp_ns - lo) / (hi - lo)) * (q_hi - q_lo)
+            result[name + "_qpos"] = q
         return result
 
     def check(self) -> None:
@@ -183,8 +193,15 @@ class Robot:
                         if frame is None:
                             continue
                         stamp = int(frame["timestamp_ns"][0])
-                        if not history or stamp != history[-1][0]:
-                            history.append((stamp, frame["qpos"][0].copy()))
+                        # 驱动保证关节有限；arm 的未就绪反馈可能仍带零时间。
+                        if stamp <= 0 or (history and stamp < history[-1][0]):
+                            raise ValueError(f"{name}: invalid joint feedback timestamp {stamp}")
+                        qpos = frame["qpos"][0]
+                        if history and stamp == history[-1][0]:
+                            if not np.array_equal(qpos, history[-1][1]):
+                                raise ValueError(f"{name}: Conflicting joint states at the same timestamp")
+                            continue
+                        history.append((stamp, qpos.copy()))
                         # 留下窗口左侧的一个样本，供边界时刻插值。
                         while len(history) > 2 and history[1][0] < stamp - self.joint_history_ns:
                             history.popleft()

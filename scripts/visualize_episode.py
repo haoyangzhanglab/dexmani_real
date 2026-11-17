@@ -53,7 +53,7 @@ FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
 EEF_COLOR = (255, 255, 255)
 
 
-def print_episode_info(episode_path: str) -> None:
+def print_episode_info(episode_path: str, *, hoi: bool = True) -> None:
     import h5py
 
     path = Path(episode_path).expanduser()
@@ -68,7 +68,7 @@ def print_episode_info(episode_path: str) -> None:
             if isinstance(obj, h5py.Dataset):
                 print(f"  {name}: shape={obj.shape}, dtype={obj.dtype}")
         data.visititems(describe)
-    if (path / "hoi.h5").is_file():
+    if hoi and (path / "hoi.h5").is_file():
         print("HOI: hoi.h5")
         with h5py.File(path / "hoi.h5", "r") as hoi:
             hoi.visititems(describe)
@@ -81,6 +81,7 @@ class EpisodeVisualizer:
         *,
         table_plane_path: str | Path | None,
         max_frames: int | None = None,
+        hoi: bool = True,
         hoi_max_joint_gap_s: float = 0.10,
         pointcloud_config: PointCloudConfig | None = None,
         hand_pointcloud_config: HandCloudConfig = HandCloudConfig(),  # noqa: B008 — 不可变配置可共享。
@@ -92,11 +93,18 @@ class EpisodeVisualizer:
         episode_name = Path(episode_path).stem
         try:
             self.reader = RawReader(episode_path)
-            self.timestamps_s = self.reader.timestamps_s
-            self.has_hoi = (self.reader.path / "hoi.h5").is_file()
+            self.frame_count = self.reader.num_frames
+            if self.frame_count <= 0:
+                raise ValueError("episode must contain at least one row")
+            if max_frames is not None:
+                if max_frames <= 0:
+                    raise ValueError("max_frames must be positive")
+                self.frame_count = min(self.frame_count, max_frames)
+            self.timestamps_s = self.reader.read_timestamps_s(stop=self.frame_count)
+            self.has_hoi = hoi and (self.reader.path / "hoi.h5").is_file()
             if self.has_hoi:
                 self.reader["object_pointcloud"]
-                self.hoi_valid = read_hoi_validity(self.reader)
+                self.hoi_valid = read_hoi_validity(self.reader, stop=self.frame_count)
 
             self.reader.require_fields(
                 "rgb",
@@ -108,11 +116,6 @@ class EpisodeVisualizer:
                 "action_hand_joint_target",
             )
 
-            self.frame_count = self.reader.num_frames
-            if self.frame_count <= 0:
-                raise ValueError("episode must contain at least one row")
-            if max_frames is not None:
-                self.frame_count = min(self.frame_count, max_frames)
             self.camera_model = self.reader.read_camera()
             if self.camera_model.depth_scale_m is None:
                 raise ValueError("RGB-D 可视化必须有 Raw 中记录的深度单位")
@@ -144,7 +147,9 @@ class EpisodeVisualizer:
             self.hand_cloud = HandPointCloud(self.hand_fk, hand_pointcloud_config.num_points)
             self.hoi_alignment = None
             if self.has_hoi:
-                self.hoi_alignment = align_hoi_episode(self.reader, hoi_max_joint_gap_s)
+                self.hoi_alignment = align_hoi_episode(
+                    self.reader, hoi_max_joint_gap_s, stop=self.frame_count,
+                )
             self.state = self.preload_state()
 
             app_id = f"DexMani - {episode_name}"
@@ -340,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
         default=True,
         help="Display the camera point cloud; FK hand cloud is always shown (default: enabled).",
     )
+    parser.add_argument("--no-hoi", action="store_true", help="View Raw without opening HOI annotations.")
     args = parser.parse_args(argv)
     if args.max_frames is not None and args.max_frames <= 0:
         parser.error("--max-frames must be a positive integer")
@@ -349,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.info:
-        print_episode_info(str(episode_path))
+        print_episode_info(str(episode_path), hoi=not args.no_hoi)
         return 0
 
     runtime = load_config(path=args.config)
@@ -364,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
         str(episode_path),
         table_plane_path=runtime.environment.table_plane_path,
         max_frames=args.max_frames,
+        hoi=not args.no_hoi,
         pointcloud_config=pointcloud_config,
         hand_pointcloud_config=runtime.hand_pointcloud,
         hoi_max_joint_gap_s=runtime.execution.hoi_max_joint_gap_s,
