@@ -1,7 +1,11 @@
 """离线手部预览只消费所选 Raw 前缀，按记录时钟推进独立参考。"""
 
 import json
+import subprocess
+import sys
 from dataclasses import asdict, replace
+from pathlib import Path
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -13,6 +17,7 @@ from dexmani_real.data.raw import TIMING_ROW_DTYPE
 from dexmani_real.geometry.kinematics import HandFK
 from dexmani_real.robot.model import XHAND_SDK_JOINT_NAMES
 from dexmani_real.teleop.retargeting.landmarks import hand_lengths, prepare_landmarks
+from scripts import benchmark_hand_retargeting as benchmark
 from scripts import preview_hand_retargeting as preview
 
 
@@ -68,6 +73,55 @@ def edit_parameters(episode, update):
         parameters = json.loads(data["meta"].attrs["effective_parameters"])
         update(parameters)
         data["meta"].attrs["effective_parameters"] = json.dumps(parameters)
+
+
+def test_benchmark_cli_replays_recorded_segments(episode, tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    output = tmp_path / "benchmark.json"
+    subprocess.run([
+        sys.executable, str(root / "scripts/benchmark_hand_retargeting.py"), str(episode),
+        "--baseline", str(root), "--repeats", "2", "--warmup", "1", "--output", str(output),
+    ], check=True)
+    report = json.loads(output.read_text())
+    assert report["config"]["smoothing_tau_s"] == .123
+    assert report["comparison"]["max_command_difference_rad"] == 0.
+    assert len(report["comparison"]["paired_speedup_percent"]["p50"]) == 2
+    for runs in report["runs"].values():
+        assert len(runs) == 2
+        for run in runs:
+            assert run["frames"] == 6 and run["calls"] == 4
+            assert not run["rejected"]
+            assert run["evaluations_total"] > 0
+
+
+def test_benchmark_reports_largest_difference_across_pairs(episode, tmp_path, monkeypatch):
+    # 进程输出边界给出首轮较大、末轮较小的误差；报告必须覆盖每轮。
+    differences = iter([0., 4e-6, 3.95e-6, 0.])
+
+    def run(*args, **kwargs):
+        return SimpleNamespace(stdout=json.dumps({
+            "config": {}, "commands": [[next(differences)]], "rejected": [],
+            "retarget_us": {"p50": 1., "p95": 2.},
+        }))
+
+    monkeypatch.setattr(benchmark, "subprocess", SimpleNamespace(
+        run=run, check_output=lambda *args, **kwargs: "revision", PIPE=subprocess.PIPE,
+    ))
+    output = tmp_path / "benchmark.json"
+    benchmark.main([str(episode), "--baseline", str(episode.parent), "--repeats", "2", "--output", str(output)])
+    assert json.loads(output.read_text())["comparison"]["max_command_difference_rad"] == 4e-6
+
+
+def test_benchmark_rejects_episodes_without_solve_rows(episode):
+    with h5py.File(episode / "data.h5", "r+") as data:
+        del data["timing/segment_starts"]
+        data.create_dataset("timing/segment_starts", data=np.arange(6))
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run([
+        sys.executable, str(root / "scripts/benchmark_hand_retargeting.py"), str(episode), "--worker",
+    ], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "requires at least one row after a segment start" in result.stderr
 
 
 @pytest.fixture

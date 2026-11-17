@@ -33,7 +33,7 @@ python scripts/preview_hand_retargeting.py /data/episodes/pick/episode_001 --max
 
 入口只读取所选前缀的实测手关节、VR landmarks、时间行及段边界，不读取图像或 HOI，不连接设备、不写回数据。路径支持 `~`，相对路径以 cwd 为准。
 
-预览与在线重定向共用 NLopt 求解器，其依赖由 `pip install -e '.[control]'` 安装；仍需已有环境中的 Pinocchio。关键点每次最多读取256行，计算块之间延续同一个求解参考，只有录制段界会重置。返回的关节曲线仍按所选帧数保留。
+预览与在线重定向共用 NLopt 求解器；依赖安装见 [CPU 离线环境](offline_cpu.md)。无窗口预览不需要 Ruckig、Policy 或 Rerun。关键点每次最多读取 256 行，计算块之间延续同一个求解参考，只有录制段界会重置。返回的关节曲线仍按所选帧数保留。
 
 默认从 `effective_parameters` 恢复完整的 `hand_retargeting`、`hand_retargeting_calibration` 及手部限位。`--config` 加载导出 `CONFIG: RealConfig` 的 Python 文件，仅替换 `hand_retargeting`；标定和限位始终取自 Raw。缺少所需记录或配置错误直接报错。
 
@@ -49,9 +49,7 @@ Rerun 在手部局部坐标系对照实测与有效候选的指尖；段首和�
 
 ## 固定样本与性能对照
 
-最小环境见 [CPU 离线环境](offline_cpu.md)。固定样本 `tests/fixtures/hand_retargeting/data.h5` 来自真实录制 `pnp_apple_banana/episode_20261101_174738`，保留全部 397 帧、原生单段、时间、VR 关键点、实测关节及提交目标；未保留图像。源文件 SHA256 与名称存在样本元数据中。
-
-样本只进行了明确的元数据转换：`runtime_config_json` 中所需参数移入 `effective_parameters`，`human_bone_lengths_m/human_palm_width_m` 改用当前标定字段名，旧 `ftol_abs=1e-7` 与当前常量核对后移除。数值数组未变。没有给生产读取器加入历史格式分支；合成测试另行覆盖段界、坏输入和拒绝。
+固定样本 `tests/fixtures/hand_retargeting/data.h5` 来自真实录制 `pnp_apple_banana/episode_20261101_174738`，保留全部 397 帧、原生单段、时间、VR 关键点、实测关节及提交目标；未保留图像。数值数组与来源一致，参数按当前 `effective_parameters` 格式保存，来源名称保存在元数据中。合成测试另行覆盖段界、坏输入和拒绝。
 
 准备基线 checkout 后交错比较：
 
@@ -61,7 +59,9 @@ python scripts/benchmark_hand_retargeting.py tests/fixtures/hand_retargeting \
   --baseline /tmp/dexmani-baseline --warmup 2 --repeats 10 --output /tmp/hand-benchmark.json
 ```
 
-基准启动独立进程，轮换前后版本的先后顺序，每个进程预热两次完整回放，再测一遍。读取、导入、初始化、任务空间误差计算不进入完整调用计时；分项独立测量，不能直接相加。输入、float64、线程数、NLopt SLSQP 的 50 次评估/25 ms 预算及全部参数相同，JSON 保存输入和源码摘要、环境、每轮统计、拒绝、评估次数及任务空间误差。
+基准启动独立进程，轮换前后版本的先后顺序，每个进程预热两次完整回放，再测一遍。读取、导入、初始化、任务空间误差计算不进入完整调用计时；分项独立测量，不能直接相加。输入、float64、线程数、NLopt SLSQP 的 50 次评估/25 ms 预算及全部参数相同。
+
+JSON 仅保存一次样本路径、各 checkout 的 Git 版本、公共参数与环境，再逐轮记录耗时、拒绝、成功求解的评估次数和任务空间误差。每一对运行都比较命令及拒绝结果，报告所有轮次中的最大命令差；单个版本的调用预算由记录参数决定。checkout 有未提交修改时，Git 版本带 `-dirty`。样本至少需要一个段首之后的求解行。
 
 2026-11-17，Ryzen 9 9900X，Linux x86_64，Python 3.10.20、NumPy 1.26.4、Pinocchio 2.7.0、NLopt 2.7.1。下表为各轮 P50/P95 的中位数；原始结果见 [10 轮测量 JSON](hand_retargeting_cpu.json)。基线为 `3d1a69c`，优化代码为 `701b0d1`。
 

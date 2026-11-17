@@ -85,11 +85,14 @@ def test_objective_gradient_for_each_loss(recorded, loss, activation, dt):
     lower, upper = solver.limits.T
     previous = lower + .6 * (upper - lower)
     objective = HandObjective(solver.fk, solver.frame_ids, targets, previous, dt, config)
+
+    def scalar(q):
+        return objective(q, np.empty(0))
+
     for fraction in (1e-4, .37, 1 - 1e-4):
         qpos = lower + fraction * (upper - lower)
         gradient = np.empty(12)
         value = objective(qpos, gradient)
-        scalar = lambda q: objective(q, np.empty(0))
         assert value == pytest.approx(scalar(qpos), abs=1e-12)
         numerical = finite_difference(scalar, qpos)
         np.testing.assert_allclose(gradient, numerical, atol=1e-7, rtol=1e-5)

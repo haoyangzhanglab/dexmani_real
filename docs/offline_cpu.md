@@ -19,7 +19,7 @@ python scripts/export_zarr.py tests/fixtures/hand_retargeting \
   --fields joint_state action eef_pose fingertip_xyz hand_pointcloud
 ```
 
-输出路径必须尚不存在。样本预览应报告 397 帧、0 次拒绝；导出应报告 1 个来源、1 个连续段、397 帧。`--no-view` 不需要 Rerun，纯预览和导出不需要 Policy。Python 3.10 自带的旧 pip 可能误判 CPU wheel 的元数据名称，因此明确使用上面验证过的 pip 版本。
+输出路径必须尚不存在。样本预览应报告 397 帧、0 次拒绝；导出应报告 1 个来源、1 个连续段、397 帧。`--no-view` 不需要 Rerun，纯预览和导出不需要 Policy。上述 pip 版本支持下方 CPU 回归所需的构建约束。
 
 | 功能 | 实际依赖 |
 | --- | --- |
@@ -54,7 +54,7 @@ python -m pytest -p no:cacheprovider -q -ra \
 
 Ruckig 0.17.3 的源码包使用旧的 `cmake.targets` 构建配置，构建约束将 scikit-build-core 限制在 0.10 之前；约束只作用于隔离构建，不改变运行时依赖。
 
-2026-11-17 在不继承系统包的新 venv 实测：最小安装的预览、五字段导出通过；继续安装 CPU 回归依赖后，上述测试 **559 passed**，`pip check` 无冲突。已有研究环境的完整测试为 **882 passed / 4 skipped**，四项跳过均为 CUDA 专项。本轮未连接真机，也未运行 GPU 实验。
+2026-11-17 在不继承系统包的新 venv 实测：最小安装的预览、五字段导出通过；继续安装 CPU 回归依赖后，上述测试 **562 passed**，`pip check` 无冲突。本仓库 `tests/` 完整回归为 **885 passed / 4 skipped**，四项跳过均为 CUDA 专项。该范围不包含 `third_party/` 的独立示例与环境测试；本轮未连接真机，也未运行 GPU 实验。
 
 [CPU workflow](../.github/workflows/cpu.yml) 用一个 job 先检查最小安装与 CLI，再安装回归依赖并执行上面的测试。PR、main 更新和手动触发均会运行。性能基准由研究者在同机运行；共享 CI 机器不作耗时阈值断言。
 
@@ -117,7 +117,7 @@ PY
 
 ## 收尾边界
 
-`EpisodeRecorder.finish(save=..., reason=..., wait=False)` 登记首次结束意图并轮询一次；返回 False 表示线程仍在写入，True 表示收尾已结束，成败从 `result()` 读取。省略 `wait` 时同步等待。重复调用不改变首次保存/丢弃意图，也不延长等待预算；完成不会再返回发布路径，路径由结果统一提供。
+`EpisodeRecorder.finish(save=..., reason=..., wait=False)` 登记首次结束意图并检查线程是否退出；返回 False 表示线程仍在写入，True 表示收尾已结束，成败及发布路径从 `result()` 读取。省略 `wait` 时同步等待，超时或程序错误抛出异常。重复调用不改变首次保存/丢弃意图，也不延长等待预算。
 
 Recorder 拥有 writer、队列、staging 与发布结果。Rollout 的 `snapshot_result()` 在 Recorder 活动时刷新快照，释放后保留最后结果。PolicyWorker 拥有在途预测及模型关闭 Future，Session 只在收尾完成后释放当前段。Teleop 保留自己的声音提示、丢弃和重新启动流程。
 

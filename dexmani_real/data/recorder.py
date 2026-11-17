@@ -206,13 +206,21 @@ class EpisodeRecorder:
         self.recording_truncated_reason = quality_issue
         return quality_issue
 
-    def _poll_finish(self) -> bool:
-        """返回资源收尾是否完成；已知 I/O 失败由 result 报告，绝不发布。"""
+    def finish(self, *, save, reason, wait=True) -> bool:
+        """停止接纳新行并收尾；False 表示仍在写入，录制成败由 result 报告。"""
+        self.is_recording = False
+        # 首次请求固定处置意图和整个等待预算；反复轮询不能延长 deadline。
+        if self.finish_request is None:
+            self.finish_request = _FinishRequest(save, reason, time.monotonic() + RECORDER_STOP_TIMEOUT_S)
         request = self.finish_request
-        if self.writer_pending:
-            if time.monotonic() < request.deadline:
+        while self.writer_pending:
+            remaining = request.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("recording writer did not exit before the deadline")
+            if not wait:
                 return False
-            raise TimeoutError("recording writer did not exit before the deadline")
+            # 中断 join 可能误报活线程已退出，不能据此发布文件。
+            time.sleep(min(0.005, remaining))
         # 线程退出后才判定最终结果；close 的程序错误不能被 I/O 失败掩盖。
         if isinstance(self.error, RecordingError):
             return True
@@ -236,23 +244,8 @@ class EpisodeRecorder:
                     logger.info("未录到数据，本段未发布。")
         except BaseException as exc:
             self.store_error(exc)
-            if not isinstance(exc, Exception):
-                raise
             if not isinstance(self.error, RecordingError):
-                self.check_error()
-        return True
-
-    def finish(self, *, save, reason, wait=True) -> bool:
-        """停止接纳新行并收尾；False 表示仍在写入，录制成败由 result 报告。"""
-        self.is_recording = False
-        # 首次请求固定处置意图和整个等待预算；反复轮询不能延长 deadline。
-        if self.finish_request is None:
-            self.finish_request = _FinishRequest(save, reason, time.monotonic() + RECORDER_STOP_TIMEOUT_S)
-        while not self._poll_finish():
-            if not wait:
-                return False
-            # 中断 join 在当前 Python 中可能误报活线程已退出，不能据此发布文件。
-            time.sleep(min(0.005, max(0.0, self.finish_request.deadline - time.monotonic())))
+                raise
         return True
 
     def write_episode(self, metadata):

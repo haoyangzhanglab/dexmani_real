@@ -1,37 +1,43 @@
 {
-  "input_sha256": "a5e256f16fe1b6dd07300da8ba220f3a7c3f20e0f147acc1746c4c16c357dcae",
+  "episode": "tests/fixtures/hand_retargeting",
+  "revisions": {
+    "baseline": "3d1a69c",
+    "candidate": "701b0d1"
+  },
+  "config": {
+    "calibration_samples": 25,
+    "calibration_timeout_s": 5.0,
+    "calibration_max_relative_mad": 0.1,
+    "bone_length_tolerance": 0.35,
+    "huber_delta_m": 0.02,
+    "shape_weight": 0.25,
+    "tip_weight": 2.0,
+    "proximal_direction_weight": 2.0,
+    "direction_weight": 1.0,
+    "direction_huber_delta": 0.3,
+    "pinch_weight": 8.0,
+    "pinch_start_m": 0.03,
+    "pinch_full_m": 0.015,
+    "damping_s": 0.002,
+    "smoothing_tau_s": 0.02,
+    "max_joint_speed_rad_s": 4.0,
+    "max_evaluations": 50,
+    "max_solve_time_s": 0.025
+  },
+  "environment": {
+    "python": "3.10.20",
+    "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+    "packages": {
+      "numpy": "1.26.4",
+      "pin": "2.7.0",
+      "nlopt": "2.7.1"
+    }
+  },
   "warmup_replays": 2,
   "threads": 1,
   "runs": {
     "baseline": [
       {
-        "revision": null,
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -82,45 +88,9 @@
           "p50": 3.15822992362289,
           "p95": 5.181669545938871
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": null,
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -171,45 +141,9 @@
           "p50": 3.15822992362289,
           "p95": 5.181669545938871
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": null,
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -260,45 +194,9 @@
           "p50": 3.15822992362289,
           "p95": 5.181669545938871
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": null,
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -349,45 +247,9 @@
           "p50": 3.15822992362289,
           "p95": 5.181669545938871
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": null,
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -438,45 +300,9 @@
           "p50": 3.15822992362289,
           "p95": 5.181669545938871
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": null,
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -527,45 +353,9 @@
           "p50": 3.15822992362289,
           "p95": 5.181669545938871
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": null,
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -616,45 +406,9 @@
           "p50": 3.15822992362289,
           "p95": 5.181669545938871
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": null,
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -705,45 +459,9 @@
           "p50": 3.15822992362289,
           "p95": 5.181669545938871
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": null,
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -794,45 +512,9 @@
           "p50": 3.15822992362289,
           "p95": 5.181669545938871
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": null,
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "6c3911c6665aef614ade1eb571e7ed42c5d3de8729d9e99ec57efefd02dbcf2f",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -883,47 +565,11 @@
           "p50": 3.15822992362289,
           "p95": 5.181669545938871
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       }
     ],
     "candidate": [
       {
-        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -974,45 +620,9 @@
           "p50": 3.1582299236229074,
           "p95": 5.181669545939415
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -1063,45 +673,9 @@
           "p50": 3.1582299236229074,
           "p95": 5.181669545939415
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -1152,45 +726,9 @@
           "p50": 3.1582299236229074,
           "p95": 5.181669545939415
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -1241,45 +779,9 @@
           "p50": 3.1582299236229074,
           "p95": 5.181669545939415
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -1330,45 +832,9 @@
           "p50": 3.1582299236229074,
           "p95": 5.181669545939415
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -1419,45 +885,9 @@
           "p50": 3.1582299236229074,
           "p95": 5.181669545939415
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -1508,45 +938,9 @@
           "p50": 3.1582299236229074,
           "p95": 5.181669545939415
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -1597,45 +991,9 @@
           "p50": 3.1582299236229074,
           "p95": 5.181669545939415
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -1686,45 +1044,9 @@
           "p50": 3.1582299236229074,
           "p95": 5.181669545939415
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       },
       {
-        "revision": "701b0d17009d3d0fd40cccf629412b820b3bc1f3",
-        "source_sha256": {
-          "teleop/retargeting/landmarks.py": "9c65b78d8d4d76535a0b35b39c97783fab11e81be428007e11376b53748cf33f",
-          "teleop/retargeting/objective.py": "2b04b0a8f24e23a5c0ddc11edd9555464604b97953d324ab982e6a857fc23da8",
-          "teleop/retargeting/solver.py": "754cd817e867b91179490ae6dc0011804d665a7575b1d39601c6d5c6b8b3ef41",
-          "geometry/kinematics.py": "0480a36ec07fe80bbbfb9aed19e29f2d2ab2d8782a9d6156f710ca46abc7c2ef"
-        },
-        "config": {
-          "calibration_samples": 25,
-          "calibration_timeout_s": 5.0,
-          "calibration_max_relative_mad": 0.1,
-          "bone_length_tolerance": 0.35,
-          "huber_delta_m": 0.02,
-          "shape_weight": 0.25,
-          "tip_weight": 2.0,
-          "proximal_direction_weight": 2.0,
-          "direction_weight": 1.0,
-          "direction_huber_delta": 0.3,
-          "pinch_weight": 8.0,
-          "pinch_start_m": 0.03,
-          "pinch_full_m": 0.015,
-          "damping_s": 0.002,
-          "smoothing_tau_s": 0.02,
-          "max_joint_speed_rad_s": 4.0,
-          "max_evaluations": 50,
-          "max_solve_time_s": 0.025
-        },
         "frames": 397,
         "calls": 396,
         "retarget_us": {
@@ -1775,16 +1097,7 @@
           "p50": 3.1582299236229074,
           "p95": 5.181669545939415
         },
-        "active_pinch_frames": 95,
-        "environment": {
-          "python": "3.10.20",
-          "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
-          "packages": {
-            "numpy": "1.26.4",
-            "pin": "2.7.0",
-            "nlopt": "2.7.1"
-          }
-        }
+        "active_pinch_frames": 95
       }
     ]
   },

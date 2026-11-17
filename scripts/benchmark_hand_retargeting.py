@@ -4,7 +4,7 @@
 """
 
 import argparse
-import hashlib
+from dataclasses import asdict
 import importlib.metadata
 import json
 import os
@@ -13,10 +13,11 @@ import platform
 import subprocess
 import sys
 from time import perf_counter_ns
+from typing import cast
 
 
-def measure(root, episode, warmup):
-    # 同一脚本可测没有此基准入口的旧 checkout；不保存第二份算法。
+def measure(root: Path, episode: Path, warmup: int) -> dict:
+    # 每个进程只导入一个 checkout 的算法。
     sys.path.insert(0, str(root))
     import numpy as np
 
@@ -37,35 +38,35 @@ def measure(root, episode, warmup):
         starts = set(reader.segment_starts)
     solver = HandRetargeter(config, limits)
     solver.calibration = calibration
-    if not len(times) or not np.isfinite(measured).all():
-        raise ValueError("benchmark requires nonempty finite measured joints")
+    if len(times) == len(starts):
+        raise ValueError("benchmark requires at least one row after a segment start")
+    if not np.isfinite(measured).all():
+        raise ValueError("benchmark requires finite measured joints")
     if not np.isfinite(points[[i for i in range(len(times)) if i not in starts]]).all():
         raise ValueError("benchmark landmarks contain nonfinite values outside segment starts")
     for _ in range(warmup + 1):
         elapsed, evaluations, rejected = [], [], []
-        commands, references, intervals = [], [], []
+        commands: list[np.ndarray] = []
+        references: dict[int, tuple[np.ndarray, float]] = {}
         for index, timestamp in enumerate(times):
             timestamp = int(timestamp)
             if index in starts:
                 solver.reset(measured[index], timestamp_ns=timestamp)
-                commands.append(solver.reference_qpos.copy())
-                references.append(None)
-                intervals.append(None)
-                continue
-            references.append(solver.reference_qpos.copy())
-            intervals.append((timestamp - solver.reference_timestamp_ns) * 1e-9)
-            before = perf_counter_ns()
-            command = solver.retarget(points[index], timestamp_ns=timestamp)
-            elapsed.append((perf_counter_ns() - before) / 1000)
-            if command is None:
-                rejected.append([index, solver.rejection_reason])
             else:
-                evaluations.append(solver.optimizer.get_numevals())
-                solver.commit(command, timestamp_ns=timestamp)
-            commands.append(solver.reference_qpos.copy())
+                dt = (timestamp - cast(int, solver.reference_timestamp_ns)) * 1e-9
+                references[index] = commands[-1], dt
+                before = perf_counter_ns()
+                command = solver.retarget(points[index], timestamp_ns=timestamp)
+                elapsed.append((perf_counter_ns() - before) / 1000)
+                if command is None:
+                    rejected.append([index, solver.rejection_reason])
+                else:
+                    evaluations.append(solver.optimizer.get_numevals())
+                    solver.commit(command, timestamp_ns=timestamp)
+            commands.append(cast(np.ndarray, solver.reference_qpos).copy())
 
     # 以下诊断不进入完整 retarget 耗时；同一帧的 warm start 服务各分项。
-    components = {key: [] for key in (
+    components: dict[str, list[float]] = {key: [] for key in (
         "targets_us", "objective_construction_us", "fk_us", "fk_jacobian_us",
         "objective_gradient_us", "objective_value_us",
     )}
@@ -78,9 +79,9 @@ def measure(root, episode, warmup):
             return calibration.targets(prepare_landmarks(points[index]), solver.geometry, config,
                                        fk=solver.fk, frame_ids=solver.frame_ids)
         target = targets()
-        previous = references[index]
+        previous, dt = references[index]
         def objective():
-            return HandObjective(solver.fk, solver.frame_ids, target, previous, intervals[index], config)
+            return HandObjective(solver.fk, solver.frame_ids, target, previous, dt, config)
         loss = objective()
         gradient, empty = np.empty(12), np.empty(0)
         for name, call in (
@@ -103,13 +104,7 @@ def measure(root, episode, warmup):
             distance = np.linalg.norm(actual[1:, 2] - actual[0, 2], axis=-1)
             pinches.append(np.abs(distance[active] - target.pinch_distances[active]).mean() * 1000)
 
-    revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True)
-    sources = ("teleop/retargeting/landmarks.py", "teleop/retargeting/objective.py",
-               "teleop/retargeting/solver.py", "geometry/kinematics.py")
-    from dataclasses import asdict
     return {
-        "revision": revision.stdout.strip() if revision.returncode == 0 else None,
-        "source_sha256": {name: hashlib.sha256((root / "dexmani_real" / name).read_bytes()).hexdigest() for name in sources},
         "config": asdict(config), "frames": len(times), "calls": len(elapsed),
         "retarget_us": percentiles(elapsed), "evaluations": percentiles(evaluations),
         "evaluations_total": sum(evaluations), "rejected": rejected,
@@ -117,12 +112,10 @@ def measure(root, episode, warmup):
         "tip_rmse_mm": percentiles(tips), "direction_mean_deg": percentiles(directions),
         "active_pinch_mean_error_mm": percentiles(pinches), "active_pinch_frames": len(pinches),
         "commands": np.asarray(commands).tolist(),
-        "environment": {"python": platform.python_version(), "platform": platform.platform(),
-                        "packages": {name: importlib.metadata.version(name) for name in ("numpy", "pin", "nlopt")}},
     }
 
 
-def main():
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("episode", type=Path)
     parser.add_argument("--baseline", type=Path, help="基线 checkout；省略时只测当前代码")
@@ -131,23 +124,31 @@ def main():
     parser.add_argument("--warmup", type=int, default=2, help="每个独立进程先完整回放的次数")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.repeats < 1 or args.warmup < 1:
         parser.error("repeats and warmup must be positive")
     episode = args.episode.expanduser().resolve()
     if args.worker:
-        print(json.dumps(measure(args.candidate.resolve(), episode, args.warmup), allow_nan=False))
+        print(json.dumps(measure(args.candidate.expanduser().resolve(), episode, args.warmup), allow_nan=False))
         return
     import numpy as np
 
     roots = {"candidate": args.candidate.expanduser().resolve()}
     if args.baseline:
         roots = {"baseline": args.baseline.expanduser().resolve(), **roots}
-    runs = {name: [] for name in roots}
-    commands = {}
+    runs: dict[str, list[dict]] = {name: [] for name in roots}
+    config = None
+    max_command_difference = 0.
+    revisions = {
+        name: subprocess.check_output(
+            ["git", "-C", str(root), "describe", "--always", "--dirty"], text=True,
+        ).strip()
+        for name, root in roots.items()
+    }
     environment = dict(os.environ, OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
                        PYTHONDONTWRITEBYTECODE="1")
     for index in range(args.repeats):
+        commands = {}
         order = list(roots) if index % 2 == 0 else list(reversed(roots))
         for name in order:
             result = subprocess.run(
@@ -156,28 +157,39 @@ def main():
                 env=environment, check=True, stdout=subprocess.PIPE, text=True,
             )
             run = json.loads(result.stdout)
+            parameters = run.pop("config")
+            if config is None:
+                config = parameters
+            elif parameters != config:
+                raise ValueError("retargeting config differs between runs")
             command = np.asarray(run.pop("commands"))
-            if name in commands:
-                np.testing.assert_allclose(command, commands[name], atol=1e-7, rtol=0)
             commands[name] = command
             runs[name].append(run)
             print(f"{index + 1}/{args.repeats} {name}: {run['retarget_us']}", file=sys.stderr)
+        if args.baseline:
+            if runs["baseline"][-1]["rejected"] != runs["candidate"][-1]["rejected"]:
+                raise ValueError("rejection behavior differs")
+            np.testing.assert_allclose(commands["baseline"], commands["candidate"], atol=1e-5, rtol=0)
+            max_command_difference = max(
+                max_command_difference,
+                float(np.max(np.abs(commands["baseline"] - commands["candidate"]))),
+            )
     comparison = None
     if args.baseline:
-        for before, after in zip(runs["baseline"], runs["candidate"]):
-            if before["config"] != after["config"] or before["rejected"] != after["rejected"]:
-                raise ValueError("config or rejection behavior differs")
-        np.testing.assert_allclose(commands["baseline"], commands["candidate"], atol=1e-5, rtol=0)
         comparison = {
-            "max_command_difference_rad": float(np.max(np.abs(commands["baseline"] - commands["candidate"]))),
+            "max_command_difference_rad": max_command_difference,
             "paired_speedup_percent": {
                 quantile: [100 * (1 - after["retarget_us"][quantile] / before["retarget_us"][quantile])
                            for before, after in zip(runs["baseline"], runs["candidate"])]
                 for quantile in ("p50", "p95")
             },
         }
-    report = {"input_sha256": hashlib.sha256((episode / "data.h5").read_bytes()).hexdigest(),
-              "warmup_replays": args.warmup, "threads": 1, "runs": runs, "comparison": comparison}
+    report = {
+        "episode": str(args.episode), "revisions": revisions, "config": config,
+        "environment": {"python": platform.python_version(), "platform": platform.platform(),
+                        "packages": {name: importlib.metadata.version(name) for name in ("numpy", "pin", "nlopt")}},
+        "warmup_replays": args.warmup, "threads": 1, "runs": runs, "comparison": comparison,
+    }
     text = json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     if args.output:
         args.output.expanduser().write_text(text, encoding="utf-8")
