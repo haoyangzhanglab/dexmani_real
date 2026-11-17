@@ -1,14 +1,18 @@
 # CordViP 实验入口
 
-从仓库根目录运行，使用 `real_robot` 环境。任务目录为 `assets/pointcloud_template/object/<task>/`。
+从仓库根目录运行，使用 `real_robot` 环境。用 `--task-dir` 显式指定包含 `task.json`、对象目录和 `hoi/template.npz` 的任务资产目录，可以放在仓库外。所有显式路径支持 `~`，相对路径以 cwd 为准。
 
 ```bash
-python scripts/cordvip/prepare_task.py --task pnp_apple_banana
-python scripts/cordvip/sample_template.py --task pnp_apple_banana
-python scripts/cordvip/annotate_episodes.py --task pnp_apple_banana
+python scripts/cordvip/prepare_task.py --task-dir /data/tasks/pick
+python scripts/cordvip/sample_template.py --task-dir /data/tasks/pick
+python scripts/cordvip/annotate_episodes.py /data/episodes/pick --task-dir /data/tasks/pick
+python scripts/cordvip/annotate_episodes.py /data/episodes/pick/episode_001 --task-dir /data/tasks/pick
+python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick
 ```
 
 `task.json` 的 `objects` 列表定义任务对象及顺序，每项包含 `name`。
+
+每个对象的输入放在 `<task-dir>/<name>/`，参考图默认是 `reference.jpg`，已有米制网格是 `mesh/mesh_m.obj`。例如 `/data/tasks/pick/task.json` 可以包含 `{"objects": [{"name": "apple", "size_axis": "x", "size_meters": 0.08}]}`，参考图放在 `/data/tasks/pick/apple/reference.jpg`。这些路径与 Raw 及 checkpoint 中的任务标签无关。
 
 - 分割：`prompt` 默认对象名，`image` 默认 `reference.jpg`。参考图有多个候选时，用 `instance` 指定去重、过滤空 mask 后按置信度降序排列的零起始索引。
 - 尺度：需要重建的对象须提供 `scale_to_meters`，或配对的 `size_axis` / `size_meters`。
@@ -23,7 +27,7 @@ python scripts/cordvip/annotate_episodes.py --task pnp_apple_banana
 米制网格保留源物体原点和朝向；模板固定对象顺序、点分段和点序，在线与离线共用。已有任务模板直接复用；修改物体 Mesh、手部 URDF 或 Visual Mesh 后，显式重建对应模板：
 
 ```bash
-python scripts/cordvip/sample_template.py --task pnp_apple_banana --overwrite
+python scripts/cordvip/sample_template.py --task-dir /data/tasks/pick --overwrite
 python scripts/generate_hand_template.py --overwrite
 ```
 
@@ -33,7 +37,7 @@ python scripts/generate_hand_template.py --overwrite
 
 ## 离线标注
 
-`annotate_episodes.py` 默认处理任务下所有已发布 Raw，也可用 `--episode <目录>` 指定一条采集。标注需要任务模板及 Raw 中的相机外参，已有 `hoi.h5` 时直接跳过；显式传入 `--overwrite` 重算。完成逐帧标注后写入基座坐标系下的米制 float32 点云；相同相机序列复用位姿、质量和有效性。遮挡、丢失和两帧恢复确认期间标为无效，后续新观测继续跟踪或恢复；时间间隔与 Mask 年龄使用 Raw 中真实相机时间和来源序列。
+`annotate_episodes.py INPUT_ROOT --task-dir TASK_DIR` 接受一个含 `data.h5` 的 Episode，或直接包含 `episode_*` 子目录的数据目录；仅处理指定目录，不递归查找，也不从任务标签推导数据路径。无效路径或空目录直接报错。标注需要任务模板及 Raw 中的相机外参，已有 `hoi.h5` 时直接跳过；显式传入 `--overwrite` 重算。完成逐帧标注后写入基座坐标系下的米制 float32 点云；相同相机序列复用位姿、质量和有效性。遮挡、丢失和两帧恢复确认期间标为无效，后续新观测继续跟踪或恢复；时间间隔与 Mask 年龄使用 Raw 中真实相机时间和来源序列。
 
 每个 `prompt` 须在去畸变后的首帧匹配唯一候选，缺失或歧义会使初始化失败，后续新帧重试。`instance` 仅用于参考图选择，不用于跟踪初始化。
 

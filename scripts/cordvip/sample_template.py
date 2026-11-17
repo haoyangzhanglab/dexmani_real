@@ -44,7 +44,7 @@ def allocate_counts(areas):
 
 
 def sample_template(task, *, overwrite=False):
-    task = Path(task).resolve()
+    task = Path(task).expanduser().resolve()
     output = task / "hoi"
     path = output / "template.npz"
     if path.exists() and not overwrite:
@@ -76,15 +76,13 @@ def sample_template(task, *, overwrite=False):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", required=True)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--task-dir", type=Path, required=True, help="任务资产目录；相对 cwd，支持 ~")
     parser.add_argument("--overwrite", action="store_true", help="显式重建模板，可能改变点序")
     args = parser.parse_args(argv)
-    if Path(args.task).name != args.task or args.task in (".", ".."):
-        parser.error("非法任务名")
     print(
         sample_template(
-            ROOT / "assets/pointcloud_template/object" / args.task,
+            args.task_dir,
             overwrite=args.overwrite,
         )
     )

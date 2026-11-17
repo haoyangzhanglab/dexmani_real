@@ -6,7 +6,7 @@ HOI（Hand–Object Interaction，手物交互）观测用手部与物体点云�
 
 物体点云来自固定网格表面模板，由 RGB-D 跟踪位姿逐帧变换；手点云来自固定的 link 局部模板，由机械臂和手部关节通过 FK 变换。两者均为 xArm base 坐标系下的米制 float32 XYZ，保留点序和分段。
 
-任务资产位于 `assets/pointcloud_template/object/<task>/`。米制网格确定物体尺度、原点和朝向；任务模板共 1024 点，按表面积分配配额，每对象至少 64 点，最多 16 个对象。新模板先按面积采样 8 倍候选点，再用固定种子和起点的 FPS 选点。手模板沿用各 link 的面积配额与 URDF visual 变换，使用同一采样函数。
+任务资产由 `--task-dir` 显式指定，例如 `/data/tasks/pick/`；任务标签不参与资产路径推导。准备、采样、标注和 HOI 部署共用这一目录，所有显式路径支持 `~`，相对路径以 cwd 为准。米制网格确定物体尺度、原点和朝向；任务模板共 1024 点，按表面积分配配额，每对象至少 64 点，最多 16 个对象。新模板先按面积采样 8 倍候选点，再用固定种子和起点的 FPS 选点。手模板沿用各 link 的面积配额与 URDF visual 变换，使用同一采样函数。
 
 手部 FK 批量收集所需 link placements，再按缓存的点到 link 索引变换表面点，保持模板点序、分段和输出形状。指尖 `fingertip_xyz` 是独立的低维观测，可按策略需要选择。
 
@@ -37,6 +37,8 @@ flowchart LR
 3. **标注 Raw**：[annotate_episodes.py](../scripts/cordvip/annotate_episodes.py) 跟踪录制的 RGB-D，完成逐帧标注后发布位姿、质量和物体点云。
 4. **导出数据**：[export_zarr.py](../scripts/export_zarr.py) 读取物体标注，对齐关节并生成手部几何，与所选状态和动作一同导出。
 5. **训练与部署**：在 dexmani_policy 中训练；部署共用任务模板、跟踪器、坐标变换和 FK。
+
+完整命令见 [CordViP 实验入口](../scripts/cordvip/README.md)。标注使用 `annotate_episodes.py INPUT_ROOT --task-dir /data/tasks/pick`，`INPUT_ROOT` 可以是单个 Episode，或直接包含 `episode_*` 子目录的数据目录；不递归搜索或回退到仓库数据。部署使用 `run_policy.py CHECKPOINT --task-dir /data/tasks/pick`。仓库路径仍用于加载代码与模型权重。
 
 ## 跟踪与时间对齐
 

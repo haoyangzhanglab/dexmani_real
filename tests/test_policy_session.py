@@ -8,6 +8,7 @@ from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 from dexmani_policy.deployment.metadata import PolicyInfo
 
@@ -98,6 +99,7 @@ def test_cli_calls_session_directly(monkeypatch, tmp_path):
         "policy.pt", "--weights", "raw", "--inference-steps", "3", "--device", "cpu",
         "--seed", "9", "--num-episodes", "2", "--max-duration", "1.5", "--record-raw",
         "--output", str(tmp_path), "--camera-calibration", "camera.json",
+        "--task-dir", "../task-assets",
     ]) == 7
     args, kwargs = constructor.call_args
     assert args == (RealConfig(), "policy.pt")
@@ -105,6 +107,7 @@ def test_cli_calls_session_directly(monkeypatch, tmp_path):
         "weights": "raw", "inference_steps": 3, "device": "cpu", "seed": 9,
         "num_episodes": 2, "max_duration_s": 1.5, "record_raw": True, "output_root": tmp_path,
         "camera_calibration_path": Path("camera.json"),
+        "task_dir": Path("../task-assets"),
     }
     constructor.return_value.run.assert_called_once_with()
 
@@ -112,9 +115,66 @@ def test_cli_calls_session_directly(monkeypatch, tmp_path):
 def test_print_config_does_not_create_session(monkeypatch, capsys):
     constructor = Mock(side_effect=AssertionError("print-config must not create a session"))
     monkeypatch.setattr(session, "PolicySession", constructor)
-    assert load_cli().main(["--print-config"]) == 0
+    assert load_cli().main(["--print-config", "--task-dir", "/missing/task-assets"]) == 0
     assert "control_dt_s=None" in capsys.readouterr().out
     constructor.assert_not_called()
+
+
+@pytest.mark.parametrize("task_dir", [None, "missing", "bad-template"])
+def test_hoi_task_errors_precede_robot_creation(policy_session, policy_info, monkeypatch, tmp_path, task_dir):
+    monkeypatch.chdir(tmp_path)
+    if task_dir == "bad-template":
+        (tmp_path / task_dir / "hoi").mkdir(parents=True)
+        (tmp_path / task_dir / "hoi/template.npz").write_bytes(b"invalid template")
+    policy_session.task_dir = task_dir
+    policy_session.wait_model = lambda: replace(policy_info, observation_fields=("object_pointcloud",))
+    monkeypatch.setattr(session, "PolicyWorker", Mock())
+    robot = Mock(side_effect=AssertionError("task errors must precede Robot creation"))
+    monkeypatch.setattr(session, "Robot", robot)
+    expected = ValueError if task_dir is None or task_dir == "bad-template" else FileNotFoundError
+    with pytest.raises(expected):
+        policy_session.prepare_resources()
+    robot.assert_not_called()
+
+
+def test_non_hoi_policy_does_not_read_task_assets(policy_session, policy_info, monkeypatch):
+    policy_session.task_dir = object()  # 任何 Path 转换或文件读取都会失败。
+    policy_session.wait_model = lambda: policy_info
+    monkeypatch.setattr(session, "PolicyWorker", Mock())
+    monkeypatch.setattr(session, "Robot", Mock())
+    policy_session.prepare_resources()
+    assert policy_session.hoi_inputs is None
+
+
+@pytest.mark.parametrize("path_form", ["relative", "home"])
+def test_hoi_session_uses_explicit_task_and_records_path(
+    policy_session, policy_info, monkeypatch, tmp_path, path_form,
+):
+    task = tmp_path / "assets/pick"
+    (task / "hoi").mkdir(parents=True)
+    (task / "task.json").write_text(json.dumps({"objects": [{"name": "apple"}]}))
+    np.savez(task / "hoi/template.npz", points_local=np.zeros((1024, 3), np.float32),
+             offsets=np.array([0, 1024]), object_names=np.array(["apple"]))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy_session.task_dir = "assets/pick" if path_form == "relative" else "~/assets/pick"
+    policy_session.output_root = tmp_path / "results"
+    policy_session.wait_model = lambda: replace(
+        policy_info, observation_fields=("object_pointcloud",), task_name="independent/experiment label",
+    )
+    monkeypatch.setattr(session, "PolicyWorker", Mock())
+    monkeypatch.setattr(session, "SensorChannels", Mock())
+    robot = Mock()
+    monkeypatch.setattr(session, "Robot", robot)
+    policy_session.prepare_resources()
+    assert policy_session.hoi_inputs[0] == task
+    np.testing.assert_array_equal(policy_session.hoi_inputs[1]["object_names"], ["apple"])
+    robot.return_value.connect.assert_not_called()
+    policy_session.save_run_config()
+    import yaml
+
+    saved = yaml.safe_load((policy_session.output_dir / "run_config.yaml").read_text())
+    assert saved["task_dir"] == str(task)
 
 
 def test_cli_accepts_unbounded_duration(monkeypatch):
@@ -193,6 +253,7 @@ def test_policy_records_only_used_parameters(monkeypatch, tmp_path, policy_info,
     assert saved["effective_camera"] == effective_camera
     assert saved["training_processing"] is None
     assert saved["actual_processing"] == {}
+    assert saved["task_dir"] is None
     assert "data_processing" not in saved
 
 

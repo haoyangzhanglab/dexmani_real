@@ -517,6 +517,72 @@ def test_template_reuse_and_explicit_overwrite(task_template):
     np.testing.assert_allclose(np.max(np.abs(updated["points_local"][segment, 0])), 0.1)
 
 
+@pytest.mark.parametrize("single", [False, True])
+def test_external_directory_workflow(task_template, monkeypatch, single):
+    from dexmani_real.deployment.preflight import resolve_hoi_inputs
+    from dexmani_real.geometry.hoi import load_task_template
+
+    checkout = task_template / "checkout"
+    (checkout / "episodes/pick/episode_unselected").mkdir(parents=True)
+    source = task_template / "external/pick"
+    episodes = [source / name for name in ("episode_001", "episode_002")]
+    for episode in episodes:
+        episode.mkdir(parents=True)
+        (episode / "data.h5").touch()
+    monkeypatch.chdir(checkout)
+    monkeypatch.setenv("HOME", str(task_template))
+    assert script("prepare_task").main(["--task-dir", "~"]) == 0
+    original = (task_template / "hoi/template.npz").read_bytes()
+    assert script("sample_template").main(["--task-dir", ".."]) == 0
+    assert (task_template / "hoi/template.npz").read_bytes() == original
+
+    module = script("annotate_episodes")
+    reads, meshes = [], []
+    monkeypatch.setattr(module, "ROOT", checkout)
+
+    def reader(path):
+        reads.append(path)
+        return FakeRawReader()
+
+    def tracker(paths, *, workspace, config):
+        assert workspace == checkout
+        meshes.append(paths)
+        return SimpleNamespace(config=config)
+
+    monkeypatch.setattr(module, "RawReader", reader)
+    monkeypatch.setattr(module, "SceneTracker", tracker)
+    monkeypatch.setattr(module, "track_episode", lambda *args: (
+        np.tile(np.eye(4), (3, 2, 1, 1)), np.eye(4), [[{}, {}]] * 3, np.ones((3, 2), bool),
+    ))
+    input_root = "../external/pick/episode_001" if single else "~/external/pick"
+    assert module.main([input_root, "--task-dir", ".."]) == 0
+    assert reads == (episodes[:1] if single else episodes)
+    assert meshes == [{name: task_template / name / "mesh/mesh_m.obj" for name in ("banana", "apple")}]
+    # 已有 HOI 的默认跳过保持惰性，不加载错误资产或模型。
+    assert module.main([input_root, "--task-dir", "../missing"]) == 0
+    assert len(reads) == (1 if single else 2)
+    resolved, template = resolve_hoi_inputs(
+        SimpleNamespace(observation_fields=("object_pointcloud",), task_name="unrelated/experiment label"),
+        "..",
+    )
+    assert resolved == task_template
+    np.testing.assert_array_equal(template["points_local"], load_task_template(task_template)["points_local"])
+
+
+@pytest.mark.parametrize("name", ["prepare_task", "sample_template", "annotate_episodes"])
+def test_task_clis_remove_replaced_options(name):
+    argv = ["input"] if name == "annotate_episodes" else []
+    with pytest.raises(SystemExit) as error:
+        script(name).main([*argv, "--task", "pick"])
+    assert error.value.code == 2
+
+
+def test_annotation_cli_removes_episode_option():
+    with pytest.raises(SystemExit) as error:
+        script("annotate_episodes").main(["input", "--task-dir", "task", "--episode", "episode"])
+    assert error.value.code == 2
+
+
 def test_template_overwrite_failure_keeps_existing_asset(task_template, monkeypatch):
     module = script("sample_template")
     path = task_template / "hoi/template.npz"
@@ -2699,6 +2765,9 @@ def test_visualizer_can_bypass_corrupt_hoi(annotated_episode, monkeypatch, info)
     import h5py
 
     from scripts import visualize_episode as visual
+    from dexmani_real.utils import log
+
+    monkeypatch.setattr(log, "configure_logging", lambda: None)
 
     episode, *_ = annotated_episode
     (episode / "hoi.h5").write_bytes(b"corrupt annotation")
