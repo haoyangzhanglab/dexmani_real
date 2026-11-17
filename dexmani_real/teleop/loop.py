@@ -4,6 +4,7 @@ import logging
 import sys
 import time
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import asdict
 
 from dexmani_real.control.actions import StartPoseRejected
@@ -35,6 +36,7 @@ from dexmani_real.runtime.observation import (
 )
 from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S, RunEndReason
 from dexmani_real.utils.log import error_detail
+from dexmani_real.utils.profile import call
 from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
 
 logger = logging.getLogger(__name__)
@@ -55,7 +57,9 @@ class TeleopLoop:
         keyboard,
         audio,
         camera_snapshot=None,
+        profiler=None,
     ):
+        self.profiler = profiler
         self.runtime_state = runtime_state
         self.runtime = runtime
         self.robot = robot
@@ -114,7 +118,7 @@ class TeleopLoop:
                     self.poll_blocking_commands()
                     if self.runtime_state.quit_requested or self.runtime_state.estop_request:
                         break
-                    self.robot.service_feedback()
+                    call(self.profiler, "feedback_service_ms", self.robot.service_feedback)
                     if self.finish_recording(wait=False):
                         break
                     time.sleep(0.005)
@@ -143,7 +147,10 @@ class TeleopLoop:
         recorder = self.recorder
         if recorder is None:
             return True
-        if not recorder.finish(save=not self.discard_requested, reason=self.pending_termination_reason, wait=wait):
+        if not call(
+            self.profiler, "recorder_finish_call_ms", recorder.finish,
+            save=not self.discard_requested, reason=self.pending_termination_reason, wait=wait,
+        ):
             return False
         # 仅收尾完成后释放 owner；pending 或异常仍保留资源。
         self.recorder = None
@@ -208,8 +215,11 @@ class TeleopLoop:
         while True:
             if self.preparation_interrupted():
                 return None
-            self.robot.service_feedback()
-            row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
+            call(self.profiler, "feedback_service_ms", self.robot.service_feedback)
+            row = call(
+                self.profiler, "observation_read_ms", read_observation,
+                self.sensors.channels, self.robot, needs=self.capture_needs, profiler=self.profiler,
+            )
             issues = self.admit_observation(row)
             joints_ready = after_ns is None or (
                 int(row.arm["timestamp_ns"][0]) >= after_ns
@@ -282,7 +292,7 @@ class TeleopLoop:
                     tactile_reset=self.robot.hand.tactile_reset_metadata,
                 )
                 self.recorder = EpisodeRecorder(
-                    self.recording_dir, control_hz=self.runtime.teleop.control_hz,
+                    self.recording_dir, control_hz=self.runtime.teleop.control_hz, profiler=self.profiler,
                 )
                 self.recorder.start(
                     task_label=self.task_label, collection_source="teleop",
@@ -315,6 +325,8 @@ class TeleopLoop:
                 started_ns + int(self.max_duration_s * 1e9) if self.recording_dir is not None else None
             )
             self.next_tick_ns = None
+            if self.profiler is not None:
+                self.profiler.start_episode()
             logger.info("Teleop active")
             return True
         except FeedbackUnavailable as exc:
@@ -359,9 +371,12 @@ class TeleopLoop:
                     "discard" if cmd == "d" else "stop", run_end_reason=RunEndReason.OPERATOR,
                 )
         elif cmd == "t":
-            return self._reset_tactile(expected_cancel_epoch)
+            return call(
+                self.profiler, "operator_tactile_reset_ms", self._reset_tactile,
+                expected_cancel_epoch,
+            )
         elif cmd == "h":
-            return self._run_home(expected_cancel_epoch)
+            return call(self.profiler, "operator_home_ms", self._run_home, expected_cancel_epoch)
         elif cmd == "b":
             if (self.episode_cancel_epoch is None
                     and self.runtime_state.cancel_epoch == expected_cancel_epoch
@@ -466,7 +481,10 @@ class TeleopLoop:
                     logger.warning("%s", exc)
                     self.request_episode_end(str(exc))
                     return
-            result = self.controller.compute_target(row, control_ns=compute_start_ns)
+            result = call(
+                self.profiler, "teleop_target_ms", self.controller.compute_target,
+                row, control_ns=compute_start_ns,
+            )
             if self.recorder is not None:
                 self.recorder.check_error()
             if (self.runtime_state.cancel_epoch != episode_cancel_epoch
@@ -496,7 +514,10 @@ class TeleopLoop:
             )
             eef_pose = self.controller.previous_eef_target if rejected else result.eef_pose
             command = self.last_command if rejected else RobotCommand(result.arm_qpos, result.hand_qpos)
-            self.robot.send_action(command, expires_ns=expires_ns)
+            call(
+                self.profiler, "robot_send_action_ms", self.robot.send_action,
+                command, expires_ns=expires_ns,
+            )
             submit_end_ns = time.monotonic_ns()
             self.controller.commit(command, eef_pose=eef_pose, submit_end_ns=submit_end_ns, measured_qpos=row.arm["qpos"][0])
             self.last_command = command
@@ -520,7 +541,7 @@ class TeleopLoop:
             if self.recorder is not None and command is not None:
                 try:
                     # 仅真实提交尝试生成动作行，包含抛错前可能已发生的部分提交。
-                    issue = self.recorder.append(row, command)
+                    issue = call(self.profiler, "recorder_append_ms", self.recorder.append, row, command)
                     if issue is not None:
                         self.request_episode_end(issue)
                 except BaseException as exc:
@@ -530,8 +551,13 @@ class TeleopLoop:
                     logger.exception("teleop recording append also failed")
 
     def admit_observation(self, row):
-        return (check_device_feedback(row, self.runtime)
-                + check_observation(row, self.runtime, self.capture_needs))
+        return call(
+            self.profiler, "check_device_feedback_ms", check_device_feedback,
+            row, self.runtime,
+        ) + call(
+            self.profiler, "check_observation_ms", check_observation,
+            row, self.runtime, self.capture_needs,
+        )
 
     def handle_executor_stop(self, unknown_reason="executor_stopped_unknown"):
         self.robot.check()
@@ -550,24 +576,31 @@ class TeleopLoop:
             return
         planned_ns = now_ns if self.next_tick_ns is None else self.next_tick_ns
         self.next_tick_ns = next_tick_ns(planned_ns, self.control_dt_ns, now_ns)
-        if now_ns - planned_ns >= self.control_dt_ns and self.recorder is not None:
-            self.recorder.mark_gap()
-        row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
-        issues = self.admit_observation(row)
-        if issues:
-            self.request_episode_end("control_sources: " + "; ".join(issues))
-            return
-        if self.target_deadline_ns is not None and now_ns >= self.target_deadline_ns:
-            self.request_episode_end("target_expired")
-            return
-        self.execute_control_step(row)
+        if self.profiler is not None:
+            skipped = (self.next_tick_ns - planned_ns) // self.control_dt_ns - 1
+            self.profiler.control_slot(now_ns, planned_ns, self.control_dt_ns, skipped)
+        with self.profiler.tick(self.next_tick_ns) if self.profiler is not None else nullcontext():
+            if now_ns - planned_ns >= self.control_dt_ns and self.recorder is not None:
+                self.recorder.mark_gap()
+            row = call(
+                self.profiler, "observation_read_ms", read_observation,
+                self.sensors.channels, self.robot, needs=self.capture_needs, profiler=self.profiler,
+            )
+            issues = self.admit_observation(row)
+            if issues:
+                self.request_episode_end("control_sources: " + "; ".join(issues))
+                return
+            if self.target_deadline_ns is not None and now_ns >= self.target_deadline_ns:
+                self.request_episode_end("target_expired")
+                return
+            self.execute_control_step(row)
 
     def service_episode(self, timeout):
         try:
             if self.runtime_state.stop_signal.is_set():
                 self.robot.service_idle()
             else:
-                self.robot.service_feedback()
+                call(self.profiler, "feedback_service_ms", self.robot.service_feedback)
         except FeedbackUnavailable as exc:
             self.request_episode_end(str(exc))
         if self.runtime_state.estop_request:
@@ -596,7 +629,7 @@ class TeleopLoop:
     def run_episode(self, expected_cancel_epoch):
         """顺序准备、控制、停止与录制收尾；每次 B 都创建独立新段。"""
         try:
-            if not self.start_episode(expected_cancel_epoch):
+            if not call(self.profiler, "episode_prepare_ms", self.start_episode, expected_cancel_epoch):
                 return
             while self.service_episode(0.005):
                 self.run_control_tick()
@@ -619,7 +652,7 @@ class TeleopLoop:
                             else RunEndReason.CANCELLED
                         ),
                     )
-                self.end_episode()
+                call(self.profiler, "episode_stop_ms", self.end_episode)
 
     def run(self):
         while not self.runtime_state.quit_requested:

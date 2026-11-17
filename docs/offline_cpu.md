@@ -47,11 +47,14 @@ python -m pytest -p no:cacheprovider -q -ra \
   tests/test_hand_cloud.py tests/test_export.py tests/test_raw_metadata.py \
   tests/test_teleop_session.py tests/test_keyboard_teleop.py tests/test_home.py \
   tests/test_policy_deployment.py tests/test_policy_session.py \
-  tests/test_rollout_hoi_recovery.py tests/test_experiment_pipeline.py
+  tests/test_rollout_hoi_recovery.py tests/test_experiment_pipeline.py \
+  tests/test_profile.py tests/test_pointcloud.py tests/test_benchmark_episode_visualizer.py
 ```
 
 `requirements-cpu.txt` 明确使用 `+cpu` wheels，不安装 CUDA Torch。配套 Policy 直接安装固定 Git 提交，不读取旁边可能正在修改的工作区。跨仓流水线在临时目录生成小型 Raw、Zarr、训练/恢复 checkpoint，再执行真实 CPU 推理，无需下载预训练权重。
 
 Ruckig 0.17.3 的源码包使用旧的 `cmake.targets` 构建配置，构建约束将 scikit-build-core 限制在 0.10 之前；约束只作用于隔离构建，不改变运行时依赖。
+
+性能画像测试使用 Fake 设备和小型临时 Episode，验证采样不改变控制与录制结果；benchmark 将真实 Rerun SDK 输出到空设备，不启动 Viewer。合成数据只用于功能回归，不作为真实实验性能结论。
 
 [CPU workflow](../.github/workflows/cpu.yml) 在 PR、main 更新和手动触发时运行：先检查最小安装与 CLI，再安装回归依赖并执行上面的测试。它覆盖本仓库的 CPU 离线流程，不包含真机、GPU 或 `third_party/` 的独立环境测试。

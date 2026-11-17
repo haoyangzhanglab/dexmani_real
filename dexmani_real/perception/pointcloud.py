@@ -48,24 +48,22 @@ def filter_depth(depth_m: np.ndarray) -> np.ndarray:
     distance = np.minimum(depth_m - local_min, local_max - depth_m)
     trusted = valid & ~(edge & (distance > EDGE_SURFACE_BAND_M))
 
-    # 每个无向邻接只算一次深度差，同时累计两端，保留原八邻域支持规则。
+    # 正邻接与对角邻接分别计数，再合并为八邻域支持数。
     support_count = np.zeros(depth_m.shape, dtype=np.uint8)
     cardinal_count = np.zeros(depth_m.shape, dtype=np.uint8)
-    for first, second, cardinal in (
-        (np.s_[:, :-1], np.s_[:, 1:], True),
-        (np.s_[:-1, :], np.s_[1:, :], True),
-        (np.s_[:-1, :-1], np.s_[1:, 1:], False),
-        (np.s_[:-1, 1:], np.s_[1:, :-1], False),
+    for first, second, counts in (
+        (np.s_[:, :-1], np.s_[:, 1:], cardinal_count),
+        (np.s_[:-1, :], np.s_[1:, :], cardinal_count),
+        (np.s_[:-1, :-1], np.s_[1:, 1:], support_count),
+        (np.s_[:-1, 1:], np.s_[1:, :-1], support_count),
     ):
         same_surface = trusted[first] & trusted[second] & (
             np.abs(depth_m[first] - depth_m[second]) <= EDGE_SURFACE_BAND_M
         )
-        support_count[first] += same_surface
-        support_count[second] += same_surface
-        if cardinal:
-            cardinal_count[first] += same_surface
-            cardinal_count[second] += same_surface
-    required_support = np.where(edge, EDGE_MIN_SUPPORT, DEPTH_MIN_SUPPORT)
+        counts[first] += same_surface
+        counts[second] += same_surface
+    support_count += cardinal_count
+    required_support = np.where(edge, np.uint8(EDGE_MIN_SUPPORT), np.uint8(DEPTH_MIN_SUPPORT))
     return trusted & (support_count >= required_support) & (~edge | (cardinal_count == 4))
 
 

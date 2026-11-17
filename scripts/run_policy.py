@@ -107,6 +107,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--seed", type=nonnegative_int, default=0, help="fixed inference seed reset at episode start and after HOI recovery"
     )
     research.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--profile-output", default=None,
+        help="Write an opt-in performance JSON after shutdown; refuses overwrite",
+    )
     return parser
 
 
@@ -124,21 +128,27 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     from dexmani_real.deployment.session import PolicySession
+    from dexmani_real.utils.profile import profile_session
 
-    return PolicySession(
-        runtime,
-        args.policy,
-        weights=args.weights,
-        inference_steps=args.inference_steps,
-        device=args.device,
-        seed=args.seed,
-        num_episodes=args.num_episodes,
-        max_duration_s=args.max_duration_s,
-        record_raw=args.record_raw,
-        output_root=args.output,
-        camera_calibration_path=args.camera_calibration,
-        task_dir=args.task_dir,
-    ).run()
+    with profile_session(args.profile_output, "policy", runtime, control_hz=None) as profiler:
+        exit_code = PolicySession(
+            runtime,
+            args.policy,
+            profiler=profiler,
+            weights=args.weights,
+            inference_steps=args.inference_steps,
+            device=args.device,
+            seed=args.seed,
+            num_episodes=args.num_episodes,
+            max_duration_s=args.max_duration_s,
+            record_raw=args.record_raw,
+            output_root=args.output,
+            camera_calibration_path=args.camera_calibration,
+            task_dir=args.task_dir,
+        ).run()
+        if profiler is not None:
+            profiler.exit_code = exit_code
+        return exit_code
 
 
 if __name__ == "__main__":

@@ -67,6 +67,7 @@ from dexmani_real.runtime.state import (
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.utils.io import write_json, write_yaml
 from dexmani_real.utils.log import configure_logging, error_detail
+from dexmani_real.utils.profile import call
 from dexmani_real.utils.table_plane import load_table_plane, resolve_table_plane_path
 
 logger = logging.getLogger(__name__)
@@ -95,7 +96,7 @@ class PolicySession:
         self, runtime, policy, *, weights=None, inference_steps=None, output_root=None,
         device="cuda:0", seed=0, max_duration_s: float | None = DEFAULT_MAX_DURATION_S,
         num_episodes=DEFAULT_NUM_EPISODES, record_raw=False, camera_calibration_path=None,
-        task_dir=None,
+        task_dir=None, profiler=None,
     ):
         # 实验预算在分配会话资源前校验；CLI 和直接 Python 调用共用此入口。
         if max_duration_s is not None:
@@ -112,6 +113,7 @@ class PolicySession:
         if camera_calibration_path is not None:
             camera_calibration_path = Path(camera_calibration_path).expanduser().resolve()
 
+        self.profiler = profiler
         self.runtime, self.policy = runtime, policy
         self.task_dir = task_dir
         self.weights, self.inference_steps = weights, inference_steps
@@ -179,14 +181,15 @@ class PolicySession:
         failure: BaseException | None = None
         try:
             try:
-                self.prepare_resources()
-                self.start_devices()
+                call(self.profiler, "session_prepare_ms", self.prepare_resources)
+                call(self.profiler, "device_start_ms", self.start_devices)
             except OperationCancelled:
                 if self.robot is not None:
                     self.robot.check()
                 if not (
                     self.runtime_state.cancel_epoch != self.startup_cancel_epoch
-                    or self.runtime_state.quit_requested or self.runtime_state.estop_request
+                    or self.runtime_state.quit_requested
+                    or self.runtime_state.estop_request
                 ):
                     raise
                 self.runtime_state.request_quit()
@@ -215,13 +218,16 @@ class PolicySession:
         self.model = PolicyWorker(
             lambda: load_policy(self.policy, weights=self.weights, inference_steps=self.inference_steps,
                                 device=self.device, seed=self.seed),
-            build_observation=lambda rows: self.observations.build(rows),
+            build_observation=lambda rows: self.observations.build(rows), profiler=self.profiler,
         )
         self.model.load()
         self.info = self.wait_model()
         self.hoi_inputs = resolve_hoi_inputs(self.info, self.task_dir)
         declared_execution = self.runtime.execution
         self.runtime = resolve_deployment_config(self.info, self.runtime)
+        if self.profiler is not None:
+            self.profiler.configure(self.runtime, control_hz=1 / self.runtime.execution.control_dt_s,
+                                    mode=self.runtime.execution.mode)
         self.observations = ObservationBuilder(self.info, self.runtime)
         self.actual_processing = collect_data_processing(self.info, self.runtime)
         self.record_needs = RAW_RECORDING_NEEDS if self.record_raw else ObservationNeeds()
@@ -482,16 +488,26 @@ class PolicySession:
         observation_deadline = time.monotonic() + INITIAL_STATE_TIMEOUT_S
         while True:
             self.check_startup()
-            row = read_observation(self.sensors.channels, self.robot, needs=self.observations.needs)
-            issues = (check_device_feedback(row, self.runtime)
-                      + check_observation(row, self.runtime, self.observations.needs))
+            row = call(
+                self.profiler, "observation_read_ms", read_observation,
+                self.sensors.channels, self.robot, needs=self.observations.needs, profiler=self.profiler,
+            )
+            issues = call(
+                self.profiler, "check_device_feedback_ms", check_device_feedback,
+                row, self.runtime,
+            ) + call(
+                self.profiler, "check_observation_ms", check_observation,
+                row, self.runtime, self.observations.needs,
+            )
             if not issues:
                 break
             if time.monotonic() >= observation_deadline:
                 raise ValueError("warmup observation: " + "; ".join(issues))
             time.sleep(0.005)
         # 首帧填充与正式预测一致。
-        rows = (self.observations.project(row),) * self.info.n_obs_steps
+        rows = (
+            call(self.profiler, "warmup_observation_project_ms", self.observations.project, row),
+        ) * self.info.n_obs_steps
         kwargs = {}
         if self.runtime.execution.mode == "rtc":
             kwargs = {
@@ -625,7 +641,7 @@ class PolicySession:
                 max_duration_s=self.max_duration_s,
                 index=len(self.episodes) + 1, output_dir=self.output_dir, record_raw=self.record_raw,
                 effective_parameters={**self.effective_parameters, "actual_processing": self.actual_processing},
-                camera_snapshot=self.camera_snapshot,
+                camera_snapshot=self.camera_snapshot, profiler=self.profiler,
             )
             try:
                 episode.run(poll_operator=self.poll_operator)

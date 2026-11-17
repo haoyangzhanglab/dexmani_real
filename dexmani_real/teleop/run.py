@@ -29,6 +29,7 @@ from dexmani_real.teleop.audio import AudioFeedback
 from dexmani_real.teleop.loop import TeleopLoop
 from dexmani_real.teleop.vr import VRController
 from dexmani_real.utils.log import configure_logging
+from dexmani_real.utils.profile import call
 from dexmani_real.utils.timing import sample_is_fresh
 from dexmani_real.utils.vr_heading import load_vr_transform
 
@@ -44,6 +45,7 @@ def run_teleop(
     task_name=DEFAULT_TASK_NAME,
     vr_transform_path=VR_TRANSFORM_PATH,
     camera_calibration_path=None,
+    profiler=None,
 ) -> int:
     """装配遥操作资源并收尾。"""
     configure_logging()
@@ -78,6 +80,7 @@ def run_teleop(
         build_hand_retargeter(runtime),
         runtime.teleop,
         vr_to_robot_rotation,
+        profiler=profiler,
     )
     ctx = mp.get_context("spawn")
     runtime_state = SessionState()
@@ -119,6 +122,7 @@ def run_teleop(
                 audio=audio,
                 recording_dir=recording_dir,
                 max_duration_s=max_duration_s,
+                profiler=profiler,
             )
             keyboard.bindings["d"] = runtime_state.request_stop
             keyboard.start()
@@ -152,15 +156,16 @@ def run_teleop(
             if (runtime_state.cancel_epoch != startup_cancel_epoch
                     or not runtime_state.requests_allow_motion()):
                 raise OperationCancelled("startup cancelled")
-            initialize_teleop(
-                loop, ctx.Process(name="vr", target=run_vr, args=(channels, runtime.vr)),
+            call(
+                profiler, "teleop_initialize_ms", initialize_teleop,
+                loop,
+                ctx.Process(name="vr", target=run_vr, args=(channels, runtime.vr)),
                 cancel_epoch=startup_cancel_epoch,
             )
         except OperationCancelled:
             if robot is not None:
                 robot.check()
-            if (runtime_state.cancel_epoch == startup_cancel_epoch
-                    and runtime_state.requests_allow_motion()):
+            if runtime_state.cancel_epoch == startup_cancel_epoch and runtime_state.requests_allow_motion():
                 raise
             runtime_state.request_quit()
             logger.info("Teleop startup cancelled")

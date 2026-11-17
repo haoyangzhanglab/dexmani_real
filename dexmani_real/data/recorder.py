@@ -65,7 +65,9 @@ class _FinishRequest:
 class EpisodeRecorder:
     """每段独占一个 writer；失败由控制流程终段，线程退出后才处置文件。"""
 
-    def __init__(self, data_dir, *, control_hz):
+    def __init__(self, data_dir, *, control_hz, profiler=None):
+        self.profiler = profiler
+        self._profile_finish_ns = None
         sampling_clock_ns(control_hz)
         self.data_dir = Path(data_dir)
         self.control_hz = float(control_hz)
@@ -111,6 +113,8 @@ class EpisodeRecorder:
             raise self.error
 
     def mark_gap(self):
+        if self.profiler is not None:
+            self.profiler.count("recording_gap_requests")
         self.pending_segment_start = True
         logger.info("录制间断；下一行开始新的连续区间。")
 
@@ -191,6 +195,8 @@ class EpisodeRecorder:
         """质量拒绝或队列满停止接纳，返回终段原因；写入错误原样传播。"""
         self.check_error()
         if not self.is_recording:
+            if self.profiler is not None:
+                self.profiler.count("recorder_append_inactive")
             return None
         if quality_issue is None:
             # 数组已脱离共享缓冲，入队后生产者不再修改。
@@ -198,57 +204,76 @@ class EpisodeRecorder:
             try:
                 self.queue.put_nowait((snapshot, command, self.pending_segment_start))
             except Full:
+                if self.profiler is not None:
+                    self.profiler.count("recorder_queue_full")
+                    self.profiler.maximum("recorder_queue_high_water_observed", self.queue.maxsize)
                 quality_issue = "recording_queue_full"
             else:
+                if self.profiler is not None:
+                    self.profiler.count("recorder_enqueued_frames")
+                    self.profiler.maximum("recorder_queue_high_water_observed", self.queue.qsize())
                 self.pending_segment_start = False
                 return None
         self.is_recording = False
         self.recording_truncated_reason = quality_issue
+        if self.profiler is not None:
+            self.profiler.count("recording_truncations")
         return quality_issue
 
     def finish(self, *, save, reason, wait=True) -> bool:
         """停止接纳新行并收尾；False 表示仍在写入，录制成败由 result 报告。"""
-        self.is_recording = False
-        # 首次请求固定处置意图和整个等待预算；反复轮询不能延长 deadline。
-        if self.finish_request is None:
-            self.finish_request = _FinishRequest(save, reason, time.monotonic() + RECORDER_STOP_TIMEOUT_S)
-        request = self.finish_request
-        while self.writer_pending:
-            remaining = request.deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("recording writer did not exit before the deadline")
-            if not wait:
-                return False
-            # 中断 join 可能误报活线程已退出，不能据此发布文件。
-            time.sleep(min(0.005, remaining))
-        # 线程退出后才判定最终结果；close 的程序错误不能被 I/O 失败掩盖。
-        if isinstance(self.error, RecordingError):
-            return True
-        self.check_error()
-        if self.staging_path is None:
-            return True
         try:
-            if request.save and self.written_frames > 0:
-                destination = self.staging_path.with_name(self.staging_path.name.removeprefix(".tmp_"))
-                publish(self.staging_path, destination)
-                self.published_path, self.staging_path = destination, None
-                if self.recording_truncated_reason is not None:
-                    logger.warning("部分录制已保存：%s（%d 行），%s。",
-                                   destination, self.written_frames, self.recording_truncated_reason)
+            self.is_recording = False
+            # 首次请求固定处置意图和整个等待预算；反复轮询不能延长 deadline。
+            if self.finish_request is None:
+                if self.profiler is not None:
+                    self._profile_finish_ns = time.perf_counter_ns()
+                self.finish_request = _FinishRequest(save, reason, time.monotonic() + RECORDER_STOP_TIMEOUT_S)
+            request = self.finish_request
+            while self.writer_pending:
+                remaining = request.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("recording writer did not exit before the deadline")
+                if not wait:
+                    return False
+                # 中断 join 可能误报活线程已退出，不能据此发布文件。
+                time.sleep(min(0.005, remaining))
+            # 线程退出后才判定最终结果；close 的程序错误不能被 I/O 失败掩盖。
+            if isinstance(self.error, RecordingError):
+                return True
+            self.check_error()
+            if self.staging_path is None:
+                return True
+            try:
+                if request.save and self.written_frames > 0:
+                    destination = self.staging_path.with_name(self.staging_path.name.removeprefix(".tmp_"))
+                    publish(self.staging_path, destination)
+                    self.published_path, self.staging_path = destination, None
+                    if self.recording_truncated_reason is not None:
+                        logger.warning("部分录制已保存：%s（%d 行），%s。",
+                                       destination, self.written_frames, self.recording_truncated_reason)
+                    else:
+                        logger.info("Raw 已保存：%s（%d 帧）。", destination, self.written_frames)
                 else:
-                    logger.info("Raw 已保存：%s（%d 帧）。", destination, self.written_frames)
-            else:
-                shutil.rmtree(self.staging_path)
-                self.staging_path = None
-                if request.save and self.written_frames == 0:
-                    logger.info("未录到数据，本段未发布。")
-        except BaseException as exc:
-            self.store_error(exc)
-            if not isinstance(self.error, RecordingError):
-                raise
-        return True
+                    shutil.rmtree(self.staging_path)
+                    self.staging_path = None
+                    if request.save and self.written_frames == 0:
+                        logger.info("未录到数据，本段未发布。")
+            except BaseException as exc:
+                self.store_error(exc)
+                if not isinstance(self.error, RecordingError):
+                    raise
+            return True
+        finally:
+            if self.profiler is not None and not self.writer_pending and self._profile_finish_ns is not None:
+                self.profiler.sample("recorder_finish_elapsed_ms",
+                                     (time.perf_counter_ns() - self._profile_finish_ns) / 1e6)
+                self._profile_finish_ns = None
 
     def write_episode(self, metadata):
+        if self.profiler is not None:
+            started = time.perf_counter_ns()
+            self.profiler.count("recorder_writers_started")
         staging = self.staging_path
         finish = None
         try:
@@ -273,6 +298,8 @@ class EpisodeRecorder:
                             break
                         continue
                     writer.append_frame(*item)
+                    if self.profiler is not None and item[2]:
+                        self.profiler.count("recording_gaps")
                 if finish is None or self.error is not None:
                     writer.flush()
                 elif finish.save:
@@ -290,6 +317,10 @@ class EpisodeRecorder:
         finally:
             self.ready.set()
             self.drain_frames()
+            if self.profiler is not None:
+                self.profiler.sample("recorder_writer_total_ms", (time.perf_counter_ns() - started) / 1e6)
+                self.profiler.count("recorder_written_frames", self.written_frames)
+                self.profiler.count("recorder_writers_completed")
 
     def drain_frames(self):
         while True:

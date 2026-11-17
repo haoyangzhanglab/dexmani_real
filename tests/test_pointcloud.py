@@ -93,6 +93,24 @@ def test_depth_filter_keeps_plane_and_removes_edge_flyer():
     assert not filter_depth(isolated).any()
 
 
+@pytest.mark.parametrize("cardinal", range(5))
+@pytest.mark.parametrize("diagonal", range(5))
+@pytest.mark.parametrize("edge", [False, True])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_depth_filter_neighbor_support_thresholds(cardinal, diagonal, edge, dtype):
+    depth = np.full((5, 5), 0.9 if edge else 0, dtype=dtype)
+    depth[2, 2] = 0.6
+    for row, column in ((1, 2), (3, 2), (2, 1), (2, 3))[:cardinal]:
+        depth[row, column] = 0.6
+    for row, column in ((1, 1), (1, 3), (3, 1), (3, 3))[:diagonal]:
+        depth[row, column] = 0.6
+    before = depth.copy()
+    expected = (cardinal == 4 and diagonal >= 1) if edge else cardinal + diagonal >= 2
+    actual = filter_depth(depth)
+    assert actual.dtype == bool and actual[2, 2] == expected
+    np.testing.assert_array_equal(depth, before)
+
+
 def test_voxel_downsample_averages_xyz_and_rgb_across_negative_cells():
     xyz = np.array([[-0.004, 0, 0], [-0.002, 0, 0], [0.001, 0, 0], [0.003, 0, 0]], np.float32)
     rgb = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]], np.float32)

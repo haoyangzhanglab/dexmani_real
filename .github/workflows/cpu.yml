@@ -49,3 +49,4 @@ jobs:
           tests/test_teleop_session.py tests/test_keyboard_teleop.py tests/test_home.py
           tests/test_policy_deployment.py tests/test_policy_session.py
           tests/test_rollout_hoi_recovery.py tests/test_experiment_pipeline.py
+          tests/test_profile.py tests/test_pointcloud.py tests/test_benchmark_episode_visualizer.py

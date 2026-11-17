@@ -6,6 +6,7 @@ import logging
 import sys
 import time
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Literal, cast
@@ -44,6 +45,7 @@ from dexmani_real.runtime.observation import (
 )
 from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S, RunEndReason
 from dexmani_real.utils.log import error_detail
+from dexmani_real.utils.profile import call
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +73,9 @@ class Rollout:
         self, runtime_state, runtime, policy_info, *, episode_cancel_epoch: int, robot,
         observations, read_needs: ObservationNeeds, record_needs: ObservationNeeds,
         sensors, action_mapper, model, max_duration_s: float | None,
-        index, output_dir, record_raw, effective_parameters, camera_snapshot=None,
+        index, output_dir, record_raw, effective_parameters, camera_snapshot=None, profiler=None,
     ):
+        self.profiler = profiler
         self.runtime_state = runtime_state
         self.runtime = runtime
         self.policy_info = policy_info
@@ -118,8 +121,10 @@ class Rollout:
         return self.result.termination_reason is not None
 
     def recording_issue(self, row):
-        issues = check_observation(row, self.runtime, self.record_needs,
-                                   now_ns=row.observation_timestamp_ns)
+        issues = call(
+            self.profiler, "check_observation_ms", check_observation,
+            row, self.runtime, self.record_needs, now_ns=row.observation_timestamp_ns,
+        )
         return "; ".join(issues) if issues else None
 
     def stop(self, detail, *, run_end_reason=RunEndReason.CANCELLED):
@@ -151,7 +156,10 @@ class Rollout:
         result = self.result
         if self.recorder is not None:
             recorder = self.recorder
-            if not recorder.finish(save=not self.discard_requested, reason=result.termination_reason, wait=wait):
+            if not call(
+                self.profiler, "recorder_finish_call_ms", recorder.finish,
+                save=not self.discard_requested, reason=result.termination_reason, wait=wait,
+            ):
                 return False
             self.snapshot_result()
             # 线程实际退出才释放 owner；失败结果及 staging 路径保留在 result。
@@ -173,12 +181,12 @@ class Rollout:
         """运行结束先停设备；段间及最终资源收尾由 Session 编排。"""
         try:
             try:
-                self.prepare(poll_operator)
+                call(self.profiler, "episode_prepare_ms", self.prepare, poll_operator)
                 while not self.finished:
                     due_ns = min(self.next_step_ns, self.robot.feedback_next_ns)
                     timeout = min(0.005, max(0, due_ns - time.monotonic_ns()) / 1e9)
                     poll_operator(timeout=timeout)
-                    self.robot.service_feedback()
+                    call(self.profiler, "feedback_service_ms", self.robot.service_feedback)
                     self.step()
             except RecordingError:
                 self.stop("recording_failed", run_end_reason=RunEndReason.FAILED)
@@ -221,20 +229,26 @@ class Rollout:
 
     def read_observations(self, *, include_visual_payloads=True) -> tuple[Observation, Observation]:
         """共享关节采样；派生模型图像同源，Raw 独立取最新相机帧。"""
-        row = read_observation(
+        row = call(
+            self.profiler, "observation_read_ms", read_observation,
             self.sensors.channels,
             self.robot,
             needs=self.read_needs,
+            profiler=self.profiler,
             joint_gap_s=self.execution.hoi_max_joint_gap_s,
             include_visual_payloads=include_visual_payloads,
         )
         raw = row
         if self.record_raw and (self.observations.needs.hoi or self.observations.needs.point_cloud):
-            camera = read_camera_frame(
+            camera = call(
+                self.profiler, "raw_camera_read_ms", read_camera_frame,
                 self.sensors.channels,
                 fields=self.record_needs.camera_fields if include_visual_payloads else (),
             )
             raw = replace(row, camera=camera, hoi=None, observation_timestamp_ns=time.monotonic_ns())
+            if self.profiler is not None:
+                self.profiler.sensor("raw_camera", int(camera["timestamp_ns"]) if camera is not None else 0,
+                                     raw.observation_timestamp_ns)
         return row, raw
 
     def start_observation(self, poll_operator, *, after_ns=None, initial_hoi=False):
@@ -244,10 +258,16 @@ class Rollout:
             poll_operator()
             if not self.preparation_valid():
                 raise OperationCancelled("initial observation cancelled")
-            self.robot.service_feedback()
+            call(self.profiler, "feedback_service_ms", self.robot.service_feedback)
             row, raw = self.read_observations()
-            devices = check_device_feedback(row, self.runtime)
-            model_issues = check_observation(row, self.runtime, self.observations.needs)
+            devices = call(
+                self.profiler, "check_device_feedback_ms", check_device_feedback,
+                row, self.runtime,
+            )
+            model_issues = call(
+                self.profiler, "check_observation_ms", check_observation,
+                row, self.runtime, self.observations.needs,
+            )
             issue = ("device feedback: " + "; ".join(devices)) if devices else (
                 "model_input_" + model_issues[0] if model_issues else None
             )
@@ -298,13 +318,17 @@ class Rollout:
         if self.observations.needs.hoi and not self.model.warmed_up:
             kwargs = ({"rtc_delay": self.execution.prefetch_steps, "rtc_guidance_cap": self.execution.rtc_guidance_cap}
                       if self.execution.mode == "rtc" else {})
-            self.model.warmup((self.observations.project(row),) * self.policy_info.n_obs_steps, **kwargs)
+            self.model.warmup(
+                (call(self.profiler, "warmup_observation_project_ms", self.observations.project, row),)
+                * self.policy_info.n_obs_steps,
+                **kwargs,
+            )
             warmup_deadline = time.monotonic() + 120
             while self.model.future is not None:
                 if time.monotonic() >= warmup_deadline:
                     raise TimeoutError("HOI policy warmup timeout")
                 poll_operator()
-                self.robot.service_feedback()
+                call(self.profiler, "feedback_service_ms", self.robot.service_feedback)
                 if not self.preparation_valid():
                     raise OperationCancelled("HOI warmup cancelled")
                 future = self.model.poll()
@@ -319,7 +343,7 @@ class Rollout:
         if not self.preparation_valid():
             raise OperationCancelled("cancelled before recorder start")
         if self.record_raw:
-            self.recorder = EpisodeRecorder(self.output_dir, control_hz=1 / self.execution.control_dt_s)
+            self.recorder = EpisodeRecorder(self.output_dir, control_hz=1 / self.execution.control_dt_s, profiler=self.profiler)
             metadata = episode_recording_metadata(
                 self.camera_snapshot, self.effective_parameters,
                 tactile_reset=self.robot.hand.tactile_reset_metadata,
@@ -352,6 +376,8 @@ class Rollout:
             raise OperationCancelled("final admission declined")
         self.started_ns = started_ns
         self.result.started_utc = utc_now()
+        if self.profiler is not None:
+            self.profiler.start_episode()
         logger.info("Policy control loop started; waiting for the first prediction")
 
     def poll_model(self):
@@ -454,17 +480,20 @@ class Rollout:
 
     def sample_observation(self, *, include_visual_payloads=True) -> tuple[Observation, Observation]:
         row, raw = self.read_observations(include_visual_payloads=include_visual_payloads)
-        devices = check_device_feedback(row, self.runtime)
+        devices = call(self.profiler, "check_device_feedback_ms", check_device_feedback, row, self.runtime)
         if devices:
             raise FeedbackUnavailable("device feedback: " + "; ".join(devices))
         return row, raw
 
     def update_history(self, row):
-        issues = check_observation(row, self.runtime, self.observations.needs)
+        issues = call(
+            self.profiler, "check_observation_ms", check_observation,
+            row, self.runtime, self.observations.needs,
+        )
         if issues:
             self._observation_failure(issues, "model_input")
             return False
-        projected = self.observations.project(row)
+        projected = call(self.profiler, "observation_project_ms", self.observations.project, row)
         if not self.history:
             self.history.extend([projected] * self.policy_info.n_obs_steps)
         else:
@@ -484,7 +513,7 @@ class Rollout:
 
     def prepare_command(self, action, row):
         try:
-            command, issue = self.map_command(action, row)
+            command, issue = call(self.profiler, "action_mapping_ms", self.map_command, action, row)
         except IKReferenceError as exc:
             self.stop(str(exc))
             return None
@@ -494,10 +523,13 @@ class Rollout:
         self.check_motion()
         if self.duration_expired():
             return None
-        issues = check_device_feedback(row, self.runtime)
+        issues = call(self.profiler, "check_device_feedback_ms", check_device_feedback, row, self.runtime)
         if issues:
             raise FeedbackUnavailable("device feedback: " + "; ".join(issues))
-        issues = check_observation(row, self.runtime, self.observations.needs)
+        issues = call(
+            self.profiler, "check_observation_ms", check_observation,
+            row, self.runtime, self.observations.needs,
+        )
         if issues:
             self._observation_failure(issues, "model_input before submission")
             return None
@@ -514,7 +546,10 @@ class Rollout:
             self.runtime_state.stop_signal.set()
         if self.recorder is not None:
             try:
-                issue = self.recorder.append(row, attempted_command, quality_issue=quality_issue)
+                issue = call(
+                    self.profiler, "recorder_append_ms", self.recorder.append,
+                    row, attempted_command, quality_issue=quality_issue,
+                )
                 if issue is not None:
                     self.stop(issue)
             except BaseException as exc:
@@ -548,6 +583,9 @@ class Rollout:
         # 首条恢复动作提交前的再次遮挡仍属于同一个恢复区间。
         if self.state == "RUNNING" and self.recorder is not None:
             self.recorder.mark_gap()
+        if self.profiler is not None:
+            self.profiler.last_tick.pop("control", None)
+            self.profiler.count("hoi_hold_entries")
         self.state = "HOI_HOLD"
         self._clear_policy_context()
         self.next_hoi_hold_ns = 0
@@ -559,13 +597,16 @@ class Rollout:
         self.check_motion()
         state = self.robot.read_state()
         now = time.monotonic_ns()
-        issues = check_device_feedback(state, self.runtime, now_ns=now)
+        issues = call(
+            self.profiler, "check_device_feedback_ms", check_device_feedback,
+            state, self.runtime, now_ns=now,
+        )
         if issues:
             raise FeedbackUnavailable("device feedback: " + "; ".join(issues))
         hand = state.hand["qpos"][0] if self.runtime.hand.enabled else None
-        self.robot.send_action(
-            RobotCommand(arm_hold=True, hand_qpos=hand),
-            expires_ns=now + COMMAND_LEASE_NS,
+        call(
+            self.profiler, "robot_send_action_ms", self.robot.send_action,
+            RobotCommand(arm_hold=True, hand_qpos=hand), expires_ns=now + COMMAND_LEASE_NS,
         )
         self.next_hoi_hold_ns = now + int(HOI_HOLD_REFRESH_S * 1e9)
 
@@ -592,7 +633,8 @@ class Rollout:
             if quality_issue is not None:
                 self.stop(quality_issue)
                 return
-            issues = check_observation(
+            issues = call(
+                self.profiler, "check_observation_ms", check_observation,
                 row, self.runtime, self.observations.needs, include_visual_payloads=False,
             )
             if issues and not is_recoverable_hoi_failure(issues):
@@ -602,18 +644,27 @@ class Rollout:
             self._advance_control_slot()
             if not issues and self.model.future is None:
                 self.state = "RESUMING"
+                if self.profiler is not None:
+                    self.profiler.last_tick.pop("hold", None)
             return
         self.step_control()
 
     def _advance_control_slot(self):
         """暂停时也推进原调度，恢复后不补跑历史控制槽。"""
+        now_ns = time.monotonic_ns()
+        planned_ns = self.next_step_ns
         slot, skipped = control_slot(
-            now_ns=time.monotonic_ns(), next_step_ns=self.next_step_ns,
+            now_ns=now_ns, next_step_ns=planned_ns,
             last_slot=self.last_slot, dt_ns=self.dt_ns,
         )
         self.result.skipped_slots += skipped
         if slot is not None:
             self.last_slot = slot
+            if self.profiler is not None:
+                self.profiler.control_slot(
+                    now_ns, planned_ns, self.dt_ns, skipped,
+                    group="hold" if self.state == "HOI_HOLD" else "control",
+                )
         return slot, skipped
 
     def step_control(self):
@@ -621,58 +672,62 @@ class Rollout:
         if slot is None:
             self.poll_model()
             return
-        was_running = self.state == "RUNNING"
-        row, raw = self.sample_observation()
-        quality_issue = self.recording_issue(raw) if self.recorder is not None else None
-        attempted = None
-        try:
-            if quality_issue is not None:
-                self.stop(quality_issue)
-                return
-            if not self.update_history(row):
-                return
-            self.check_motion()
-            if self.duration_expired():
-                return
-            self.poll_model()
-            action = self.select_action(slot)
-            if action is None:
-                return
-            plan = cast(ActionChunk, self.plan)
-            command = self.prepare_command(action, row)
-            if command is None:
-                return
-            now = time.monotonic_ns()
-            if (self.execution.mode == "async"
-                    and now >= self.started_ns + (plan.anchor_slot + len(plan.actions)) * self.dt_ns):
-                self.poll_model()
-                current_slot = (time.monotonic_ns() - self.started_ns) // self.dt_ns
-                replacement = handoff_plan(self.query, slot=current_slot)
-                if replacement is not None and not plan_exhausted(replacement, current_slot):
-                    self.plan, self.query = replacement, None
+        with self.profiler.tick(self.next_step_ns) if self.profiler is not None else nullcontext():
+            was_running = self.state == "RUNNING"
+            row, raw = self.sample_observation()
+            quality_issue = self.recording_issue(raw) if self.recorder is not None else None
+            attempted = None
+            try:
+                if quality_issue is not None:
+                    self.stop(quality_issue)
                     return
-                self.stop("prediction window expired during mapping")
-                return
-            attempted = command
-            self.robot.send_action(command, expires_ns=now + COMMAND_LEASE_NS)
-            if self.duration_expired():
-                return
-            if self.policy_info.requires_prev_action:
-                self.prev_action = np.concatenate((command.arm_qpos, command.hand_qpos))
-            if self.policy_info.action_mode == "eef":
-                anchor = (arm_reference_from_feedback(
-                    row.arm["qpos"][0], *self.action_mapper.solver.limits.T,
-                ) if self.ik_reference is None else self.ik_reference.anchor)
-                self.ik_reference = IKReference(command.arm_qpos, anchor, time.monotonic_ns())
-            if self.execution.mode in {"sync", "rtc"}:
-                self.cursor += 1
-                if self.execution.mode == "sync" and self.cursor == min(len(plan.actions), self.execution.action_steps):
-                    self.plan = None
-            if self.state == "RESUMING":
-                self.state = "RUNNING"
-        finally:
-            # 已尝试提交的恢复动作也需要记录。
-            if self.state == "RUNNING" or attempted is not None:
-                if skipped and was_running and self.recorder is not None:
-                    self.recorder.mark_gap()
-                self.record_row(raw, attempted, quality_issue=quality_issue)
+                if not self.update_history(row):
+                    return
+                self.check_motion()
+                if self.duration_expired():
+                    return
+                self.poll_model()
+                action = self.select_action(slot)
+                if action is None:
+                    return
+                plan = cast(ActionChunk, self.plan)
+                command = self.prepare_command(action, row)
+                if command is None:
+                    return
+                now = time.monotonic_ns()
+                if (self.execution.mode == "async"
+                        and now >= self.started_ns + (plan.anchor_slot + len(plan.actions)) * self.dt_ns):
+                    self.poll_model()
+                    current_slot = (time.monotonic_ns() - self.started_ns) // self.dt_ns
+                    replacement = handoff_plan(self.query, slot=current_slot)
+                    if replacement is not None and not plan_exhausted(replacement, current_slot):
+                        self.plan, self.query = replacement, None
+                        return
+                    self.stop("prediction window expired during mapping")
+                    return
+                attempted = command
+                call(
+                    self.profiler, "robot_send_action_ms", self.robot.send_action,
+                    command, expires_ns=now + COMMAND_LEASE_NS,
+                )
+                if self.duration_expired():
+                    return
+                if self.policy_info.requires_prev_action:
+                    self.prev_action = np.concatenate((command.arm_qpos, command.hand_qpos))
+                if self.policy_info.action_mode == "eef":
+                    anchor = (arm_reference_from_feedback(
+                        row.arm["qpos"][0], *self.action_mapper.solver.limits.T,
+                    ) if self.ik_reference is None else self.ik_reference.anchor)
+                    self.ik_reference = IKReference(command.arm_qpos, anchor, time.monotonic_ns())
+                if self.execution.mode in {"sync", "rtc"}:
+                    self.cursor += 1
+                    if self.execution.mode == "sync" and self.cursor == min(len(plan.actions), self.execution.action_steps):
+                        self.plan = None
+                if self.state == "RESUMING":
+                    self.state = "RUNNING"
+            finally:
+                # 已尝试提交的恢复动作也需要记录。
+                if self.state == "RUNNING" or attempted is not None:
+                    if skipped and was_running and self.recorder is not None:
+                        self.recorder.mark_gap()
+                    self.record_row(raw, attempted, quality_issue=quality_issue)

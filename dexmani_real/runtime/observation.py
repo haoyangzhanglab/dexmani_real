@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.ipc.sensors import read_camera_frame
+from dexmani_real.utils.profile import call
 from dexmani_real.utils.timing import sample_is_fresh
 
 _RECOVERABLE_HOI_ISSUES = frozenset({
@@ -76,10 +77,11 @@ class Observation:
 
 def read_observation(
     channels, robot, *, needs: ObservationNeeds, joint_gap_s=0.10, include_visual_payloads=True,
+    profiler=None,
 ) -> Observation:
     """省略视觉载荷时仍读取来源元数据、非视觉输入及必要的关节对齐。"""
     control_ns = time.monotonic_ns()
-    state = robot.read_state()
+    state = call(profiler, "observation_robot_state_ms", robot.read_state)
     camera_fields = needs.camera_fields if include_visual_payloads else ()
     cloud_result = None
     if needs.point_cloud:
@@ -108,8 +110,11 @@ def read_observation(
     vr_result = channels.vr_ring.read() if needs.vr else None
     aligned_joints = None
     if needs.hoi_joint_devices and hoi is not None and hoi["valid"]:
-        aligned_joints = robot.aligned_joints(int(hoi["timestamp_ns"]), joint_gap_s)
-    return Observation(
+        aligned_joints = call(
+            profiler, "observation_joint_alignment_ms", robot.aligned_joints,
+            int(hoi["timestamp_ns"]), joint_gap_s,
+        )
+    row = Observation(
         arm=state.arm,
         hand=state.hand,
         hoi=hoi,
@@ -121,6 +126,9 @@ def read_observation(
         control_timestamp_ns=control_ns,
         pointcloud_timestamp_ns=int(cloud["timestamp_ns"]) if cloud is not None else 0,
     )
+    if profiler is not None:
+        profiler.observe(row, needs, include_visual_payloads=include_visual_payloads)
+    return row
 
 
 def check_device_feedback(row, runtime, *, now_ns=None):

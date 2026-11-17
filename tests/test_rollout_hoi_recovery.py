@@ -57,6 +57,7 @@ class FakeRing:
 
 
 class FakePolicyWorker:
+    profiler = None
     poll = PolicyWorker.poll
 
     def __init__(self):
@@ -396,7 +397,7 @@ def test_preparation_records_parameters_and_starts_budget(env, monkeypatch, tmp_
         assert rollout.started_ns == env.clock.now
         assert not rollout.duration_expired()
     assert env.worker.warmed_up
-    constructor.assert_called_once_with(tmp_path, control_hz=20.)
+    constructor.assert_called_once_with(tmp_path, control_hz=20., profiler=None)
     recorder.start.assert_called_once_with(
         task_label="test", episode_name="episode_007", collection_source="policy_rollout",
         metadata=episode_recording_metadata(
@@ -1059,12 +1060,16 @@ def test_recorder_finish_timeout_keeps_live_owner_and_staging(tmp_path, monkeypa
     (OSError, RuntimeError, RuntimeError),
     (OSError, KeyboardInterrupt, KeyboardInterrupt),
 ])
+@pytest.mark.parametrize("profiling", [False, True])
 def test_writer_and_close_errors_keep_causes_and_staging(
-    tmp_path, monkeypatch, caplog, primary_type, close_type, reported_type,
+    tmp_path, monkeypatch, caplog, primary_type, close_type, reported_type, profiling,
 ):
     from dexmani_real.data import recorder as recorder_module
 
-    recorder = EpisodeRecorder(tmp_path, control_hz=20)
+    from dexmani_real.utils.profile import Profiler
+
+    profile = Profiler("policy") if profiling else None
+    recorder = EpisodeRecorder(tmp_path, control_hz=20, profiler=profile)
     recorder.staging_path = tmp_path / ".tmp_failed"
     recorder.staging_path.mkdir()
     writer = Mock(frame_count=0)
@@ -1082,6 +1087,10 @@ def test_writer_and_close_errors_keep_causes_and_staging(
             recorder.finish(save=True, reason="failed")
     assert recorder.result()["status"] == "failed"
     assert recorder.staging_path.exists() and recorder.published_path is None
+
+    if profile is not None:
+        assert profile.counts["recorder_writer_total_ms"] == 1
+        assert profile.counts["recorder_finish_elapsed_ms"] == 1
 
 
 @pytest.mark.parametrize("outcome", ["success", "failure", "timeout"])

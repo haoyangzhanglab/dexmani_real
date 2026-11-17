@@ -31,6 +31,7 @@ flowchart TD
 | VR 采集 / 仅遥操作 | `python scripts/collect_teleop.py TASK` / 加 `--no-record` |
 | 键盘调整姿态 | `python scripts/keyboard_teleop.py` |
 | 查看记录 | `python scripts/visualize_episode.py EPISODE`（`--no-hoi` 绕过标注，`--max-frames N` 按需读取前 N 帧） |
+| 离线测量可视化性能 | `python scripts/benchmark_episode_visualizer.py EPISODE --output /tmp/visualizer-profile`（默认无 GUI，报告目录必须不存在） |
 | 离线调试手部重定向 | `python scripts/preview_hand_retargeting.py EPISODE`（`--no-view` 仅计算统计，`--max-frames N` 限制前缀） |
 | 导出训练数据 | `python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr --fields joint_state action` |
 | 策略评估并录制 | `python scripts/run_policy.py CHECKPOINT --record-raw` |
@@ -132,6 +133,7 @@ Raw 以整个 episode 目录为单位使用：`data.h5` 保存采集数据，`rg
 
 ## 主题文档
 
+- [Teleop / Policy 性能画像](docs/performance_profile.md)：默认关闭的阶段计时、来源年龄和 Recorder 统计。
 - [手部重定向](docs/hand_retargeting.md)：人体关键点到 XHand 关节目标的映射。
 - [策略部署](docs/policy_deployment.md)：观测、推理、动作执行与多段评估流程。
 - [物体重建与 HOI](docs/object_reconstruction.md)：物体资产、固定点云模板及训练与部署流程。

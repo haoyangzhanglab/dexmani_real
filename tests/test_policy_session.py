@@ -104,7 +104,7 @@ def test_cli_calls_session_directly(monkeypatch, tmp_path):
     args, kwargs = constructor.call_args
     assert args == (RealConfig(), "policy.pt")
     assert kwargs == {
-        "weights": "raw", "inference_steps": 3, "device": "cpu", "seed": 9,
+        "profiler": None, "weights": "raw", "inference_steps": 3, "device": "cpu", "seed": 9,
         "num_episodes": 2, "max_duration_s": 1.5, "record_raw": True, "output_root": tmp_path,
         "camera_calibration_path": Path("camera.json"),
         "task_dir": Path("../task-assets"),
