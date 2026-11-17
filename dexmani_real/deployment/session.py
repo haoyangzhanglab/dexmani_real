@@ -8,7 +8,7 @@ import multiprocessing as mp
 import time
 from collections.abc import Sequence
 from concurrent.futures import wait
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -54,7 +54,6 @@ from dexmani_real.runtime.lifecycle import (
 )
 from dexmani_real.runtime.observation import (
     RAW_RECORDING_NEEDS,
-    ObservationNeeds,
     check_device_feedback,
     check_observation,
     read_observation,
@@ -230,14 +229,8 @@ class PolicySession:
                                     mode=self.runtime.execution.mode)
         self.observations = ObservationBuilder(self.info, self.runtime)
         self.actual_processing = collect_data_processing(self.info, self.runtime)
-        self.record_needs = RAW_RECORDING_NEEDS if self.record_raw else ObservationNeeds()
         model_needs = self.observations.needs
-        self.sensor_needs = model_needs.union(self.record_needs)
-        # 派生 Ring 仅携带模型图像；Raw 在 Rollout 独立读取原始 RGB-D。
-        self.read_needs = (
-            replace(self.sensor_needs, camera_fields=model_needs.camera_fields)
-            if model_needs.hoi or model_needs.point_cloud else self.sensor_needs
-        )
+        self.sensor_needs = model_needs.union(RAW_RECORDING_NEEDS) if self.record_raw else model_needs
         needs = self.sensor_needs
         camera_required = needs.camera_worker or self.observations.camera_static
         if camera_required:
@@ -308,7 +301,7 @@ class PolicySession:
                 depth_enabled=needs.hoi or needs.point_cloud or "depth" in needs.camera_fields,
                 hoi=needs.hoi,
                 pointcloud_num_points=self.runtime.pointcloud.num_points if needs.point_cloud else None,
-                camera_fields=self.read_needs.camera_fields,
+                include_derived_rgb="rgb" in model_needs.camera_fields,
             ) if camera_required else None
         )
         self.sensors.channels = channels
@@ -636,7 +629,6 @@ class PolicySession:
             episode = self.episode = Rollout(
                 self.runtime_state, self.runtime, self.info, episode_cancel_epoch=cancel_epoch,
                 robot=self.robot, sensors=self.sensors, observations=self.observations,
-                read_needs=self.read_needs, record_needs=self.record_needs,
                 action_mapper=self.action_mapper, model=self.model,
                 max_duration_s=self.max_duration_s,
                 index=len(self.episodes) + 1, output_dir=self.output_dir, record_raw=self.record_raw,

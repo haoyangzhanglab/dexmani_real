@@ -35,8 +35,8 @@ from dexmani_real.robot.commands import (
 )
 from dexmani_real.runtime.ik_reference import IKReference, prepare_reference
 from dexmani_real.runtime.observation import (
+    RAW_RECORDING_NEEDS,
     Observation,
-    ObservationNeeds,
     check_device_feedback,
     check_hoi_status,
     check_observation,
@@ -71,7 +71,7 @@ class EpisodeResult:
 class Rollout:
     def __init__(
         self, runtime_state, runtime, policy_info, *, episode_cancel_epoch: int, robot,
-        observations, read_needs: ObservationNeeds, record_needs: ObservationNeeds,
+        observations,
         sensors, action_mapper, model, max_duration_s: float | None,
         index, output_dir, record_raw, effective_parameters, camera_snapshot=None, profiler=None,
     ):
@@ -81,14 +81,18 @@ class Rollout:
         self.policy_info = policy_info
         self.execution = runtime.execution
         self.robot, self.sensors = robot, sensors
-        if observations.needs.hoi_joint_devices:
+        model_needs = observations.needs
+        if model_needs.hoi_joint_devices:
             robot.enable_joint_history(
                 self.execution.hoi_max_age_s + self.execution.hoi_max_joint_gap_s,
-                devices=observations.needs.hoi_joint_devices,
+                devices=model_needs.hoi_joint_devices,
             )
         self.observations = observations
-        self.read_needs = read_needs
-        self.record_needs = record_needs
+        self.read_needs = model_needs.union(RAW_RECORDING_NEEDS) if record_raw else model_needs
+        self.read_raw_camera = record_raw and (model_needs.hoi or model_needs.point_cloud)
+        if self.read_raw_camera:
+            # 派生 Ring 只提供模型图像，Raw RGB-D 由相机 Ring 提供。
+            self.read_needs = replace(self.read_needs, camera_fields=model_needs.camera_fields)
         self.action_mapper, self.model = action_mapper, model
         self.recorder: EpisodeRecorder | None = None
         self.output_dir, self.record_raw = output_dir, record_raw
@@ -123,7 +127,7 @@ class Rollout:
     def recording_issue(self, row):
         issues = call(
             self.profiler, "check_observation_ms", check_observation,
-            row, self.runtime, self.record_needs, now_ns=row.observation_timestamp_ns,
+            row, self.runtime, RAW_RECORDING_NEEDS, now_ns=row.observation_timestamp_ns,
         )
         return "; ".join(issues) if issues else None
 
@@ -228,7 +232,7 @@ class Rollout:
         return valid
 
     def read_observations(self, *, include_visual_payloads=True) -> tuple[Observation, Observation]:
-        """共享关节采样；派生模型图像同源，Raw 独立取最新相机帧。"""
+        """共享关节采样；模型使用派生观测时，Raw 独立读取相机。"""
         row = call(
             self.profiler, "observation_read_ms", read_observation,
             self.sensors.channels,
@@ -239,11 +243,11 @@ class Rollout:
             include_visual_payloads=include_visual_payloads,
         )
         raw = row
-        if self.record_raw and (self.observations.needs.hoi or self.observations.needs.point_cloud):
+        if self.read_raw_camera:
             camera = call(
                 self.profiler, "raw_camera_read_ms", read_camera_frame,
                 self.sensors.channels,
-                fields=self.record_needs.camera_fields if include_visual_payloads else (),
+                fields=RAW_RECORDING_NEEDS.camera_fields if include_visual_payloads else (),
             )
             raw = replace(row, camera=camera, hoi=None, observation_timestamp_ns=time.monotonic_ns())
             if self.profiler is not None:
@@ -276,8 +280,7 @@ class Rollout:
                 issue = issue or recording_issue
             joints_ready = after_ns is None or (
                 int(row.arm["timestamp_ns"][0]) >= after_ns
-                and (not self.runtime.hand.enabled or row.hand is not None
-                     and int(row.hand["timestamp_ns"][0]) >= after_ns)
+                and row.hand is not None and int(row.hand["timestamp_ns"][0]) >= after_ns
             )
             if issue is None and joints_ready:
                 self.preparation_issue = None
@@ -604,10 +607,9 @@ class Rollout:
         )
         if issues:
             raise FeedbackUnavailable("device feedback: " + "; ".join(issues))
-        hand = state.hand["qpos"][0] if self.runtime.hand.enabled else None
         call(
             self.profiler, "robot_send_action_ms", self.robot.send_action,
-            RobotCommand(arm_hold=True, hand_qpos=hand), expires_ns=now + COMMAND_LEASE_NS,
+            RobotCommand(arm_hold=True, hand_qpos=state.hand["qpos"][0]), expires_ns=now + COMMAND_LEASE_NS,
         )
         self.next_hoi_hold_ns = now + int(HOI_HOLD_REFRESH_S * 1e9)
 

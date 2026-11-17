@@ -87,6 +87,8 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     if not runtime.hand.enabled:
         raise ValueError("Dexterous policy deployment requires hand.enabled=true")
     if "point_cloud" in info.observation_fields:
+        if "object_pointcloud" in info.observation_fields:
+            raise ValueError("HOI 与 point_cloud 不支持混合输入")
         runtime.pointcloud.validate()
     runtime = replace(runtime, execution=execution)
     validate_robot_config(runtime)
@@ -102,8 +104,6 @@ def resolve_hoi_inputs(info, task_dir):
 
     if "object_pointcloud" not in info.observation_fields:
         return None
-    if "point_cloud" in info.observation_fields:
-        raise ValueError("HOI 与 point_cloud 不支持混合输入")
     if task_dir is None:
         raise ValueError("HOI policy requires explicit task_dir (--task-dir)")
     from dexmani_real.geometry.hoi import load_task_template

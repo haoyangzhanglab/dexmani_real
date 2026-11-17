@@ -44,10 +44,7 @@ def run_pointcloud_worker(
     # 会话仅在相机和点云通道均已分配时启动本进程。
     camera_ring = cast("SharedRing", shared.camera_ring)
     pointcloud_ring = cast("SharedRing", shared.pointcloud_ring)
-    image_fields = tuple(
-        name for name in ("rgb", "depth")
-        if name in pointcloud_ring.field_names
-    )
+    publish_rgb = "rgb" in pointcloud_ring.field_names
 
     while shared.is_running.value:
         if camera_ring.latest_sequence <= last_camera_sequence:
@@ -71,5 +68,5 @@ def run_pointcloud_worker(
             source_camera_sequence=camera_sequence,
             timestamp_ns=data["timestamp_ns"],
             point_cloud=cloud,
-            **{name: data[name] for name in image_fields},
+            **({"rgb": data["rgb"]} if publish_rgb else {}),
         )

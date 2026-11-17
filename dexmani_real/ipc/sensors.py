@@ -36,15 +36,14 @@ def camera_dtype(height: int, width: int, *, depth_enabled: bool = True) -> np.d
     return np.dtype(fields, align=True)
 
 
-def pointcloud_dtype(num_points: int, camera=None, camera_fields=()) -> np.dtype:
+def pointcloud_dtype(num_points: int, rgb_dtype: np.dtype | None = None) -> np.dtype:
     fields: list[tuple] = [
         ("source_camera_sequence", "<u8"),
         ("timestamp_ns", "<u8"),
         ("point_cloud", "<f4", (num_points, 6)),
     ]
-    if camera_fields:
-        image_dtype = camera_dtype(camera.height, camera.width)
-        fields.extend((name, image_dtype[name]) for name in camera_fields)
+    if rgb_dtype is not None:
+        fields.append(("rgb", rgb_dtype))
     return np.dtype(fields, align=True)
 
 
@@ -57,7 +56,7 @@ class SensorChannels:
         depth_enabled: bool = True,
         vr: bool = False,
         pointcloud_num_points: int | None = None,
-        camera_fields: tuple[str, ...] = (),
+        include_derived_rgb: bool = False,
         hoi: bool = False,
     ):
         self.camera_ring = (
@@ -66,9 +65,13 @@ class SensorChannels:
             else None
         )
         self.vr_ring = SharedRing(ctx, VR_DTYPE, 8) if vr else None
+        rgb_dtype = None
+        if include_derived_rgb:
+            image_dtype: np.dtype = cast(SharedRing, self.camera_ring).dtype
+            rgb_dtype = image_dtype["rgb"]
         self.pointcloud_ring = (
             SharedRing(
-                ctx, pointcloud_dtype(pointcloud_num_points, camera, camera_fields), 8,
+                ctx, pointcloud_dtype(pointcloud_num_points, rgb_dtype), 8,
             )
             if pointcloud_num_points is not None
             else None
@@ -80,9 +83,8 @@ class SensorChannels:
                 ("episode_id", "u8"), ("timestamp_ns", "u8"), ("source_camera_sequence", "u8"),
                 ("valid", "?"), ("object_pointcloud", "f4", (HOI_NUM_POINTS, 3)),
             ]
-            if camera_fields:
-                image_dtype: np.dtype = cast(SharedRing, self.camera_ring).dtype
-                fields.extend((name, image_dtype[name]) for name in camera_fields)
+            if rgb_dtype is not None:
+                fields.append(("rgb", rgb_dtype))
             self.hoi_ring = SharedRing(ctx, np.dtype(fields), 3)
             self.hoi_request = SharedRing(ctx, np.dtype([
                 ("episode_id", "u8"), ("after_ns", "u8"), ("after_sequence", "u8"),

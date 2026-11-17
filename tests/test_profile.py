@@ -117,17 +117,17 @@ def test_control_metrics_reuse_schedule_and_reset_between_episodes(monkeypatch):
     assert result["counters"]["deadline_misses"] == 1
 
 
-def test_freshness_uses_source_stamps_without_extra_ring_reads(monkeypatch):
+@pytest.mark.parametrize("field,source,age", [("object_pointcloud", "hoi", 100), ("point_cloud", "pointcloud", 90)])
+def test_freshness_uses_source_stamps_without_extra_ring_reads(monkeypatch, field, source, age):
     env = rollout_fixture.__wrapped__(
-        monkeypatch, True, ("object_pointcloud", "point_cloud", "joint_state", "rgb")
+        monkeypatch, True, (field, "joint_state", "rgb")
     )
     profile = profiler(runtime=env.rollout.runtime)
     needs = env.rollout.read_needs
     now = env.clock.now
     env.robot.arm_age = 30_000_000
     env.robot.hand_age = 40_000_000
-    env.channels.hoi_ring.data["timestamp_ns"] = now - 100_000_000
-    env.channels.pointcloud_ring.data["timestamp_ns"] = now - 200_000_000
+    getattr(env.channels, f"{source}_ring").data["timestamp_ns"] = now - age * 1_000_000
     rings = [
         env.channels.hoi_ring,
         env.channels.hoi_request,
@@ -140,19 +140,20 @@ def test_freshness_uses_source_stamps_without_extra_ring_reads(monkeypatch):
         ring.reads.clear()
     row = read_observation(env.channels, env.robot, needs=needs, profiler=profile)
     assert [r.reads for r in rings] == reads
-    assert row.hoi["object_pointcloud"] is plain.hoi["object_pointcloud"]
-    assert row.point_cloud is plain.point_cloud
+    if source == "hoi":
+        assert row.hoi["object_pointcloud"] is plain.hoi["object_pointcloud"]
+    else:
+        assert row.point_cloud is plain.point_cloud
     result = profile.report()["metrics"]
-    for source, expected in (
+    for name, expected in (
         ("arm", 30),
         ("hand", 40),
-        ("camera", 100),
-        ("hoi", 100),
-        ("pointcloud", 200),
+        ("camera", age),
+        (source, age),
         ("tactile_aggregate", 0),
         ("tactile_dense", 0),
     ):
-        assert result[f"sensor_age_ms.{source}"]["mean"] == expected
+        assert result[f"sensor_age_ms.{name}"]["mean"] == expected
     env.rollout.profiler = profile
     _, raw = env.rollout.read_observations()
     assert profile.counts["raw_camera_read_ms"] == 1

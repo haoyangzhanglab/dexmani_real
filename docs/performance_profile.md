@@ -17,7 +17,7 @@
 | `deadline_misses` | 控制主体结束时已达到或超过原调度器的下一槽时间。 |
 | `hold_period_ms` / `hold_lateness_ms` / `hold_target_period_ms` | Policy HOI_HOLD 分支的原调度推进点，与正常控制分开。 |
 | `observation_read_ms` | `read_observation()`，含已取回元数据的标量采样。 |
-| `raw_camera_read_ms` | Policy 为 Raw 独立调用 `read_camera_frame()` 的耗时，不包含在上一项中。 |
+| `raw_camera_read_ms` | Policy 在启用 Raw 且使用 HOI 或场景点云时独立读取 Raw 相机的耗时，单独计量。 |
 | `observation_robot_state_ms` / `observation_joint_alignment_ms` | 读取已有 Robot 反馈缓存 / 已有 HOI 关节对齐调用。 |
 | `check_device_feedback_ms` / `check_observation_ms` | 原检查函数；长计算后的再次检查仍是独立调用。 |
 | `feedback_service_ms` | Teleop / Rollout 的反馈服务，包括准备或收尾期间的调用。 |

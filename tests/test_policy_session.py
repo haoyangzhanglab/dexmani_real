@@ -146,6 +146,31 @@ def test_non_hoi_policy_does_not_read_task_assets(policy_session, policy_info, m
     assert policy_session.hoi_inputs is None
 
 
+@pytest.mark.parametrize("field,ring_name", [("point_cloud", "pointcloud_ring"), ("object_pointcloud", "hoi_ring")])
+@pytest.mark.parametrize("include_rgb", [False, True])
+def test_policy_derived_channel_carries_only_requested_rgb(
+    policy_session, policy_info, monkeypatch, tmp_path, field, ring_name, include_rgb,
+):
+    runtime = policy_session.runtime
+    policy_session.runtime = replace(runtime, camera=replace(runtime.camera, width=4, height=3))
+    policy_session.record_raw = True
+    policy_session.output_root = tmp_path
+    fields = (field, "rgb") if include_rgb else (field,)
+    policy_session.wait_model = lambda: replace(policy_info, observation_fields=fields)
+    monkeypatch.setattr(session, "resolve_hoi_inputs", Mock())
+    monkeypatch.setattr(session, "PolicyWorker", Mock())
+    monkeypatch.setattr(session, "Robot", Mock())
+    policy_session.prepare_resources()
+
+    channels = policy_session.sensors.channels
+    ring = getattr(channels, ring_name)
+    assert channels.camera_ring.field_names == {"timestamp_ns", "rgb", "depth"}
+    assert "depth" not in ring.field_names
+    assert ("rgb" in ring.field_names) is include_rgb
+    if include_rgb:
+        assert ring.dtype["rgb"] == channels.camera_ring.dtype["rgb"]
+
+
 @pytest.mark.parametrize("explicit,dt,period_ns", [
     (False, 5., 5_000_000_000),
     (True, 5., 5_000_000_000),

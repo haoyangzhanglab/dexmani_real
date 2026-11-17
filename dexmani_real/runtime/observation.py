@@ -83,18 +83,17 @@ def read_observation(
     control_ns = time.monotonic_ns()
     state = call(profiler, "observation_robot_state_ms", robot.read_state)
     camera_fields = needs.camera_fields if include_visual_payloads else ()
-    cloud_result = None
-    if needs.point_cloud:
-        fields = ("point_cloud", *camera_fields) if include_visual_payloads else ()
-        cloud_result = channels.pointcloud_ring.read(
-            fields=("timestamp_ns", "source_camera_sequence", *fields),
-        )
-    cloud = cloud_result[0] if cloud_result else None
-    hoi = None
+    cloud = hoi = None
     if needs.hoi:
         hoi = _read_hoi(
             channels, fields=("object_pointcloud", *camera_fields) if include_visual_payloads else (),
         )
+    elif needs.point_cloud:
+        fields = ("point_cloud", *camera_fields) if include_visual_payloads else ()
+        cloud_result = channels.pointcloud_ring.read(
+            fields=("timestamp_ns", "source_camera_sequence", *fields),
+        )
+        cloud = cloud_result[0] if cloud_result is not None else None
     camera = None
     if needs.camera_fields:
         if needs.hoi or needs.point_cloud:
@@ -153,25 +152,25 @@ def check_observation(row, runtime, needs, *, now_ns=None, include_visual_payloa
         stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0]) if row.hand is not None else 0
         if not sample_is_fresh(stamp, runtime.hand.feedback_max_age_s, now):
             issues.append(f"hand_tactile_{channel}_timestamp_ns_unavailable_or_stale")
-    # 派生观测的相机时效由对应点云/HOI 来源统一检查。
-    if needs.camera_fields and not (needs.point_cloud or needs.hoi):
-        if row.camera is None:
-            issues.append("camera_source_unavailable_or_unmatched")
-        else:
-            stamp = int(row.camera["timestamp_ns"])
-            if not sample_is_fresh(stamp, runtime.camera.max_frame_age_s, now):
-                issues.append("camera_source_stale")
-    if needs.point_cloud:
+    # 派生图像与对应的点云或 HOI 观测共用来源时间。
+    if needs.hoi:
+        issues.extend(_hoi_issues(row.hoi, runtime, now))
+        if needs.hoi_joint_devices and row.aligned_joints is None:
+            issues.append("hoi_joint_alignment_unavailable")
+    elif needs.point_cloud:
         stamp = row.pointcloud_timestamp_ns
         available = row.point_cloud is not None if include_visual_payloads else stamp > 0
         if not available:
             issues.append("pointcloud_unavailable")
         elif not sample_is_fresh(stamp, runtime.camera.max_frame_age_s, now):
             issues.append("pointcloud_stale")
-    if needs.hoi:
-        issues.extend(_hoi_issues(row.hoi, runtime, now))
-        if needs.hoi_joint_devices and row.aligned_joints is None:
-            issues.append("hoi_joint_alignment_unavailable")
+    elif needs.camera_fields:
+        if row.camera is None:
+            issues.append("camera_source_unavailable_or_unmatched")
+        else:
+            stamp = int(row.camera["timestamp_ns"])
+            if not sample_is_fresh(stamp, runtime.camera.max_frame_age_s, now):
+                issues.append("camera_source_stale")
     if needs.vr:
         if row.vr is None:
             issues.append("vr_unavailable")

@@ -15,7 +15,7 @@ from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.geometry.camera import CameraIntrinsics
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
-from dexmani_real.runtime.observation import RAW_RECORDING_NEEDS
+from dexmani_real.runtime.observation import RAW_RECORDING_NEEDS, ObservationNeeds
 
 
 @pytest.fixture
@@ -38,6 +38,19 @@ def test_pointcloud_uses_experiment_config(info):
     assert resolve_deployment_config(info, explicit).execution == explicit.execution
     with pytest.raises(ValueError, match='num_points'):
         resolve_deployment_config(info, replace(runtime, pointcloud=PointCloudConfig(num_points=0)))
+
+
+def test_deployment_rejects_mixed_pointcloud_sources(info):
+    info = replace(info, observation_fields=(*info.observation_fields, 'object_pointcloud'))
+    with pytest.raises(ValueError, match='不支持混合输入'):
+        resolve_deployment_config(info, RealConfig())
+
+
+def test_deployment_requires_hand_feedback(info):
+    runtime = RealConfig()
+    runtime = replace(runtime, hand=replace(runtime.hand, enabled=False))
+    with pytest.raises(ValueError, match='requires hand.enabled=true'):
+        resolve_deployment_config(info, runtime)
 
 
 @pytest.mark.parametrize('dt', [0., float('nan'), float('inf'), 1e-10])
@@ -223,7 +236,7 @@ def test_hoi_warmup_commits_only_successful_uncancelled_result(fault):
     worker.warmup = warmup
     runtime = RealConfig(execution=ExecutionConfig(control_dt_s=0.05, action_steps=2, mode="rtc"))
     observations = SimpleNamespace(
-        needs=SimpleNamespace(hoi=True, hoi_joint_devices=()), project=lambda row: {}
+        needs=ObservationNeeds(hoi=True), project=lambda row: {}
     )
     robot = SimpleNamespace(
         stop=lambda: None,
@@ -243,8 +256,6 @@ def test_hoi_warmup_commits_only_successful_uncancelled_result(fault):
                 episode_cancel_epoch=state.cancel_epoch,
                 robot=robot,
                 observations=observations,
-                read_needs=None,
-                record_needs=None,
                 sensors=sensors,
                 action_mapper=None,
                 model=worker,

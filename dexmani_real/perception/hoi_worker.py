@@ -27,9 +27,7 @@ def run_hoi_worker(shared, camera, task, template, *, tracking_config=None):
     signal.signal(signal.SIGTERM, terminate)
     by_name = {obj["name"]: obj for obj in task_objects(task)}
     prompts = {name: by_name[name]["prompt"] for name in template["object_names"]}
-    camera_fields = tuple(
-        name for name in ("rgb", "depth") if name in shared.hoi_ring.field_names
-    )
+    publish_rgb = "rgb" in shared.hoi_ring.field_names
     epoch = last_sequence = 0
     first = True
     tracker = SceneTracker(
@@ -90,5 +88,5 @@ def run_hoi_worker(shared, camera, task, template, *, tracking_config=None):
             source_camera_sequence=sequence,
             valid=failure is None,
             object_pointcloud=points,
-            **{name: data[name] for name in camera_fields},
+            **({"rgb": data["rgb"]} if publish_rgb else {}),
         )

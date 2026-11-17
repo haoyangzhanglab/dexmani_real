@@ -81,7 +81,7 @@ VR 和键盘启动时各自检查控制周期严格短于 `target_max_age_s`。�
 | --- | --- |
 | 改采集过程 | `scripts/collect_teleop.py` → `teleop/run.py` 装配资源 → `TeleopLoop` 运行示教 |
 | 改策略执行 | `scripts/run_policy.py` → `PolicySession` 管会话资源 → `Rollout` 管单段控制；`schedule.py` 只计算动作窗口 |
-| 改模型观测 | `runtime/observation.py` 读取并检查来源 → `ObservationBuilder` 组装模型历史；字段依赖在 `FIELD_DEPENDENCIES` 声明 |
+| 改模型观测 | `runtime/observation.py` 读取并检查来源 → `ObservationBuilder.project()` 投影 → `Rollout` 保存历史 → `ObservationBuilder.build()` 构建模型输入。字段依赖见 `FIELD_DEPENDENCIES`。 |
 | 改训练数据 | `RawReader` 按需读取并校验输入 → `export.py` 分块派生 → 完整产物发布；失败录制由 `EpisodeRecorder` 向运行层报告 |
 
 直接从 Python 启动策略使用 `PolicySession(runtime, checkpoint, record_raw=True).run()`（从 `dexmani_real.deployment.session` 导入）；HOI 策略还须传 `task_dir="/data/tasks/pick"`。输出路径通过 `output_root` 指定。

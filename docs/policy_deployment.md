@@ -7,22 +7,26 @@
 ## 执行架构
 
 ```mermaid
-flowchart LR
-    sensors[传感器与机器人反馈] --> observation[观测历史]
-    observation --> inference[模型推理]
+flowchart TB
+    sensors[传感器与机器人反馈] --> observation[观测采样]
+    observation --> projection[观测投影]
+    observation --> raw[Raw 录制]
+    projection --> history[模型历史]
+    history --> inference[模型推理]
     inference --> schedule[动作序列调度]
     schedule --> control[动作映射与运动约束]
     control --> robot[xArm7 + XHand]
     robot -->|反馈| sensors
-    observation --> raw[Raw 录制]
     control -->|指令提交尝试| raw
 ```
+
+启用 Raw 录制且策略使用 HOI 或场景点云时，两路共享本次关节采样，Raw 单独读取相机帧，因此 Raw RGB 与模型使用的 RGB 可能来自不同帧。
 
 观测按模型需求组合图像、关节、触觉和点云。调度器从预测序列中选择当前动作；关节动作经限位后提交，末端动作通过共享局部 IK 转为关节目标，再交由设备执行。
 
 Checkpoint 描述模型的观测字段、动作、RGB 预处理和控制周期。[RealConfig](../dexmani_real/config/real.py) 与本地标定提供设备、传感器和运动限制等实验设置。执行周期和每次执行的动作步数默认取自 Checkpoint，也可由实验配置指定。连接设备前，部署检查有效的 `execution.control_dt_s` 严格短于 2 秒命令租约。
 
-HOI 策略必须显式提供任务资产目录：`python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick`；Python 使用 `PolicySession(runtime, checkpoint, task_dir="/data/tasks/pick").run()`。该目录与离线准备、模板采样及标注共用，支持 `~`，相对路径以 cwd 为准。Checkpoint 的 `task_name` 保留实验标签含义，不参与资产路径推导，也无需与目录名一致。缺失目录或模板错误在连接设备前报告。非 HOI 策略不要求、也不读取任务资产；`--print-config` 仅检查声明配置。已有 `run_config.yaml` 记录实际使用的 `task_dir`。
+现场部署将 HOI（`object_pointcloud`）和场景点云（`point_cloud`）作为互斥输入。HOI 策略必须显式提供任务资产目录：`python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick`；Python 使用 `PolicySession(runtime, checkpoint, task_dir="/data/tasks/pick").run()`。该目录与离线准备、模板采样及标注共用，支持 `~`，相对路径以 cwd 为准。Checkpoint 的 `task_name` 保留实验标签含义，不参与资产路径推导，也无需与目录名一致。缺失目录或模板错误在连接设备前报告。非 HOI 策略不要求、也不读取任务资产；`--print-config` 仅检查声明配置。已有 `run_config.yaml` 记录实际使用的 `task_dir`。
 
 场景点云使用 `RealConfig.pointcloud`，手表面点云使用 `RealConfig.hand_pointcloud`。指尖 FK 与数据导出共用机器人模型中的固定五指顺序（thumb、index、middle、ring、pinky）。普通策略允许调整合法采样与几何参数进行研究，处理记录的差异不会阻止部署，部署不计算或比较模板摘要；这不保证调整后的任务表现。模型实际输入输出形状、动作单位、坐标和本地模板合法性仍须满足消费者要求。部署分别保存 `training_processing` 与 `actual_processing`，已知差异会显示，缺少训练研究记录则为 None。现场相机与桌面标定使用当前值。
 
@@ -36,7 +40,7 @@ HOI 策略必须显式提供任务资产目录：`python scripts/run_policy.py C
 | --- | --- |
 | [session.py](../dexmani_real/deployment/session.py) | 管理模型、设备和传感器，组织多段评估与结果汇总。 |
 | [preflight.py](../dexmani_real/deployment/preflight.py) | 合并模型描述与本地配置，检查部署条件，加载所需任务模板。 |
-| [observation.py](../dexmani_real/deployment/observation.py) | 将观测历史编码为模型输入。 |
+| [observation.py](../dexmani_real/deployment/observation.py) | 将观测投影为历史快照，并从历史窗口构建模型输入。 |
 | [inference.py](../dexmani_real/deployment/inference.py) | 加载、预热模型，并执行预测。 |
 | [schedule.py](../dexmani_real/deployment/schedule.py) | 计算控制时刻与动作序列接续位置。 |
 | [rollout.py](../dexmani_real/deployment/rollout.py) | 推进单段的观测采样、推理请求、动作提交与录制。 |
