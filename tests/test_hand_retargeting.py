@@ -110,6 +110,29 @@ def test_exact_geometry_is_stationary(recorded):
     np.testing.assert_allclose(gradient, 0., atol=1e-12)
 
 
+def test_palm_targets_are_invariant_to_world_rigid_motion(recorded):
+    from scipy.spatial.transform import Rotation
+
+    solver, landmarks, _ = recorded
+    original = landmarks[150]
+    moved = original @ Rotation.from_rotvec([.2, -.4, .3]).as_matrix().T + [1., 2., -3.]
+    np.testing.assert_allclose(prepare_landmarks(original), prepare_landmarks(moved), atol=1e-14, rtol=0)
+
+
+def test_zero_dt_returns_owned_reference_and_backwards_time_fails(recorded):
+    solver, landmarks, qpos = recorded
+    solver.reset(qpos[0], timestamp_ns=1_000_000_000)
+    command = solver.retarget(landmarks[1], timestamp_ns=1_000_000_000)
+    np.testing.assert_array_equal(command, qpos[0])
+    command[:] = 0
+    np.testing.assert_array_equal(solver.reference_qpos, qpos[0])
+    with pytest.raises(ValueError, match="backwards"):
+        solver.retarget(landmarks[1], timestamp_ns=999_999_999)
+    with pytest.raises(ValueError, match="backwards"):
+        solver.commit(qpos[0], timestamp_ns=999_999_999)
+    assert solver.reference_timestamp_ns == 1_000_000_000
+
+
 @pytest.mark.parametrize("tau", [0., .02, .2])
 @pytest.mark.parametrize("dt", [.001, .0625, .5])
 def test_final_rate_and_smoothing_at_optimizer_boundary(recorded, tau, dt):
