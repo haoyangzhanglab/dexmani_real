@@ -363,7 +363,7 @@ class Rollout:
         future = self.model.poll()
         if future is not None:
             actions = future.result()
-            if self.state == "HOI_HOLD":
+            if self.state == "HOI_HOLD" or self.first_prediction:
                 # result() 的异常仍须传播，旧预测不能进入恢复后的计划。
                 return
             # sync 直接接收动作；async/RTC 将结果关联到原预测请求。
@@ -465,7 +465,7 @@ class Rollout:
         return row, raw
 
     def update_history(self, row):
-        """收集有效控制采样。跳槽推进时钟，历史可跨越该间断。"""
+        """收集有效控制采样，历史不足时重复段首。"""
         issues = check_observation(row, self.runtime, self.observations.needs)
         if issues:
             self._observation_failure(issues, "model_input")
@@ -626,6 +626,16 @@ class Rollout:
             self.poll_model()
             return
         was_running = self.state == "RUNNING"
+        ode_gap = skipped and self.policy_info.requires_prev_action
+        if ode_gap:
+            self._clear_policy_context()
+            if was_running and self.recorder is not None:
+                self.recorder.mark_gap()
+        if self.policy_info.requires_prev_action and self.first_prediction and self.model.future is not None:
+            self.poll_model()
+            if self.model.future is not None:
+                # 新段从首个可提交查询的观测开始，与离线起点一致。
+                return
         row, raw = self.sample_observation()
         quality_issue = self.recording_issue(raw) if self.recorder is not None else None
         attempted = None
@@ -680,6 +690,6 @@ class Rollout:
         finally:
             # 已尝试提交的恢复动作也需要记录。
             if self.state == "RUNNING" or attempted is not None:
-                if skipped and was_running and self.recorder is not None:
+                if skipped and not ode_gap and was_running and self.recorder is not None:
                     self.recorder.mark_gap()
                 self.record_row(raw, attempted, quality_issue=quality_issue, action_accepted=action_accepted)

@@ -405,7 +405,7 @@ def export_zarr(
     ranges: list[list[int]] = []
     rejected: list[dict[str, str]] = []
     source_count = 0
-    shared_digest: str | None = None
+    shared_geometry: tuple[np.ndarray, np.ndarray] | None = None
     try:
         for index, episode in enumerate(selected):
             if progress_callback:
@@ -446,9 +446,17 @@ def export_zarr(
                 ends.extend((offset + boundaries[1:]).tolist())
                 sources.extend([episode.name] * (len(boundaries) - 1))
                 ranges.extend([[int(a), int(b)] for a, b in pairwise(boundaries)])
-                if template is not None and (source_count == 0 or shared_digest is not None):
-                    digest = geometry_digest(template["points_local"], template["offsets"])
-                    shared_digest = digest if source_count == 0 or digest == shared_digest else None
+                if template is not None and (source_count == 0 or shared_geometry is not None):
+                    points, offsets = template["points_local"], template["offsets"]
+                    if shared_geometry is None:
+                        shared_geometry = points, offsets
+                    else:
+                        shared_points, shared_offsets = shared_geometry
+                        # 比较摘要实际使用的 float32 位模式，包括正负零。
+                        if not np.array_equal(points.view(np.uint32), shared_points.view(np.uint32)) or not np.array_equal(
+                            offsets, shared_offsets,
+                        ):
+                            shared_geometry = None
                 source_count += 1
             except RawDataError as exc:
                 if arrays:
@@ -471,6 +479,7 @@ def export_zarr(
         if "hand_pointcloud" in fields:
             metadata["hand_pointcloud"] = {"num_points": processing.hand_pointcloud.num_points}
         if "object_pointcloud" in fields:
+            shared_digest = geometry_digest(*shared_geometry) if shared_geometry is not None else None
             metadata["object_pointcloud"] = {"geometry_sha256": shared_digest}
             if hoi_devices:
                 metadata["object_pointcloud"]["max_joint_gap_s"] = processing.hoi_max_joint_gap_s
