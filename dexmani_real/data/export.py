@@ -104,21 +104,21 @@ def export_camera(reader, fields):
     camera: dict[str, Any] = {"parameters": {}}
     snapshot = None
     if names & {"rgb", "depth", "point_cloud"}:
+        include_depth = bool(names & {"depth", "point_cloud"})
         snapshot = reader.read_camera(
-            include_depth=bool(names & {"depth", "point_cloud"}),
+            include_depth=include_depth,
             include_extrinsics=bool(names & {"camera_extrinsic", "point_cloud"}),
         )
         camera["snapshot"] = snapshot
         camera["shape"] = (snapshot.color.height, snapshot.color.width)
         if names & {"point_cloud", "camera_extrinsic"} and snapshot.T_xarm_base_from_color is None:
             raise ValueError("point_cloud/camera_extrinsic require camera extrinsics")
-        if names & {"depth", "point_cloud"}:
-            if snapshot.depth_scale_m is None:
-                raise ValueError("depth and point_cloud require a camera depth scale")
+        if include_depth:
             camera["depth_scale_m"] = snapshot.depth_scale_m
         if names & {"rgb", "depth"}:
             camera["image_maps"] = init_undistort_maps(snapshot.color)
         elif "point_cloud" in names:
+            # 在 Raw 输入边界拒绝不支持的畸变，点云算子故障仍直接传播。
             validate_distortion_model(snapshot.color.distortion_model)
     if "camera_intrinsic" in names:
         if snapshot is not None:
@@ -191,7 +191,8 @@ def iter_canonical_blocks(
         with raw_input():
             raw = {name: source[start:end] for name, source in sources.items()}
             for name, values in raw.items():
-                if values.dtype.kind == "f":
+                # 触觉及物体点云直接交给 append_rows 校验。
+                if values.dtype.kind == "f" and name not in {"hand_contact", "hand_tactile_force", "object_pointcloud"}:
                     valid = np.isfinite(values).reshape(count, -1).all(axis=1)
                     if not valid.all():
                         row = start + int(np.flatnonzero(~valid)[0])
@@ -209,9 +210,7 @@ def iter_canonical_blocks(
                 )
             for offset, index in enumerate(range(start, end)):
                 with raw_input():
-                    raw_rgb = next(images, None)
-                if raw_rgb is None:
-                    raise RawDataError(f"{reader.path / 'rgb.mp4'}: RGB missing at row {index}")
+                    raw_rgb = next(images)
                 if "rgb" in fields:
                     block["rgb"][offset] = remap_image(
                         raw_rgb, camera["image_maps"], interpolation=cv2.INTER_LINEAR,
@@ -246,7 +245,7 @@ def iter_canonical_blocks(
         for name, source in (("finger_tactile_force", "hand_contact"), ("taxel_tactile_force", "hand_tactile_force")):
             if name in fields:
                 # Raw 已为 SDK / 255；导出只复制，不再次缩放。
-                block[name] = raw[source].astype(np.float32, copy=False)
+                block[name] = raw[source]
         for name, values in camera["parameters"].items():
             block[name] = np.broadcast_to(values, (count, values.size))
         if "depth" in fields:
@@ -260,9 +259,9 @@ def iter_canonical_blocks(
             block["depth"] = raw["depth"]
         yield block
         del raw, block
-    with raw_input():
-        if images is not None and next(images, None) is not None:
-            raise RawDataError(f"{reader.path / 'rgb.mp4'}: unexpected RGB frame at row {frames}")
+    if images is not None:
+        with raw_input():
+            next(images, None)  # 完整读取还需检查末帧后是否存在多余帧。
 
 
 @contextmanager
@@ -294,8 +293,6 @@ def raw_input():
 
 
 def accepted_joint_targets(reader, boundaries, alignment):
-    if "action_send_accepted" not in reader.data_file:
-        raise RawDataError("action_ode requires recorded per-row action_send_accepted; recollect this Raw")
     status = reader["action_send_accepted"][:]
     accepted = status == 1
     unknown = np.flatnonzero((status != 0) & ~accepted)
@@ -408,7 +405,7 @@ def export_zarr(
     ranges: list[list[int]] = []
     rejected: list[dict[str, str]] = []
     source_count = 0
-    shared_template = None
+    shared_digest: str | None = None
     try:
         for index, episode in enumerate(selected):
             if progress_callback:
@@ -449,16 +446,9 @@ def export_zarr(
                 ends.extend((offset + boundaries[1:]).tolist())
                 sources.extend([episode.name] * (len(boundaries) - 1))
                 ranges.extend([[int(a), int(b)] for a, b in pairwise(boundaries)])
-                if source_count == 0:
-                    shared_template = template
-                elif shared_template is not None and (
-                    # 按与模板摘要相同的 float32 位模式比较。
-                    not np.array_equal(
-                        shared_template["points_local"].view(np.uint32), template["points_local"].view(np.uint32),
-                    )
-                    or not np.array_equal(shared_template["offsets"], template["offsets"])
-                ):
-                    shared_template = None
+                if template is not None and (source_count == 0 or shared_digest is not None):
+                    digest = geometry_digest(template["points_local"], template["offsets"])
+                    shared_digest = digest if source_count == 0 or digest == shared_digest else None
                 source_count += 1
             except RawDataError as exc:
                 if arrays:
@@ -473,7 +463,7 @@ def export_zarr(
                 logger.warning("Rejected Raw %s: %s", episode, exc)
         if root is None:
             raise ValueError(f"all Raw episodes rejected: {rejected}")
-        metadata = {}
+        metadata: dict[str, dict[str, Any]] = {}
         if "action_ode" in fields:
             metadata["action_ode"] = {"semantics": "held_accepted_joint_target"}
         if "point_cloud" in fields:
@@ -481,11 +471,7 @@ def export_zarr(
         if "hand_pointcloud" in fields:
             metadata["hand_pointcloud"] = {"num_points": processing.hand_pointcloud.num_points}
         if "object_pointcloud" in fields:
-            digest = (
-                geometry_digest(shared_template["points_local"], shared_template["offsets"])
-                if shared_template is not None else None
-            )
-            metadata["object_pointcloud"] = {"geometry_sha256": digest}
+            metadata["object_pointcloud"] = {"geometry_sha256": shared_digest}
             if hoi_devices:
                 metadata["object_pointcloud"]["max_joint_gap_s"] = processing.hoi_max_joint_gap_s
         selection = {"rejected_episodes": rejected, "excluded_episodes": sorted(excluded)}

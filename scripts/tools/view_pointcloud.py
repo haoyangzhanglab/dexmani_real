@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """预览 RealSense RGB-D、可选拟合桌面，处理一帧点云后关闭相机静态查看。"""
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ if TYPE_CHECKING:
 
 VIS_DEPTH_RANGE_M = (0.3, 2.5)
 TABLE_CALIBRATION_FRAMES = 5
+MAX_CALIBRATION_POINTS_PER_FRAME = 30_000
 
 
 def parse_args(argv=None):
@@ -43,10 +43,8 @@ def calibrate_table_plane(
     from dexmani_real.perception.pointcloud import aligned_depth_points_in_base
     from dexmani_real.utils.table_plane import save_table_plane
 
-    depth_scale_m = camera.depth_scale_m
-    if depth_scale_m is None:
-        raise ValueError("table calibration requires an RGB-D camera")
-    lower, upper = config.workspace_bounds()
+    depth_scale_m = cast(float, camera.depth_scale_m)
+    lower_xy, upper_xy = config.workspace_bounds()[:, :2]
     print("\n" + "=" * 60)
     print("Table Plane Calibration (multi-frame RANSAC)")
     print("=" * 60)
@@ -71,9 +69,10 @@ def calibrate_table_plane(
             T_xarm_base_from_color=T_xarm_base_from_color,
         )
         # 标定仅限制 XY；Z 边界会单侧截断桌面噪声并偏移拟合高度。
-        points = points[np.all((points[:, :2] >= lower[:2]) & (points[:, :2] <= upper[:2]), axis=1)]
-        if points.shape[0] > 30_000:
-            indices = np.linspace(0, len(points) - 1, 30_000, dtype=np.intp)
+        xy = points[:, :2]
+        points = points[np.all((xy >= lower_xy) & (xy <= upper_xy), axis=1)]
+        if len(points) > MAX_CALIBRATION_POINTS_PER_FRAME:
+            indices = np.linspace(0, len(points) - 1, MAX_CALIBRATION_POINTS_PER_FRAME, dtype=np.intp)
             points = points[indices]
         point_batches.append(points)
     calibration_points = np.concatenate(point_batches, axis=0)

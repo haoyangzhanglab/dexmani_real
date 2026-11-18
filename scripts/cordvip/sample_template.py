@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 
 from cordvip_geometry.mesh import load_mesh
+
 from dexmani_real.config.perception import (
     HOI_MAX_OBJECTS,
     HOI_MIN_POINTS_PER_OBJECT,
@@ -28,8 +29,6 @@ from dexmani_real.utils.io import publish
 
 def allocate_counts(areas):
     areas = np.asarray(areas, dtype=np.float64)
-    if areas.ndim != 1 or not len(areas) or not np.isfinite(areas).all() or np.any(areas <= 0):
-        raise ValueError("表面积必须为非空有限正数数组")
     remaining = HOI_NUM_POINTS - HOI_MIN_POINTS_PER_OBJECT * len(areas)
     if remaining < 0:
         raise ValueError(

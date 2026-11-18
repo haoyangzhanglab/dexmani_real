@@ -29,15 +29,12 @@ def publish(src: str | Path, dst: str | Path) -> Path:
     return target
 
 
-def _write_text(text, target, *, overwrite=True):
+def _write_text(text, target):
     fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.tmp-", dir=target.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(text)
-        if overwrite:
-            os.replace(temporary, target)
-        else:
-            publish(temporary, target)
+        os.replace(temporary, target)
     except BaseException:
         try:
             Path(temporary).unlink(missing_ok=True)
@@ -54,9 +51,9 @@ def write_yaml(obj: object, path: str | Path) -> Path:
     return _write_text(text, Path(path))
 
 
-def write_json(obj: object, path: str | Path, *, overwrite=True) -> Path:
-    """序列化成功后原子发布，保留调用方明确的覆盖政策。"""
+def write_json(obj: object, path: str | Path) -> Path:
+    """完整序列化后原子替换目标文件。"""
     text = json.dumps(obj, indent=2, ensure_ascii=False, allow_nan=False)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    return _write_text(text, target, overwrite=overwrite)
+    return _write_text(text, target)

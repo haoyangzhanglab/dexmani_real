@@ -23,7 +23,7 @@ flowchart TD
 
 ## 实验流程
 
-先完成[相机标定](scripts/calibrate_camera.py)与 [VR 朝向标定](scripts/calibrate_vr_heading.py)。在已配置依赖的 `real_robot` 环境、仓库根目录中运行以下入口；`TASK`、`EPISODE`、`CHECKPOINT` 替换为实际任务、录制目录与模型路径。
+先完成[相机标定](scripts/calibrate_camera.py)与 [VR 朝向标定](scripts/calibrate_vr_heading.py)。场景点云需要去桌面时，运行[点云工具](scripts/tools/view_pointcloud.py)并选择桌面标定。以下命令在 `real_robot` 环境下从仓库根目录运行。将 `TASK`、`EPISODE`、`CHECKPOINT` 替换为实际任务、录制目录与模型路径。
 
 | 要做的实验 | 命令 |
 | --- | --- |
@@ -31,18 +31,15 @@ flowchart TD
 | VR 采集 / 仅遥操作 | `python scripts/collect_teleop.py TASK` / 加 `--no-record` |
 | 键盘调整姿态 | `python scripts/keyboard_teleop.py` |
 | 查看记录 | `python scripts/visualize_episode.py EPISODE`（`--no-hoi` 绕过标注，`--max-frames N` 按需读取前 N 帧） |
-| 离线调试手部重定向 | `python scripts/preview_hand_retargeting.py EPISODE`（`--no-view` 仅计算统计，`--max-frames N` 限制前缀） |
 | 导出训练数据 | `python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr --fields joint_state action` |
 | 策略评估并录制 | `python scripts/run_policy.py CHECKPOINT --record-raw` |
 | 回放臂和手目标完整的 VR 示教 | `python scripts/replay_episode.py episodes/pick/episode_001 --segment 0`（替换实际采集目录，段号从 0 开始） |
 
-需要手动标记任务成败时使用 [label_episode.py](scripts/label_episode.py)。HOI 数据先完成[物体资产准备与离线标注](docs/object_reconstruction.md)。具体选项见各入口的 `--help`。
-
-手部预览从上次离线接受候选的观测时刻算到本行 `observation_ns`，现场求解从上次提交返回算到本槽开始计算目标的时刻。预览使用 Raw 记录的参数、标定和限位；`--config experiment.py` 仅替换重定向参数。输入要求、记录时间和分段语义见[手部重定向](docs/hand_retargeting.md#离线预览)。
+HOI 数据先完成[物体资产准备与离线标注](docs/object_reconstruction.md)。具体选项见各入口的 `--help`。
 
 ### 从示教训练并部署 CordViP
 
-下面使用 `requirements-cpu.txt` 固定的 Policy `b1ddc36` 接口。从本仓库根目录运行。示例 Raw 的 `meta.task_label` 为 `pick`，训练命令的 `task_name` 须与它一致。将前三个路径改为实际的 VR 采集目录、已准备好米制网格和 `task.json` 的资产目录、新的实验输出目录。标注和现场部署需要配好 HOI 跟踪后端，完整训练使用带 GPU 的 Policy 环境。
+以下命令使用 `dexmani_policy` 提交 `d87b937` 中的接口。从本仓库根目录运行。示例 Raw 的 `meta.task_label` 为 `pick`，训练命令的 `task_name` 须与它一致。将前三个路径改为实际的 VR 采集目录、已准备好米制网格和 `task.json` 的资产目录、新的实验输出目录。标注和现场部署需要配好 HOI 跟踪后端，完整训练使用带 GPU 的 Policy 环境。
 
 ```bash
 RAW=/data/episodes/pick
@@ -59,7 +56,7 @@ python scripts/run_policy.py "$RUN/train/checkpoints/latest.pt" \
     --task-dir "$ASSETS" --output "$RUN/evaluation"
 ```
 
-部署记录实际模板的有序局部点和 offsets 摘要，去桌面的场景点云记录归一化平面系数。训练记录有值时会提示差异，便于跨对象、跨台架评估。场景点云过滤为空时，在线继续使用最近一次非空结果，直到其来源过期。
+`run_config.yaml` 保存训练处理参数和部署实际使用的场景、手部点云处理参数。场景点云去桌面时记录归一化平面系数。场景点云过滤为空时，在线继续使用最近一次非空结果，直到其来源过期。
 
 物理回放要求先将机器人就位到所选示教段的起点。回放按 Raw 标称频率顺序重发臂和手的绝对目标，慢槽会延长播放时间。目标含 NaN 或越限时，启动检查给出动作字段和 Raw 内从 0 开始的绝对行号。结尾日志的会话耗时包含连接、播放、末端留驻和关闭。
 
@@ -113,15 +110,8 @@ VR 和键盘启动时各自检查控制周期严格短于 `target_max_age_s`。�
 
 主进程持有会话与 XHand I/O；机械臂 SDK、相机、VR 与启用的感知任务运行在子进程；策略推理和录制各有自己的工作线程。设备 SDK 留在驱动层，动作映射只生成目标，实际发送归 `Robot`。新增实验优先修改配置和对应流程，独立算法放入现有几何或感知模块。
 
-## 开发验证
-
-最小安装、固定样本预览/导出及 CPU CI 命令见 [CPU 离线环境与回归](docs/offline_cpu.md)。手部梯度验证与提交语义见[手部重定向](docs/hand_retargeting.md#数值验证与提交语义)。
-
-安装本项目与配套 Policy 的测试依赖后运行 `python -m pytest -p no:cacheprovider tests -q`。CUDA 用例需要可用 GPU；无设备测试会使用替身，因此通过不代表真机时序、实际执行误差或模型任务性能已验证。
-
 ## 主题文档
 
-- [Teleop / Policy 性能画像](docs/performance_profile.md)：默认关闭的阶段计时、来源年龄和 Recorder 统计。
 - [手部重定向](docs/hand_retargeting.md)：人体关键点到 XHand 关节目标的映射。
 - [策略部署](docs/policy_deployment.md)：观测、推理、动作执行与多段评估流程。
 - [实验数据](docs/data.md) · Raw 记录、时间、动作与 Zarr 导出。

@@ -42,14 +42,7 @@ if [[ -z "${CONDA_PREFIX:-}" ]]; then
     printf 'Activate the existing compatible conda environment before running this script.\n' >&2
     exit 1
 fi
-python - <<'PY'
-import os
-from pathlib import Path
-import sys
-
-if Path(sys.prefix).resolve() != Path(os.environ['CONDA_PREFIX']).resolve():
-    raise SystemExit('python does not belong to the active conda environment')
-PY
+cordvip_python="$CONDA_PREFIX/bin/python"
 
 if ! command -v git >/dev/null; then
     printf 'Missing tool: git\n' >&2
@@ -70,7 +63,7 @@ fi
 
 cordvip_constraints="$(mktemp)"
 trap 'rm -f "$cordvip_constraints"' EXIT
-python - <<'PY' > "$cordvip_constraints"
+"$cordvip_python" - <<'PY' > "$cordvip_constraints"
 from importlib.metadata import version
 for package in ('torch', 'torchvision', 'numpy', 'transformers'):
     print(f'{package}=={version(package)}')
@@ -106,9 +99,12 @@ mkdir -p third_party
 if [[ "$cordvip_operation" == reconstruction ]]; then
     checkout_source Hunyuan3D-2.1 https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git 82920d643c0dc2f7bfd7255f45f62d386edfe60c
     apply_source_patch Hunyuan3D-2.1 hunyuan_hierarchical_decode.patch
-    python -m pip install \
+    "$cordvip_python" -m pip install \
         --constraint "$cordvip_constraints" \
-        --requirement "$cordvip_library/requirements-reconstruction.txt"
+        diffusers==0.30.3 \
+        pymeshlab==2023.12.post3 \
+        scikit-image==0.24.0
+    printf '重建依赖安装完成。下载模型：python -m cordvip_geometry download --models shape\n'
 else
     checkout_source Grounded-SAM-2 https://github.com/IDEA-Research/Grounded-SAM-2.git b7a9c29f196edff0eb54dbe14588d7ae5e3dde28
     checkout_source FoundationPose https://github.com/NVlabs/FoundationPose.git a1b694b83e633c2cb6115b9063d940a687759392
@@ -117,36 +113,39 @@ else
     apply_source_patch Grounded-SAM-2 sam2_inference.patch
     apply_source_patch FoundationPose foundationpose_inference.patch
 
-    python -m pip install \
+    "$cordvip_python" -m pip install \
         --constraint "$cordvip_constraints" \
-        --requirement "$cordvip_library/requirements-tracking.txt"
+        hydra-core==1.3.5 \
+        iopath==0.1.10 \
+        ninja==1.13.2 \
+        kornia==0.7.3 \
+        warp-lang==1.5.1 \
+        ruamel.yaml==0.18.6 \
+        transformations==2024.5.24 \
+        cmeel-eigen==3.4.1 \
+        pybind11==2.13.1
 
     # 使用现有 conda CUDA 编译，保留基础 Torch/CUDA 版本。
     export CUDA_HOME="$CONDA_PREFIX"
     export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include${CPATH:+:$CPATH}"
     export PATH="$CONDA_PREFIX/bin:$PATH"
     export MAX_JOBS="${MAX_JOBS:-4}"
-    python -m pip install --no-build-isolation --no-deps \
+    "$cordvip_python" -m pip install --no-build-isolation --no-deps \
         -e "$cordvip_library"
-    python -m pip install --no-build-isolation --no-deps third_party/nvdiffrast
+    "$cordvip_python" -m pip install --no-build-isolation --no-deps third_party/nvdiffrast
 
-    cordvip_pybind_dir="$(python -m pybind11 --cmakedir)"
-    cordvip_cmeel_prefix="$(python - <<'PY'
+    cordvip_pybind_dir="$("$cordvip_python" -m pybind11 --cmakedir)"
+    cordvip_cmeel_prefix="$("$cordvip_python" - <<'PY'
 import sysconfig
 from pathlib import Path
 print(Path(sysconfig.get_path('purelib')) / 'cmeel.prefix')
 PY
     )"
     cmake -S third_party/FoundationPose/mycpp -B third_party/FoundationPose/mycpp/build \
-        -DPYTHON_EXECUTABLE="$CONDA_PREFIX/bin/python" \
+        -DPYTHON_EXECUTABLE="$cordvip_python" \
         -Dpybind11_DIR="$cordvip_pybind_dir" \
         -DCMAKE_PREFIX_PATH="$cordvip_cmeel_prefix"
     cmake --build third_party/FoundationPose/mycpp/build -j"$MAX_JOBS"
-fi
-
-if [[ "$cordvip_operation" == reconstruction ]]; then
-    printf '重建依赖安装完成。下载模型：python -m cordvip_geometry download --models shape\n'
-else
     printf '跟踪依赖编译完成。下载模型：python -m cordvip_geometry download\n'
     printf 'FoundationPose 权重另放于 third_party/FoundationPose/weights/，见后端 README。\n'
 fi

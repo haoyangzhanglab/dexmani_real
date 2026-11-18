@@ -59,27 +59,23 @@ def track_episode(reader, tracker, names, prompts):
     camera = reader.read_camera()
     if camera.T_xarm_base_from_color is None:
         raise ValueError("HOI 必须有 Raw 中记录的相机外参")
-    if camera.depth_scale_m is None:
-        raise ValueError("HOI 必须有 Raw 中记录的深度单位")
 
     frames = reader.num_frames
     if frames == 0:
         raise ValueError("空 Episode")
     depth = reader["depth"]
 
-    timing = reader["timing/rows"][:]
+    timing = reader.read_timing(source_clocks=("camera_ns",))
     sequences, stamps = timing["camera_sequence"], timing["camera_ns"]
-    new_sequence = np.ones(frames, dtype=bool)
-    new_sequence[1:] = sequences[1:] != sequences[:-1]
-    invalid_clock = (sequences <= 0) | (stamps <= 0)
-    invalid_clock[1:] |= (sequences[1:] < sequences[:-1]) | (stamps[1:] < stamps[:-1])
-    time_conflict = np.zeros(frames, dtype=bool)
-    time_conflict[1:] = ~new_sequence[1:] & (stamps[1:] != stamps[:-1])
-    bad_rows = np.flatnonzero(invalid_clock | time_conflict)
+    new_sequence = np.r_[True, sequences[1:] != sequences[:-1]]
+    invalid_sequence = sequences <= 0
+    invalid_sequence[1:] |= sequences[1:] < sequences[:-1]
+    time_conflict = np.r_[False, ~new_sequence[1:] & (stamps[1:] != stamps[:-1])]
+    bad_rows = np.flatnonzero(invalid_sequence | time_conflict)
     if bad_rows.size:
         index = bad_rows[0]
         reason = (
-            "非法相机时钟" if invalid_clock[index] else "相同相机序列的来源时间冲突"
+            "非法相机序列" if invalid_sequence[index] else "相同相机序列的来源时间冲突"
         )
         raise ValueError(f"{reason}，行 {index}")
 
@@ -87,11 +83,7 @@ def track_episode(reader, tracker, names, prompts):
     valid = np.zeros((frames, len(names)), bool)
     first = True
     quality: list[list[dict[str, float | int | None]]] = []
-    images = iter(reader.iter_rgb_frames())
-    for index in range(frames):
-        rgb = next(images, None)
-        if rgb is None:
-            raise ValueError(f"Raw RGB ended before row {index}")
+    for index, rgb in enumerate(reader.iter_rgb_frames()):
         if not new_sequence[index]:
             poses[index] = poses[index - 1]
             quality.append(quality[-1])
@@ -117,8 +109,6 @@ def track_episode(reader, tracker, names, prompts):
                 poses[index, obj] = result.poses[name]
         quality.append([result.quality[name] for name in names])
 
-    if next(images, None) is not None:
-        raise ValueError("Raw RGB contains more frames than the HDF5 rows")
     return poses, camera.T_xarm_base_from_color, quality, valid
 
 

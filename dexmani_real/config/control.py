@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import isfinite
 
 import numpy as np
 
@@ -67,11 +66,6 @@ class EnvironmentConfig:
 
     # 点云去桌面所用的标定事实。
     table_plane_path: str | None = TABLE_PLANE_RELATIVE_PATH
-
-    def validate(self) -> None:
-        self.workspace.as_array()
-        if not isfinite(self.eef_workspace_tolerance_m) or self.eef_workspace_tolerance_m < 0:
-            raise ValueError("eef_workspace_tolerance_m must be finite and non-negative")
 
     def validate_home(self) -> None:
         if type(self.home_model_confirmed) is not bool:

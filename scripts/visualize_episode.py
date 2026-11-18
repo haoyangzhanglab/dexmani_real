@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+from itertools import islice
 from pathlib import Path
 from typing import cast
 
@@ -21,9 +22,6 @@ from dexmani_real.data.hoi import align_hoi_episode, read_hoi_validity
 from dexmani_real.data.raw import (
     TACTILE_FINGER_ORDER,
     RawReader,
-    open_hoi_file,
-    published_raw_path,
-    read_episode_outcome,
 )
 from dexmani_real.geometry.camera import init_undistort_maps, remap_image
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
@@ -61,23 +59,20 @@ def print_episode_info(episode_path: str, *, hoi: bool = True) -> None:
     import h5py
 
     requested = Path(episode_path).expanduser()
-    path = published_raw_path(requested)
-    print(f"Episode: {requested} -> {path}")
-    print(f"Task outcome: {read_episode_outcome(path)['outcome']}")
-    print(f"RGB file exists: {(path / 'rgb.mp4').is_file()}")
-    with h5py.File(path / "data.h5", "r") as data:
-        for name, value in data["meta"].attrs.items():
+    with RawReader(requested) as reader:
+        print(f"Episode: {requested} -> {reader.path}")
+        print(f"RGB file exists: {reader.rgb_path.is_file()}")
+        for name, value in reader.meta.items():
             print(f"  {name}: {value}")
 
         def describe(name, obj):
             if isinstance(obj, h5py.Dataset):
                 print(f"  {name}: shape={obj.shape}, dtype={obj.dtype}")
 
-        data.visititems(describe)
-        if hoi and (path / "hoi.h5").is_file():
+        reader.data_file.visititems(describe)
+        if hoi and (reader.path / "hoi.h5").is_file():
             print("HOI: hoi.h5")
-            with open_hoi_file(path / "hoi.h5", data["meta"].attrs) as annotations:
-                annotations.visititems(describe)
+            reader.hoi_file.visititems(describe)
 
 
 class EpisodeVisualizer:
@@ -92,6 +87,8 @@ class EpisodeVisualizer:
         pointcloud_config: PointCloudConfig | None = None,
         hand_pointcloud_config: HandCloudConfig = HandCloudConfig(),  # noqa: B008 — 不可变配置可共享。
     ):
+        if max_frames is not None and max_frames <= 0:
+            raise ValueError("max_frames must be positive")
         import rerun as rr
 
         self.rr = rr
@@ -103,8 +100,6 @@ class EpisodeVisualizer:
             if self.frame_count <= 0:
                 raise ValueError("episode must contain at least one row")
             if max_frames is not None:
-                if max_frames <= 0:
-                    raise ValueError("max_frames must be positive")
                 self.frame_count = min(self.frame_count, max_frames)
             hoi_timing = None
             self.hoi_alignment: dict[str, np.ndarray] = {}
@@ -127,8 +122,6 @@ class EpisodeVisualizer:
             self.depth = self.reader["depth"]
 
             self.camera_model = self.reader.read_camera()
-            if self.camera_model.depth_scale_m is None:
-                raise ValueError("RGB-D 可视化必须有 Raw 中记录的深度单位")
             self.image_maps = init_undistort_maps(self.camera_model.color)
             self.T_xarm_base_from_color = self.camera_model.T_xarm_base_from_color
             if pointcloud_config is not None and self.T_xarm_base_from_color is None:
@@ -353,8 +346,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--no-hoi", action="store_true", help="View Raw without opening HOI annotations.")
     args = parser.parse_args(argv)
-    if args.max_frames is not None and args.max_frames <= 0:
-        parser.error("--max-frames must be a positive integer")
     episode_path = Path(args.episode).expanduser()
     if not episode_path.is_dir():
         logger.error("Episode not found: %s", episode_path)
@@ -379,11 +370,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.frame_count)
-        images = viz.reader.iter_rgb_frames()
-        for step in range(viz.frame_count):
-            rgb = next(images, None)
-            if rgb is None:
-                raise ValueError(f"RGB missing at frame {step}")
+        for step, rgb in enumerate(islice(viz.reader.iter_rgb_frames(), viz.frame_count)):
             viz.log_step(step, rgb)
         logger.info("数据已发送，脚本结束；可在 Rerun 中继续浏览。")
     finally:

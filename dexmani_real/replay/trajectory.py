@@ -9,7 +9,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dexmani_real.data.raw import RawReader
-from dexmani_real.runtime.preflight import validate_robot_config, validate_xhand_target_rate
+from dexmani_real.runtime.preflight import (
+    validate_robot_config,
+    validate_xhand_target_rate,
+)
 
 if TYPE_CHECKING:
     from dexmani_real.config.real import RealConfig
@@ -64,7 +67,7 @@ def load_trajectory(episode_path: str | Path, runtime: RealConfig, *, segment: i
             ),
         ):
             # RawReader 统一检查当前动作语义、关节顺序及与时间行数一致的形状。
-            values = reader[field][start:end].astype(np.float64)
+            values = reader[field][start:end]
             finite = np.isfinite(values).all(axis=1)
             if not finite.all():
                 raise ValueError(f"{field} requires finite targets at row {start + np.flatnonzero(~finite)[0]}")

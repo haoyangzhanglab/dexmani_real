@@ -31,7 +31,6 @@ class KeyboardTeleop:
     def run(self):
         configure_logging()
         validate_robot_config(self.runtime)
-        self.runtime.environment.validate()
         config = self.runtime.keyboard_teleop
         config.validate()
         self.period_ns = sampling_clock_ns(config.control_hz)
@@ -41,12 +40,18 @@ class KeyboardTeleop:
                 f"keyboard_teleop.control_hz gives a {self.period_ns} ns period, which must be "
                 f"shorter than the keyboard_teleop.target_max_age_s command lease ({lease_ns} ns)"
             )
-        workspace = self.runtime.environment.workspace.as_array()
+        solver = IKSolver(
+            self.runtime.arm, self.runtime.environment,
+            target_speed=np.deg2rad(self.runtime.motion.ik_target_speed_deg_s),
+            device_speed=self.runtime.arm.max_joint_velocity_rad_per_s,
+            max_lead=np.deg2rad(self.runtime.motion.ik_max_lead_deg),
+        )
+        workspace = solver.workspace
         margin = config.workspace_command_margin_m
         lower, upper = workspace[:, 0] + margin, workspace[:, 1] - margin
         if np.any(lower >= upper):
             raise ValueError("keyboard workspace command margin leaves no interior workspace")
-        self.bounds = lower, upper
+        self.jog = CartesianJog(solver, config, (lower, upper))
         self.runtime_state = SessionState()
         self.robot = Robot(
             self.runtime.arm, self.runtime.hand, runtime_state=self.runtime_state,
@@ -70,9 +75,6 @@ class KeyboardTeleop:
         except KeyboardInterrupt:
             self.runtime_state.request_emergency_stop()
             raise
-        except Exception:
-            self.runtime_state.stop_signal.set()
-            raise
         finally:
             try:
                 close_runtime(self.runtime_state, self.robot, keyboard=self.keys)
@@ -86,13 +88,6 @@ class KeyboardTeleop:
         )
 
     def start(self):
-        solver = IKSolver(
-            self.runtime.arm, self.runtime.environment,
-            target_speed=np.deg2rad(self.runtime.motion.ik_target_speed_deg_s),
-            device_speed=self.runtime.arm.max_joint_velocity_rad_per_s,
-            max_lead=np.deg2rad(self.runtime.motion.ik_max_lead_deg),
-        )
-        self.jog = CartesianJog(solver, self.runtime.keyboard_teleop, self.bounds)
         startup_epoch = self.runtime_state.cancel_epoch
         self.keys.start()
         if not self.keys.check_health():

@@ -1,2 +1,0 @@
-# Ruckig 0.17.3 的源码包使用旧 cmake.targets 配置。
-scikit-build-core<0.10

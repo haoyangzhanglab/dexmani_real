@@ -23,7 +23,6 @@ from dexmani_real.robot.model import (
     XHAND_SDK_JOINT_NAMES,
     XHAND_TACTILE_SCALE_DIVISOR,
 )
-from dexmani_real.utils.io import write_json
 from dexmani_real.utils.timing import sampling_clock_ns
 
 if TYPE_CHECKING:
@@ -41,41 +40,6 @@ class RawDataError(ValueError):
 
 ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
 TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
-EPISODE_OUTCOMES = ("success", "failure", "unknown")
-
-
-def read_episode_outcome(episode_path: str | Path) -> dict[str, object]:
-    """已存在的 Episode 缺少标注才表示 unknown；非法标注与 I/O 错误直接报告。"""
-    episode = Path(episode_path).expanduser()
-    if not episode.is_dir():
-        raise NotADirectoryError(episode)
-    path = episode / "outcome.json"
-    try:
-        with path.open(encoding="utf-8") as stream:
-            annotation = json.load(stream)
-    except FileNotFoundError:
-        return {"outcome": "unknown"}
-    if not isinstance(annotation, dict) or annotation.get("outcome") not in EPISODE_OUTCOMES:
-        raise ValueError(f"{path}: outcome must be one of {EPISODE_OUTCOMES}")
-    return annotation
-
-
-def write_episode_outcome(
-    episode_path: str | Path, outcome: str, *, note: str | None = None, overwrite: bool = False,
-) -> Path:
-    """向已有目录写入独立人工标签。"""
-    if outcome not in EPISODE_OUTCOMES:
-        raise ValueError(f"outcome must be one of {EPISODE_OUTCOMES}")
-    path = Path(episode_path).expanduser()
-    if not path.is_dir():
-        raise NotADirectoryError(path)
-    episode = published_raw_path(path)
-    if not (episode / "data.h5").is_file():
-        raise FileNotFoundError(episode / "data.h5")
-    annotation = {"outcome": outcome}
-    if note is not None:
-        annotation["note"] = note
-    return write_json(annotation, episode / "outcome.json", overwrite=overwrite)
 
 
 ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
@@ -233,7 +197,7 @@ def decode_camera_extrinsic(meta):
 def decode_camera_metadata(meta, *, include_depth=True, include_extrinsics=True) -> CameraSnapshot:
     model = meta["camera_color_distortion_model"]
     if not isinstance(model, str):
-        raise ValueError("camera_color_distortion_model must be a string")
+        raise RawDataError("Raw camera_color_distortion_model must be a string")
     coeffs = np.asarray(meta["camera_color_distortion_coeffs"])
     if coeffs.shape != (5,) or coeffs.dtype.kind not in "fiu":
         raise ValueError("camera_color_distortion_coeffs must contain five numeric values")
@@ -254,10 +218,9 @@ def decode_camera_metadata(meta, *, include_depth=True, include_extrinsics=True)
     scale = None
     if include_depth:
         mode = meta["camera_payload_mode"]
-        if not isinstance(mode, str) or mode not in {"rgb", "depth_to_color_aligned_rgbd"}:
-            raise ValueError(f"Unsupported Raw camera payload: {mode!r}")
-        if mode == "depth_to_color_aligned_rgbd":
-            scale = positive_metadata_scalar(meta, "depth_scale")
+        if not isinstance(mode, str) or mode != "depth_to_color_aligned_rgbd":
+            raise RawDataError(f"Raw camera_payload_mode must be depth_to_color_aligned_rgbd, got {mode!r}")
+        scale = positive_metadata_scalar(meta, "depth_scale")
     return CameraSnapshot(None, color, scale, transform)
 
 
@@ -502,9 +465,12 @@ class RawReader:
         self.data_file = h5py.File(self.path / "data.h5", "r")
         try:
             rows = self.data_file["timing/rows"]
-            if not isinstance(rows, h5py.Dataset) or rows.ndim != 1:
-                raise RawDataError("Raw timing/rows: expected a one-dimensional dataset")
+            if not isinstance(rows, h5py.Dataset) or rows.ndim != 1 or rows.dtype != TIMING_ROW_DTYPE:
+                raise RawDataError(
+                    f"Raw {self.path}: timing/rows must be a one-dimensional dataset of dtype {TIMING_ROW_DTYPE}"
+                )
             self.num_frames = len(rows)
+            self.dataset_cache["timing/rows"] = rows
         except BaseException:
             try:
                 self.close()
@@ -536,8 +502,11 @@ class RawReader:
         self._validate_observation_clock(observation)
         for key in source_clocks:
             stamps = rows[key]
-            if np.any(stamps <= 0) or np.any(stamps > observation) or np.any(stamps[1:] < stamps[:-1]):
-                raise RawDataError(f"invalid source timestamp: {key}")
+            invalid = (stamps <= 0) | (stamps > observation)
+            invalid[1:] |= stamps[1:] < stamps[:-1]
+            indices = np.flatnonzero(invalid)
+            if len(indices):
+                raise RawDataError(f"Raw {self.path}: invalid source timestamp: {key} at row {indices[0]}")
         return rows
 
     def _validate_observation_clock(self, stamps: np.ndarray) -> None:
@@ -555,7 +524,7 @@ class RawReader:
         if not isinstance(dataset, h5py.Dataset):
             raise RawDataError(f"Raw {self.path}: timing/segment_starts must be a dataset")
         starts = np.asarray(dataset[()])
-        if (starts.ndim != 1 or starts.dtype.kind not in "iu"
+        if (starts.ndim != 1 or starts.dtype != np.int64
                 or (self.num_frames == 0 and starts.size != 0)
                 or (self.num_frames > 0 and (starts.size == 0 or starts[0] != 0))
                 or np.any(starts[1:] <= starts[:-1])
@@ -581,9 +550,7 @@ class RawReader:
             if not isinstance(array, h5py.Dataset):
                 raise RawDataError(f"Raw {name}: expected a dataset")
             spec: tuple[tuple[int, ...], np.dtype] | None
-            if name == "timing/rows":
-                spec = (), TIMING_ROW_DTYPE
-            elif name == "depth":
+            if name == "depth":
                 spec = (self.meta["camera_color_height"], self.meta["camera_color_width"]), np.dtype(np.uint16)
             elif name == "object_pointcloud":
                 spec = (HOI_NUM_POINTS, 3), np.dtype(np.float32)
@@ -592,15 +559,9 @@ class RawReader:
             if spec is not None:
                 shape, dtype = spec
                 expected = (self.num_frames, *shape)
-                if dtype.kind == "f" and name != "object_pointcloud":
-                    dtype_ok = array.dtype.kind == "f"
-                    expected_dtype = "floating dtype"
-                else:
-                    dtype_ok = array.dtype == dtype
-                    expected_dtype = f"dtype {dtype}"
-                if array.shape != expected or not dtype_ok:
+                if array.shape != expected or array.dtype != dtype:
                     raise RawDataError(
-                        f"Raw {name}: expected shape {expected} and {expected_dtype}, "
+                        f"Raw {name}: expected shape {expected} and dtype {dtype}, "
                         f"got shape {array.shape} and dtype {array.dtype}"
                     )
             self.dataset_cache[name] = array
@@ -648,6 +609,7 @@ class RawReader:
         return stamps
 
     def iter_rgb_frames(self):
+        """按 Raw 行读取图像，消费结束时检查有无额外帧。"""
         import av
 
         if self.video_container is None:
@@ -659,7 +621,11 @@ class RawReader:
             stream.thread_count = 4
         self.video_container.seek(0)
         expected = (self.meta["camera_color_height"], self.meta["camera_color_width"], 3)
-        for index, frame in enumerate(self.video_container.decode(video=0)):
+        frames = self.video_container.decode(video=0)
+        for index in range(self.num_frames):
+            frame = next(frames, None)
+            if frame is None:
+                raise RawDataError(f"Raw {self.rgb_path}: RGB missing at row {index}")
             image = frame.to_ndarray(format="rgb24")
             if image.shape != expected:
                 raise ValueError(
@@ -667,6 +633,8 @@ class RawReader:
                 )
             yield image
             del image, frame
+        if next(frames, None) is not None:
+            raise RawDataError(f"Raw {self.rgb_path}: unexpected RGB frame at row {self.num_frames}")
 
     def close(self):
         self.dataset_cache.clear()

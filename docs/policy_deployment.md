@@ -2,8 +2,6 @@
 
 策略部署将 dexmani_policy 的预测接入真实机器人闭环。模型负责根据观测输出动作序列，本仓库负责组织观测、调度动作、执行控制，并记录实验数据。
 
-需要测量观测、推理、动作提交和录制耗时时，显式添加 `--profile-output PATH`。报告在会话收尾后独立导出，默认关闭；指标定义和手动验证方法见[性能画像](performance_profile.md)。
-
 ## 执行架构
 
 ```mermaid
@@ -30,7 +28,7 @@ Checkpoint 描述模型的观测字段、动作、RGB 预处理和控制周期�
 
 HOI（`object_pointcloud`）与场景点云（`point_cloud`）是互斥输入。HOI 策略通过 CLI 的 `--task-dir` 或 `PolicySession(..., task_dir=...)` 指定与离线标注共用的任务资产目录。目录支持 `~`，相对路径基于当前工作目录。部署在创建设备前解析并校验任务，`run_config.yaml` 记录实际目录。Checkpoint 的 `task_name` 用作实验标签。
 
-场景点云使用 `RealConfig.pointcloud`，手表面点云使用 `RealConfig.hand_pointcloud`。指尖 FK 与数据导出共用固定五指顺序（thumb、index、middle、ring、pinky）。部署使用当前几何参数和标定，分别记录 `training_processing` 与 `actual_processing`，有差异时在终端提示。桌面平面的归一化系数按 `1e-12` 的绝对容差比较。其他处理参数（含 `geometry_sha256`）精确比较。
+场景点云使用 `RealConfig.pointcloud`，手表面点云使用 `RealConfig.hand_pointcloud`。指尖 FK 与数据导出共用固定五指顺序（thumb、index、middle、ring、pinky）。会话归档的 `training_processing` 来自 Checkpoint，`actual_processing` 记录部署使用的场景及手部点云处理参数。HOI 的关节对齐预算记入 `effective_parameters.execution.hoi_max_joint_gap_s`。
 
 所有策略 RGB 在进入历史前统一为针孔图像，同一相机来源序号复用矫正结果。Policy 在该网格上继续做投影和 resize 坐标变换。图像几何与录制路径见[实验数据](data.md#图像与模型输入)。
 

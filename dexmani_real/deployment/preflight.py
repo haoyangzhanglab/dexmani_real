@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import logging
 import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
-
-import numpy as np
 
 from dexmani_real.config.deployment import ExecutionConfig
 from dexmani_real.deployment.observation import JOINT_OBSERVATION_FIELDS
@@ -20,8 +17,6 @@ from dexmani_real.utils.timing import validate_joint_gap
 
 if TYPE_CHECKING:
     from dexmani_real.config.real import RealConfig
-
-logger = logging.getLogger(__name__)
 
 
 def validate_execution_config(info, execution: ExecutionConfig) -> None:
@@ -101,15 +96,12 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
         runtime.pointcloud.validate()
     runtime = replace(runtime, execution=execution)
     validate_robot_config(runtime)
-    if info.action_mode == "eef":
-        runtime.environment.validate()
     validate_xhand_target_rate(1.0 / cast(float, execution.control_dt_s))
     return runtime
 
 
-def collect_data_processing(info, runtime, *, table_plane_abcd=None, template=None):
-    """记录实际使用的特征处理；已知训练差异仅供实验记录。"""
-    from dexmani_real.geometry.hoi import geometry_digest
+def collect_data_processing(info, runtime, *, table_plane_abcd=None):
+    """记录实际使用的场景点云和手部点云处理参数。"""
     from dexmani_real.perception.pointcloud import processing_metadata
 
     actual = {}
@@ -118,26 +110,4 @@ def collect_data_processing(info, runtime, *, table_plane_abcd=None, template=No
         actual["point_cloud"] = processing_metadata(runtime.pointcloud, table_plane_abcd)
     if "hand_pointcloud" in fields:
         actual["hand_pointcloud"] = {"num_points": runtime.hand_pointcloud.num_points}
-    if "object_pointcloud" in fields:
-        actual["object_pointcloud"] = {
-            "geometry_sha256": geometry_digest(template["points_local"], template["offsets"]),
-        }
-        if JOINT_OBSERVATION_FIELDS.intersection(fields):
-            actual["object_pointcloud"]["max_joint_gap_s"] = runtime.execution.hoi_max_joint_gap_s
-    training = info.data_processing or {}
-    for name, values in actual.items():
-        saved = training.get(name, {})
-        for key, value in values.items():
-            if key not in saved:
-                continue
-            saved_value = saved[key]
-            if saved_value is None:
-                logger.info("训练处理参数未确定 %s.%s", name, key)
-                continue
-            if (name, key) == ("point_cloud", "table_plane_abcd"):
-                differs = not np.allclose(value, saved_value, rtol=0, atol=1e-12)
-            else:
-                differs = value != saved_value
-            if differs:
-                logger.info("处理参数差异 %s.%s: training=%r, actual=%r", name, key, saved_value, value)
     return actual

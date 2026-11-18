@@ -1,6 +1,7 @@
 """有界局部 EEF 跟随；返回下一条目标，不表示到达输入位姿。"""
 
 from dataclasses import dataclass
+from math import isfinite
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -42,6 +43,8 @@ class IKSolver:
         self.limits = np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper))
         self.workspace = environment.workspace.as_array()
         tolerance = environment.eef_workspace_tolerance_m
+        if not isfinite(tolerance) or tolerance < 0:
+            raise ValueError("eef_workspace_tolerance_m must be finite and non-negative")
         self.workspace_with_tolerance = self.workspace + (-tolerance, tolerance)
         self.fk = ArmFK()
         model = self.fk.model

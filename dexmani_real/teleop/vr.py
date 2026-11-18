@@ -10,12 +10,10 @@ from dexmani_real.geometry.pose import (
 )
 from dexmani_real.robot.commands import arm_reference_from_feedback
 from dexmani_real.runtime.ik_reference import IKReference, prepare_reference
-from dexmani_real.utils.profile import call
 
 
 class VRController:
-    def __init__(self, action_mapper, hand_retargeter, config, vr_to_robot_rot, *, profiler=None):
-        self.profiler = profiler
+    def __init__(self, action_mapper, hand_retargeter, config, vr_to_robot_rot):
         self.action_mapper = action_mapper
         self.hand_retargeter = hand_retargeter
         self.config = config
@@ -70,16 +68,13 @@ class VRController:
         target = self._wrist_target(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
         hand = None
         if self.hand_retargeter is not None:
-            hand = call(
-                self.profiler, "hand_retarget_ms", self.hand_retargeter.retarget,
-                row.vr["landmarks"], timestamp_ns=control_ns,
-            )
+            hand = self.hand_retargeter.retarget(row.vr["landmarks"], timestamp_ns=control_ns)
             if hand is None:
                 # 无 arm 求解时仍检查参考，禁止失配目标进入普通重发。
                 measured, command, _, h = reference
                 self.action_mapper.solver.bounds(measured, command, h=h)
                 return ActionResult(None, None, self.hand_retargeter.rejection_reason)
-        return call(self.profiler, "action_mapping_ms", self.action_mapper.map_eef, target, hand, reference)
+        return self.action_mapper.map_eef(target, hand, reference)
 
     def commit(self, command, *, eef_pose, submit_end_ns, measured_qpos):
         if self.hand_retargeter is not None:

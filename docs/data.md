@@ -4,9 +4,9 @@
 
 遥操作默认写入当前目录的 `episodes/<task_name>/`。每个已发布的 Episode 可独立读取和导出，包含 `data.h5`、有损 H.264 图像 `rgb.mp4` 和可选的 [HOI 标注](object_reconstruction.md#标注与查看) `hoi.h5`。用 `python scripts/visualize_episode.py EPISODE --info` 查看结构和录制截断原因。
 
-`data.h5` 的 `meta` 顶层属性保存该段的相机内参、畸变、深度单位和已有外参。`effective_parameters` 是 JSON，保存实际使用的硬件、控制和算法参数，包括 `camera_config`、适用的 VR 标定和 `tactile_reset`。任务成败、控制结束原因与录制结果分别记录。任务成败可用 [label_episode.py](../scripts/label_episode.py) 标注。
+`data.h5` 的 `meta` 顶层属性保存该段的相机内参、畸变、深度单位和已有外参。`effective_parameters` 是 JSON，保存实际使用的硬件、控制和算法参数，包括 `camera_config`、适用的 VR 标定和 `tactile_reset`。
 
-Raw 写入时，关节、绝对关节目标、VR 腕部位姿和手部关键点使用 float64，聚合与稠密触觉使用 float32。读取时这些字段接受任意浮点精度，保留文件中的 dtype。深度须为 uint16，HOI 的 `object_pointcloud` 须为 float32，VR 接收时间和序列号须为 uint64，`timing/rows` 须符合 `TIMING_ROW_DTYPE`。
+Raw 按字段使用固定类型。关节、绝对关节目标、VR 腕部位姿和手部关键点使用 `float64`，触觉与 HOI 点云使用 `float32`，深度使用 `uint16`，VR 接收时间和序列号使用 `uint64`。提交状态使用 `int8`，`timing/segment_starts` 使用 `int64`，`timing/rows` 使用 `TIMING_ROW_DTYPE`。
 
 ## 时间与动作
 
@@ -20,6 +20,8 @@ Raw 动作列保存尝试提交的绝对关节目标，缺失目标记为 NaN。
 
 Raw 保留采集像素网格上的 RGB-D，解码后的有损 RGB 与现场像素值可能有差异。点云取色使用这一路 RGB-D。在线策略 RGB、Canonical RGB/depth 和 Raw 可视化使用同一针孔图像几何，沿用固定 K、原分辨率和光轴。RGB 双线性采样，depth 最近邻采样，越界填零。含图像的 Zarr 标记 `image_geometry="pinhole"`。
 
+读取深度时要求 Raw 记录对齐到彩色网格的深度及其正尺度。完整读取视频时，`rgb.mp4` 帧数必须与 `timing/rows` 一致。可视化只读取所选帧。
+
 模型所需模态经投影进入策略历史。Raw 录制使用本次采样的实测关节、触觉和原始 RGB-D。启用录制时，普通 RGB 策略与 Raw 共用相机源帧。HOI 或场景点云策略的 RGB 跟随对应的派生观测，Raw 从相机通道单独取帧。录制所需的传感器来源也成为本段依赖。
 
 ## 按需导出
@@ -30,6 +32,6 @@ Raw 保留采集像素网格上的 RGB-D，解码后的有损 RGB 与现场像�
 - 所选数据缺失、损坏或所需的 HOI 关节对齐无法覆盖整段时，整条 Raw 回滚并继续处理其他采集。完整有效的截断前缀仍可导出。没有可用采集时导出失败。
 - 根属性 `rejected_episodes` 保存被拒的入口名和原因，`excluded_episodes` 保存显式排除的入口名。排除后仍有两个入口指向同一目录时会报错。
 
-Real ODE 使用 `export_zarr.py --fields joint_state point_cloud action_ode` 导出。失败行沿用上一条已接受目标并保留原时间轴，段首在首条成功命令前使用该段起始关节状态。录制缺少逐行提交状态时，导出器会拒绝生成 `action_ode`。
+配套 Policy 的 Real 原生 ODE 读取 `action_ode`，使用 `export_zarr.py --fields joint_state point_cloud action_ode` 导出。导出器按逐行提交状态选择动作，失败行沿用上一条已接受目标并保留原时间轴。段首在首条成功命令前使用该段起始关节状态。
 
 Zarr 的 `data_processing` 保存实际使用的处理参数。开启去桌面时，归一化系数写入 `data_processing.point_cloud.table_plane_abcd`。部署对应值见 `run_config.yaml` 的 `actual_processing.point_cloud.table_plane_abcd`。开启 contact loss 的固定 1024 槽预训练及其完整续训要求共享的对象模板身份。见[模板摘要](object_reconstruction.md#标注与查看)。

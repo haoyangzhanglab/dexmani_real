@@ -65,12 +65,6 @@ def hand_geometry(
 
     按请求返回 float32 指尖 [T,5,3] 和手部表面点 [T,N,3]；允许 T=0。
     """
-    eef_transforms = np.asarray(eef_transforms)
-    hand_qpos = np.asarray(hand_qpos)
-    if eef_transforms.ndim != 3 or eef_transforms.shape[1:] != (4, 4):
-        raise ValueError("eef_transforms must have shape [T,4,4]")
-    if hand_qpos.ndim != 2 or hand_qpos.shape[1] != 12:
-        raise ValueError("hand_qpos must have shape [T,12]")
     if len(eef_transforms) != len(hand_qpos):
         raise ValueError("eef_transforms and hand_qpos must have the same batch length")
 

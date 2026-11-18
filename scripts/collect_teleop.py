@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
     通过 VR 控制 xArm7/XHand，并将示教录制为 Raw episode。
     python scripts/collect_teleop.py pnp_apple_banana
@@ -49,38 +48,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--camera-calibration", default=None, help="Explicit camera extrinsics JSON"
     )
-    parser.add_argument(
-        "--profile-output", default=None,
-        help="Write an opt-in performance JSON after shutdown; refuses overwrite",
-    )
     args = parser.parse_args(argv)
 
     runtime = load_config(args.config)
     if args.print_config:
-        # collection 展示最终 CLI 选项；运行直接消费下面的显式参数。
-        pprint({"runtime": runtime, "collection": dict(
-            enabled=args.record, episodes_dir=args.episodes_dir, max_duration_s=args.max_duration,
-        )}, sort_dicts=False)
+        pprint({
+            "runtime": runtime,
+            "collection": {
+                "enabled": args.record,
+                "episodes_dir": args.episodes_dir,
+                "max_duration_s": args.max_duration,
+            },
+        }, sort_dicts=False)
         return 0
 
     from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
     from dexmani_real.teleop.run import run_teleop
-    from dexmani_real.utils.profile import profile_session
 
-    with profile_session(args.profile_output, "teleop", runtime, control_hz=runtime.teleop.control_hz) as profiler:
-        exit_code = run_teleop(
-            runtime,
-            profiler=profiler,
-            record=args.record,
-            episodes_dir=args.episodes_dir,
-            max_duration_s=args.max_duration,
-            task_name=args.task_name,
-            vr_transform_path=VR_TRANSFORM_PATH if args.vr_transform is None else args.vr_transform,
-            camera_calibration_path=args.camera_calibration,
-        )
-        if profiler is not None:
-            profiler.exit_code = exit_code
-        return exit_code
+    return run_teleop(
+        runtime,
+        record=args.record,
+        episodes_dir=args.episodes_dir,
+        max_duration_s=args.max_duration,
+        task_name=args.task_name,
+        vr_transform_path=VR_TRANSFORM_PATH if args.vr_transform is None else args.vr_transform,
+        camera_calibration_path=args.camera_calibration,
+    )
 
 
 if __name__ == "__main__":
