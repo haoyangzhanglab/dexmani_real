@@ -34,11 +34,36 @@ flowchart TD
 | 离线调试手部重定向 | `python scripts/preview_hand_retargeting.py EPISODE`（`--no-view` 仅计算统计，`--max-frames N` 限制前缀） |
 | 导出训练数据 | `python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr --fields joint_state action` |
 | 策略评估并录制 | `python scripts/run_policy.py CHECKPOINT --record-raw` |
-| 回放关节目标 | `python scripts/replay_episode.py EPISODE` |
+| 回放臂和手目标完整的 VR 示教 | `python scripts/replay_episode.py episodes/pick/episode_001 --segment 0`（替换实际采集目录，段号从 0 开始） |
 
 需要手动标记任务成败时使用 [label_episode.py](scripts/label_episode.py)。HOI 数据先完成[物体资产准备与离线标注](docs/object_reconstruction.md)。具体选项见各入口的 `--help`。
 
-手部预览使用 Raw 记录的参数、标定和限位；`--config experiment.py` 仅替换重定向参数。输入要求、记录时间和分段语义见[手部重定向](docs/hand_retargeting.md#离线预览)。
+手部预览从上次离线接受候选的观测时刻算到本行 `observation_ns`，现场求解从上次提交返回算到本槽开始计算目标的时刻。预览使用 Raw 记录的参数、标定和限位；`--config experiment.py` 仅替换重定向参数。输入要求、记录时间和分段语义见[手部重定向](docs/hand_retargeting.md#离线预览)。
+
+### 从示教训练并部署 CordViP
+
+下面使用 `requirements-cpu.txt` 固定的 Policy `b1ddc36` 接口。从本仓库根目录运行。示例 Raw 的 `meta.task_label` 为 `pick`，训练命令的 `task_name` 须与它一致。将前三个路径改为实际的 VR 采集目录、已准备好米制网格和 `task.json` 的资产目录、新的实验输出目录。标注和现场部署需要配好 HOI 跟踪后端，完整训练使用带 GPU 的 Policy 环境。
+
+```bash
+RAW=/data/episodes/pick
+ASSETS=/data/tasks/pick
+RUN=/data/experiments/pick_01
+
+python scripts/cordvip/sample_template.py --task-dir "$ASSETS"
+python scripts/cordvip/annotate_episodes.py "$RAW" --task-dir "$ASSETS"
+python scripts/export_zarr.py "$RAW" --output "$RUN/pick.zarr" \
+    --fields joint_state hand_pointcloud object_pointcloud action
+python -m dexmani_policy.train --config-name cordvip task_name=pick \
+    zarr_path="$RUN/pick.zarr" hydra.run.dir="$RUN/train"
+python scripts/run_policy.py "$RUN/train/checkpoints/latest.pt" \
+    --task-dir "$ASSETS" --output "$RUN/evaluation"
+```
+
+部署记录实际模板的有序局部点和 offsets 摘要，去桌面的场景点云记录归一化平面系数。训练记录有值时会提示差异，便于跨对象、跨台架评估。场景点云过滤为空时，在线继续使用最近一次非空结果，直到其来源过期。
+
+物理回放要求先将机器人就位到所选示教段的起点。回放按 Raw 标称频率顺序重发臂和手的绝对目标，慢槽会延长播放时间。目标含 NaN 或越限时，启动检查给出动作字段和 Raw 内从 0 开始的绝对行号。结尾日志的会话耗时包含连接、播放、末端留驻和关闭。
+
+普通策略等待预测的录制行可含 NaN。Raw 动作列的有限值来自该槽尝试提交的组合命令，实际关节位置由反馈列给出。主机时间戳记录采样过程，视频 PTS 取自相对首帧的控制采样时间，两者都无法给出设备执行时延。
 
 实验配置由 [RealConfig](dexmani_real/config/real.py) 组装。用一个可信本地 Python 文件导出 `CONFIG`，将实际设备、工作空间、运动参数集中保存；采集、部署、导出和回放均可传 `--config experiment.py`。例如下面只改变采集周期，其余配置仍须符合实际设备：
 

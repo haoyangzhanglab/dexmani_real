@@ -66,6 +66,7 @@ class EpisodeResult:
     errors: list[dict] = field(default_factory=list)
     raw: dict | None = None
     skipped_slots: int = 0
+    discard_requested: bool = False
 
 
 class Rollout:
@@ -115,7 +116,6 @@ class Rollout:
         self.ik_reference: IKReference | None = None
         self.first_prediction = True
         self.prev_action: np.ndarray | None = None
-        self.discard_requested = False
         self.state: Literal["RUNNING", "HOI_HOLD", "RESUMING"] = "RUNNING"
         self.next_hoi_hold_ns = 0
 
@@ -165,7 +165,7 @@ class Rollout:
             recorder = self.recorder
             if call(
                 self.profiler, "recorder_finish_call_ms", recorder.finish,
-                save=not self.discard_requested, reason=result.termination_reason, wait=wait,
+                save=not result.discard_requested, reason=result.termination_reason, wait=wait,
             ) is None:
                 return False
             self.snapshot_result()
@@ -179,9 +179,6 @@ class Rollout:
         if isinstance(error, KeyboardInterrupt):
             self.runtime_state.request_emergency_stop()
         self.stop(None, run_end_reason=RunEndReason.FAILED)
-        # 停止与收尾仍属于本段；不能保留它们失败前的正常结束状态。
-        self.result.termination_reason = "failed" if self.started_ns else "preparation_failed"
-        self.result.termination_details = None
         self.result.errors.append(error_detail(stage, error))
 
     def run(self, *, poll_operator):
@@ -252,7 +249,8 @@ class Rollout:
                 self.sensors.channels,
                 fields=RAW_RECORDING_NEEDS.camera_fields if include_visual_payloads else (),
             )
-            raw = replace(row, camera=camera, hoi=None, observation_timestamp_ns=time.monotonic_ns())
+            raw = replace(row, camera=camera, point_cloud=None, hoi=None, aligned_joints=None,
+                          observation_timestamp_ns=time.monotonic_ns())
             if self.profiler is not None:
                 self.profiler.sensor("raw_camera", int(camera["timestamp_ns"]) if camera is not None else 0,
                                      raw.observation_timestamp_ns)

@@ -65,13 +65,16 @@ def load_trajectory(episode_path: str | Path, runtime: RealConfig, *, segment: i
         ):
             # RawReader 统一检查当前动作语义、关节顺序及与时间行数一致的形状。
             values = reader[field][start:end].astype(np.float64)
-            if not np.isfinite(values).all():
-                raise ValueError(f"{field} requires finite targets")
+            finite = np.isfinite(values).all(axis=1)
+            if not finite.all():
+                raise ValueError(f"{field} requires finite targets at row {start + np.flatnonzero(~finite)[0]}")
             lower_bound, upper_bound = np.asarray(lower), np.asarray(upper)
-            if np.any(values < lower_bound - TARGET_LIMIT_TOLERANCE_RAD) or np.any(
+            outside = (values < lower_bound - TARGET_LIMIT_TOLERANCE_RAD) | (
                 values > upper_bound + TARGET_LIMIT_TOLERANCE_RAD
-            ):
-                raise ValueError(f"{field} violates configured absolute limits")
+            )
+            if outside.any():
+                row = start + np.flatnonzero(outside.any(axis=1))[0]
+                raise ValueError(f"{field} violates configured absolute limits at row {row}")
             # 仅归一文件精度造成的边界误差；真正越界已在上面拒绝。
             np.clip(values, lower_bound, upper_bound, out=values)
             arrays.append(values)

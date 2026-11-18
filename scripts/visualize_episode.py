@@ -7,7 +7,6 @@ import logging
 import os
 import sys
 import time
-from itertools import islice
 from pathlib import Path
 from typing import cast
 
@@ -19,12 +18,19 @@ import numpy as np
 from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.config.real import load_config
 from dexmani_real.data.hoi import align_hoi_episode, read_hoi_validity
-from dexmani_real.data.raw import TACTILE_FINGER_ORDER, RawReader, read_episode_outcome
+from dexmani_real.data.raw import (
+    TACTILE_FINGER_ORDER,
+    RawReader,
+    open_hoi_file,
+    published_raw_path,
+    read_episode_outcome,
+)
 from dexmani_real.geometry.camera import init_undistort_maps, remap_image
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.utils.table_plane import load_table_plane
+from dexmani_real.utils.timing import validate_joint_gap
 from dexmani_real.utils.visualization.rerun import (
     episode_blueprint,
     log_camera_geometry,
@@ -54,8 +60,9 @@ EEF_COLOR = (255, 255, 255)
 def print_episode_info(episode_path: str, *, hoi: bool = True) -> None:
     import h5py
 
-    path = Path(episode_path).expanduser()
-    print(f"Episode: {path} -> {path.resolve()}")
+    requested = Path(episode_path).expanduser()
+    path = published_raw_path(requested)
+    print(f"Episode: {requested} -> {path}")
     print(f"Task outcome: {read_episode_outcome(path)['outcome']}")
     print(f"RGB file exists: {(path / 'rgb.mp4').is_file()}")
     with h5py.File(path / "data.h5", "r") as data:
@@ -67,10 +74,10 @@ def print_episode_info(episode_path: str, *, hoi: bool = True) -> None:
                 print(f"  {name}: shape={obj.shape}, dtype={obj.dtype}")
 
         data.visititems(describe)
-    if hoi and (path / "hoi.h5").is_file():
-        print("HOI: hoi.h5")
-        with h5py.File(path / "hoi.h5", "r") as annotations:
-            annotations.visititems(describe)
+        if hoi and (path / "hoi.h5").is_file():
+            print("HOI: hoi.h5")
+            with open_hoi_file(path / "hoi.h5", data["meta"].attrs) as annotations:
+                annotations.visititems(describe)
 
 
 class EpisodeVisualizer:
@@ -102,16 +109,22 @@ class EpisodeVisualizer:
             hoi_timing = None
             self.hoi_alignment: dict[str, np.ndarray] = {}
             if hoi and (self.reader.path / "hoi.h5").is_file():
-                hoi_timing = self.reader.read_timing(stop=self.frame_count)
+                validate_joint_gap(hoi_max_joint_gap_s)
+                hoi_timing = self.reader.read_timing(
+                    stop=self.frame_count, source_clocks=("camera_ns", "arm_ns", "hand_ns"),
+                )
                 stamps = hoi_timing["observation_ns"]
                 self.reader["object_pointcloud"]
                 self.hoi_valid = read_hoi_validity(self.reader, stop=self.frame_count)
-                self.hoi_alignment = align_hoi_episode(self.reader, hoi_timing, hoi_max_joint_gap_s)
+                boundaries = np.r_[self.reader.segment_starts, self.reader.num_frames]
+                self.hoi_alignment = align_hoi_episode(self.reader, hoi_timing, boundaries, hoi_max_joint_gap_s)
             else:
                 stamps = self.reader.read_observation_stamps(stop=self.frame_count)
             self.time_ns = stamps - stamps[0]
 
-            self.reader.require_fields("rgb", "depth")
+            if not self.reader.rgb_path.is_file():
+                raise FileNotFoundError(self.reader.rgb_path)
+            self.depth = self.reader["depth"]
 
             self.camera_model = self.reader.read_camera()
             if self.camera_model.depth_scale_m is None:
@@ -121,7 +134,6 @@ class EpisodeVisualizer:
             if pointcloud_config is not None and self.T_xarm_base_from_color is None:
                 logger.warning("No camera extrinsics: camera point cloud disabled")
             self.pointcloud_processor = None
-            self.empty_cloud_count = 0
             if pointcloud_config is not None and self.T_xarm_base_from_color is not None:
                 table_plane = load_table_plane(table_plane_path) if pointcloud_config.remove_table else None
                 self.pointcloud_processor = PointCloudProcessor(
@@ -273,7 +285,7 @@ class EpisodeVisualizer:
         )
 
     def log_camera(self, step_idx: int, rgb: np.ndarray) -> np.ndarray:
-        depth = np.asarray(self.reader["depth"][step_idx])
+        depth = self.depth[step_idx]
         depth_scale_m = cast(float, self.camera_model.depth_scale_m)
         log_rgbd(
             remap_image(rgb, self.image_maps, interpolation=cv2.INTER_LINEAR),
@@ -287,10 +299,7 @@ class EpisodeVisualizer:
     def log_pointcloud(self, rgb: np.ndarray, depth: np.ndarray) -> None:
         if self.pointcloud_processor is None:
             return
-        cloud = self.pointcloud_processor.process(depth, rgb)
-        if not len(cloud):
-            self.empty_cloud_count += 1
-        log_points("pcd", cloud)
+        log_points("pcd", self.pointcloud_processor.process(depth, rgb))
 
     def close(self, error: BaseException | None = None) -> None:
         failure = error
@@ -370,19 +379,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.frame_count)
-        logged_frames = 0
-        for step, rgb in enumerate(islice(viz.reader.iter_rgb_frames(), viz.frame_count)):
+        images = viz.reader.iter_rgb_frames()
+        for step in range(viz.frame_count):
+            rgb = next(images, None)
+            if rgb is None:
+                raise ValueError(f"RGB missing at frame {step}")
             viz.log_step(step, rgb)
-            logged_frames += 1
-            if step % 500 == 0:
-                logger.info("  frame %d/%d", step, viz.frame_count)
-        if logged_frames != viz.frame_count:
-            raise ValueError(f"RGB missing at frame {logged_frames}")
-        if viz.empty_cloud_count:
-            logger.warning(
-                "%d point-cloud frames were empty and explicitly cleared",
-                viz.empty_cloud_count,
-            )
         logger.info("数据已发送，脚本结束；可在 Rerun 中继续浏览。")
     finally:
         viz.close(sys.exc_info()[1])

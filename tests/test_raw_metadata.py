@@ -140,3 +140,24 @@ def test_episode_metadata_preserves_camera_and_input(camera_snapshot, full_camer
 def test_episode_metadata_propagates_serialization_errors(camera_snapshot, effective, tactile_reset, error):
     with pytest.raises(error):
         episode_recording_metadata(camera_snapshot, effective, tactile_reset=tactile_reset)
+
+
+def test_label_requires_published_raw(tmp_path):
+    from scripts.label_episode import main
+
+    episode = tmp_path / "episode"
+    episode.mkdir()
+    with pytest.raises(FileNotFoundError, match="data.h5"):
+        main([str(episode), "success"])
+    staging = tmp_path / ".tmp_episode"
+    staging.mkdir()
+    (staging / "data.h5").touch()
+    alias = tmp_path / "alias"
+    alias.symlink_to(staging)
+    for path in (staging, alias):
+        with pytest.raises(ValueError, match="unpublished Raw"):
+            main([str(path), "success"])
+    assert not (staging / "outcome.json").exists()
+    (episode / "data.h5").touch()
+    assert main([str(episode), "success"]) == 0
+    assert json.loads((episode / "outcome.json").read_text()) == {"outcome": "success"}

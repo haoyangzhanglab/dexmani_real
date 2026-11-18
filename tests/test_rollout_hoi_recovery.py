@@ -318,6 +318,7 @@ def test_rollout_routes_model_and_raw_camera_frames(env, monkeypatch, record_raw
         assert "rgb" not in projected
     assert (raw is row) is (source in (None, "camera") or not record_raw)
     if record_raw:
+        assert raw.point_cloud is raw.hoi is raw.aligned_joints is None
         assert raw.camera["ring_sequence"] == 8
         assert raw.camera["rgb"] is camera.data["rgb"]
         assert raw.camera["depth"] is camera.data["depth"]
@@ -1382,3 +1383,45 @@ def test_episode_finalization_releases_only_completed_resources(env, monkeypatch
         if not task.done():
             task.set_result(None)
         worker.close().result()
+
+
+def test_duration_survives_recording_close_failure(env, tmp_path, monkeypatch):
+    from dexmani_real.data import recorder as recorder_module
+    from dexmani_real.deployment import session as session_module
+
+    monkeypatch.setattr(session_module, "SessionState", lambda: env.state)
+    session = session_module.PolicySession(env.rollout.runtime, "policy.pt", device="cpu")
+    session.episode, session.episodes = env.rollout, [env.rollout.result]
+    recorder = env.rollout.recorder = EpisodeRecorder(tmp_path, control_hz=20)
+    writer = Mock(frame_count=0)
+    writer.close.side_effect = OSError("video close failed")
+    monkeypatch.setattr(recorder_module, "RawWriter", Mock(return_value=writer))
+    recorder.start(task_label="test", collection_source="policy", metadata={})
+    env.advance(60)
+    assert env.rollout.duration_expired()
+    env.advance(2)
+    assert session.close() == 1
+    result = env.rollout.result
+    assert (result.termination_reason, result.termination_details, result.duration_s) == (
+        "duration_complete", "duration_timeout", 60,
+    )
+    assert result.raw["status"] == "failed"
+    assert result.errors[0]["stage"] == "recording" and "video close failed" in result.errors[0]["message"]
+
+
+@pytest.mark.parametrize("key", ["s", "d"])
+@pytest.mark.parametrize("record_raw", [False])
+def test_session_records_discard_without_raw(env, tmp_path, monkeypatch, key):
+    import json
+
+    from dexmani_real.deployment import session as session_module
+
+    monkeypatch.setattr(session_module, "SessionState", lambda: env.state)
+    session = session_module.PolicySession(env.rollout.runtime, "policy.pt", output_root=tmp_path)
+    session.output_dir = tmp_path
+    session.episode, session.episodes = env.rollout, [env.rollout.result]
+    session.handle_command_batch([key])
+    session.save_results()
+    result, = json.loads((tmp_path / "session_result.json").read_text())["episodes"]
+    assert result["raw"] is None and result["termination_reason"] == "operator"
+    assert result["discard_requested"] is (key == "d")

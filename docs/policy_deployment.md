@@ -80,7 +80,9 @@ HOI 的关节与 FK 观测使用按相机来源时间对齐的关节，设备反
 
 用 `--output` 或 Python 的 `output_root` 可显式指定会话输出根目录。省略路径时，启用 Raw 的会话默认写入当前工作目录下的 `rollouts/`，关闭 Raw 的会话仅输出到终端。
 
-启用会话输出目录时，`run_config.yaml` 保存会话实际配置、相机标定和训练与部署各自的处理参数，`session_result.json` 保存运行结果。Raw Episode 各自保存标定及实验参数，结构见[实验数据](data.md#raw-episode)。
+启用会话输出目录时，`run_config.yaml` 保存会话实际配置、相机标定和训练与部署各自的处理参数，`session_result.json` 保存运行结果。每个已启动试次计入 `--num-episodes`。试次结果的 `discard_requested` 记录操作者是否按 D，关闭 Raw 时同样保留。
+
+`termination_reason` 与 `termination_details` 保留首次控制结束原因，录像处置记入 `raw`，收尾故障记入 `errors` 并使会话失败退出。Raw Episode 各自保存标定及实验参数，结构见[实验数据](data.md#raw-episode)。
 
 模型在成功且未取消的预热完成后登记一次；HOI 首次有效观测后预热，之后各轮仍执行跟踪初始化和 episode reset。预热失败、取消或超时不登记成功。
 

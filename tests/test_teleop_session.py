@@ -419,3 +419,20 @@ def test_session_failure_survives_successful_new_episode(teleop):
     teleop.robot.send_action.assert_called_once()
     assert teleop.pending_termination_reason == "operator"
     assert teleop.session_failed and teleop.episode_cancel_epoch is None
+
+
+def test_compute_crosses_recording_deadline_without_submission(active_teleop):
+    teleop, clock = active_teleop
+    teleop.episode_deadline_ns = clock.now + 10_000_000
+    teleop.recorder = Mock()
+
+    def compute(*args, **kwargs):
+        clock.now += 20_000_000
+        return ActionResult(np.zeros(7), None)
+
+    teleop.controller.compute_target.side_effect = compute
+    teleop.run_control_tick()
+    teleop.robot.send_action.assert_not_called()
+    teleop.recorder.append.assert_not_called()
+    assert teleop.pending_termination_reason == "duration_complete"
+    assert teleop.termination_details == [{"stage": "termination", "reason": "max_record_duration"}]

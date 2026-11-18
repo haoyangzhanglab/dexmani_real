@@ -2,20 +2,16 @@
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.perception import PointCloudConfig
 from dexmani_real.geometry.camera import CameraSnapshot
 from dexmani_real.perception.pointcloud import PointCloudProcessor
-from dexmani_real.utils.log import configure_logging
 
 if TYPE_CHECKING:
     from dexmani_real.ipc.ring import SharedRing
     from dexmani_real.ipc.sensors import SensorChannels
-
-logger = logging.getLogger(__name__)
 
 IDLE_POLL_S = 0.001
 
@@ -26,7 +22,6 @@ def run_pointcloud_worker(
     camera: CameraSnapshot,
     table_plane_abcd: tuple[float, float, float, float] | None,
 ) -> None:
-    configure_logging()
     processor = PointCloudProcessor(
         depth_scale_m=camera.depth_scale_m,
         intrinsics=camera.color,
@@ -34,12 +29,6 @@ def run_pointcloud_worker(
         table_plane_abcd=table_plane_abcd,
         config=pointcloud,
     )
-    logger.debug(
-        "pointcloud config=%s table_plane_abcd=%s",
-        pointcloud,
-        table_plane_abcd,
-    )
-
     last_camera_sequence = 0
     # 会话仅在相机和点云通道均已分配时启动本进程。
     camera_ring = cast("SharedRing", shared.camera_ring)

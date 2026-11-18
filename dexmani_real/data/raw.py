@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -17,7 +17,7 @@ from dexmani_real.geometry.camera import (
     CameraSnapshot,
     parse_camera_matrix,
 )
-from dexmani_real.geometry.pose import validate_rigid_transform
+from dexmani_real.geometry.pose import ROTATION_ATOL, validate_rigid_transform
 from dexmani_real.robot.model import (
     XARM7_JOINT_NAMES,
     XHAND_SDK_JOINT_NAMES,
@@ -69,10 +69,13 @@ def write_episode_outcome(
     path = Path(episode_path).expanduser()
     if not path.is_dir():
         raise NotADirectoryError(path)
+    episode = published_raw_path(path)
+    if not (episode / "data.h5").is_file():
+        raise FileNotFoundError(episode / "data.h5")
     annotation = {"outcome": outcome}
     if note is not None:
         annotation["note"] = note
-    return write_json(annotation, path / "outcome.json", overwrite=overwrite)
+    return write_json(annotation, episode / "outcome.json", overwrite=overwrite)
 
 
 ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
@@ -219,6 +222,13 @@ def positive_metadata_scalar(meta, key):
     return float(value)
 
 
+def decode_camera_extrinsic(meta):
+    return validate_rigid_transform(
+        np.asarray(meta["camera_T_xarm_base_from_color"]).reshape(4, 4),
+        label="camera_T_xarm_base_from_color",
+    )
+
+
 def decode_camera_metadata(meta, *, include_depth=True, include_extrinsics=True) -> CameraSnapshot:
     model = meta["camera_color_distortion_model"]
     if not isinstance(model, str):
@@ -239,10 +249,7 @@ def decode_camera_metadata(meta, *, include_depth=True, include_extrinsics=True)
     )
     transform = None
     if include_extrinsics and "camera_T_xarm_base_from_color" in meta:
-        transform = validate_rigid_transform(
-            np.asarray(meta["camera_T_xarm_base_from_color"]).reshape(4, 4),
-            label="camera_T_xarm_base_from_color",
-        )
+        transform = decode_camera_extrinsic(meta)
     scale = None
     if include_depth:
         mode = meta["camera_payload_mode"]
@@ -434,20 +441,41 @@ class RawWriter:
             self.timing_rows = None
 
 
-def _check_raw_published(requested: Path, resolved: Path) -> None:
+def open_hoi_file(path: Path, raw_meta):
+    """打开标注并核对其相机外参与 Raw 一致。"""
+    import h5py
+
+    annotations = h5py.File(path, "r")
+    try:
+        transform = annotations["base_from_camera"]
+        if not isinstance(transform, h5py.Dataset) or transform.shape != (4, 4):
+            raise RawDataError("HOI base_from_camera must be a (4, 4) dataset")
+        recorded = decode_camera_extrinsic(raw_meta)
+        annotated = validate_rigid_transform(transform[()], label="HOI base_from_camera")
+        if not np.allclose(recorded, annotated, atol=ROTATION_ATOL, rtol=0):
+            raise RawDataError("HOI base_from_camera conflicts with Raw camera_T_xarm_base_from_color")
+    except BaseException:
+        annotations.close()
+        raise
+    return annotations
+
+
+def published_raw_path(requested: Path) -> Path:
+    resolved = requested.resolve()
     if requested.name.startswith(".tmp_") or resolved.name.startswith(".tmp_"):
         raise ValueError(f"unpublished Raw: {requested}")
+    return resolved
 
 
 def discover_episode_dirs(input_root: str | Path) -> tuple[Path, ...]:
     """枚举所有 episode 目录，损坏文件由读取边界直接报错。"""
     requested_path = Path(input_root).expanduser()
+    if (requested_path / "data.h5").is_file():
+        episode = published_raw_path(requested_path)
+        return (requested_path.absolute() if requested_path.is_symlink() else episode,)
     root = requested_path.resolve()
     if not root.is_dir():
         raise NotADirectoryError(root)
-    if (root / "data.h5").is_file():
-        _check_raw_published(requested_path, root)
-        return (root,)
     episodes = tuple(
         sorted(
             child
@@ -464,9 +492,7 @@ class RawReader:
     def __init__(self, episode_path: str | Path):
         import h5py
 
-        requested_path = Path(episode_path).expanduser()
-        self.path = requested_path.resolve()
-        _check_raw_published(requested_path, self.path)
+        self.path = published_raw_path(Path(episode_path).expanduser())
         self.rgb_path = self.path / "rgb.mp4"
         self.video_container: av.container.InputContainer | None = None
         self.dataset_cache: dict[str, h5py.Dataset] = {}
@@ -494,7 +520,7 @@ class RawReader:
         sampling_clock_ns(hz)
         return hz
 
-    def read_timing(self, stop: int | None = None) -> np.ndarray:
+    def read_timing(self, stop: int | None = None, *, source_clocks: Iterable[str] = ()) -> np.ndarray:
         """读取并校验所选时间行；连续段由 segment_starts 指定。"""
         rows = self["timing/rows"][:stop]
         control, observation = rows["control_ns"], rows["observation_ns"]
@@ -506,6 +532,10 @@ class RawReader:
             if len(indices):
                 raise ValueError(f"Raw {self.path}: {detail} at row {int(indices[0]) + offset}")
         self._validate_observation_clock(observation)
+        for key in source_clocks:
+            stamps = rows[key]
+            if np.any(stamps <= 0) or np.any(stamps > observation) or np.any(stamps[1:] < stamps[:-1]):
+                raise RawDataError(f"invalid source timestamp: {key}")
         return rows
 
     def _validate_observation_clock(self, stamps: np.ndarray) -> None:
@@ -529,16 +559,7 @@ class RawReader:
                 or np.any(starts[1:] <= starts[:-1])
                 or np.any(starts >= self.num_frames)):
             raise ValueError(f"Raw {self.path}: invalid timing/segment_starts")
-        return starts
-
-    def require_fields(self, *names):
-        """按需打开并校验字段，不枚举与当前任务无关的 HDF5 对象。"""
-        for name in names:
-            if name == "rgb":
-                if not self.rgb_path.is_file():
-                    raise FileNotFoundError(self.rgb_path)
-            else:
-                self[name]
+        return starts.astype(np.intp, copy=False)
 
     def __getitem__(self, name):
         if name not in self.dataset_cache:
@@ -557,6 +578,7 @@ class RawReader:
             import h5py
             if not isinstance(array, h5py.Dataset):
                 raise RawDataError(f"Raw {name}: expected a dataset")
+            spec: tuple[tuple[int, ...], np.dtype] | None
             if name == "timing/rows":
                 spec = (), TIMING_ROW_DTYPE
             elif name == "depth":
@@ -584,10 +606,8 @@ class RawReader:
 
     @property
     def hoi_file(self):
-        import h5py
-
         if self._hoi_file is None:
-            self._hoi_file = h5py.File(self.path / "hoi.h5", "r")
+            self._hoi_file = open_hoi_file(self.path / "hoi.h5", self.meta)
         return self._hoi_file
 
     def read_camera(self, *, include_depth=True, include_extrinsics=True) -> CameraSnapshot:

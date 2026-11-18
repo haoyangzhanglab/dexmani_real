@@ -78,7 +78,7 @@ class TeleopLoop:
         self.audio = audio
 
         self.episode_cancel_epoch: int | None = None  # None 表示当前无活动段；Recorder 仍可能在收尾。
-        self.next_tick_ns = None
+        self.next_tick_ns: int | None = None
         self.control_dt_ns = control_dt_ns
 
         self.recorder: EpisodeRecorder | None = None
@@ -140,7 +140,6 @@ class TeleopLoop:
             status = "结束" if self.recorder is None else "控制结束，录制收尾未完成"
             logger.log(level, "Teleop 本段%s\nEnd reason: %s\nDetails: %s\n%s",
                        status, self.pending_termination_reason, self.termination_details, text)
-            logger.info("Task outcome: unknown")
         if (failure is None and self.recorder is None
                 and not self.runtime_state.quit_requested and not self.runtime_state.estop_request):
             logger.info("停止流程已完成；遥操作控制锚点已清空。检查上方结束原因及录制结果后按 B 开始新段。")
@@ -351,7 +350,6 @@ class TeleopLoop:
             expected_cancel_epoch = self.keyboard.accept_operation(self.runtime_state)
             if expected_cancel_epoch is None:
                 return False
-        logger.debug("Teleop key=%s", cmd.upper())
         if cmd == "esc":
             self.runtime_state.request_emergency_stop()
             self.audio.play("emergency")
@@ -499,6 +497,8 @@ class TeleopLoop:
                 self.request_episode_end("control_sources: " + "; ".join(issues))
                 return
             submit_start_ns = time.monotonic_ns()
+            if self.record_duration_expired(submit_start_ns):
+                return
             candidate_deadline_ns = row.control_timestamp_ns + int(self.runtime.teleop.target_max_age_s * 1e9)
             if (submit_start_ns >= candidate_deadline_ns or
                     self.target_deadline_ns is not None and submit_start_ns >= self.target_deadline_ns):
@@ -566,15 +566,18 @@ class TeleopLoop:
         self.robot.check()
         self.request_episode_end(self.robot.arm.stop_reason or unknown_reason)
 
+    def record_duration_expired(self, now_ns: int) -> bool:
+        if self.episode_deadline_ns is None or now_ns < self.episode_deadline_ns:
+            return False
+        self.request_episode_end("max_record_duration", run_end_reason=RunEndReason.DURATION_COMPLETE)
+        return True
+
     def run_control_tick(self):
         if self.pending_termination_reason is not None:
             return
-        if self.episode_deadline_ns is not None and time.monotonic_ns() >= self.episode_deadline_ns:
-            self.request_episode_end("max_record_duration", run_end_reason=RunEndReason.DURATION_COMPLETE)
-            return
-        if self.runtime_state.stop_signal.is_set():
-            return  # service_episode 归因，并确认停止。
         now_ns = time.monotonic_ns()
+        if self.record_duration_expired(now_ns) or self.runtime_state.stop_signal.is_set():
+            return
         if self.next_tick_ns is not None and now_ns < self.next_tick_ns:
             return
         planned_ns = now_ns if self.next_tick_ns is None else self.next_tick_ns

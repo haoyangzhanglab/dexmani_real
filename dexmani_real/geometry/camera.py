@@ -63,6 +63,11 @@ class CameraIntrinsics:
             raise ValueError("distortion_coeffs must contain five finite values")
         object.__setattr__(self, "distortion_coeffs", coeffs)
 
+    @property
+    def has_distortion(self) -> bool:
+        validate_distortion_model(self.distortion_model)
+        return self.distortion_model.removeprefix("distortion.") != "none" and any(self.distortion_coeffs)
+
     def to_dict(self) -> dict[str, Any]:
         return {**asdict(self), "distortion_coeffs": list(self.distortion_coeffs)}
 
@@ -110,9 +115,7 @@ def camera_parameters_cv(
 
 def init_undistort_maps(intrinsics: CameraIntrinsics) -> tuple[np.ndarray, np.ndarray] | None:
     """固定 K、分辨率和 optical 轴的针孔网格；None 表示恒等映射。"""
-    validate_distortion_model(intrinsics.distortion_model)
-    if (intrinsics.distortion_model in {"none", "distortion.none"}
-            or not any(intrinsics.distortion_coeffs)):
+    if not intrinsics.has_distortion:
         return None
     matrix = intrinsics.matrix()
     return cv2.initUndistortRectifyMap(
@@ -129,9 +132,7 @@ def remap_image(
 ) -> np.ndarray:
     if maps is None:
         return image
-    return cv2.remap(
-        image, *maps, interpolation, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-    )
+    return cv2.remap(image, maps[0], maps[1], interpolation)
 
 
 def camera_extrinsic_cv(T_xarm_base_from_color: np.ndarray) -> np.ndarray:
@@ -146,22 +147,20 @@ def undistorted_depth_coordinates(
     columns: np.ndarray,
     intrinsics: CameraIntrinsics,
 ) -> tuple[np.ndarray, np.ndarray]:
-    validate_distortion_model(intrinsics.distortion_model)
     xd = (np.asarray(columns, dtype=np.float32) - np.float32(intrinsics.ppx)) / np.float32(intrinsics.fx)
     yd = (np.asarray(rows, dtype=np.float32) - np.float32(intrinsics.ppy)) / np.float32(intrinsics.fy)
-    if intrinsics.distortion_model in {"distortion.none", "none"}:
-        x, y = xd, yd
-    else:
-        # 与 librealsense 一致，固定点迭代反解 Brown-Conrady 畸变。
-        k1, k2, p1, p2, k3 = (np.float32(value) for value in intrinsics.distortion_coeffs)
-        x, y = xd.copy(), yd.copy()
-        for _ in range(10):
-            r2 = x * x + y * y
-            radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
-            delta_x = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
-            delta_y = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
-            x = (xd - delta_x) / radial
-            y = (yd - delta_y) / radial
+    if not intrinsics.has_distortion:
+        return xd, yd
+    # 与 librealsense 一致，固定点迭代反解 Brown-Conrady 畸变。
+    k1, k2, p1, p2, k3 = (np.float32(value) for value in intrinsics.distortion_coeffs)
+    x, y = xd.copy(), yd.copy()
+    for _ in range(10):
+        r2 = x * x + y * y
+        radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+        delta_x = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+        delta_y = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+        x = (xd - delta_x) / radial
+        y = (yd - delta_y) / radial
     return x, y
 
 

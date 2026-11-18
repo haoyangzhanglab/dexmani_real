@@ -12,8 +12,9 @@ import numpy as np
 from dexmani_real.config.perception import HOI_NUM_POINTS
 from dexmani_real.data.raw import RawDataError, RawReader
 from dexmani_real.geometry.hoi import transform_task_points
+from dexmani_real.geometry.pose import validate_rigid_transform
 from dexmani_real.utils.io import publish
-from dexmani_real.utils.timing import interpolate_joints, validate_joint_gap
+from dexmani_real.utils.timing import interpolate_joints
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ def write_hoi(
 ):
     import h5py
 
+    base_from_camera = validate_rigid_transform(base_from_camera, label="HOI base_from_camera")
     poses = np.asarray(poses, dtype=np.float32)
     frames = len(poses)
     expected = (frames, len(template["object_names"]))
@@ -97,25 +99,21 @@ def write_hoi(
 
 
 def align_hoi_episode(
-    reader: RawReader, timing: np.ndarray, max_gap_s: float,
+    reader: RawReader, timing: np.ndarray, boundaries: np.ndarray, max_gap_s: float,
+    *, devices: tuple[str, ...] = ("arm", "hand"), require_complete: bool = False,
 ) -> dict[str, np.ndarray]:
     """对齐已校验的时间前缀；只在同一原生段内读取所需邻点。"""
-    validate_joint_gap(max_gap_s)
     count = len(timing)
-    devices = ("arm", "hand")
-    for key in ("camera_ns", *(f"{device}_ns" for device in devices)):
-        if np.any(timing[key] <= 0) or np.any(timing[key] > timing["observation_ns"]):
-            raise ValueError(f"Invalid HOI source timestamp: {key}")
     joints = {
         f"{device}_qpos": np.empty((count, *reader[f"{device}_qpos"].shape[1:]))
         for device in devices
     }
-    boundaries = np.r_[reader.segment_starts, reader.num_frames]
-    for start, end in pairwise(boundaries):
+    for segment, (start, end) in enumerate(pairwise(boundaries)):
         if start >= count:
             break
         selected_end = min(end, count)
         targets = timing["camera_ns"][start:selected_end]
+        gaps = []
         for device in devices:
             name, clock = f"{device}_qpos", f"{device}_ns"
             stamps = timing[clock][start:selected_end]
@@ -145,8 +143,13 @@ def align_hoi_episode(
                 indices, extra_stamps = zip(*neighbors)
                 stamps = np.r_[stamps, extra_stamps]
                 values = np.concatenate((values, reader[name][list(indices)]))
-            positions, _ = interpolate_joints(stamps, values, targets, max_gap_s)
+            positions, valid = interpolate_joints(stamps, values, targets, max_gap_s)
             joints[name][start:selected_end] = positions
+            if require_complete and not valid.all():
+                gaps.append((start + np.flatnonzero(~valid)[0], device))
+        if gaps:
+            row, device = min(gaps)
+            raise RawDataError(f"{device}: unalignable row {row} in segment {segment}")
     return joints
 
 

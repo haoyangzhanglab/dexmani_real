@@ -28,5 +28,6 @@ Raw 保留采集像素网格上的 RGB-D，解码后的有损 RGB 与现场像�
 - 同一产物的 `task_name` 取自各 Raw 一致的 `meta.task_label`。`action_space="joint"` 标记采集动作空间，训练用 `action_key` 选择 `action` 或经 FK 派生的 `action_ee`。
 - 每个原生连续段成为一个 Zarr episode，`source_episodes` 和 `source_row_ranges=[start, stop)` 与 `episode_ends` 逐段对应。位置对齐和采样窗口限于段内。同一采集的各段属于同一个训练或验证分组，`val_episodes` 和 `max_train_episodes` 按采集组计数。
 - 所选数据缺失、损坏或所需的 HOI 关节对齐无法覆盖整段时，整条 Raw 回滚并继续处理其他采集。完整有效的截断前缀仍可导出。没有可用采集时导出失败。
+- 根属性 `rejected_episodes` 保存被拒的入口名和原因，`excluded_episodes` 保存显式排除的入口名。排除后仍有两个入口指向同一目录时会报错。
 
-`data_processing` 是普通训练和恢复可选的研究记录，保存实际使用的处理参数。开启 contact loss 的固定 1024 槽预训练及其完整续训要求共享的对象模板身份。见[模板摘要](object_reconstruction.md#标注与查看)。
+`data_processing` 保存实际使用的处理参数。开启去桌面时，归一化系数写入 `data_processing.point_cloud.table_plane_abcd`；部署对应值见 `run_config.yaml` 的 `actual_processing.point_cloud.table_plane_abcd`。开启 contact loss 的固定 1024 槽预训练及其完整续训要求共享的对象模板身份。见[模板摘要](object_reconstruction.md#标注与查看)。

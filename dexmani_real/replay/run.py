@@ -129,7 +129,7 @@ def run_replay(episode_path: str | Path, runtime: RealConfig, *, segment: int | 
             logger.exception("replay close also failed")
         finally:
             logger.info(
-                "Replay submitted %d/%d rows in %.3f s",
+                "Replay submitted %d/%d rows; session elapsed %.3f s",
                 sent_count,
                 len(trajectory),
                 time.monotonic() - started,

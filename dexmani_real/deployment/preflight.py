@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
@@ -14,6 +15,8 @@ from dexmani_real.utils.timing import validate_joint_gap
 
 if TYPE_CHECKING:
     from dexmani_real.config.real import RealConfig
+
+logger = logging.getLogger(__name__)
 
 
 def validate_execution_config(info, execution: ExecutionConfig) -> None:
@@ -99,25 +102,31 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     return runtime
 
 
-def collect_data_processing(info, runtime):
+def collect_data_processing(info, runtime, *, table_plane_abcd=None, template=None):
     """记录实际使用的特征处理；已知训练差异仅供实验记录。"""
+    from dexmani_real.geometry.hoi import geometry_digest
     from dexmani_real.perception.pointcloud import processing_metadata
 
     actual = {}
     fields = info.observation_fields
     if "point_cloud" in fields:
-        actual["point_cloud"] = processing_metadata(runtime.pointcloud)
+        actual["point_cloud"] = processing_metadata(runtime.pointcloud, table_plane_abcd)
     if "hand_pointcloud" in fields:
         actual["hand_pointcloud"] = {"num_points": runtime.hand_pointcloud.num_points}
-    if "object_pointcloud" in fields and JOINT_OBSERVATION_FIELDS.intersection(fields):
-        actual["object_pointcloud"] = {"max_joint_gap_s": runtime.execution.hoi_max_joint_gap_s}
-    if info.data_processing is None:
-        print("训练处理参数：未记录；本次实际参数单独保存。")
-        return actual
-    for name, values in actual.items():
-        training = {
-            key: info.data_processing.get(name, {}).get(key) for key in values
+    if "object_pointcloud" in fields:
+        actual["object_pointcloud"] = {
+            "geometry_sha256": geometry_digest(template["points_local"], template["offsets"]),
         }
-        if values != training:
-            print(f"处理参数差异 {name}: training={training!r}; actual={values!r}")
+        if JOINT_OBSERVATION_FIELDS.intersection(fields):
+            actual["object_pointcloud"]["max_joint_gap_s"] = runtime.execution.hoi_max_joint_gap_s
+    training = info.data_processing or {}
+    for name, values in actual.items():
+        saved = training.get(name, {})
+        for key, value in values.items():
+            if key not in saved:
+                continue
+            if saved[key] is None:
+                logger.info("训练处理参数未确定 %s.%s", name, key)
+            elif value != saved[key]:
+                logger.info("处理参数差异 %s.%s: training=%r, actual=%r", name, key, saved[key], value)
     return actual

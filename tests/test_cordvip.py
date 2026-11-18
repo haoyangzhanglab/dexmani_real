@@ -53,9 +53,6 @@ class FakeRawReader:
             color=color, depth_scale_m=0.001, T_xarm_base_from_color=np.eye(4)
         )
 
-    def require_fields(self, *names):
-        pass
-
     def __getitem__(self, name):
         if name == "depth":
             return np.ones((3, 2, 2), np.uint16)
@@ -372,6 +369,17 @@ def test_hoi_replacement_failure_keeps_published_files(annotated_episode, monkey
         hoi.write_hoi(episode / "hoi.h5", template, poses, np.eye(4), overwrite=True, **kwargs)
     assert not list(episode.glob(".hoi.h5.tmp-*"))
     assert {name: (episode / name).read_bytes() for name in before} == before
+
+
+def test_hoi_rejects_invalid_extrinsic_before_replacing_annotation(annotated_episode):
+    from dexmani_real.data.hoi import write_hoi
+
+    episode, template, poses, kwargs = annotated_episode
+    path = episode / "hoi.h5"
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="HOI base_from_camera"):
+        write_hoi(path, template, poses, np.zeros((4, 4)), overwrite=True, **kwargs)
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize("stage", ["initialize", "track"])
@@ -2821,21 +2829,28 @@ def test_multiple_moving_objects_share_one_batch_per_frame(recovery_scene, monke
 
 
 @pytest.mark.parametrize("info", [False, True])
-def test_visualizer_can_bypass_corrupt_hoi(annotated_episode, monkeypatch, info):
-    from scripts import visualize_episode as visual
+@pytest.mark.parametrize("conflict", [False, True], ids=["corrupt", "extrinsic_conflict"])
+def test_visualizer_can_bypass_corrupt_hoi(annotated_episode, monkeypatch, info, conflict):
+    import h5py
+
     from dexmani_real.utils import log
+    from scripts import visualize_episode as visual
 
     monkeypatch.setattr(log, "configure_logging", lambda: None)
 
     episode, *_ = annotated_episode
-    (episode / "hoi.h5").write_bytes(b"corrupt annotation")
+    if conflict:
+        with h5py.File(episode / "hoi.h5", "r+") as annotations:
+            annotations["base_from_camera"][0, 3] = .20
+    else:
+        (episode / "hoi.h5").write_bytes(b"corrupt annotation")
     _disable_viewer(monkeypatch, visual)
 
     args = [str(episode), "--no-hoi", "--max-frames", "1", "--no-point-cloud"]
     if info:
         args.append("--info")
     assert visual.main(args) == 0
-    with pytest.raises(OSError):
+    with pytest.raises(ValueError if conflict else OSError, match="base_from_camera conflicts" if conflict else None):
         visual.main([arg for arg in args if arg != "--no-hoi"])
 
 
@@ -2863,6 +2878,23 @@ def _disable_viewer(monkeypatch, visual):
         monkeypatch.setattr(rr, name, lambda *a, **kw: None)
     for name in ("log_rgbd", "log_camera_geometry", "log_points"):
         monkeypatch.setattr(visual, name, lambda *a, **kw: None)
+
+
+def test_viewer_checks_camera_clock_only_for_displayed_hoi_rows(annotated_episode, monkeypatch):
+    import h5py
+
+    from scripts import visualize_episode as visual
+
+    episode, *_ = annotated_episode
+    with h5py.File(episode / "data.h5", "r+") as data:
+        rows = data["timing/rows"][:]
+        rows["camera_ns"][1] = rows["camera_ns"][0] - 1
+        data["timing/rows"][:] = rows
+    _disable_viewer(monkeypatch, visual)
+    visual.EpisodeVisualizer(str(episode), max_frames=1, table_plane_path=None).close()
+    visual.EpisodeVisualizer(str(episode), hoi=False, table_plane_path=None).close()
+    with pytest.raises(ValueError, match="invalid source timestamp: camera_ns"):
+        visual.EpisodeVisualizer(str(episode), table_plane_path=None)
 
 
 def test_visualizer_reads_only_consumed_prefix(annotated_episode, monkeypatch):

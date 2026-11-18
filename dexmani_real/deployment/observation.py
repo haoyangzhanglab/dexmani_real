@@ -33,6 +33,9 @@ JOINT_OBSERVATION_FIELDS = frozenset(
 
 
 class ObservationBuilder:
+    last_rgb_sequence: int | None
+    last_rgb: np.ndarray | None
+
     def __init__(self, info, runtime):
         self.fields = tuple(info.observation_fields)
         unknown = set(self.fields) - FIELD_DEPENDENCIES.keys()
@@ -114,7 +117,7 @@ class ObservationBuilder:
         }
         arrays = {}
         if "joint_state" in fields:
-            arrays["joint_state"] = np.concatenate((joints["arm"], joints["hand"]), axis=1).astype(np.float32)
+            arrays["joint_state"] = np.concatenate((joints["arm"], joints["hand"]), axis=1, dtype=np.float32)
         for name in fields:
             sources = FIELD_DEPENDENCIES[name]
             if "camera_static" in sources:

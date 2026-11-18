@@ -155,7 +155,6 @@ class PolicySession:
             "effective_camera": ({"camera_T_xarm_base_from_color": None,
                                   **camera_metadata(self.camera_snapshot)}
                                  if self.camera_snapshot is not None else None),
-            "table_plane_abcd": self.table_plane_abcd,
             "table_plane_path": (str(resolve_table_plane_path(self.runtime.environment.table_plane_path))
                                  if self.table_plane_abcd is not None else None),
             "num_episodes": self.num_episodes, "max_duration_s": self.max_duration_s,
@@ -233,7 +232,12 @@ class PolicySession:
                 raise ValueError("HOI policy requires explicit task_dir (--task-dir)")
             self.task_dir = Path(self.task_dir).expanduser().resolve()
             self.hoi_inputs = load_hoi_task(self.task_dir)
-        self.actual_processing = collect_data_processing(self.info, self.runtime)
+        if needs.point_cloud and self.runtime.pointcloud.remove_table:
+            self.table_plane_abcd = load_table_plane(self.runtime.environment.table_plane_path)
+        self.actual_processing = collect_data_processing(
+            self.info, self.runtime, table_plane_abcd=self.table_plane_abcd,
+            template=self.hoi_inputs[0] if needs.hoi else None,
+        )
         camera_required = needs.camera_worker or self.record_raw or self.observations.camera_static
         if camera_required:
             self.runtime.camera.validate()
@@ -367,8 +371,6 @@ class PolicySession:
         if needs.point_cloud:
             from dexmani_real.perception.worker import run_pointcloud_worker
 
-            if self.runtime.pointcloud.remove_table:
-                self.table_plane_abcd = load_table_plane(self.runtime.environment.table_plane_path)
             self.sensors.start(
                 self.process_context.Process(
                     name="pointcloud", target=run_pointcloud_worker,
@@ -523,7 +525,7 @@ class PolicySession:
         robot = cast(Robot, self.robot)
         keys = set(signals)
         if "d" in keys and self.episode is not None and not self.episode.finished:
-            self.episode.discard_requested = True
+            self.episode.result.discard_requested = True
         if self.episode is not None and keys.intersection({"s", "c", "d", "q", "esc"}):
             reason = (RunEndReason.ESTOP if "esc" in keys else
                       RunEndReason.QUIT if "q" in keys else RunEndReason.OPERATOR)
@@ -532,7 +534,6 @@ class PolicySession:
             self.runtime_state.request_emergency_stop()
             return None
         if keys.intersection({"s", "c", "d", "q"}):
-            logger.debug("operator: S/C/D/Q suppresses preparation commands in this batch")
             return None
         for signal in signals:
             if signal not in {"b", "h", "t"}:
@@ -649,7 +650,6 @@ class PolicySession:
                         result.index, status, result.duration_s, result.termination_reason,
                         result.termination_details, result.skipped_slots)
             logger.log(level, "%s", text)
-            logger.info("Task outcome: unknown")
             if result.started_utc is not None:
                 completed = sum(item.started_utc is not None for item in self.episodes)
                 if self.num_episodes is not None and completed >= self.num_episodes:

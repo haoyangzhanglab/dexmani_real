@@ -29,12 +29,21 @@ def load_table_plane(path: str | Path | None) -> tuple[float, float, float, floa
     with plane_path.open(encoding="utf-8") as stream:
         plane = json.load(stream)
     coefficients = (float(plane["a"]), float(plane["b"]), float(plane["c"]), float(plane["d"]))
-    if not np.isfinite(coefficients).all():
-        raise ValueError("table plane must be finite")
-    norm = np.linalg.norm(coefficients[:3])
-    if norm <= 1e-9 or coefficients[2] / norm <= 0:
+    return normalize_table_plane(coefficients)
+
+
+def normalize_table_plane(coefficients) -> tuple[float, float, float, float]:
+    plane = np.asarray(coefficients, dtype=np.float64)
+    if plane.shape != (4,) or not np.isfinite(plane).all():
+        raise ValueError("table plane must contain four finite coefficients")
+    norm = np.linalg.norm(plane[:3])
+    if norm <= 1e-9 or plane[2] / norm <= 0:
         raise ValueError("table plane must have an upward non-zero normal")
-    return coefficients
+    # JSON 与 Python 入口共用此表示，已归一化的系数保持逐位一致。
+    if abs(norm - 1.0) > np.finfo(float).eps:
+        plane = plane / norm
+    a, b, c, d = plane
+    return float(a), float(b), float(c), float(d)
 
 
 def save_table_plane(path: str | Path, fit: TablePlaneFit) -> None:

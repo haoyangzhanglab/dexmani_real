@@ -43,29 +43,7 @@ python -m pip install --build-constraint requirements-build.txt \
 python -m pip check
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
 
-python -m pytest -p no:cacheprovider -q -ra \
-  tests/test_cordvip.py::test_rectification_identity \
-  tests/test_cordvip.py::test_brown_rectification_resamples_rgb_and_depth \
-  tests/test_cordvip.py::test_rectification_rejects_unsupported_model_with_zero_coefficients \
-  tests/test_cordvip.py::test_rectification_rejects_mismatched_grids \
-  tests/test_cordvip.py::test_worker_backend_failure_exits_without_invalid_frame \
-  tests/test_cordvip.py::test_refinement_failure_propagates_without_retry \
-  tests/test_cordvip.py::test_initial_backend_failure_propagates \
-  tests/test_cordvip.py::test_tracking_backend_failure_propagates \
-  tests/test_cordvip.py::test_viewer_batches_diagnostics_on_both_timelines \
-  tests/test_cordvip.py::test_visualizer_reads_only_consumed_prefix \
-  tests/test_cordvip.py::test_visualizer_can_bypass_corrupt_hoi \
-  tests/test_cordvip.py::test_visualizer_rejects_invalid_observation_clock_without_hoi \
-  tests/test_cordvip.py::test_viewer_float16_contact_magnitude
-
-python -m pytest -p no:cacheprovider -q -ra \
-  tests/test_hand_retargeting.py tests/test_hand_retargeting_preview.py \
-  tests/test_hand_cloud.py tests/test_export.py tests/test_raw_metadata.py \
-  tests/test_control_xhand.py \
-  tests/test_teleop_session.py tests/test_keyboard_teleop.py tests/test_home.py \
-  tests/test_policy_deployment.py tests/test_policy_session.py \
-  tests/test_rollout_hoi_recovery.py tests/test_experiment_pipeline.py \
-  tests/test_profile.py tests/test_pointcloud.py
+python -m pytest -p no:cacheprovider -q -ra tests
 ```
 
 `requirements-cpu.txt` 明确使用 `+cpu` wheels，不安装 CUDA Torch。配套 Policy 直接安装固定 Git 提交，不读取旁边可能正在修改的工作区。跨仓流水线在临时目录生成小型 Raw、Zarr、训练/恢复 checkpoint，再执行真实 CPU 推理，无需下载预训练权重。
@@ -76,4 +54,4 @@ Ruckig 0.17.3 的源码包使用旧的 `cmake.targets` 构建配置，构建约�
 
 性能画像测试使用设备替身和小型临时 Episode，核对开启采样前后的控制与录制结果。
 
-[CPU workflow](../.github/workflows/cpu.yml) 在 PR、main 更新和手动触发时运行：先检查最小安装与 CLI，再安装回归依赖并执行上面的测试。它覆盖本仓库的 CPU 离线流程，不包含真机、GPU 或 `third_party/` 的独立环境测试。
+[CPU workflow](../.github/workflows/cpu.yml) 在 PR、main 更新和手动触发时运行：先检查最小安装与 CLI，再安装回归依赖并执行上面的测试。CPU 环境会自动跳过需要 CUDA 的用例。

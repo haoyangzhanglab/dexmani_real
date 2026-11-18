@@ -19,7 +19,10 @@ QUAT_NORM_EPS = 1e-12
 
 
 def validate_rigid_transform(value, *, label="transform"):
-    matrix = np.asarray(value, dtype=np.float64)
+    matrix = np.asarray(value)
+    if matrix.dtype.kind not in "fiu":
+        raise ValueError(f"{label} must contain real numeric coefficients")
+    matrix = matrix.astype(np.float64)
     if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
         raise ValueError(f"{label} must be a finite (4, 4) transform")
     if not np.allclose(matrix[3], (0, 0, 0, 1), atol=HOMOGENEOUS_ATOL, rtol=0):
@@ -29,7 +32,7 @@ def validate_rigid_transform(value, *, label="transform"):
     determinant_error = abs(float(np.linalg.det(rotation)) - 1.0)
     if orthogonality_error > ROTATION_ATOL or determinant_error > ROTATION_ATOL:
         raise ValueError(f"{label} must have a proper SO(3) rotation")
-    return matrix.copy()
+    return matrix
 
 
 def _quaternion(value, name):

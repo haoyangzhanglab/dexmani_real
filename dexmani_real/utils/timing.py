@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 
 
-def next_tick_ns(planned_ns, period_ns, now_ns):
+def next_tick_ns(planned_ns: int, period_ns: int, now_ns: int) -> int:
     """跳到时钟网格的下一个未来时刻，不补发已错过的点。"""
     return planned_ns + max(1, (now_ns - planned_ns) // period_ns + 1) * period_ns
 

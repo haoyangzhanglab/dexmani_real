@@ -8,7 +8,7 @@ import shutil
 import sys
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -23,10 +23,11 @@ from dexmani_real.config.perception import (
     HandCloudConfig,
     PointCloudConfig,
 )
-from dexmani_real.data.hoi import read_hoi_validity
+from dexmani_real.data.hoi import align_hoi_episode, read_hoi_validity
 from dexmani_real.data.raw import (
     RawDataError,
     RawReader,
+    decode_camera_extrinsic,
     discover_episode_dirs,
     validate_task_label,
 )
@@ -40,7 +41,7 @@ from dexmani_real.geometry.camera import (
 )
 from dexmani_real.geometry.hoi import geometry_digest, validate_task_template
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
-from dexmani_real.geometry.pose import encode_eef_pose, validate_rigid_transform
+from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor, processing_metadata
 from dexmani_real.robot.model import (
@@ -48,7 +49,8 @@ from dexmani_real.robot.model import (
     XHAND_TACTILE_SCALE_DIVISOR,
 )
 from dexmani_real.utils.io import publish
-from dexmani_real.utils.timing import interpolate_joints, validate_joint_gap
+from dexmani_real.utils.table_plane import normalize_table_plane
+from dexmani_real.utils.timing import validate_joint_gap
 
 CANONICAL_FORMAT = "dexmani.real.canonical"
 logger = logging.getLogger(__name__)
@@ -105,7 +107,6 @@ def export_camera(reader, fields):
             include_depth=bool(names & {"depth", "point_cloud"}),
             include_extrinsics=bool(names & {"camera_extrinsic", "point_cloud"}),
         )
-    if snapshot is not None:
         camera["snapshot"] = snapshot
         camera["shape"] = (snapshot.color.height, snapshot.color.width)
         if names & {"point_cloud", "camera_extrinsic"} and snapshot.T_xarm_base_from_color is None:
@@ -125,10 +126,7 @@ def export_camera(reader, fields):
             matrix = parse_camera_matrix(reader.meta["camera_color_intrinsics"]).astype(np.float32)
         camera["parameters"]["camera_intrinsic"] = matrix.ravel()
     if "camera_extrinsic" in names:
-        transform = snapshot.T_xarm_base_from_color if snapshot is not None else validate_rigid_transform(
-            np.asarray(reader.meta["camera_T_xarm_base_from_color"]).reshape(4, 4),
-            label="camera_T_xarm_base_from_color",
-        )
+        transform = snapshot.T_xarm_base_from_color if snapshot is not None else decode_camera_extrinsic(reader.meta)
         camera["parameters"]["camera_extrinsic"] = camera_extrinsic_cv(transform)
     return camera
 
@@ -156,6 +154,7 @@ def iter_canonical_blocks(
     config: ExportConfig,
     *,
     specs,
+    inputs,
     arm_fk,
     hand_fk,
     hand_cloud,
@@ -164,7 +163,6 @@ def iter_canonical_blocks(
 ):
     frames = reader.num_frames
     fields = specs.keys()
-    inputs = {name for field in fields for name in FIELD_INPUTS[field]}
     row_bytes = sum(int(np.prod(shape)) * dtype.itemsize for shape, dtype in specs.values())
     if "point_cloud" in fields and "depth" not in fields:
         # 点云逐帧计算，但原始深度仍按块读取；额外计入读取预算。
@@ -292,17 +290,15 @@ def raw_input():
         raise
 
 
-def prepare_raw(reader, processing, fields):
+def prepare_raw(reader, processing, fields, clocks, hoi_devices):
     """验证完整 Raw，并准备低维关节对齐；RGB-D 仍在写入时单遍读取。"""
     with raw_input():
         validate_task_label(reader.meta["task_label"])
         if reader.num_frames <= 0:
             raise RawDataError("episode contains no rows")
         boundaries = np.r_[reader.segment_starts, reader.num_frames]
-        timing = reader.read_timing()
-        has_object = "object_pointcloud" in fields
         template = None
-        if has_object:
+        if "object_pointcloud" in fields:
             valid = read_hoi_validity(reader)
             if not valid.all():
                 raise RawDataError(f"HOI contains invalid rows: first at {int(np.flatnonzero(~valid)[0])}")
@@ -317,43 +313,13 @@ def prepare_raw(reader, processing, fields):
             template = {key: saved[key][:] for key in ("points_local", "offsets")}
             template["object_names"] = saved["object_names"].asstr()[:].astype(str)
             validate_task_template(template)
-        inputs = {name for field in fields for name in FIELD_INPUTS[field]}
-        source_clocks = {
-            "arm_qpos": "arm_ns",
-            "hand_qpos": "hand_ns",
-            "hand_contact": "tactile_aggregate_ns",
-            "hand_tactile_force": "tactile_dense_ns",
-            "rgb": "camera_ns",
-            "depth": "camera_ns",
-            "object_pointcloud": "camera_ns",
-        }
-        clocks = {source_clocks[name] for name in inputs if name in source_clocks}
-        for clock in clocks:
-            stamps = timing[clock]
-            if (
-                np.any(stamps <= 0)
-                or np.any(stamps > timing["observation_ns"])
-                or np.any(np.diff(stamps) < 0)
-            ):
-                raise RawDataError(f"invalid source timestamp: {clock}")
+        timing = reader.read_timing(source_clocks=clocks)
         alignment = {}
-        if has_object:
-            for device in ("arm", "hand"):
-                name = f"{device}_qpos"
-                if name not in inputs:
-                    continue
-                source = reader[name]
-                values = np.empty(source.shape, dtype=np.float64)
-                for segment, (start, stop) in enumerate(pairwise(boundaries)):
-                    aligned, valid = interpolate_joints(
-                        timing[f"{device}_ns"][start:stop], source[start:stop],
-                        timing["camera_ns"][start:stop], processing.hoi_max_joint_gap_s,
-                    )
-                    if not valid.all():
-                        row = int(start + np.flatnonzero(~valid)[0])
-                        raise RawDataError(f"{device}: unalignable row {row} in segment {segment}")
-                    values[start:stop] = aligned
-                alignment[name] = values
+        if hoi_devices:
+            alignment = align_hoi_episode(
+                reader, timing, boundaries, processing.hoi_max_joint_gap_s,
+                devices=hoi_devices, require_complete=True,
+            )
         return template, alignment, export_camera(reader, fields), boundaries
 
 
@@ -361,21 +327,27 @@ def export_zarr(
     input_root, output_path, *, processing, fields, exclude=(), progress_callback=None
 ):
     fields = resolve_fields(fields)
-    align_hoi_joints = "object_pointcloud" in fields and any(
-        name in fields for name in ("joint_state", "eef_pose", "fingertip_xyz", "hand_pointcloud")
+    inputs = {name for field in fields for name in FIELD_INPUTS[field]}
+    source_clocks = {
+        "arm_qpos": "arm_ns",
+        "hand_qpos": "hand_ns",
+        "hand_contact": "tactile_aggregate_ns",
+        "hand_tactile_force": "tactile_dense_ns",
+        "rgb": "camera_ns",
+        "depth": "camera_ns",
+        "object_pointcloud": "camera_ns",
+    }
+    clocks = {source_clocks[name] for name in inputs if name in source_clocks}
+    hoi_devices = tuple(
+        device for device in ("arm", "hand")
+        if "object_pointcloud" in inputs and f"{device}_qpos" in inputs
     )
-    if align_hoi_joints:
+    if hoi_devices:
         validate_joint_gap(processing.hoi_max_joint_gap_s)
     if "point_cloud" in fields:
         processing.pointcloud.validate()
         if processing.pointcloud.remove_table:
-            plane = np.asarray(processing.table_plane_abcd, dtype=float)
-            if (
-                plane.shape != (4,)
-                or not np.isfinite(plane).all()
-                or np.linalg.norm(plane[:3]) == 0
-            ):
-                raise ValueError("remove_table=True requires a finite calibrated table plane")
+            processing = replace(processing, table_plane_abcd=normalize_table_plane(processing.table_plane_abcd))
     if "hand_pointcloud" in fields:
         processing.hand_pointcloud.validate()
     target = Path(output_path).expanduser().absolute()
@@ -383,12 +355,11 @@ def export_zarr(
         raise FileExistsError(target)
     selected, excluded = select_episodes(input_root, exclude)
     arm_fk = ArmFK() if ARM_FK_FIELDS.intersection(fields) else None
-    hand_fk = HandFK() if HAND_FK_FIELDS.intersection(fields) else None
-    hand_cloud = (
-        HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
-        if "hand_pointcloud" in fields
-        else None
-    )
+    hand_fk = hand_cloud = None
+    if HAND_FK_FIELDS.intersection(fields):
+        hand_fk = HandFK()
+        if "hand_pointcloud" in fields:
+            hand_cloud = HandPointCloud(hand_fk, processing.hand_pointcloud.num_points)
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=target.parent))
     root = None
@@ -408,13 +379,15 @@ def export_zarr(
                 with raw_input():
                     reader = RawReader(episode)
                 with reader:
-                    template, alignment, camera, boundaries = prepare_raw(reader, processing, fields)
+                    template, alignment, camera, boundaries = prepare_raw(
+                        reader, processing, fields, clocks, hoi_devices,
+                    )
                     specs = canonical_array_specs(fields, processing, camera)
                     with raw_input():
                         hz = reader.control_hz
                     if root is None:
                         root, arrays = create_store(
-                            zarr.DirectoryStore(str(staging)), processing, camera,
+                            zarr.DirectoryStore(str(staging)), camera,
                             specs=specs, control_hz=hz, task_name=reader.meta["task_label"],
                         )
                     else:
@@ -429,7 +402,7 @@ def export_zarr(
                         if any(arrays[name].shape[1:] != shape for name, (shape, _) in specs.items()):
                             raise RawDataError("inconsistent field shape")
                     blocks = iter_canonical_blocks(
-                        reader, processing, specs=specs, arm_fk=arm_fk, hand_fk=hand_fk,
+                        reader, processing, specs=specs, inputs=inputs, arm_fk=arm_fk, hand_fk=hand_fk,
                         hand_cloud=hand_cloud, camera=camera, alignment=alignment,
                     )
                     append_rows(arrays, offset, blocks, reader.num_frames)
@@ -463,7 +436,9 @@ def export_zarr(
             raise ValueError(f"all Raw episodes rejected: {rejected}")
         metadata = {}
         if "point_cloud" in fields:
-            metadata["point_cloud"] = processing_metadata(processing.pointcloud)
+            metadata["point_cloud"] = processing_metadata(processing.pointcloud, processing.table_plane_abcd)
+            if processing.pointcloud.remove_table:
+                root.attrs["table_plane_abcd"] = metadata["point_cloud"]["table_plane_abcd"]
         if "hand_pointcloud" in fields:
             metadata["hand_pointcloud"] = {"num_points": processing.hand_pointcloud.num_points}
         if "object_pointcloud" in fields:
@@ -472,16 +447,17 @@ def export_zarr(
                 if shared_template is not None else None
             )
             metadata["object_pointcloud"] = {"geometry_sha256": digest}
-            if align_hoi_joints:
+            if hoi_devices:
                 metadata["object_pointcloud"]["max_joint_gap_s"] = processing.hoi_max_joint_gap_s
-        root.attrs.update(source_episodes=sources, source_row_ranges=ranges, data_processing=metadata)
+        selection = {"rejected_episodes": rejected, "excluded_episodes": sorted(excluded)}
+        root.attrs.update(**selection, source_episodes=sources, source_row_ranges=ranges, data_processing=metadata)
         root.create_group("meta").create_dataset("episode_ends", data=np.asarray(ends, dtype=np.int64))
         publish(staging, target)
         if progress_callback:
             progress_callback(len(selected), len(selected))
         return {
             "path": str(target), "source_count": source_count, "episode_count": len(ends),
-            "total_frames": ends[-1], "rejected_episodes": rejected, "excluded_episodes": sorted(excluded),
+            "total_frames": ends[-1], **selection,
         }
     finally:
         failure = sys.exc_info()[1]
@@ -494,7 +470,7 @@ def export_zarr(
             logger.exception("export staging cleanup also failed: %s", staging)
 
 
-def create_store(store, processing, camera, *, specs, control_hz, task_name):
+def create_store(store, camera, *, specs, control_hz, task_name):
     fields = specs.keys()
     root = zarr.group(store=store, overwrite=True)
     root.attrs.update(
@@ -507,8 +483,6 @@ def create_store(store, processing, camera, *, specs, control_hz, task_name):
         root.attrs["tactile_scale_divisor"] = XHAND_TACTILE_SCALE_DIVISOR
     if {"action", "action_ee"}.intersection(fields):
         root.attrs["action_semantics"] = "absolute_joint_goal_not_next_step_arrival"
-    if "point_cloud" in fields and processing.pointcloud.remove_table:
-        root.attrs["table_plane_abcd"] = processing.table_plane_abcd
     if "fingertip_xyz" in fields:
         root.attrs["fingertip_link_names"] = list(XHAND_FINGERTIP_LINK_NAMES)
     if {"rgb", "depth"}.intersection(fields):
@@ -558,4 +532,10 @@ def select_episodes(source, exclude):
     selected = [episode for episode in episodes if episode.name not in excluded]
     if not selected:
         raise ValueError("export has no selected episodes")
+    entries: dict[Path, str] = {}
+    for episode in selected:
+        resolved = episode.resolve()
+        if resolved in entries:
+            raise ValueError(f"duplicate Raw directory: {entries[resolved]} and {episode.name}")
+        entries[resolved] = episode.name
     return selected, excluded

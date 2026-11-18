@@ -71,7 +71,7 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 | 逐对象有效性，bool `[T,O]` | `hoi.h5:/object_valid` |
 | 逐帧、逐对象质量指标 | `hoi.h5:/quality/` |
 | 固定模板、对象顺序及点分段 | `hoi.h5:/template/` |
-| 相机到基座的变换 | `hoi.h5:/base_from_camera` |
+| 相机到基座的变换 | `hoi.h5:/base_from_camera`，必须与 Raw 的 `camera_T_xarm_base_from_color` 一致 |
 | 实际跟踪配置 | `hoi.h5` 根属性 `tracking_config` |
 
 `quality` 组始终存在，可以为空。缺失或为 `None` 的指标保存为 NaN；纯深度路径未计算的 Mask 指标为 −1，可视化均显示为曲线缺口。指标含义见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)。
@@ -84,7 +84,7 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 
 [visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则。HOI 诊断、关节和触觉曲线与逐帧 RGB-D、几何共用帧号 `step` 和相对首帧观测的整数纳秒 `time`。关节与相机的来源时差以毫秒显示，逐物体质量和有效性按列发送。无效物体点云和不可对齐的手几何隐藏，保留对应行的时间位置。
 
-可视化启动前要求展示范围内的 `observation_ns` 严格递增。查看 HOI 时同时校验控制时钟。
+可视化启动前要求展示范围内的 `observation_ns` 严格递增。查看 HOI 时还校验控制时钟，并要求所读的相机、臂和手来源时间为正、不晚于观测且不倒退。
 
 - `--max-frames N` 只加载展示前缀；关节插值可读取同一原生段内所需的邻点。
 - `--no-hoi`（Python 参数 `hoi=False`）完全绕过标注，手部几何使用 Raw 关节；与 `--info` 组合也不打开 HOI 文件。

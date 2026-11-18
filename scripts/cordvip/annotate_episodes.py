@@ -65,7 +65,6 @@ def track_episode(reader, tracker, names, prompts):
     frames = reader.num_frames
     if frames == 0:
         raise ValueError("空 Episode")
-    reader.require_fields("rgb", "depth")
     depth = reader["depth"]
 
     timing = reader["timing/rows"][:]

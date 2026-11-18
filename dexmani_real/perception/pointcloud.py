@@ -7,6 +7,7 @@ from numpy.typing import NDArray
 
 from dexmani_real.config.perception import PointCloudConfig
 from dexmani_real.geometry.camera import CameraIntrinsics, deproject_depth, depth_rays
+from dexmani_real.utils.table_plane import normalize_table_plane
 
 DEPTH_RANGE_M = (0.30, 1.50)
 NEIGHBORHOOD_KERNEL = np.ones((3, 3), dtype=np.uint8)
@@ -183,8 +184,7 @@ class PointCloudProcessor:
         self.rays_base = (rays @ transform[:3, :3].T).astype(np.float32)
         self.translation = transform[:3, 3].astype(np.float32)
         if config.remove_table:
-            plane = np.asarray(table_plane_abcd, dtype=np.float64)
-            plane_color = transform.T @ (plane / np.linalg.norm(plane[:3]))
+            plane_color = transform.T @ normalize_table_plane(table_plane_abcd)
             self.table_height_per_depth = rays @ plane_color[:3]
             self.table_offset = plane_color[3]
 
@@ -219,19 +219,22 @@ class PointCloudProcessor:
         return np.column_stack((points[selected], colors[selected]))
 
 
-def processing_metadata(config):
+def processing_metadata(config, table_plane_abcd):
     """记录实际配置和固定滤波常量；与处理实现共用权威值。"""
     from dataclasses import asdict
 
-    return dict(
-        config={**asdict(config), "workspace": list(config.workspace)},
-        depth_range_m=list(DEPTH_RANGE_M),
-        edge_jump_m=EDGE_JUMP_M,
-        edge_surface_band_m=EDGE_SURFACE_BAND_M,
-        depth_min_support=DEPTH_MIN_SUPPORT,
-        edge_min_support=EDGE_MIN_SUPPORT,
-        voxel_size_m=VOXEL_SIZE_M,
-        outlier_radius_m=OUTLIER_RADIUS_M,
-        outlier_min_neighbors=OUTLIER_MIN_NEIGHBORS,
-        outlier_min_component_points=OUTLIER_MIN_COMPONENT_POINTS,
-    )
+    metadata = {
+        "config": {**asdict(config), "workspace": list(config.workspace)},
+        "depth_range_m": list(DEPTH_RANGE_M),
+        "edge_jump_m": EDGE_JUMP_M,
+        "edge_surface_band_m": EDGE_SURFACE_BAND_M,
+        "depth_min_support": DEPTH_MIN_SUPPORT,
+        "edge_min_support": EDGE_MIN_SUPPORT,
+        "voxel_size_m": VOXEL_SIZE_M,
+        "outlier_radius_m": OUTLIER_RADIUS_M,
+        "outlier_min_neighbors": OUTLIER_MIN_NEIGHBORS,
+        "outlier_min_component_points": OUTLIER_MIN_COMPONENT_POINTS,
+    }
+    if config.remove_table:
+        metadata["table_plane_abcd"] = list(table_plane_abcd)
+    return metadata

@@ -278,6 +278,7 @@ def hoi_episodes(raw_episodes):
     }
     for episode in sorted(source.iterdir()):
         with h5py.File(episode / "data.h5", "r+") as f:
+            f["meta"].attrs["camera_T_xarm_base_from_color"] = np.eye(4).ravel()
             count = len(f["timing/rows"])
         write_hoi(
             episode / "hoi.h5",
@@ -396,7 +397,8 @@ def test_hoi_diagnostics_preserve_internal_gap(raw_episodes):
         rows["camera_ns"][1] -= 10_000_000
         f["timing/rows"][:] = rows
     with RawReader(episode) as reader:
-        aligned = align_hoi_episode(reader, reader.read_timing(), 0.01)
+        boundaries = np.r_[reader.segment_starts, reader.num_frames]
+        aligned = align_hoi_episode(reader, reader.read_timing(), boundaries, 0.01)
         for values in aligned.values():
             assert len(values) == reader.num_frames
             assert np.isnan(values[1]).all()
@@ -526,7 +528,7 @@ def test_pinhole_export_matches_online_and_keeps_raw_cloud(tmp_path, raw_episode
         display = Mock()
         monkeypatch.setattr(visualize_episode, "log_rgbd", display)
         with RawReader(episode) as reader:
-            viewer = SimpleNamespace(reader=reader, camera_model=snapshot, image_maps=maps)
+            viewer = SimpleNamespace(depth=reader["depth"], camera_model=snapshot, image_maps=maps)
             raw_depth = visualize_episode.EpisodeVisualizer.log_camera(viewer, 0, images[0])
         np.testing.assert_array_equal(display.call_args.args[0], root["data/rgb"][0])
         np.testing.assert_array_equal(display.call_args.args[1], root["data/depth"][0])
@@ -775,7 +777,7 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
     from dexmani_policy.datasets.demonstration import DemonstrationDataset
     from dexmani_policy.datasets.preprocess.contact_map import generate
     from dexmani_policy.datasets.pretrain.cordvip import CordViPPretrainDataset
-    from dexmani_policy.training.data import record_data_processing
+    from dexmani_policy.training.common.data import record_data_processing
     from dexmani_policy.training.pretrain.hand_prior.vqvae import prepare_hand_data
     from omegaconf import OmegaConf
 
@@ -820,7 +822,7 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
     cfg = OmegaConf.create({})
     record_data_processing(cfg, pretrain)
     checkpoint = Checkpoint(
-        global_step=0, model_state={}, optimizer_state={}, scheduler_state={},
+        global_step=0, model_state={}, ema_model_state=None, optimizer_state={}, scheduler_state={},
         effective_config=OmegaConf.to_container(cfg, resolve=True),
     )
     restored = load_checkpoint(save_checkpoint(tmp_path / "model.pt", checkpoint))
@@ -830,9 +832,14 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
         observation_fields=("hand_pointcloud", "object_pointcloud"),
         data_processing=restored.effective_config["data_processing"],
     )
-    assert collect_data_processing(info, runtime) == {
+    with h5py.File(complete_episodes / "episode_0/hoi.h5") as annotations:
+        template = {key: annotations[f"template/{key}"][:] for key in ("points_local", "offsets")}
+    assert collect_data_processing(info, runtime, template=template) == {
         "hand_pointcloud": {"num_points": runtime.hand_pointcloud.num_points},
-        "object_pointcloud": {"max_joint_gap_s": runtime.execution.hoi_max_joint_gap_s},
+        "object_pointcloud": {
+            "geometry_sha256": info.data_processing["object_pointcloud"]["geometry_sha256"],
+            "max_joint_gap_s": runtime.execution.hoi_max_joint_gap_s,
+        },
     }
     assert "geometry_sha256" in info.data_processing["object_pointcloud"]
     assert "geometry_sha256" not in info.data_processing["hand_pointcloud"]
@@ -872,7 +879,7 @@ def test_complete_interpolation_preserves_every_row(tmp_path, hoi_episodes, with
     from dexmani_real.utils.timing import interpolate_joints
 
     interpolate = Mock(wraps=interpolate_joints)
-    monkeypatch.setattr("dexmani_real.data.export.interpolate_joints", interpolate)
+    monkeypatch.setattr("dexmani_real.data.hoi.interpolate_joints", interpolate)
     source, states, actions = hoi_episodes
     raw_states = states.copy()
     expected = states.copy()
@@ -1193,11 +1200,12 @@ def test_rgb_ignores_unused_camera_metadata(tmp_path, complete_episodes, depth_s
     assert result["source_count"] == 2 and not result["rejected_episodes"]
 
 
-def test_joint_alignment_never_crosses_native_gap(tmp_path, hoi_episodes):
+@pytest.mark.parametrize("index_dtype", [np.int64, np.uint64])
+def test_joint_alignment_never_crosses_native_gap(tmp_path, hoi_episodes, index_dtype):
     source, _, _ = hoi_episodes
     with h5py.File(source / "episode_0/data.h5", "r+") as data:
         del data["timing/segment_starts"]
-        data.create_dataset("timing/segment_starts", data=[0, 2])
+        data.create_dataset("timing/segment_starts", data=np.array([0, 2], dtype=index_dtype))
         timing = data["timing/rows"][:]
         timing["camera_ns"][2] -= 10_000_000
         data["timing/rows"][:] = timing
@@ -1291,8 +1299,9 @@ def test_hoi_prefix_matches_full_alignment(raw_episodes, starts, gap, stop, dela
         data.create_dataset("timing/segment_starts", data=starts)
     with RawReader(episode) as reader:
         timing = reader.read_timing()
-        full = align_hoi_episode(reader, timing, gap)
-        prefix = align_hoi_episode(reader, timing[:stop], gap)
+        boundaries = np.r_[reader.segment_starts, reader.num_frames]
+        full = align_hoi_episode(reader, timing, boundaries, gap)
+        prefix = align_hoi_episode(reader, timing[:stop], boundaries, gap)
         for key in full:
             np.testing.assert_allclose(prefix[key], full[key][:stop], equal_nan=True)
         if starts == [0] and (gap == .1 or delay_ns == 100_000_000):
@@ -1332,7 +1341,8 @@ def test_prefix_reads_needed_right_neighbor_not_bad_tail(raw_episodes, monkeypat
             data[f"{device}_qpos"][1] = data[f"{device}_qpos"][0]
         data["timing/rows"][:] = rows
     with RawReader(episode) as reader:
-        expected = align_hoi_episode(reader, reader.read_timing(), .1)
+        boundaries = np.r_[reader.segment_starts, reader.num_frames]
+        expected = align_hoi_episode(reader, reader.read_timing(), boundaries, .1)
     with h5py.File(episode / "data.h5", "r+") as data:
         data["arm_qpos"][3] = np.nan
         data["hand_qpos"][3] = np.nan
@@ -1351,7 +1361,8 @@ def test_prefix_reads_needed_right_neighbor_not_bad_tail(raw_episodes, monkeypat
 
     monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
     with RawReader(episode) as reader:
-        prefix = align_hoi_episode(reader, reader.read_timing(stop=1), .1)
+        boundaries = np.r_[reader.segment_starts, reader.num_frames]
+        prefix = align_hoi_episode(reader, reader.read_timing(stop=1), boundaries, .1)
         for key in prefix:
             np.testing.assert_allclose(prefix[key], expected[key][:1], equal_nan=True)
     assert reads == [(name, key) for name in ("/arm_qpos", "/hand_qpos")
@@ -1373,7 +1384,8 @@ def test_prefix_skips_unneeded_stale_joint_values(raw_episodes, monkeypatch, cas
             data[f"{device}_qpos"][:] = 0
         data["timing/rows"][:] = rows
     with RawReader(episode) as reader:
-        expected = align_hoi_episode(reader, reader.read_timing(), .1)
+        boundaries = np.r_[reader.segment_starts, reader.num_frames]
+        expected = align_hoi_episode(reader, reader.read_timing(), boundaries, .1)
     with h5py.File(episode / "data.h5", "r+") as data:
         for device in ("arm", "hand"):
             data[f"{device}_qpos"][1] = np.nan
@@ -1388,6 +1400,88 @@ def test_prefix_skips_unneeded_stale_joint_values(raw_episodes, monkeypatch, cas
 
     monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
     with RawReader(episode) as reader:
-        actual = align_hoi_episode(reader, reader.read_timing(stop=1), .1)
+        boundaries = np.r_[reader.segment_starts, reader.num_frames]
+        actual = align_hoi_episode(reader, reader.read_timing(stop=1), boundaries, .1)
         for key in actual:
             np.testing.assert_allclose(actual[key], expected[key][:1], equal_nan=True)
+
+
+def test_raw_alias_selected_only_once(tmp_path, raw_episodes):
+    source, _, _ = raw_episodes
+    alias = source / "episode_alias"
+    alias.symlink_to(source / "episode_0", target_is_directory=True)
+    output = tmp_path / "export/data.zarr"
+    kwargs = {"processing": ExportConfig(), "fields": ("joint_state",)}
+    with pytest.raises(ValueError, match="episode_0.*episode_alias"):
+        export_zarr(source, output, **kwargs)
+    assert not output.parent.exists()
+
+    result = export_zarr(source, output, exclude=["episode_0"], **kwargs)
+    root = zarr.open_group(result["path"], mode="r")
+    assert root.attrs["source_episodes"] == ["episode_1", "episode_alias"]
+    assert root.attrs["excluded_episodes"] == ["episode_0"]
+    result = export_zarr(alias, tmp_path / "single.zarr", **kwargs)
+    assert zarr.open_group(result["path"], mode="r").attrs["source_episodes"] == ["episode_alias"]
+
+
+@pytest.mark.parametrize(("field", "value", "reason"), [
+    ("base_from_camera", None, "base_from_camera"),
+    ("camera_T_xarm_base_from_color", None, "camera_T_xarm_base_from_color"),
+    ("base_from_camera", np.eye(4) + np.eye(4, k=3) * .20, "HOI base_from_camera conflicts"),
+    ("base_from_camera", np.full((4, 4), b"x"), "HOI base_from_camera must contain real numeric coefficients"),
+    ("camera_T_xarm_base_from_color", np.eye(4) + 1j, "must contain real numeric coefficients"),
+])
+def test_hoi_extrinsic_rejects_only_selected_raw(
+    tmp_path, complete_episodes, hoi_episodes, field, value, reason,
+):
+    episode = complete_episodes / "episode_1"
+    is_raw = field == "camera_T_xarm_base_from_color"
+    with h5py.File(episode / ("data.h5" if is_raw else "hoi.h5"), "r+") as data:
+        target = data["meta"].attrs if is_raw else data
+        del target[field]
+        if value is not None:
+            target[field] = value
+    result = export_zarr(complete_episodes, tmp_path / "hoi.zarr", processing=ExportConfig(),
+                         fields=("object_pointcloud",))
+    root = zarr.open_group(result["path"], mode="r")
+    assert root.attrs["source_episodes"] == ["episode_0"]
+    assert root.attrs["rejected_episodes"] == result["rejected_episodes"]
+    rejected, = result["rejected_episodes"]
+    assert rejected["episode"] == "episode_1" and reason in rejected["reason"]
+    result = export_zarr(complete_episodes, tmp_path / "joints.zarr", processing=ExportConfig(),
+                         fields=("joint_state",))
+    assert result["source_count"] == 2
+
+
+def test_pointcloud_export_records_normalized_table_plane(tmp_path, complete_episodes):
+    from dexmani_real.config.perception import PointCloudConfig
+
+    config = PointCloudConfig(workspace=(-1, -1, 0, 1, 1, 1))
+    for height in (.05, .10):
+        result = export_zarr(complete_episodes, tmp_path / f"{height}.zarr", fields=("point_cloud",),
+                             processing=ExportConfig(pointcloud=config, table_plane_abcd=(0, 0, 2, -2 * height)))
+        attrs = zarr.open_group(result["path"], mode="r").attrs
+        assert attrs["data_processing"]["point_cloud"]["table_plane_abcd"] == attrs["table_plane_abcd"] == [0, 0, 1, -height]
+    with pytest.raises(ValueError, match="upward"):
+        export_zarr(complete_episodes, tmp_path / "invalid.zarr", fields=("point_cloud",),
+                    processing=ExportConfig(pointcloud=config, table_plane_abcd=(0, 0, -1, .05)))
+
+
+@pytest.mark.parametrize("field,value,reason", [
+    ("action_arm_joint_target", np.nan, "finite targets"),
+    ("action_hand_joint_target", 20.0, "absolute limits"),
+])
+def test_replay_reports_absolute_target_row_in_selected_segment(raw_episodes, field, value, reason):
+    from dexmani_real.config.real import RealConfig
+    from dexmani_real.replay.trajectory import load_trajectory
+
+    episode = raw_episodes[0] / "episode_0"
+    runtime = RealConfig()
+    with h5py.File(episode / "data.h5", "r+") as data:
+        del data["timing/segment_starts"]
+        data["timing/segment_starts"] = [0, 2]
+        data["action_arm_joint_target"][:] = runtime.arm.home_qpos
+        data["action_hand_joint_target"][:] = np.deg2rad(runtime.hand.home_qpos_deg)
+        data[field][3, 0] = value
+    with pytest.raises(ValueError, match=rf"{field}.*{reason} at row 3"):
+        load_trajectory(episode, runtime, segment=1)

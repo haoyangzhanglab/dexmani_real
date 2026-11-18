@@ -158,7 +158,9 @@ def test_policy_derived_channel_carries_only_requested_rgb(
     policy_session.task_dir = tmp_path
     fields = (field, "rgb") if include_rgb else (field,)
     policy_session.wait_model = lambda: replace(policy_info, observation_fields=fields)
-    monkeypatch.setattr(session, "load_hoi_task", Mock())
+    monkeypatch.setattr(session, "load_hoi_task", Mock(return_value=(
+        {"points_local": np.zeros((1024, 3), np.float32), "offsets": np.array([0, 1024])}, {}, {},
+    )))
     monkeypatch.setattr(session, "PolicyWorker", Mock())
     monkeypatch.setattr(session, "Robot", Mock())
     policy_session.prepare_resources()
@@ -242,19 +244,28 @@ def test_resolved_period_must_fit_policy_lease(policy_session, policy_info, monk
 
 @pytest.mark.parametrize("path_form", ["relative", "home"])
 def test_hoi_session_uses_explicit_task_and_records_path(
-    policy_session, policy_info, monkeypatch, tmp_path, path_form,
+    policy_session, policy_info, monkeypatch, tmp_path, path_form, caplog,
 ):
     task = tmp_path / "assets/pick"
     (task / "hoi").mkdir(parents=True)
     (task / "task.json").write_text(json.dumps({"objects": [{"name": "apple"}]}))
-    np.savez(task / "hoi/template.npz", points_local=np.zeros((1024, 3), np.float32),
-             offsets=np.array([0, 1024]), object_names=np.array(["apple"]))
+    from dexmani_real.geometry.hoi import geometry_digest
+
+    points = np.arange(3072, dtype=np.float32).reshape(1024, 3)
+    offsets = np.array([0, 1024])
+    path = task / "hoi/template.npz"
+    np.savez(path, points_local=points, offsets=offsets, object_names=["apple"])
+    original, _, _ = session.load_hoi_task(task)
+    trained = geometry_digest(original["points_local"], original["offsets"])
+    np.savez(path, points_local=points[::-1], offsets=offsets, object_names=["apple"])
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path))
+    caplog.set_level("INFO", logger="dexmani_real.deployment.preflight")
     policy_session.task_dir = "assets/pick" if path_form == "relative" else "~/assets/pick"
     policy_session.output_root = tmp_path / "results"
     policy_session.wait_model = lambda: replace(
         policy_info, observation_fields=("object_pointcloud",), task_name="independent/experiment label",
+        data_processing={"object_pointcloud": {"geometry_sha256": trained if path_form == "home" else None}},
     )
     monkeypatch.setattr(session, "PolicyWorker", Mock())
     channels = Mock(hoi_ready=SimpleNamespace(value=True))
@@ -286,6 +297,10 @@ def test_hoi_session_uses_explicit_task_and_records_path(
 
     saved = yaml.safe_load((policy_session.output_dir / "run_config.yaml").read_text())
     assert saved["task_dir"] == str(task)
+    digest = saved["actual_processing"]["object_pointcloud"]["geometry_sha256"]
+    assert digest == geometry_digest(points[::-1], offsets) and digest != trained
+    expected = "差异" if path_form == "home" else "未确定"
+    assert f"{expected} object_pointcloud.geometry_sha256" in caplog.text
 
 
 def test_cli_accepts_unbounded_duration(monkeypatch):

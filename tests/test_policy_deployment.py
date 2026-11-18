@@ -277,23 +277,25 @@ def test_hoi_warmup_commits_only_successful_uncancelled_result(fault):
         worker.close().result()
 
 
-def test_processing_records_differences_without_rejecting(info, capsys):
+def test_processing_records_differences_without_rejecting(info, caplog):
     from dexmani_real.deployment.preflight import collect_data_processing
     from dexmani_real.perception.pointcloud import processing_metadata
 
     runtime = RealConfig()
-    saved = {"point_cloud": processing_metadata(runtime.pointcloud)}
+    caplog.set_level("INFO", logger="dexmani_real.deployment.preflight")
+    plane = (0, 0, 1, -.02)
+    saved = {"point_cloud": processing_metadata(runtime.pointcloud, plane)}
     info = replace(info, data_processing=saved)
-    assert collect_data_processing(info, runtime) == saved
+    assert collect_data_processing(info, runtime, table_plane_abcd=plane) == saved
     changed = replace(runtime, pointcloud=replace(runtime.pointcloud, num_points=17))
-    assert collect_data_processing(info, changed) == {
-        "point_cloud": processing_metadata(changed.pointcloud),
+    assert collect_data_processing(info, changed, table_plane_abcd=plane) == {
+        "point_cloud": processing_metadata(changed.pointcloud, plane),
     }
-    assert "处理参数差异 point_cloud" in capsys.readouterr().out
-    without_record = replace(info, data_processing=None)
-    assert collect_data_processing(without_record, runtime) == saved
-    assert without_record.data_processing is None
-    assert "未记录" in capsys.readouterr().out
+    assert "处理参数差异 point_cloud" in caplog.text
+    other_plane = (0, 0, 1, -.03)
+    actual = collect_data_processing(info, runtime, table_plane_abcd=other_plane)
+    assert actual["point_cloud"]["table_plane_abcd"] == list(other_plane)
+    assert "差异 point_cloud.table_plane_abcd" in caplog.text
 
 
 @pytest.mark.parametrize("fail", [False, True])
