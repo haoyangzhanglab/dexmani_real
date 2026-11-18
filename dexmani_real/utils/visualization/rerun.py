@@ -101,13 +101,11 @@ def log_points(path: str, points: np.ndarray | None, *, colors=None, radii=0.003
 
 
 def log_series(
-    path: str, values: np.ndarray, *, labels: Sequence[str], steps: np.ndarray,
-    timestamps_s: np.ndarray,
+    path: str, values: np.ndarray, *, labels: Sequence[str], indexes,
 ) -> None:
     """批量发送一组曲线；双时间轴由数据来源显式提供。"""
     import rerun as rr
 
-    indexes = [rr.TimeSequenceColumn("step", steps), rr.TimeSecondsColumn("time", timestamps_s)]
     for index, label in enumerate(labels):
         entity = f"{path}/{index}"
         rr.log(entity, rr.SeriesLine(name=label), static=True)

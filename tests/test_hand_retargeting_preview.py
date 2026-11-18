@@ -44,7 +44,7 @@ def episode(tmp_path):
         },
     }
     times = np.array([
-        1_000_000_000, 1_040_000_000, 1_110_000_000, 2_000_000_000, 2_060_000_000, 2_100_000_000,
+        1_000_000_000, 1_062_500_008, 1_110_000_000, 2_000_000_000, 2_060_000_000, 2_100_000_000,
     ])
     rows = np.zeros(6, dtype=TIMING_ROW_DTYPE)
     rows["observation_ns"] = times
@@ -59,7 +59,7 @@ def episode(tmp_path):
         data.create_dataset("timing/rows", data=rows)
         data.create_dataset("timing/segment_starts", data=np.array([0, 3], dtype=np.int64))
         data.create_dataset("hand_qpos", data=qpos)
-        data.create_dataset("vr_landmarks", data=np.tile(landmarks, (6, 1, 1)))
+        data.create_dataset("vr_landmarks", data=np.tile(landmarks, (6, 1, 1)), dtype=np.float32)
     return path
 
 
@@ -173,7 +173,7 @@ def test_recorded_observation_clock_and_segment_resets(episode, fake_solver):
     events, _ = fake_solver
     result = preview.preview_episode(episode, view=False)
     assert [(e[0], e[1]) for e in events] == [
-        ("reset", 1_000_000_000), ("retarget", 1_040_000_000), ("commit", 1_040_000_000),
+        ("reset", 1_000_000_000), ("retarget", 1_062_500_008), ("commit", 1_062_500_008),
         ("retarget", 1_110_000_000), ("reset", 2_000_000_000),
         ("retarget", 2_060_000_000), ("commit", 2_060_000_000),
         ("retarget", 2_100_000_000), ("commit", 2_100_000_000),
@@ -191,7 +191,7 @@ def test_rejection_preserves_reference_position_and_time(episode, fake_solver):
     events, _ = fake_solver
     result = preview.preview_episode(episode, max_frames=4, view=False)
     after_rejection = [event for event in events if event[0] == "retarget"][-1]
-    assert after_rejection[2] == 1_040_000_000
+    assert after_rejection[2] == 1_062_500_008
     np.testing.assert_array_equal(after_rejection[3], result["reference_qpos"][1])
     np.testing.assert_array_equal(result["reference_qpos"][2], result["reference_qpos"][1])
     assert np.isnan(result["candidate_qpos"][2]).all()
@@ -285,8 +285,9 @@ def test_invalid_selected_input_and_solver_errors_propagate(episode, fake_solver
         preview.preview_episode(episode, view=False)
 
 
-def test_rerun_logging_with_viewer_spawn_disabled(episode, fake_solver, monkeypatch):
+def test_rerun_logging_with_viewer_spawn_disabled(episode, fake_solver, monkeypatch, tmp_path):
     import rerun as rr
+    from rerun.dataframe import load_recording
 
     result = preview.preview_episode(episode, max_frames=3, view=False)
     original_log = rr.log
@@ -298,8 +299,16 @@ def test_rerun_logging_with_viewer_spawn_disabled(episode, fake_solver, monkeypa
 
     monkeypatch.setattr(rr, "init", lambda *args, **kwargs: None)
     monkeypatch.setattr(rr, "log", capture_log)
-    with rr.new_recording("hand-preview-test", spawn=False):
+    path = tmp_path / "preview.rrd"
+    with rr.new_recording("hand-preview-test", spawn=False) as recording:
+        recording.save(path)
         preview.show_preview(result, HandFK(), episode.name)
+        recording.disconnect()
+    saved = load_recording(path)
+    for entity in ("/qpos/measured/0", "/hand/measured/fingertips"):
+        axes = saved.view(index="step", contents=entity).select("step", "time").read_all()
+        assert axes["step"].to_pylist() == [0, 1, 2]
+        assert axes["time"].cast("int64").to_pylist() == [0, 62_500_008, 110_000_000]
     # 候选与保留参考互斥显示；同时运行真实 blueprint、archetypes 和列发送。
     candidates = [args[0] for path, args in logs if path == "hand/candidate/fingertips"]
     assert [type(value) for value in candidates] == [rr.Clear, rr.Points3D, rr.Clear]

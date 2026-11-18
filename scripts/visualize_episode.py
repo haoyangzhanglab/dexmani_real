@@ -109,8 +109,7 @@ class EpisodeVisualizer:
                 self.hoi_alignment = align_hoi_episode(self.reader, hoi_timing, hoi_max_joint_gap_s)
             else:
                 stamps = self.reader.read_observation_stamps(stop=self.frame_count)
-            # 整数相减后再换算，保留大时钟值之间的细小时间差。
-            self.timestamps_s = (stamps - stamps[0]) / 1e9
+            self.time_ns = stamps - stamps[0]
 
             self.reader.require_fields("rgb", "depth")
 
@@ -188,7 +187,7 @@ class EpisodeVisualizer:
         }
 
         contact = self.reader["hand_contact"][: self.frame_count]
-        state["hand_contact_mag"] = np.linalg.norm(contact, axis=2)
+        state["hand_contact_mag"] = np.hypot.reduce(contact, axis=2, dtype=np.float64)
         state["hand_force_thumb"] = contact[:, 0, :]
         state["hand_force_index"] = contact[:, 1, :]
 
@@ -198,11 +197,12 @@ class EpisodeVisualizer:
         self, series: list[tuple[str, np.ndarray, tuple[str, ...]]], hoi_timing: np.ndarray | None,
     ) -> None:
         steps = np.arange(self.frame_count)
+        indexes = [
+            self.rr.TimeSequenceColumn("step", steps),
+            self.rr.TimeNanosColumn("time", self.time_ns),
+        ]
         for path, values, labels in series:
-            log_series(
-                path, values, labels=labels, steps=steps,
-                timestamps_s=self.timestamps_s,
-            )
+            log_series(path, values, labels=labels, indexes=indexes)
         log_camera_geometry(self.camera_model.color, self.T_xarm_base_from_color)
         if hoi_timing is None:
             return
@@ -229,16 +229,12 @@ class EpisodeVisualizer:
                 # 跟踪后端以 -1 标记未计算的指标。
                 diagnostics[f"hoi/object_{index}/{name}"] = np.where(values == -1, np.nan, values)
 
-        indexes = [
-            self.rr.TimeSequenceColumn("step", steps),
-            self.rr.TimeSecondsColumn("time", self.timestamps_s),
-        ]
         for entity, values in diagnostics.items():
             self.rr.send_columns(entity, indexes=indexes, columns=self.rr.Scalar.columns(scalar=values))
 
     def log_step(self, step_idx: int, rgb: np.ndarray) -> None:
         self.rr.set_time_sequence("step", step_idx)
-        self.rr.set_time_seconds("time", float(self.timestamps_s[step_idx]))
+        self.rr.set_time_nanos("time", int(self.time_ns[step_idx]))
         depth = self.log_camera(step_idx, rgb)
         self.log_pointcloud(rgb, depth)
         self.log_hand_geometry(step_idx)

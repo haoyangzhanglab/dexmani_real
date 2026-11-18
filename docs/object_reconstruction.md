@@ -82,7 +82,7 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 
 导出完成时，若接纳的采集具有相同的有序局部点与 offsets，则计算一次 `geometry_sha256` 供接触监督训练和续训使用。混用合法模板时记录 `null`。手模板的 link 名称须有效映射到 FK。
 
-[visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则。HOI 查看时，同一批时间行供时间轴、关节对齐和来源时差使用，逐物体质量和有效性按列发送。图像和几何逐帧显示。无效物体点云和不可对齐的手几何隐藏，保留对应行的时间位置。
+[visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则。HOI 诊断、关节和触觉曲线与逐帧 RGB-D、几何共用帧号 `step` 和相对首帧观测的整数纳秒 `time`。关节与相机的来源时差以毫秒显示，逐物体质量和有效性按列发送。无效物体点云和不可对齐的手几何隐藏，保留对应行的时间位置。
 
 可视化启动前要求展示范围内的 `observation_ns` 严格递增。查看 HOI 时同时校验控制时钟。
 

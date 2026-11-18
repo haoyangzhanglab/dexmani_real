@@ -126,18 +126,18 @@ def show_preview(result: dict, fk, episode_name: str) -> None:
         ),
     )))
     timestamps = result["observation_ns"]
-    # 仅显示轴转换为相对秒；求解器始终收到原始 observation_ns。
-    seconds = (timestamps - timestamps[0]) / 1e9
+    time_ns = timestamps - timestamps[0]
     steps = np.arange(len(timestamps))
+    indexes = [rr.TimeSequenceColumn("step", steps), rr.TimeNanosColumn("time", time_ns)]
     for kind in ("measured", "candidate", "reference"):
         log_series(
-            f"qpos/{kind}", result[f"{kind}_qpos"], steps=steps, timestamps_s=seconds,
+            f"qpos/{kind}", result[f"{kind}_qpos"], indexes=indexes,
             labels=[f"{kind} (rad)"] * len(XHAND_SDK_JOINT_NAMES),
         )
     starts = result["segment_starts"]
-    for index, second in enumerate(seconds):
+    for index, stamp in enumerate(time_ns):
         rr.set_time_sequence("step", index)
-        rr.set_time_seconds("time", float(second))
+        rr.set_time_nanos("time", int(stamp))
         reason = result["rejection_reasons"][index]
         is_start = index in starts
         is_rejected = reason is not None

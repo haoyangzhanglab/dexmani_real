@@ -59,6 +59,24 @@ def raw_episodes(tmp_path):
     return source, np.concatenate(states), np.concatenate(actions)
 
 
+def test_export_accepts_float32_arm_qpos(tmp_path, raw_episodes):
+    source, states, _ = raw_episodes
+    with h5py.File(source / "episode_0/data.h5", "r+") as data:
+        joints = data["arm_qpos"][:].astype(np.float32)
+        del data["arm_qpos"]
+        data["arm_qpos"] = joints
+
+    result = export_zarr(
+        source, tmp_path / "joints.zarr", processing=ExportConfig(), fields=("joint_state",),
+    )
+    root = zarr.open_group(result["path"], mode="r")
+    assert root.attrs["source_episodes"] == ["episode_0", "episode_1"]
+    assert result["total_frames"] == 7
+    np.testing.assert_array_equal(root["meta/episode_ends"][:], [4, 7])
+    np.testing.assert_array_equal(root["data/joint_state"][:], states.astype(np.float32))
+    root.store.close()
+
+
 def test_raw_reader_observation_prefix(raw_episodes, monkeypatch):
     stop = 3
     source, *_ = raw_episodes
@@ -926,7 +944,8 @@ def test_hoi_timing_is_checked_only_when_selected(tmp_path, hoi_episodes, with_o
     ("group_timing", "timing/rows"),
     ("matrix_timing", "timing/rows"),
     ("integer_names", "arm_joint_names"),
-    ("float32_joints", "arm_qpos: expected shape"),
+    ("joint_shape", "arm_qpos: expected shape"),
+    ("integer_joints", "floating dtype"),
     ("audio_only", "video stream"),
 ])
 def test_malformed_raw_is_skipped(tmp_path, complete_episodes, bad_index, fault, reason, caplog):
@@ -964,10 +983,10 @@ def test_malformed_raw_is_skipped(tmp_path, complete_episodes, bad_index, fault,
         with h5py.File(bad / "data.h5", "r+") as data:
             if fault == "integer_names":
                 data["meta"].attrs["arm_joint_names"] = 123
-            elif fault == "float32_joints":
-                joints = data["arm_qpos"][:].astype(np.float32)
+            elif fault in {"joint_shape", "integer_joints"}:
+                joints = data["arm_qpos"][:]
                 del data["arm_qpos"]
-                data["arm_qpos"] = joints
+                data["arm_qpos"] = joints[:, :6] if fault == "joint_shape" else joints.astype(np.int32)
             else:
                 rows = data["timing/rows"][:]
                 del data["timing/rows"]

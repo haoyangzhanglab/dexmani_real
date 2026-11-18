@@ -6,7 +6,7 @@
 
 `data.h5` 的 `meta` 顶层属性保存该段的相机内参、畸变、深度单位和已有外参。`effective_parameters` 是 JSON，保存实际使用的硬件、控制和算法参数，包括 `camera_config`、适用的 VR 标定和 `tactile_reset`。任务成败、控制结束原因与录制结果分别记录。任务成败可用 [label_episode.py](../scripts/label_episode.py) 标注。
 
-Raw 读取按当前写入器的字段类型校验。关节、绝对关节目标和 VR 位姿使用 float64，聚合与稠密触觉使用 float32，深度使用 uint16。
+Raw 写入时，关节、绝对关节目标、VR 腕部位姿和手部关键点使用 float64，聚合与稠密触觉使用 float32。读取时这些字段接受任意浮点精度，保留文件中的 dtype。深度须为 uint16，HOI 的 `object_pointcloud` 须为 float32，VR 接收时间和序列号须为 uint64，`timing/rows` 须符合 `TIMING_ROW_DTYPE`。
 
 ## 时间与动作
 

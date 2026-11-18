@@ -455,6 +455,24 @@ def test_hoi_validity_reports_malformed_object_names(annotated_episode, kind):
         read_hoi_validity(reader)
 
 
+def test_viewer_float16_contact_magnitude(annotated_episode, monkeypatch):
+    import h5py
+    from scripts import visualize_episode as visual
+
+    episode, *_ = annotated_episode
+    with h5py.File(episode / "data.h5", "r+") as data:
+        contact = data["hand_contact"][:].astype(np.float16)
+        contact[:, 0] = [210, 280, 0]
+        del data["hand_contact"]
+        data["hand_contact"] = contact
+    _disable_viewer(monkeypatch, visual)
+    viewer = visual.EpisodeVisualizer(str(episode), table_plane_path=None)
+    try:
+        np.testing.assert_array_equal(viewer.state["hand_contact_mag"][:, 0], 350)
+    finally:
+        viewer.close()
+
+
 def test_viewer_rejects_missing_depth_units_before_starting_display(annotated_episode, monkeypatch):
     import h5py
     import rerun as rr
@@ -2218,13 +2236,13 @@ def test_viewer_batches_diagnostics_on_both_timelines(monkeypatch):
         Scalar=SimpleNamespace(columns=lambda *, scalar: scalar),
         send_columns=sent,
         TimeSequenceColumn=lambda name, values: (name, values),
-        TimeSecondsColumn=lambda name, values: (name, values),
+        TimeNanosColumn=lambda name, values: (name, values),
     )
     monkeypatch.setattr(visual, "log_camera_geometry", Mock())
     viewer.camera_model = SimpleNamespace(color=None)
     viewer.T_xarm_base_from_color = None
     viewer.frame_count = 2
-    viewer.timestamps_s = np.array([0., 0.05])
+    viewer.time_ns = np.array([0, 62_500_008])
     viewer.hoi_alignment = {"arm_qpos": np.zeros((2, 7)), "hand_qpos": np.zeros((2, 12))}
     viewer.hoi_alignment["hand_qpos"][1] = np.nan
     viewer.hoi_valid = np.array([False, True])
@@ -2257,7 +2275,7 @@ def test_viewer_batches_diagnostics_on_both_timelines(monkeypatch):
         (step_name, steps), (time_name, times) = entry.kwargs["indexes"]
         assert (step_name, time_name) == ("step", "time")
         np.testing.assert_array_equal(steps, [0, 1])
-        np.testing.assert_array_equal(times, viewer.timestamps_s)
+        np.testing.assert_array_equal(times, viewer.time_ns)
         np.testing.assert_array_equal(entry.kwargs["columns"], expected.pop(entity))
     iou = quality["iou"]
     for bad in (iou[:1], iou[:, :1]):
@@ -2841,14 +2859,15 @@ def test_visualizer_rejects_invalid_observation_clock_without_hoi(annotated_epis
 
 def _disable_viewer(monkeypatch, visual):
     import rerun as rr
-    for name in ("init", "send_blueprint", "disconnect", "log", "send_columns", "set_time_sequence", "set_time_seconds"):
+    for name in ("init", "send_blueprint", "disconnect", "log", "send_columns", "set_time_sequence", "set_time_nanos"):
         monkeypatch.setattr(rr, name, lambda *a, **kw: None)
-    for name in ("log_rgbd", "log_series", "log_camera_geometry", "log_points"):
+    for name in ("log_rgbd", "log_camera_geometry", "log_points"):
         monkeypatch.setattr(visual, name, lambda *a, **kw: None)
 
 
 def test_visualizer_reads_only_consumed_prefix(annotated_episode, monkeypatch):
     import h5py
+    import rerun as rr
 
     from scripts import visualize_episode as visual
 
@@ -2857,12 +2876,16 @@ def test_visualizer_reads_only_consumed_prefix(annotated_episode, monkeypatch):
         data["arm_qpos"][2] = np.nan
         rows = data["timing/rows"][:]
         rows["control_ns"][2] = -1
-        rows["observation_ns"] = 2**60 + np.arange(3, dtype=np.int64)
+        rows["observation_ns"] = 2**60 + np.arange(3, dtype=np.int64) * 62_500_008
         data["timing/rows"][:] = rows
     with h5py.File(episode / "hoi.h5", "r+") as annotations:
         annotations["object_valid"][1] = False
         annotations["object_pointcloud"][1] = np.nan
     _disable_viewer(monkeypatch, visual)
+    sent, set_step, set_time = Mock(), Mock(), Mock()
+    monkeypatch.setattr(rr, "send_columns", sent)
+    monkeypatch.setattr(rr, "set_time_sequence", set_step)
+    monkeypatch.setattr(rr, "set_time_nanos", set_time)
     clouds = []
 
     def log_points(name, points, **kwargs):
@@ -2882,12 +2905,22 @@ def test_visualizer_reads_only_consumed_prefix(annotated_episode, monkeypatch):
     monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
     viewer = visual.EpisodeVisualizer(str(episode), table_plane_path=None, max_frames=2)
     try:
-        np.testing.assert_array_equal(viewer.timestamps_s, [0.0, 1e-9])
+        columns = {entry.args[0]: entry.kwargs["indexes"] for entry in sent.call_args_list}
+        indexes = columns["state/arm_qpos/0"]
+        assert columns["hoi/valid"] is indexes
+        steps, times = indexes
+        assert (steps.timeline_name(), times.timeline_name()) == ("step", "time")
+        assert isinstance(times, rr.TimeNanosColumn)
+        assert steps.as_arrow_array().to_pylist() == [0, 1]
+        assert times.as_arrow_array().cast("int64").to_pylist() == [0, 62_500_008]
         assert len(viewer.hoi_valid) == 2
         assert all(len(q) == 2 for q in viewer.hoi_alignment.values())
         images = iter(viewer.reader.iter_rgb_frames())
         for step in range(2):
             viewer.log_step(step, next(images))
+        set_step.assert_called_with("step", 1)
+        set_time.assert_called_with("time", 62_500_008)
+        assert isinstance(set_time.call_args.args[1], int)
     finally:
         viewer.close()
     assert [name for name, _ in reads].count("/timing/rows") == 1

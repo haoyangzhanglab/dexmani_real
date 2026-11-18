@@ -568,8 +568,17 @@ class RawReader:
             if spec is not None:
                 shape, dtype = spec
                 expected = (self.num_frames, *shape)
-                if array.shape != expected or array.dtype != dtype:
-                    raise RawDataError(f"Raw {name}: expected shape {expected} and dtype {dtype}")
+                if dtype.kind == "f" and name != "object_pointcloud":
+                    dtype_ok = array.dtype.kind == "f"
+                    expected_dtype = "floating dtype"
+                else:
+                    dtype_ok = array.dtype == dtype
+                    expected_dtype = f"dtype {dtype}"
+                if array.shape != expected or not dtype_ok:
+                    raise RawDataError(
+                        f"Raw {name}: expected shape {expected} and {expected_dtype}, "
+                        f"got shape {array.shape} and dtype {array.dtype}"
+                    )
             self.dataset_cache[name] = array
         return self.dataset_cache[name]
 

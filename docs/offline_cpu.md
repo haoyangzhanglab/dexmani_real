@@ -51,7 +51,12 @@ python -m pytest -p no:cacheprovider -q -ra \
   tests/test_cordvip.py::test_worker_backend_failure_exits_without_invalid_frame \
   tests/test_cordvip.py::test_refinement_failure_propagates_without_retry \
   tests/test_cordvip.py::test_initial_backend_failure_propagates \
-  tests/test_cordvip.py::test_tracking_backend_failure_propagates
+  tests/test_cordvip.py::test_tracking_backend_failure_propagates \
+  tests/test_cordvip.py::test_viewer_batches_diagnostics_on_both_timelines \
+  tests/test_cordvip.py::test_visualizer_reads_only_consumed_prefix \
+  tests/test_cordvip.py::test_visualizer_can_bypass_corrupt_hoi \
+  tests/test_cordvip.py::test_visualizer_rejects_invalid_observation_clock_without_hoi \
+  tests/test_cordvip.py::test_viewer_float16_contact_magnitude
 
 python -m pytest -p no:cacheprovider -q -ra \
   tests/test_hand_retargeting.py tests/test_hand_retargeting_preview.py \

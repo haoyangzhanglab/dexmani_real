@@ -3,6 +3,7 @@
 from contextlib import closing
 from types import SimpleNamespace
 
+import h5py
 import numpy as np
 import pytest
 import torch
@@ -92,6 +93,12 @@ def test_current_raw_to_grouped_policy_resume(tmp_path):
         poses[:, 0, 2, 3] = .5 + np.arange(8) * .001
         write_hoi(episode / "hoi.h5", template, poses, np.eye(4),
                   quality=[[{}]] * 8, object_valid=np.ones((8, 1), bool), tracking_config={})
+    # 同一训练集混用写入器默认精度与 float32 关节记录。
+    with h5py.File(source / "episode_0/data.h5", "r+") as raw:
+        for name in ("arm_qpos", "action_arm_joint_target"):
+            joints = raw[name][:].astype(np.float32)
+            del raw[name]
+            raw[name] = joints
     with RawReader(source / "episode_0") as reader:
         recorded = reader.read_camera()
         assert recorded.color == camera.color
