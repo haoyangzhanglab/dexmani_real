@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-import h5py
 import numpy as np
 import zarr
 
@@ -39,7 +38,6 @@ from dexmani_real.geometry.camera import (
     remap_image,
     validate_distortion_model,
 )
-from dexmani_real.geometry.hoi import validate_task_template
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
 from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
@@ -333,17 +331,6 @@ def prepare_raw(reader, processing, fields, clocks, hoi_devices):
             valid = read_hoi_validity(reader)
             if not valid.all():
                 raise RawDataError(f"HOI contains invalid rows: first at {int(np.flatnonzero(~valid)[0])}")
-            saved = reader.hoi_file["template"]
-            if any(
-                not isinstance(saved.get(key), h5py.Dataset)
-                for key in ("points_local", "offsets")
-            ):
-                raise RawDataError("invalid HOI template datasets")
-            if h5py.check_string_dtype(saved["object_names"].dtype) is None:
-                raise RawDataError("HOI object_names must be strings")
-            template = {key: saved[key][:] for key in ("points_local", "offsets")}
-            template["object_names"] = saved["object_names"].asstr()[:].astype(str)
-            validate_task_template(template)
         timing = reader.read_timing(source_clocks=clocks)
         alignment = {}
         if hoi_devices:

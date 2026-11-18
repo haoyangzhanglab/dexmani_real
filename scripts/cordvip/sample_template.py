@@ -11,7 +11,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 
-from cordvip_geometry.mesh import load_mesh
+from cordvip_geometry.mesh import load_mesh, simplify_mesh
 
 from dexmani_real.config.perception import (
     HOI_MAX_OBJECTS,
@@ -19,6 +19,7 @@ from dexmani_real.config.perception import (
     HOI_NUM_POINTS,
 )
 from dexmani_real.geometry.hoi import (
+    TASK_MESH_PATH,
     load_hoi_task,
     sample_surface_points,
     task_objects,
@@ -51,7 +52,7 @@ def sample_template(task, *, overwrite=False):
         load_hoi_task(task)
         return output
     names = [obj["name"] for obj in task_objects(task)]
-    meshes = [load_mesh(task / name / "mesh/mesh_m.obj") for name in names]
+    meshes = [simplify_mesh(load_mesh(task / name / TASK_MESH_PATH)) for name in names]
     counts = allocate_counts([mesh.area for mesh in meshes])
     points = [
         sample_surface_points(mesh, int(count), seed=0) for mesh, count in zip(meshes, counts)
@@ -81,12 +82,7 @@ def main(argv=None):
     parser.add_argument("--task-dir", type=Path, required=True, help="任务资产目录；相对 cwd，支持 ~")
     parser.add_argument("--overwrite", action="store_true", help="显式重建模板，可能改变点序")
     args = parser.parse_args(argv)
-    print(
-        sample_template(
-            args.task_dir,
-            overwrite=args.overwrite,
-        )
-    )
+    print(sample_template(args.task_dir, overwrite=args.overwrite))
     return 0
 
 

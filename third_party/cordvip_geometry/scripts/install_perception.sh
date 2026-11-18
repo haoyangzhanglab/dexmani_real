@@ -130,8 +130,8 @@ else
     export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include${CPATH:+:$CPATH}"
     export PATH="$CONDA_PREFIX/bin:$PATH"
     export MAX_JOBS="${MAX_JOBS:-4}"
-    "$cordvip_python" -m pip install --no-build-isolation --no-deps \
-        -e "$cordvip_library"
+    "$cordvip_python" -m pip install --no-build-isolation \
+        --constraint "$cordvip_constraints" -e "${cordvip_library}[cloud]"
     "$cordvip_python" -m pip install --no-build-isolation --no-deps third_party/nvdiffrast
 
     cordvip_pybind_dir="$("$cordvip_python" -m pybind11 --cmakedir)"

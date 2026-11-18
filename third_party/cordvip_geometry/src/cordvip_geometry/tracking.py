@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 logger = logging.getLogger(__name__)
-PIXEL_STRIDE = 2
+PIXEL_STRIDE = 4
 # 容纳 float32 迭代误差，拒绝明显非刚体候选。
 POSE_ROTATION_ATOL = 1e-3
 POSE_HOMOGENEOUS_ATOL = 1e-6
@@ -30,13 +30,13 @@ POSE_HOMOGENEOUS_ATOL = 1e-6
 @dataclass(frozen=True)
 class TrackingConfig:
     depth_tolerance_m: float = 0.015
-    min_depth_pixels: int = 30
+    min_depth_pixels: int = 8
     min_depth_fraction: float = 0.5
     min_depth_coverage: float = 0.5
     min_precision: float = 0.5
     min_recall: float = 0.5
 
-    segmentation_interval_frames: int = 2
+    segmentation_interval_frames: int = 5
     occlusion_timeout_s: float = 0.5
     max_translation_speed_m_s: float | None = None
     max_rotation_speed_rad_s: float | None = None
@@ -135,7 +135,6 @@ def _classify_quality(metrics, config):
         mask_supported
         and visible_supported
         and metrics["depth_pixels"] >= config.min_depth_pixels
-        and metrics["depth_fraction"] >= config.min_depth_fraction
         and metrics["precision"] >= config.min_precision
         and metrics["recall"] >= config.min_recall
     ):
@@ -217,38 +216,35 @@ def pose_depth_quality(observed, rendered, config):
 
 
 def pose_motion(previous, current, tracker, dt, config):
-    """在居中网格坐标中比较等价位姿，报告同一候选的平移和转角。"""
+    """在居中网格坐标中比较位姿，避免物体原点偏移引入额外平移。"""
     previous = previous @ tracker.object_from_center
-    equivalent = (current @ tracker.object_from_center)[None] @ tracker.symmetry_tfs
-    translations = np.linalg.norm(equivalent[:, :3, 3] - previous[:3, 3], axis=1)
-    rotations = np.arccos(
-        np.clip(
-            (np.einsum("ij,nij->n", previous[:3, :3], equivalent[:, :3, :3]) - 1) / 2,
-            -1,
-            1,
-        )
-    )
-    diameter = tracker.estimator.diameter
-    allowed = np.ones(len(equivalent), bool)
+    current = current @ tracker.object_from_center
+    displacement = current[:3, 3] - previous[:3, 3]
+    translation = np.sqrt(np.sum(displacement * displacement))
+    trace = np.einsum("ij,ij->", previous[:3, :3], current[:3, :3])
+    rotation = np.arccos(np.clip((trace - 1) / 2, -1, 1), dtype=trace.dtype)
+    continuous = True
     # 没有实测上限时只报告变化量；零 dt 也不能据此推断无限速度。
     if dt > 0:
+        # 在位姿指标精度下比较阈值，避免标量运算改变临界值的舍入。
         if config.max_translation_speed_m_s is not None:
-            allowed &= (
-                translations
-                <= config.max_translation_speed_m_s * dt + config.depth_tolerance_m
+            translation_limit = translation.dtype.type(
+                config.max_translation_speed_m_s * dt + config.depth_tolerance_m
             )
+            continuous = translation <= translation_limit
         if config.max_rotation_speed_rad_s is not None:
-            angular_slack = 2 * np.arcsin(min(1, config.depth_tolerance_m / diameter))
-            allowed &= rotations <= config.max_rotation_speed_rad_s * dt + angular_slack
-    indices = np.flatnonzero(allowed)
-    if not len(indices):
-        indices = np.arange(len(equivalent))
-    index = indices[np.argmin(rotations[indices])]
+            angular_slack = 2 * np.arcsin(
+                min(1, config.depth_tolerance_m / tracker.estimator.diameter)
+            )
+            rotation_limit = rotation.dtype.type(
+                config.max_rotation_speed_rad_s * dt + angular_slack
+            )
+            continuous &= rotation <= rotation_limit
     return {
-        "translation_delta_m": float(translations[index]),
-        "rotation_delta_rad": float(rotations[index]),
+        "translation_delta_m": float(translation),
+        "rotation_delta_rad": float(rotation),
         "pose_dt_s": dt,
-    }, bool(allowed.any())
+    }, bool(continuous)
 
 
 class SceneTracker:
@@ -427,9 +423,11 @@ class SceneTracker:
             .reshape(self.directions.shape[:2])
         )
         if reference is None:
-            motion = dict(
-                translation_delta_m=0.0, rotation_delta_rad=0.0, pose_dt_s=0.0
-            )
+            motion = {
+                "translation_delta_m": 0.0,
+                "rotation_delta_rad": 0.0,
+                "pose_dt_s": 0.0,
+            }
             continuous = True
         else:
             motion, continuous = pose_motion(
@@ -453,7 +451,7 @@ class SceneTracker:
             quality={name: {} for name in self.trackers},
             valid=dict.fromkeys(self.trackers, False),
         )
-        confirming = set(self.pending_pose) if self.config.recovery_enabled else set()
+        confirming = set(self.pending_pose)
         # 本帧新丢失（包括遮挡超时）的对象，从下一处理帧才开始检测恢复。
         due = [
             name
@@ -467,7 +465,8 @@ class SceneTracker:
         verdicts = dict.fromkeys(self.trackers, "LOST")
         registered = set()
         pose_checks = {}
-        sampled = depth_m[::PIXEL_STRIDE, ::PIXEL_STRIDE]
+        grid = np.s_[::PIXEL_STRIDE, ::PIXEL_STRIDE]
+        sampled = depth_m[grid]
 
         def reject(name, error):
             verdicts[name] = "LOST"
@@ -514,7 +513,7 @@ class SceneTracker:
                 metrics, verdict = pose_depth_quality(sampled, rendered, self.config)
             else:
                 metrics, verdict = pose_quality(
-                    mask[::PIXEL_STRIDE, ::PIXEL_STRIDE], sampled, rendered, self.config
+                    mask[grid], sampled, rendered, self.config
                 )
             metrics.update(
                 mask_source=int(mask is not None),
@@ -550,11 +549,7 @@ class SceneTracker:
             try:
                 if mask is None:
                     raise TrackingFailure("missing registration mask")
-                valid = (
-                    mask[::PIXEL_STRIDE, ::PIXEL_STRIDE]
-                    & np.isfinite(sampled)
-                    & (sampled >= 0.001)
-                )
+                valid = mask[grid] & np.isfinite(sampled) & (sampled >= 0.001)
                 if np.count_nonzero(valid) < self.config.min_depth_pixels:
                     raise TrackingFailure("insufficient segmented depth")
                 pose = self.trackers[name].register(rgb, depth_m, K, mask)

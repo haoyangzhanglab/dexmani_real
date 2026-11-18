@@ -13,14 +13,14 @@ sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 from cordvip_geometry.mesh import load_mesh, scale_mesh, validate_scale
 from cordvip_geometry.weights import DEFAULT_MODELS_DIR, resolve_sam_model
 
-from dexmani_real.geometry.hoi import task_objects
+from dexmani_real.geometry.hoi import TASK_MESH_PATH, task_objects
 
 
 def prepare_task(task):
     task = Path(task).expanduser().resolve()
     objects = []
     for obj in task_objects(task):
-        mesh_path = task / obj["name"] / "mesh/mesh_m.obj"
+        mesh_path = task / obj["name"] / TASK_MESH_PATH
         existing = mesh_path.exists()
         scaling = {
             key: obj[key] for key in ("scale_to_meters", "size_axis", "size_meters") if key in obj
@@ -98,8 +98,9 @@ def prepare_task(task):
                 if key in obj
             },
         )
-        (directory / "mesh").mkdir(exist_ok=True)
-        metric_mesh.export(directory / "mesh/mesh_m.obj")
+        mesh_path = directory / TASK_MESH_PATH
+        mesh_path.parent.mkdir(exist_ok=True)
+        metric_mesh.export(mesh_path)
         print(f"已保存米制 Mesh：{directory}")
 
 

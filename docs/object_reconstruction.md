@@ -6,7 +6,7 @@ HOI（Hand–Object Interaction，手物交互）观测用手部与物体点云�
 
 物体点云来自固定网格表面模板，由 RGB-D 跟踪位姿逐帧变换。手点云来自固定的 link 局部模板，由机械臂和手部关节通过 FK 变换。两者均为 xArm base 坐标系下的米制 float32 XYZ，保留点序和分段。
 
-任务模板共 1024 点，按表面积分配配额，每对象至少 64 点，最多 16 个对象。新模板先按面积采样 8 倍候选点，再用固定种子和起点的 FPS 选点。手模板沿用各 link 的面积配额与 URDF visual 变换，使用同一采样函数。
+任务模板、FoundationPose 和 MeshRaycaster 使用由同一米制 CAD 经 `simplify_mesh()` 处理后的几何，保留物体坐标原点与朝向。任务模板共 1024 点，按处理后的网格表面积分配配额，每对象至少 64 点，最多 16 个对象。每个对象以 `seed=0` 按面积均匀采样 8 倍候选点，再用固定起点的 FPS 选点。手模板沿用各 link 的面积配额与 URDF visual 变换，使用同一采样函数。
 
 手模板保存 float32 `points[N,3]`，按 `part_names` 和整数 `part_offsets` 对应 URDF link。`hand_geometry()` 接收 EEF 变换 `[T,4,4]` 与 SDK 顺序的手关节 `[T,12]`，通过批量 FK 返回所选的指尖 `[T,5,3]` 和表面点 `[T,N,3]`；导出、部署和可视化共用此接口，保留模板点序与分段。
 
@@ -19,6 +19,8 @@ HOI（Hand–Object Interaction，手物交互）观测用手部与物体点云�
 ## 实验流程
 
 从仓库根目录运行，使用 `real_robot` 环境。用 `--task-dir` 为准备、采样、标注和部署指定同一个任务资产目录。目录可放在仓库外，显式路径支持 `~`，相对路径以当前目录为准。Raw 和 checkpoint 中的任务标签用于标识实验。
+
+物体模板采样使用 trimesh 读取 CAD，并用 Open3D 简化超过 20,000 个三角面的网格。两项依赖与跟踪共用，安装见[后端说明](../third_party/cordvip_geometry/README.md#安装与命令)。
 
 ### 任务资产
 
@@ -38,13 +40,15 @@ python scripts/cordvip/annotate_episodes.py /data/episodes/pick --task-dir /data
 python scripts/export_zarr.py /data/episodes/pick --fields joint_state action hand_pointcloud object_pointcloud
 ```
 
-在 dexmani_policy 中训练后，用 `python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick` 部署。采样生成 `hoi/template.npz`，已有模板直接复用。修改物体网格后用 `sample_template.py --task-dir TASK_DIR --overwrite` 重建。修改手部 URDF 或 Visual Mesh 后，用 `python scripts/generate_hand_template.py --overwrite` 重建手模板。模板完整写入后原子替换，重建后重新生成相关标注和训练数据。
+`sample_template.py` 生成 `hoi/template.npz`，默认复用已有模板。更新 CAD 或按当前简化规则重建模板时，沿用上例路径，依次给 `sample_template.py` 和 `annotate_episodes.py` 加上 `--overwrite`，再用 `export_zarr.py` 重新导出。原 Zarr 路径已存在时，用 `--output` 指定新路径。修改手部 URDF 或 Visual Mesh 后，用 `python scripts/generate_hand_template.py --overwrite` 重建手模板并重新导出训练数据。
 
-标注输入也可直接指定单个 Episode，如 `/data/episodes/pick/episode_001`。目录输入只处理其直接包含的 `episode_*` 子目录。标注读取 Raw 内的 RGB-D、深度单位与相机外参。离线用 `--segmentation-interval-frames` 设置活动对象的 SAM2 最大处理帧间隔，默认 2，设为 1 时逐帧分割。Python 入口 `annotate_episodes(..., tracking_config=..., overwrite=True)` 可调整同一套配置。见[后端安装、接口与分割规则](../third_party/cordvip_geometry/README.md)。
+在 dexmani_policy 中训练后，用 `python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick` 部署。
+
+标注输入也可直接指定单个 Episode，如 `/data/episodes/pick/episode_001`。目录输入只处理其直接包含的 `episode_*` 子目录。标注读取 Raw 内的 RGB-D、深度单位与相机外参。活动对象的 SAM2 周期刷新间隔在线和离线均默认为 5 个处理帧。离线可用 `--segmentation-interval-frames` 调整，设为 1 时逐帧分割。Python 入口 `annotate_episodes(..., tracking_config=..., overwrite=True)` 可调整同一套配置。见[后端安装、接口与分割规则](../third_party/cordvip_geometry/README.md)。
 
 ## 跟踪与时间对齐
 
-在线 worker 加载并预热模型后宣告就绪。每段首帧对 RGB-D 去畸变，经 Grounding DINO、SAM2 和 FoundationPose 注册得到初始位姿。每个 `prompt` 须匹配唯一候选，参考图的 `instance` 只用于资产准备。后续对活动对象合批 refinement，使用 CAD、深度及当前 Mask 验证候选。见[后端质量规则](../third_party/cordvip_geometry/README.md#质量检查)。
+在线 worker 加载并预热模型后宣告就绪。每段首帧对 RGB-D 去畸变，经 Grounding DINO、SAM2 和 FoundationPose 注册得到初始位姿。每个 `prompt` 须匹配唯一候选，参考图的 `instance` 只用于资产准备。后续对活动对象合批 refinement，用 CAD 和实测深度验证候选。有当前帧的 SAM2 Mask 时，同时检查可见轮廓。见[后端质量规则](../third_party/cordvip_geometry/README.md#质量检查)。
 
 当前按非对称物体跟踪；对称物体的旋转歧义见 [Object Symmetry](../third_party/cordvip_geometry/README.md#object-symmetry)。
 
@@ -62,7 +66,7 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 
 ## 标注与查看
 
-标注要求 `rgb.mp4` 的帧数和纳秒时间戳均与 [Raw 控制时间轴](data.md#图像与模型输入) 一致。逐帧标注完成后原子发布 `episode/hoi.h5`。默认跳过与 Raw 来源时间一致的已有标注。缺少来源时间或与 Raw 错配的标注需要使用 `--overwrite` 重新标注。重算失败时保留原标注。遮挡与恢复期间保留原始行和时间戳，并记录无效状态。
+标注要求 `rgb.mp4` 的帧数和纳秒时间戳均与 [Raw 控制时间轴](data.md#图像与模型输入) 一致。逐帧标注完成后原子发布 `episode/hoi.h5`。默认校验已有标注与 Raw 的相机来源时间和外参，校验通过后跳过。`--overwrite` 在重算成功后原子替换标注。遮挡与恢复期间保留原始行和时间戳，并记录无效状态。
 
 | 内容 | 路径或位置 |
 | --- | --- |
@@ -79,9 +83,7 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 
 无效对象的位姿为 NaN；只有全部对象有效时才生成模板点云，否则该帧物体点云全零。整帧有效性由 `object_valid.all(axis=1)` 决定。
 
-导出 `object_pointcloud` 要求所选 Raw 的每帧物体均有效。完整性检查及分段规则见[按需导出](data.md#按需导出)。
-
-导出可以合并采用不同模板的录制。每帧物体点云沿用当前录制的点顺序，接触标签由对应帧的手部和物体点云生成。手模板的 link 名称须有效映射到 FK。
+导出 `object_pointcloud` 要求所选 Raw 的每帧物体均有效，可以合并采用不同模板的录制。每帧物体点云沿用当前录制的点顺序，接触标签由对应帧的手部和物体点云生成。手模板的 link 名称须有效映射到 FK。导出规则见[按需导出](data.md#按需导出)。
 
 [visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则。HOI 诊断、关节和触觉曲线与逐帧 RGB-D、几何共用帧号 `step` 和相对首帧观测的整数纳秒 `time`。关节与相机的来源时差以毫秒显示，逐物体质量和有效性按列发送。无效物体点云和不可对齐的手几何隐藏，保留对应行的时间位置。
 

@@ -11,7 +11,7 @@ bash third_party/cordvip_geometry/scripts/install_perception.sh
 python -m cordvip_geometry download
 ```
 
-安装脚本拉取固定版本的源码、应用补丁并编译 CUDA 扩展。FoundationPose 权重需另行放入 `third_party/FoundationPose/weights/`：
+安装脚本准备跟踪源码、应用补丁并编译 CUDA 扩展，同时通过 `[cloud]` 安装读取 CAD 用的 trimesh，以及简化网格和射线渲染用的 Open3D。仅生成模板时，在主项目环境中运行 `python -m pip install -e 'third_party/cordvip_geometry[cloud]'`。FoundationPose 权重需另行放入 `third_party/FoundationPose/weights/`：
 
 | 模型 | 权重目录 |
 | --- | --- |
@@ -89,14 +89,14 @@ if result.valid["apple"]:
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
 | `depth_tolerance_m` | 0.015 m | 实测与 CAD 深度的匹配容差 |
-| `min_depth_pixels` | 30 | stride=2 网格上的最少匹配点数和支持点数 |
+| `min_depth_pixels` | 8 | stride=4 网格上的最少匹配点数和支持点数 |
 | `min_depth_fraction` | 0.5 | 最低深度匹配比例 |
 | `min_depth_coverage` | 0.5 | 检查区域的最低有效深度覆盖率 |
 | `min_precision`、`min_recall` | 0.5 | 可见轮廓的最低一致性 |
 
 TRACKING 和 OCCLUDED 对象先合批执行 FoundationPose，再验证候选。注册需要 Mask 深度生成平移初值；正常 Track 不以 Mask 深度预检。
 
-每个候选的 SE(3)、运动连续性和 CAD 渲染只计算一次。Mask 更新或校正后，复用 CAD 深度重算当前可见证据。有 Mask 时使用 `pose_quality()`：仅 Mask 外更近、超出容差的有效深度支持前景遮挡，缺失深度不算遮挡。无 Mask 时使用 `pose_depth_quality()`，双向深度残差均计为不匹配。
+每个候选的 SE(3)、运动连续性和 CAD 渲染只计算一次。相机射线、实测深度、SAM2 Mask 和渲染深度在质量检查中共用 stride=4 的像素网格，640×480 图像对应 160×120 条射线。Mask 更新或校正后，复用 CAD 深度重算当前可见证据。有 Mask 时使用 `pose_quality()`：仅 Mask 外更近、超出容差的有效深度支持前景遮挡，缺失深度不算遮挡。无 Mask 时使用 `pose_depth_quality()`，双向深度残差均计为不匹配。
 
 两个质量函数均返回 `(metrics, verdict)`：
 
@@ -128,13 +128,13 @@ FoundationPose 输出须为有限 `[4,4]` 位姿，齐次末行容差为 `1e-6`�
 
 ### Object Symmetry
 
-当前按非对称物体跟踪：FoundationPose 使用默认单位对称变换，任务资产不配置 `symmetry_tfs`，也不从 Mesh 自动识别对称性。对称物体可能产生几何等价姿态的旋转歧义，不保证绕对称轴的绝对旋转角稳定；是否允许这种歧义由任务决定。
+当前按非对称物体跟踪，FoundationPose 使用默认单位对称变换。对称物体可能出现几何等价姿态之间的旋转歧义。
 
-`pose_motion()` 在居中网格坐标中比较位姿，使用平移欧氏距离和 SO(3) 测地角。它复用 Estimator 的对称变换集合；启用运动门控时，同一候选须同时满足平移和旋转限制，指标取通过候选中旋转差最小者。
+`pose_motion()` 直接比较居中网格位姿的平移距离和 SO(3) 测地角。启用运动门控时，候选须同时满足已配置的平移和旋转限制。
 
 ## 事件触发分割
 
-SAM2 在初始化、周期到期、候选深度质量不通过、恢复注册或恢复确认时共享刷新，同帧图像只追加一次。`segmentation_interval_frames=2` 表示活动对象每两个处理帧刷新，设为 1 时逐帧分割。全部对象 LOST 时，等待恢复到期再刷新。DINO 仅用于初始化和到期 LOST 对象的重新检测。
+SAM2 在初始化、周期到期、候选深度质量不通过、恢复注册或恢复确认时共享刷新，同帧图像只追加一次。默认 `segmentation_interval_frames=5`，活动对象每五个处理帧周期刷新一次，设为 1 时逐帧分割。全部对象 LOST 时，等待恢复到期再刷新。DINO 仅用于初始化和到期 LOST 对象的重新检测。
 
 `RGBDFrame` 必须携带真实的 `source_sequence` 和 `timestamp_ns`。`from_camera(camera, row, source_sequence=...)` 从相机行读取时间；在线来源为 Camera Ring，离线来源为 Raw timing。三种计数分别是：
 
@@ -174,7 +174,7 @@ SAM2 在初始化、周期到期、候选深度质量不通过、恢复注册或
 
 SAM2 流式前处理使用 1024 输入和 LANCZOS 缩放，上传 uint8 图像后查表获得 float32 输入，保持 float64 归一化后转 float32 的数值结果。[SAM2 补丁](scripts/sam2_inference.patch) 保留多尺度图像特征，仅计算 memory attention 所需的最终层位置编码。
 
-FoundationPose 后续帧复用图像缓冲、相机投影矩阵及采样网格常量，共享深度预处理。位姿保留在 GPU，从上一帧位姿开始更新；各物体独立渲染，观测裁剪与归一化合批执行。两轮 refinement 后，逐物体渲染完整投影，按当前 mask 是否可用执行完整质量检查或深度门控。
+FoundationPose 后续帧复用图像缓冲、相机投影矩阵及采样网格常量，共享深度预处理。位姿保留在 GPU，从上一帧位姿开始更新。各物体独立渲染，观测裁剪与归一化合批执行。两轮 refinement 后，在固定像素网格上渲染各物体的 CAD 深度，按当前 Mask 是否可用执行轮廓与深度检查或纯深度检查。
 
 RGB 与几何输入共用采样网格：refine 直接裁剪 XYZ，score 从裁剪深度重建 XYZ。跟踪使用 PyTorch 原生 CUDA 卷积；注册和跟踪的 cuDNN 设置仅在调用内生效。批量大小会影响浮点结果，近对称物体的旋转可能不稳定。
 
@@ -191,6 +191,6 @@ Hunyuan3D 重建使用分层体积解码、完整 attention 和 Marching Cubes�
 | `tracking.py` | 多物体跟踪与轮廓/深度质量检查 |
 | `cli.py`、`visualization.py`、`weights.py` | 命令行、结果预览与模型下载 |
 
-表面模板采样由主项目 `geometry/hoi.py` 负责，后端不依赖主项目或 fpsample。
+FoundationPose 与 MeshRaycaster 使用 `simplify_mesh()` 处理后的 CAD 网格。主项目生成表面模板时复用同一网格简化函数，再由 `geometry/hoi.py` 采样。后端不依赖主项目或 fpsample。
 
 任务命令与资产结构见[主项目实验流程](../../docs/object_reconstruction.md#实验流程)。

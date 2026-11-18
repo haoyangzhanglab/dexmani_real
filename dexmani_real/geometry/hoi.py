@@ -7,6 +7,8 @@ import numpy as np
 
 from dexmani_real.config.perception import HOI_NUM_POINTS
 
+TASK_MESH_PATH = Path("mesh/mesh_m.obj")
+
 
 def task_objects(task):
     """读取有序任务对象，补齐默认 Prompt。"""
@@ -43,7 +45,7 @@ def load_hoi_task(
     prompts_by_name = {obj["name"]: obj["prompt"] for obj in task_objects(task)}
     if set(names) != prompts_by_name.keys():
         raise ValueError("模板对象与任务对象不对应")
-    mesh_paths = {name: task / name / "mesh/mesh_m.obj" for name in names}
+    mesh_paths = {name: task / name / TASK_MESH_PATH for name in names}
     prompts = {name: prompts_by_name[name] for name in names}
     return template, mesh_paths, prompts
 

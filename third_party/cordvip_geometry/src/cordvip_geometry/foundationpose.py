@@ -80,7 +80,6 @@ class FoundationPoseTracker:
         self.object_from_center = np.linalg.inv(
             self.estimator.tf_to_centered_mesh.detach().cpu().numpy()
         )
-        self.symmetry_tfs = self.estimator.symmetry_tfs.detach().cpu().numpy()
 
     def register(self, rgb, depth_m, intrinsics, mask):
         import torch
