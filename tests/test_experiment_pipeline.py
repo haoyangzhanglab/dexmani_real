@@ -40,8 +40,8 @@ def isolated_hydra():
 def test_current_raw_to_grouped_policy_resume(tmp_path):
     from dexmani_policy.deployment import load_policy
     from dexmani_policy.test_tools.smoke_test import run_smoke
-    from dexmani_policy.training.common.config import load_config
-    from dexmani_policy.training.common.data import build_dataset
+    from dexmani_policy.training.config import load_config
+    from dexmani_policy.training.data import build_dataset
 
     source = tmp_path / "raw"
     camera = CameraSnapshot(

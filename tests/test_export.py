@@ -775,7 +775,7 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
     from dexmani_policy.datasets.demonstration import DemonstrationDataset
     from dexmani_policy.datasets.preprocess.contact_map import generate
     from dexmani_policy.datasets.pretrain.cordvip import CordViPPretrainDataset
-    from dexmani_policy.training.common.data import record_data_processing
+    from dexmani_policy.training.data import record_data_processing
     from dexmani_policy.training.pretrain.hand_prior.vqvae import prepare_hand_data
     from omegaconf import OmegaConf
 
@@ -819,7 +819,10 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
     assert (train_hand[:, 0] < 1).all() != (val_hand[:, 0] < 1).all()
     cfg = OmegaConf.create({})
     record_data_processing(cfg, pretrain)
-    checkpoint = Checkpoint(0, {}, None, {}, {}, OmegaConf.to_container(cfg, resolve=True))
+    checkpoint = Checkpoint(
+        global_step=0, model_state={}, optimizer_state={}, scheduler_state={},
+        effective_config=OmegaConf.to_container(cfg, resolve=True),
+    )
     restored = load_checkpoint(save_checkpoint(tmp_path / "model.pt", checkpoint))
     assert restored.effective_config["data_processing"] == source.attrs["data_processing"]
     runtime = RealConfig()
