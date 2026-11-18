@@ -15,6 +15,7 @@ from dexmani_real.robot.xarm7.protocol import (
     READY_TIMEOUT_S,
     STANDSTILL_DWELL_S,
     HomeRequest,
+    PhysicalStopRequest,
     PrepareRequest,
     StandstillRequest,
 )
@@ -36,7 +37,7 @@ class ArmController:
         return (self.io.stop.is_set() or self.io.emergency.is_set()
                 or self.io.closing.is_set() or bool(self.io.fault.value))
 
-    def check_lifecycle(self, *, deadline_ns, stage):
+    def check_lifecycle(self, *, deadline_ns, stage, while_stopped=False):
         if self.pipe.poll():
             try:
                 self.pipe.recv()
@@ -44,7 +45,11 @@ class ArmController:
                 self.io.closing.set()
                 raise OperationCancelled("parent pipe closed") from exc
             raise RuntimeError("overlapping arm lifecycle requests")
-        if self.cancelled():
+        cancelled = (
+            not self.io.stop.is_set() or self.io.closing.is_set() or bool(self.io.fault.value)
+            if while_stopped else self.cancelled()
+        )
+        if cancelled:
             raise OperationCancelled(f"{stage} cancelled")
         if time.monotonic_ns() >= deadline_ns:
             raise TimeoutError(f"{stage} execution deadline expired")
@@ -79,12 +84,16 @@ class ArmController:
         stage,
         deadline_ns,
         target=None,
+        while_stopped=False,
     ):
         """在绝对期限内确认连续停稳；不合格样本重新累计。"""
         tolerance = self.cfg.standstill_position_tolerance_rad
         interval_ns = round(1e9 / self.cfg.feedback_hz)
         stable = None
         anchor = None
+        previous_sample_ns = None
+        # 停止确认期间 stop 已置位，改用 closing 等待下一次采样。
+        wake = self.io.closing if while_stopped else self.io.stop
         while time.monotonic_ns() < deadline_ns:
             check_abort()
             self.read_feedback()
@@ -96,6 +105,11 @@ class ArmController:
             sample_ns = int(self.status["timestamp_ns"])
             if not sample_is_fresh(sample_ns, self.cfg.feedback_max_age_s, completed_ns):
                 raise FeedbackUnavailable(f"{stage}: current arm feedback unavailable/stale")
+            if while_stopped and previous_sample_ns is not None and not sample_is_fresh(
+                previous_sample_ns, self.cfg.feedback_max_age_s, completed_ns,
+            ):
+                raise FeedbackUnavailable(f"{stage}: arm feedback gap exceeded freshness budget")
+            previous_sample_ns = sample_ns
             valid = np.max(np.abs(v)) <= self.cfg.standstill_velocity_tolerance_rad_s
             if target is not None:
                 valid = valid and np.max(np.abs(q - target)) <= tolerance
@@ -110,7 +124,7 @@ class ArmController:
                 stable = anchor = None
             # 按查询开始时刻限频，查询耗时既不拉长采样间隔，也不充作停稳时长。
             remaining_ns = min(sample_ns + interval_ns, deadline_ns) - time.monotonic_ns()
-            self.io.stop.wait(max(0, remaining_ns) / 1e9)
+            wake.wait(max(0, remaining_ns) / 1e9)
         check_abort()
         raise TimeoutError(f"{stage}: measured position/velocity dwell not confirmed")
 
@@ -185,7 +199,7 @@ class ArmController:
             self.io.publish_status(self.status)
             self.io.stopped.set()  # 处理结束；停止失败仍保存在 fault。
 
-    def operation(self, message: PrepareRequest | HomeRequest | StandstillRequest):
+    def motion_operation(self, message: PrepareRequest | HomeRequest | StandstillRequest) -> BaseException | None:
         self.io.stop_reason.value = b""
         self.io.stopped.clear()
         kind = "home" if isinstance(message, HomeRequest) else "prepare"
@@ -227,7 +241,23 @@ class ArmController:
             self.stop()
             if self.io.emergency.is_set() or self.io.fault.value:
                 self.io.closing.set()
+        return error
 
+    def operation(self, message: PrepareRequest | HomeRequest | StandstillRequest | PhysicalStopRequest) -> None:
+        error: BaseException | None = None
+        if isinstance(message, PhysicalStopRequest):
+            stage = "arm physical stop"
+            try:
+                self.wait_settled(
+                    lambda: self.check_lifecycle(
+                        deadline_ns=message.deadline_ns, stage=stage, while_stopped=True,
+                    ),
+                    stage=stage, deadline_ns=message.deadline_ns, while_stopped=True,
+                )
+            except (OperationCancelled, TimeoutError) as exc:
+                error = exc
+        else:
+            error = self.motion_operation(message)
         self.io.publish_status(self.status)
         try:
             self.pipe.send(error)

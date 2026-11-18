@@ -7,7 +7,7 @@ from math import isfinite, radians
 
 import numpy as np
 
-from dexmani_real.robot.commands import validate_hand_target
+from dexmani_real.robot.commands import validate_hand_qpos, validate_hand_target
 from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_RATED_QPOS_MAX_RAD,
@@ -64,8 +64,16 @@ class HandConfig:
         300, 300,       # 小指
     )
 
-    # 关节及策略必需触觉共用的主机查询时效预算，不保证物理采样年龄。
+    # 关节及触觉各自使用主机查询时间判断时效。
     feedback_max_age_s: float = 0.20
+    tactile_max_age_s: float = 0.10
+    tactile_calibration_samples: int = 5
+    tactile_calibration_timeout_s: float = 1.0
+    # Aggregate、Dense 的三轴范数上限，使用 SDK 原始单位，需现场核定。
+    tactile_contact_limits: tuple[float, float] = (40.0, 40.0)
+    tactile_residual_limits: tuple[float, float] = (5.0, 5.0)
+    crc_retries: int = 1
+    crc_retry_interval_s: float = 0.05
     home_timeout_s: float | None = None
     home_max_step_deg: float | None = None
     home_tor_max: int | None = None
@@ -84,6 +92,8 @@ class HandConfig:
             ))
 
     def validate(self) -> None:
+        from dexmani_real.geometry.kinematics import validate_xhand_urdf
+
         if self.comm_type not in ("ethercat", "serial"):
             raise ValueError("hand comm_type must be 'ethercat' or 'serial'")
         if self.device_name is not None:
@@ -104,6 +114,8 @@ class HandConfig:
             if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
                 raise ValueError(f"hand {name} must be an integer >= {minimum}")
         self.validate_limits()
+        validate_hand_qpos(self.home_qpos_rad)
+        validate_xhand_urdf()
         if len(self.kp) != HAND_DOF or any(
             not isinstance(value, int) or isinstance(value, bool) or value <= 0
             for value in self.kp
@@ -118,6 +130,21 @@ class HandConfig:
             )
         if not isfinite(self.feedback_max_age_s) or self.feedback_max_age_s <= 0:
             raise ValueError("hand feedback_max_age_s must be finite and positive")
+        if type(self.crc_retries) is not int or not 0 <= self.crc_retries <= 2:
+            raise ValueError("hand crc_retries must be an integer in [0, 2]")
+        if not isfinite(self.crc_retry_interval_s) or self.crc_retry_interval_s <= 0:
+            raise ValueError("hand crc_retry_interval_s must be finite and positive")
+
+        for name in ("tactile_max_age_s", "tactile_calibration_timeout_s"):
+            value = getattr(self, name)
+            if not isfinite(value) or value <= 0:
+                raise ValueError(f"hand {name} must be finite and positive")
+        if type(self.tactile_calibration_samples) is not int or self.tactile_calibration_samples < 2:
+            raise ValueError("hand tactile_calibration_samples must be an integer >= 2")
+        for name in ("tactile_contact_limits", "tactile_residual_limits"):
+            limits = getattr(self, name)
+            if len(limits) != 2 or any(not isfinite(limit) or limit <= 0 for limit in limits):
+                raise ValueError(f"hand {name} must contain two finite positive limits")
 
     def validate_limits(self) -> None:
         """实验范围必须包含在硬件额定范围内。"""
@@ -130,8 +157,12 @@ class HandConfig:
         if np.any(lower < XHAND_RATED_QPOS_MIN_RAD) or np.any(upper > XHAND_RATED_QPOS_MAX_RAD):
             raise ValueError("hand command limits exceed the rated device envelope")
 
+    @property
+    def home_qpos_rad(self) -> np.ndarray:
+        return np.deg2rad(self.home_qpos_deg)
+
     def validate_home(self) -> None:
-        validate_hand_target(np.deg2rad(self.home_qpos_deg), self.qpos_min_rad, self.qpos_max_rad)
+        validate_hand_target(self.home_qpos_rad, self.qpos_min_rad, self.qpos_max_rad)
         if type(self.home_tor_max) is not int or not 0 < self.home_tor_max <= 400:
             raise ValueError("HOME output limit requires a tested integer in [1, 400]")
         for value in (self.home_timeout_s, self.home_tolerance_deg, self.home_max_step_deg):

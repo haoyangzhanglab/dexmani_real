@@ -7,10 +7,13 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
+from dexmani_real.config.real import RealConfig
+from dexmani_real.control.actions import ActionMapper
 from dexmani_real.data.export import accepted_joint_targets
 from dexmani_real.deployment import rollout as deployment
 from dexmani_real.deployment.inference import PolicyWorker
 from dexmani_real.deployment.schedule import ActionChunk
+from dexmani_real.robot.commands import HandCommandUnconfirmed
 
 
 class Worker:
@@ -37,6 +40,9 @@ class Recorder:
     def mark_gap(self):
         self.new_segment = True
 
+    def check_error(self):
+        pass
+
     def append(self, row, command, *, action_accepted, quality_issue):
         if self.new_segment:
             self.starts.append(len(self.rows))
@@ -59,6 +65,8 @@ def episode(monkeypatch):
         project=lambda row: row,
     )
     worker, recorder, robot = Worker(), Recorder(), Mock()
+    robot.hand_feedback_pending = False
+    robot.feedback_next_ns = 0
     action_mapper = SimpleNamespace(
         map_joint=lambda arm, hand: SimpleNamespace(arm_qpos=arm, hand_qpos=hand, rejection_reason=None),
     )
@@ -71,11 +79,12 @@ def episode(monkeypatch):
     rollout.read_observations = lambda **kwargs: (clock.row, clock.row)
     rollout.recording_issue = lambda row: None
     rollout.recorder = recorder
+    control_step = rollout.step
 
     def step(slot, joint_state):
         clock.now = rollout.started_ns + slot * rollout.dt_ns
         clock.row = np.full(19, joint_state, dtype=np.float32)
-        rollout.step_control()
+        control_step()
 
     return rollout, worker, recorder, robot, step
 
@@ -139,3 +148,89 @@ def test_ode_discards_unexecuted_chunk_on_skip(episode):
     rows, kwargs = worker.calls[-1]
     np.testing.assert_array_equal(rows, np.full((2, 19), 3))
     assert kwargs["reset_episode"] and kwargs["prev_action"] is None
+
+
+def test_policy_run_resumes_after_write_crc_without_advancing_ode_history(episode):
+    rollout, worker, recorder, robot, step = episode
+    rollout.prepare = Mock()
+    robot.send_action.side_effect = [None, HandCommandUnconfirmed(2, persistent=False), None]
+
+    def tick():
+        step(0, 1)
+        worker.finish(10)
+        step(1, 2)
+        step(2, 3)
+        np.testing.assert_array_equal(worker.calls[-1][1]["prev_action"], np.full(19, 10))
+        worker.finish(99)
+        step(3, 4)
+        assert not rollout.finished and not rollout.runtime_state.stop_signal.is_set()
+        assert rollout.prev_action is None and not rollout.history and rollout.cursor == 0
+        assert not recorder.rows[-1][2]
+        np.testing.assert_array_equal(recorder.rows[-1][1], np.full(19, 99))
+
+        step(4, 5)
+        rows, kwargs = worker.calls[-1]
+        assert kwargs["reset_episode"] and kwargs["prev_action"] is None
+        np.testing.assert_array_equal(rows, np.full((2, 19), 5))
+        worker.finish(20)
+        step(5, 6)
+        np.testing.assert_array_equal(rollout.prev_action, np.full(19, 20))
+        assert recorder.starts == [0, 4]
+        rollout.stop("test complete")
+
+    rollout.step = tick
+    result = rollout.run(poll_operator=Mock())
+    assert result.termination_details == "test complete" and not result.errors
+    assert rollout.model is worker
+    assert robot.send_action.call_count == 3
+
+
+def test_rollout_ends_only_episode_on_persistent_crc(episode):
+    rollout, worker, recorder, robot, step = episode
+    robot.send_action.side_effect = HandCommandUnconfirmed(5, persistent=True)
+    step(0, 1)
+    worker.finish(10)
+    step(1, 2)
+    assert rollout.finished and rollout.runtime_state.stop_signal.is_set()
+    assert "5 consecutive write CRC" in rollout.result.termination_details
+    assert not recorder.rows[-1][2]
+
+
+def test_out_of_limits_policy_action_ends_episode_without_exiting_session(episode):
+    rollout, worker, _, robot, step = episode
+    cfg = RealConfig()
+    rollout.action_mapper = ActionMapper.for_mode(
+        "joint", arm=cfg.arm, hand=cfg.hand, motion=cfg.motion, environment=cfg.environment,
+    )
+    rollout.prepare = Mock()
+
+    def tick():
+        step(0, 1)
+        worker.finish(10)
+        step(1, 2)
+
+    rollout.step = tick
+    result = rollout.run(poll_operator=Mock())
+
+    assert rollout.finished and rollout.model is worker
+    assert "right_hand_thumb_bend_joint" in result.termination_details
+    robot.send_action.assert_not_called()
+    robot.stop.assert_called_once()
+
+
+def test_rollout_waits_for_good_feedback_before_using_next_observation(episode):
+    rollout, worker, recorder, robot, step = episode
+    step(0, 1)
+    worker.finish(99)
+    robot.hand_feedback_pending = True
+    step(1, 2)
+    assert worker.future is None and rollout.prev_action is None and not rollout.history
+    assert not rollout.finished and not rollout.runtime_state.stop_signal.is_set()
+    robot.send_action.assert_not_called()
+    assert len(recorder.rows) == 1 and recorder.new_segment
+
+    robot.hand_feedback_pending = False
+    step(2, 3)
+    rows, kwargs = worker.calls[-1]
+    assert kwargs["reset_episode"]
+    np.testing.assert_array_equal(rows, np.full((2, 19), 3))

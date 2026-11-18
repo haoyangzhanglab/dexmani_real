@@ -6,6 +6,7 @@ import numpy as np
 
 from dexmani_real.control.ik import IKSolver
 from dexmani_real.geometry.pose import Pose
+from dexmani_real.robot.commands import validate_hand_target
 
 
 class StartPoseRejected(ValueError):
@@ -39,7 +40,7 @@ class ActionMapper:
 
     @classmethod
     def for_mode(cls, mode, *, arm, hand, motion, environment):
-        """joint 裁剪绝对关节目标；EEF 使用几何约束。"""
+        """配置关节目标边界或 EEF 几何约束。"""
         if mode not in ("joint", "eef"):
             raise ValueError("action mode must be joint or eef")
         solver = None
@@ -65,13 +66,10 @@ class ActionMapper:
             return None
         if hand is None:
             raise ValueError("hand-enabled action mapping requires a hand intent")
-        target = np.asarray(hand, dtype=np.float64)
-        if target.shape != (12,) or not np.isfinite(target).all():
-            raise ValueError("hand preparation requires a finite (12,) target")
-        return np.clip(target, self.hand_lower, self.hand_upper)
+        return validate_hand_target(hand, self.hand_lower, self.hand_upper)
 
     def map_joint(self, arm, hand):
-        """裁剪绝对关节目标，保留角度分支，不执行几何筛选。"""
+        """限制机械臂目标并校验 XHand 的绝对关节目标。"""
         target = np.asarray(arm, dtype=np.float64)
         if target.shape != (7,) or not np.isfinite(target).all():
             raise ValueError("arm preparation requires a finite (7,) target")

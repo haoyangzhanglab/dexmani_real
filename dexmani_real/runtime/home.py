@@ -10,6 +10,7 @@ from dexmani_real.robot.commands import (
     FeedbackUnavailable,
     HomeTimeout,
     OperationCancelled,
+    RobotError,
     arm_reference_from_feedback,
 )
 from dexmani_real.robot.xarm7.protocol import STANDSTILL_DWELL_S
@@ -138,7 +139,7 @@ def _home_hand(robot, check):
     check()
     _hand_sample(robot)
     deadline = time.monotonic_ns() + int(cfg.home_timeout_s * 1e9)
-    target = np.deg2rad(cfg.home_qpos_deg)
+    target = cfg.home_qpos_rad
     step = np.deg2rad(cfg.home_max_step_deg)
     tolerance = np.deg2rad(cfg.home_tolerance_deg)
     last = 0
@@ -155,7 +156,7 @@ def _home_hand(robot, check):
             raise HomeTimeout("hand HOME feedback exceeded deadline")
         sample = _hand_sample(robot)
         stamp = int(sample["timestamp_ns"])
-        if stamp > last:
+        if stamp > last and not robot.hand_feedback_pending:
             warning_stamp, read_warning, joints = robot.hand.feedback_overcurrent
             if warning_stamp != stamp:
                 raise FeedbackUnavailable("HOME hand overcurrent status does not match feedback")
@@ -174,7 +175,8 @@ def _home_hand(robot, check):
             if consecutive >= HOME_CONSECUTIVE_SAMPLES:
                 return
             if not abort_before_send:
-                command = q + np.clip(target - q, -step, step)
+                delta = target - q
+                command = np.where(np.abs(delta) <= step, target, q + np.copysign(step, delta))
                 write_warning = robot.send_hand_home(command, deadline_ns=deadline, check_abort=check)
             warned = read_warning or write_warning
             overcurrent_consecutive = overcurrent_consecutive + 1 if warned else 0
@@ -189,7 +191,7 @@ def _home_hand(robot, check):
                 )
                 logger.error("%s", error)
                 raise error
-            submitted = True
+            submitted = not write_warning
             last = time.monotonic_ns()
         time.sleep(0.005)
 
@@ -236,7 +238,7 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
 
         check_arm()
         _hand_sample(robot)
-        if not robot.stop_hand():
+        if not robot.hold_hand():
             raise FeedbackUnavailable("HOME requires confirmed XHand position hold")
         robot.arm.settle(
             cancel_epoch,
@@ -332,4 +334,7 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
         state.request_emergency_stop()
         raise
     finally:
-        robot.stop()
+        try:
+            robot.stop()
+        except OperationCancelled as exc:
+            raise RobotError("HOME stop could not be confirmed") from exc

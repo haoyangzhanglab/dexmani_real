@@ -48,6 +48,7 @@ XHAND_SDK_JOINT_NAMES: tuple[str, ...] = (
 )
 
 XHAND_MODEL_DIR = ASSET_DIR / "robots" / "xhand"
+XHAND_RIGHT_URDF_PATH = XHAND_MODEL_DIR / "xhand_right.urdf"
 XARM7_XHAND_RIGHT_URDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand_right.urdf"
 XARM7_XHAND_SRDF_PATH = XHAND_MODEL_DIR / "xarm7_xhand.srdf"
 
@@ -64,6 +65,7 @@ XARM7_HARD_UPPER = (
     2 * pi, pi, 2 * pi,
 )
 
+# 本仓右手 XHand URDF 的 revolute limits，按 SDK ID 排列，单位 rad。
 XHAND_RATED_QPOS_MIN_RAD: tuple[float, ...] = (
     0.0,
     -0.698,

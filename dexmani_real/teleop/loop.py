@@ -17,6 +17,7 @@ from dexmani_real.data.recorder import (
 from dexmani_real.robot.commands import (
     CommandExpired,
     FeedbackUnavailable,
+    HandCommandUnconfirmed,
     HomeTimeout,
     OperationCancelled,
     RobotCommand,
@@ -220,7 +221,7 @@ class TeleopLoop:
                 and (not self.runtime.hand.enabled or row.hand is not None
                      and int(row.hand["timestamp_ns"][0]) >= after_ns)
             )
-            if not issues and joints_ready:
+            if not issues and joints_ready and not self.robot.hand_feedback_pending:
                 return row
             if time.monotonic_ns() >= until:
                 if issues:
@@ -284,9 +285,11 @@ class TeleopLoop:
                 metadata = episode_recording_metadata(
                     self.camera_snapshot, effective_parameters,
                     tactile_reset=self.robot.hand.tactile_reset_metadata,
+                    tactile_calibration=self.robot.hand.tactile_calibration_metadata,
                 )
                 self.recorder = EpisodeRecorder(
                     self.recording_dir, control_hz=self.runtime.teleop.control_hz,
+                    read_xhand_crc=self.robot.hand.crc_counts.copy,
                 )
                 self.recorder.start(
                     task_label=self.task_label, collection_source="teleop",
@@ -362,7 +365,7 @@ class TeleopLoop:
                     "discard" if cmd == "d" else "stop", run_end_reason=RunEndReason.OPERATOR,
                 )
         elif cmd == "t":
-            return self._reset_tactile(expected_cancel_epoch)
+            return self._calibrate_tactile(expected_cancel_epoch)
         elif cmd == "h":
             return self._run_home(expected_cancel_epoch)
         elif cmd == "b":
@@ -374,7 +377,7 @@ class TeleopLoop:
             return False
         return False
 
-    def _reset_tactile(self, expected_cancel_epoch):
+    def _calibrate_tactile(self, expected_cancel_epoch):
         if not self.runtime.hand.enabled:
             logger.info("T ignored: hand is disabled")
             return False
@@ -383,11 +386,12 @@ class TeleopLoop:
             or self.runtime_state.cancel_epoch != expected_cancel_epoch
             or not self.runtime_state.requests_allow_motion()
         ):
-            logger.warning("T ignored: tactile reset requires idle, no capture or preparation")
+            logger.warning("T ignored: tactile calibration requires idle, no capture or preparation")
             return False
         try:
-            logger.info("正在请求触觉传感器复位，请保持手部无接触；S/Q/Esc 可中断后续请求。")
-            self.robot.reset_tactile_sensors(
+            logger.info("正在校准触觉，请保持五指无接触；S/Q/Esc 可中断。")
+            self.robot.calibrate_tactile(
+                no_contact=True,
                 cancel_epoch=expected_cancel_epoch,
                 cancel_requested=self.poll_blocking_commands,
             )
@@ -460,6 +464,7 @@ class TeleopLoop:
         episode_cancel_epoch = self.episode_cancel_epoch
         command = None
         action_accepted = False
+        command_unconfirmed = False
         compute_start_ns = time.monotonic_ns()
         first_target = self.last_command is None
         try:
@@ -515,6 +520,10 @@ class TeleopLoop:
             self.request_episode_end(str(exc))
         except (FeedbackUnavailable, CommandExpired) as exc:
             self.request_episode_end(str(exc))
+        except HandCommandUnconfirmed as exc:
+            command_unconfirmed = True
+            if exc.persistent:
+                self.request_episode_end(str(exc))
         except OperationCancelled as exc:
             # 先检查 SDK/worker 故障，再即时登记已入队的终止意图。
             interrupted = self.poll_blocking_commands()
@@ -528,6 +537,8 @@ class TeleopLoop:
                 try:
                     # 仅真实提交尝试生成动作行，包含抛错前可能已发生的部分提交。
                     issue = self.recorder.append(row, command, action_accepted=action_accepted)
+                    if command_unconfirmed:
+                        self.recorder.mark_gap()
                     if issue is not None:
                         self.request_episode_end(issue)
                 except BaseException as exc:
@@ -563,13 +574,17 @@ class TeleopLoop:
         self.next_tick_ns = next_tick_ns(planned_ns, self.control_dt_ns, now_ns)
         if now_ns - planned_ns >= self.control_dt_ns and self.recorder is not None:
             self.recorder.mark_gap()
+        if self.target_deadline_ns is not None and now_ns >= self.target_deadline_ns:
+            self.request_episode_end("target_expired")
+            return
+        if self.robot.hand_feedback_pending:
+            if self.recorder is not None:
+                self.recorder.mark_gap()
+            return
         row = read_observation(self.sensors.channels, self.robot, needs=self.capture_needs)
         issues = self.admit_observation(row)
         if issues:
             self.request_episode_end("control_sources: " + "; ".join(issues))
-            return
-        if self.target_deadline_ns is not None and now_ns >= self.target_deadline_ns:
-            self.request_episode_end("target_expired")
             return
         self.execute_control_step(row)
 

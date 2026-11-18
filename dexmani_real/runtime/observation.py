@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.ipc.sensors import read_camera_frame
+from dexmani_real.robot.xhand.feedback import expire_tactile, tactile_validity
 from dexmani_real.utils.timing import sample_is_fresh
 
 _RECOVERABLE_HOI_ISSUES = frozenset({
@@ -34,7 +35,6 @@ class ObservationNeeds:
 
 RAW_RECORDING_NEEDS = ObservationNeeds(
     camera_fields=("rgb", "depth"),
-    required_tactile=("aggregate", "dense"),
 )
 
 
@@ -85,15 +85,17 @@ def read_observation(
     aligned_joints = None
     if needs.hoi_joint_devices and hoi is not None and hoi["valid"]:
         aligned_joints = robot.aligned_joints(int(hoi["timestamp_ns"]), joint_gap_s)
+    observed_ns = time.monotonic_ns()
+    hand = expire_tactile(state.hand, max_age_s=robot.hand_config.tactile_max_age_s, now_ns=observed_ns)
     return Observation(
         arm=state.arm,
-        hand=state.hand,
+        hand=hand,
         hoi=hoi,
         aligned_joints=aligned_joints,
         camera=camera,
         vr=vr_result[0] if vr_result is not None else None,
         point_cloud=cloud["point_cloud"] if cloud is not None else None,
-        observation_timestamp_ns=time.monotonic_ns(),
+        observation_timestamp_ns=observed_ns,
         control_timestamp_ns=control_ns,
         pointcloud_timestamp_ns=int(cloud["timestamp_ns"]) if cloud is not None else 0,
     )
@@ -118,9 +120,9 @@ def check_observation(row, runtime, needs, *, now_ns=None):
     now = time.monotonic_ns() if now_ns is None else now_ns
     issues: list[str] = []
     for channel in needs.required_tactile:
-        stamp = int(row.hand[f"tactile_{channel}_timestamp_ns"][0]) if row.hand is not None else 0
-        if not sample_is_fresh(stamp, runtime.hand.feedback_max_age_s, now):
-            issues.append(f"hand_tactile_{channel}_timestamp_ns_unavailable_or_stale")
+        valid = tactile_validity(row.hand, channel, max_age_s=runtime.hand.tactile_max_age_s, now_ns=now)
+        if not valid.all():
+            issues.append(f"hand_tactile_{channel}_unavailable_or_stale: fingers={np.flatnonzero(~valid).tolist()}")
     # 派生图像与对应的点云或 HOI 观测共用来源时间。
     if needs.hoi:
         issues.extend(_hoi_issues(row.hoi, runtime, now))

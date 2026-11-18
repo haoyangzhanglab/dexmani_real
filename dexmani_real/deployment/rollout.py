@@ -28,10 +28,13 @@ from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.robot.commands import (
     COMMAND_LEASE_NS,
     FeedbackUnavailable,
+    HandCommandUnconfirmed,
+    HandTargetRejected,
     OperationCancelled,
     RobotCommand,
     arm_reference_from_feedback,
 )
+from dexmani_real.robot.xhand.feedback import expire_tactile
 from dexmani_real.runtime.ik_reference import IKReference, prepare_reference
 from dexmani_real.runtime.observation import (
     RAW_RECORDING_NEEDS,
@@ -236,8 +239,10 @@ class Rollout:
                 self.sensors.channels,
                 fields=RAW_RECORDING_NEEDS.camera_fields if include_visual_payloads else (),
             )
-            raw = replace(row, camera=camera, point_cloud=None, hoi=None, aligned_joints=None,
-                          observation_timestamp_ns=time.monotonic_ns())
+            observed_ns = time.monotonic_ns()
+            hand = expire_tactile(row.hand, max_age_s=self.runtime.hand.tactile_max_age_s, now_ns=observed_ns)
+            raw = replace(row, hand=hand, camera=camera, point_cloud=None, hoi=None, aligned_joints=None,
+                          observation_timestamp_ns=observed_ns)
         return row, raw
 
     def start_observation(self, poll_operator, *, after_ns=None, initial_hoi=False):
@@ -261,7 +266,7 @@ class Rollout:
                 int(row.arm["timestamp_ns"][0]) >= after_ns
                 and row.hand is not None and int(row.hand["timestamp_ns"][0]) >= after_ns
             )
-            if issue is None and joints_ready:
+            if issue is None and joints_ready and not self.robot.hand_feedback_pending:
                 self.preparation_issue = None
                 break
             if time.monotonic_ns() >= until:
@@ -324,10 +329,14 @@ class Rollout:
         if not self.preparation_valid():
             raise OperationCancelled("cancelled before recorder start")
         if self.record_raw:
-            self.recorder = EpisodeRecorder(self.output_dir, control_hz=1 / self.execution.control_dt_s)
+            self.recorder = EpisodeRecorder(
+                self.output_dir, control_hz=1 / self.execution.control_dt_s,
+                read_xhand_crc=self.robot.hand.crc_counts.copy,
+            )
             metadata = episode_recording_metadata(
                 self.camera_snapshot, self.effective_parameters,
                 tactile_reset=self.robot.hand.tactile_reset_metadata,
+                tactile_calibration=self.robot.hand.tactile_calibration_metadata,
             )
             self.recorder.start(
                 task_label=self.policy_info.task_name,
@@ -491,7 +500,7 @@ class Rollout:
     def prepare_command(self, action, row):
         try:
             command, issue = self.map_command(action, row)
-        except IKReferenceError as exc:
+        except (IKReferenceError, HandTargetRejected) as exc:
             self.stop(str(exc))
             return None
         if issue is not None:
@@ -570,9 +579,13 @@ class Rollout:
         issues = check_device_feedback(state, self.runtime, now_ns=now)
         if issues:
             raise FeedbackUnavailable("device feedback: " + "; ".join(issues))
-        self.robot.send_action(
-            RobotCommand(arm_hold=True, hand_qpos=state.hand["qpos"][0]), expires_ns=now + COMMAND_LEASE_NS,
-        )
+        self.robot.send_action(RobotCommand(arm_hold=True), expires_ns=now + COMMAND_LEASE_NS)
+        if self.robot.hand_feedback_pending:
+            return
+        if not self.robot.hold_hand(check_abort=self.check_motion):
+            if self.robot.hand_feedback_pending:
+                return
+            raise FeedbackUnavailable("HOI HOLD XHand position hold not confirmed")
         self.next_hoi_hold_ns = now + int(HOI_HOLD_REFRESH_S * 1e9)
 
     def step(self):
@@ -588,8 +601,16 @@ class Rollout:
             issues = check_hoi_status(self.sensors.channels, self.runtime)
             if issues:
                 self._enter_hoi_hold()
-        if self.state != "RUNNING":
+        if self.state != "RUNNING" and not self.robot.hand_feedback_pending:
             self._refresh_hoi_hold()
+        if self.robot.hand_feedback_pending:
+            slot, _ = self._advance_control_slot()
+            if slot is not None:
+                self._clear_policy_context()
+                if self.recorder is not None:
+                    self.recorder.mark_gap()
+            self.poll_model()
+            return
         if self.state == "HOI_HOLD":
             # 即使旧推理未完成，也不能掩盖设备或其他输入故障。
             # 暂停不构建模型历史或追加 Raw，仅读取视觉来源元数据检查时效。
@@ -631,7 +652,7 @@ class Rollout:
             self._clear_policy_context()
             if was_running and self.recorder is not None:
                 self.recorder.mark_gap()
-        if self.policy_info.requires_prev_action and self.first_prediction and self.model.future is not None:
+        if self.first_prediction and self.model.future is not None:
             self.poll_model()
             if self.model.future is not None:
                 # 新段从首个可提交查询的观测开始，与离线起点一致。
@@ -640,6 +661,7 @@ class Rollout:
         quality_issue = self.recording_issue(raw) if self.recorder is not None else None
         attempted = None
         action_accepted = False
+        command_unconfirmed = False
         try:
             if quality_issue is not None:
                 self.stop(quality_issue)
@@ -687,9 +709,17 @@ class Rollout:
                     self.plan = None
             if self.state == "RESUMING":
                 self.state = "RUNNING"
+        except HandCommandUnconfirmed as exc:
+            command_unconfirmed = True
+            if exc.persistent:
+                self.stop(str(exc))
+            else:
+                self._clear_policy_context()
         finally:
             # 已尝试提交的恢复动作也需要记录。
             if self.state == "RUNNING" or attempted is not None:
                 if skipped and not ode_gap and was_running and self.recorder is not None:
                     self.recorder.mark_gap()
                 self.record_row(raw, attempted, quality_issue=quality_issue, action_accepted=action_accepted)
+                if command_unconfirmed and self.recorder is not None:
+                    self.recorder.mark_gap()

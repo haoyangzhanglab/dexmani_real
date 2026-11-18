@@ -41,6 +41,11 @@ class StandstillRequest:
 
 
 @dataclass(frozen=True)
+class PhysicalStopRequest:
+    deadline_ns: int
+
+
+@dataclass(frozen=True)
 class HomeRequest:
     deadline_ns: int
     samples: np.ndarray

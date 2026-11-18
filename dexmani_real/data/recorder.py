@@ -5,6 +5,7 @@ import os
 import shutil
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -44,6 +45,9 @@ def format_recording_result(raw: dict | None) -> tuple[int, str]:
         lines.append(f"录制截断原因：{truncated}")
     if raw["error"] is not None:
         lines.append(f"录制错误：{raw['error']}")
+    xhand_crc = raw["xhand_crc_counts"]
+    if any(xhand_crc.values()):
+        lines.append(f"XHand CRC: {xhand_crc}")
     staging = raw["staging_path"]
     if staging is not None or status in {"failed", "pending"}:
         lines.append(f"Staging：{staging if staging is not None else 'Recorder 未提供路径'}")
@@ -59,15 +63,16 @@ class _FinishRequest:
     save: bool
     reason: str
     deadline: float
+    xhand_crc_counts: dict[str, int]
 
 
 class EpisodeRecorder:
     """每段独占一个 writer；失败由控制流程终段，线程退出后才处置文件。"""
 
-    def __init__(self, data_dir, *, control_hz):
+    def __init__(self, data_dir, *, control_hz, read_xhand_crc: Callable[[], dict[str, int]] | None = None):
         self.data_dir = Path(data_dir)
         self.control_hz = float(control_hz)
-        self.thread = None
+        self.thread: threading.Thread | None = None
         self.queue: Queue[tuple[Observation, RobotCommand | None, bool, bool]] = Queue(maxsize=16)
         self.ready = threading.Event()
         self.error = None
@@ -78,6 +83,8 @@ class EpisodeRecorder:
         self.staging_path: Path | None = None
         self.published_path: Path | None = None
         self.writer = None
+        self.read_xhand_crc = read_xhand_crc
+        self.initial_xhand_crc = read_xhand_crc() if read_xhand_crc is not None else {}
 
     @property
     def written_frames(self):
@@ -109,8 +116,9 @@ class EpisodeRecorder:
             raise self.error
 
     def mark_gap(self):
-        self.pending_segment_start = True
-        logger.info("录制间断；下一行开始新的连续区间。")
+        if not self.pending_segment_start:
+            self.pending_segment_start = True
+            logger.info("录制间断；下一行开始新的连续区间。")
 
     def result(self):
         """仅报告最后可观察的结果，pending 不推断线程之后的结局。"""
@@ -131,6 +139,7 @@ class EpisodeRecorder:
             "row_count": self.written_frames,
             "error": str(self.error) if self.error is not None else None,
             "recording_truncated_reason": self.recording_truncated_reason,
+            "xhand_crc_counts": self.finish_request.xhand_crc_counts if self.finish_request else {},
         }
 
     def start(
@@ -203,7 +212,9 @@ class EpisodeRecorder:
         self.is_recording = False
         # 首次请求固定处置意图和等待预算。
         if self.finish_request is None:
-            self.finish_request = _FinishRequest(save, reason, time.monotonic() + RECORDER_STOP_TIMEOUT_S)
+            counts = self.read_xhand_crc() if self.read_xhand_crc is not None else {}
+            delta = {key: count - self.initial_xhand_crc[key] for key, count in counts.items()}
+            self.finish_request = _FinishRequest(save, reason, time.monotonic() + RECORDER_STOP_TIMEOUT_S, delta)
         request = self.finish_request
         while self.writer_pending:
             remaining = request.deadline - time.monotonic()
@@ -270,6 +281,7 @@ class EpisodeRecorder:
                     writer.finish(
                         finish.reason,
                         recording_truncated_reason=self.recording_truncated_reason,
+                        xhand_crc_counts=finish.xhand_crc_counts,
                     )
             except BaseException as exc:  # noqa: BLE001 — 写入失败及中断由控制线程处理。
                 self.store_error(exc)

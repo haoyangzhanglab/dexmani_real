@@ -12,15 +12,12 @@ import numpy as np
 from dexmani_real.robot.commands import (
     CommandExpired,
     FeedbackUnavailable,
+    HandCommandUnconfirmed,
     HomeTimeout,
     OperationCancelled,
     RobotError,
     validate_arm_target,
     validate_hand_target,
-)
-from dexmani_real.robot.model import (
-    XHAND_RATED_QPOS_MAX_RAD,
-    XHAND_RATED_QPOS_MIN_RAD,
 )
 from dexmani_real.robot.xhand.feedback import XHandFeedback
 from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S
@@ -54,8 +51,8 @@ class Robot:
         self.arm_config, self.hand_config = arm_config, hand_config
         self.arm_lower = np.asarray(arm_config.joint_limit_lower, dtype=np.float64)
         self.arm_upper = np.asarray(arm_config.joint_limit_upper, dtype=np.float64)
-        self.hand_lower = np.asarray(XHAND_RATED_QPOS_MIN_RAD, dtype=np.float64)
-        self.hand_upper = np.asarray(XHAND_RATED_QPOS_MAX_RAD, dtype=np.float64)
+        self.hand_lower = np.array(hand_config.qpos_min_rad, dtype=np.float64, copy=True)
+        self.hand_upper = np.array(hand_config.qpos_max_rad, dtype=np.float64, copy=True)
         self.runtime_state = runtime_state
         self.check_services = check_services
         self.arm: ArmProcess | None = None
@@ -144,10 +141,10 @@ class Robot:
         self.connected = True
         self._read_initial_state(cancel_requested=cancelled)
 
-    def reset_tactile_sensors(self, *, cancel_epoch, cancel_requested) -> dict[int, int]:
+    def calibrate_tactile(self, *, no_contact: bool, cancel_epoch, cancel_requested) -> bool:
         """cancel_requested 负责设备故障轮询；此处补充停止与取消上下文。"""
         if self.hand is None:
-            raise RobotError("XHand unavailable for tactile reset")
+            raise RobotError("XHand unavailable for tactile calibration")
 
         def cancelled():
             return bool(
@@ -157,17 +154,25 @@ class Robot:
             )
 
         if cancelled():
-            raise OperationCancelled("tactile reset cancelled before stopping")
+            raise OperationCancelled("tactile calibration cancelled before stopping")
         self.stop()
         if cancelled():
-            raise OperationCancelled("tactile reset cancelled after stopping")
-        self.hand_feedback.clear_tactile()
-        return self.hand.reset_tactile_sensors(cancel_requested=cancelled)
+            raise OperationCancelled("tactile calibration cancelled after stopping")
+        try:
+            return self.hand.calibrate_tactile(no_contact=no_contact, cancel_requested=cancelled)
+        finally:
+            # 下一份触觉必须来自本次校准之后的读取。
+            self.hand_feedback.clear_tactile()
+            self.feedback_next_ns = 0
 
     def read_hand(self):
         if self.hand is None:
             return None
         return self.hand_feedback.consume(self.hand.get_state())
+
+    @property
+    def hand_feedback_pending(self) -> bool:
+        return self.hand is not None and self.hand.consecutive_read_crc > 0
 
     def read_state(self):
         """消费来源时间不变的反馈缓存，不执行硬件查询。"""
@@ -215,13 +220,14 @@ class Robot:
             self.runtime_state.stop_signal.set()
             raise
 
-    def _check_hand_feedback(self) -> None:
+    def _check_hand_feedback(self) -> int:
         if self.hand is None:
-            return
+            return 0
         frame = self.hand_feedback.snapshot()
         stamp = int(frame["timestamp_ns"][0]) if frame is not None else 0
         if not sample_is_fresh(stamp, self.hand_config.feedback_max_age_s, time.monotonic_ns()):
             raise FeedbackUnavailable("current hand feedback unavailable/stale")
+        return stamp
 
     def _read_initial_state(self, *, cancel_requested):
         """回调负责完整故障检查及当前操作的取消语义，异常原样传播。"""
@@ -263,8 +269,10 @@ class Robot:
         self.check_run()
 
     def send_action(self, command, *, expires_ns):
-        """顺序发布 arm、发送 hand；返回不表示原子执行、SDK 回执或到位。"""
+        """顺序发布 arm 邮箱并确认 hand SDK 发送结果。"""
         self.validate_command(command)
+        if command.hand_qpos is not None and self.hand_feedback_pending:
+            raise FeedbackUnavailable("fresh XHand feedback pending after CRC")
         try:
             self.check_run()
             if command.arm_qpos is not None or command.arm_hold:
@@ -274,12 +282,19 @@ class Robot:
             if command.hand_qpos is not None:
                 self.check_run()
                 # arm 发布可能等待邮箱锁；真正发送 hand 前仍须复核当前反馈。
-                self._check_hand_feedback()
-                if time.monotonic_ns() >= expires_ns:
+                stamp = self._check_hand_feedback()
+                hand_deadline_ns = min(expires_ns, stamp + int(self.hand_config.feedback_max_age_s * 1e9))
+                if time.monotonic_ns() >= hand_deadline_ns:
                     raise CommandExpired("command expired before hand submission")
                 self.hand_stop_required = True
-                cast("XHand", self.hand)._send_action(command.hand_qpos)
+                cast("XHand", self.hand).send_action(
+                    command.hand_qpos, deadline_ns=hand_deadline_ns, check_abort=self.check_run,
+                )
             self.check_run()
+        except HandCommandUnconfirmed:
+            # 组合发送可能已发布 arm；下个控制周期先安排新的 hand 实测反馈。
+            self.feedback_next_ns = 0
+            raise
         except BaseException:
             self.runtime_state.stop_signal.set()
             raise
@@ -297,58 +312,65 @@ class Robot:
             validate_hand_target(command.hand_qpos, self.hand_lower, self.hand_upper)
 
     def send_hand_home(self, qpos, *, deadline_ns, check_abort) -> bool:
-        """提交 HOME 小步目标并返回过流告警；CRC 立即失败。"""
+        """提交 HOME 小步目标并返回过流告警。"""
         if not self.connected or self.hand is None or not self.hand.is_connected:
             raise RobotError("hand device unavailable")
         # 操作范围已由连接前配置校验限制在额定范围内。
-        target = validate_hand_target(
-            qpos, self.hand_config.qpos_min_rad, self.hand_config.qpos_max_rad,
-        )
+        target = validate_hand_target(qpos, self.hand_lower, self.hand_upper)
         # 回调负责完整故障与取消检查；反馈和期限仍在实际发送前独立检查。
         check_abort()
-        self._check_hand_feedback()
+        if self.hand_feedback_pending:
+            raise FeedbackUnavailable("HOME requires fresh XHand feedback after CRC")
+        stamp = self._check_hand_feedback()
         if time.monotonic_ns() >= deadline_ns:
             raise HomeTimeout("hand HOME budget exhausted before submission")
         self.hand_stop_required = True
-        from dexmani_real.robot.xhand.driver import (
-            COMMUNICATION_CRC_ERROR_CODE,
-            OVERCURRENT_WARNING_CODE,
-            XHandError,
-        )
+        from dexmani_real.robot.xhand.driver import OVERCURRENT_WARNING_CODE
 
-        code = self.hand._send_position(target, tor_max=np.minimum(
-            self.hand_config.tor_max, self.hand_config.home_tor_max))
-        if code == COMMUNICATION_CRC_ERROR_CODE:
-            raise XHandError("HOME send", code, "delivery unconfirmed")
+        tor_max = np.minimum(self.hand_config.tor_max, self.hand_config.home_tor_max)
+        code = self.hand.send_position(
+            target, tor_max=tor_max,
+            deadline_ns=min(deadline_ns, stamp + int(self.hand_config.feedback_max_age_s * 1e9)),
+            check_abort=check_abort,
+        )
+        if code is None:
+            raise FeedbackUnavailable("HOME XHand position submission unconfirmed within its deadline")
         return code == OVERCURRENT_WARNING_CODE
 
-    def stop_hand(self, *, passive=False) -> bool:
+    def hold_hand(self, *, check_abort=None) -> bool:
+        """使用最近可信的反馈保持位置，必要时刷新一次。"""
         if self.hand is None:
             return False
         self.hand_stop_required = True
         frame = self.hand_feedback.snapshot()
-        if not passive and frame is not None:
-            return self.hand.stop(frame["qpos"][0], timestamp_ns=int(frame["timestamp_ns"][0]))
-        else:
-            return self.hand.stop()
+        stamp = int(frame["timestamp_ns"][0]) if frame is not None else 0
+        if self.hand_feedback_pending or not sample_is_fresh(
+            stamp, self.hand.hold_feedback_max_age_s, time.monotonic_ns(),
+        ):
+            frame = self.read_hand()
+        if frame is None or self.hand_feedback_pending:
+            return False
+        confirmed = self.hand.hold(
+            frame["qpos"][0], timestamp_ns=int(frame["timestamp_ns"][0]), check_abort=check_abort,
+        )
+        self.hand_stop_required = not confirmed
+        return confirmed
 
     def stop(self):
-        """arm 停止结果由 Owner 持有；仅未完成的手部停止需要再次发送。"""
+        """请求机械臂停止，同时保持 XHand 位置，并确认机械臂停稳。"""
         self.runtime_state.stop_signal.set()
         errors = []
         if self.hand_stop_required:
             try:
-                if self.hand is None:
-                    raise RobotError("hand stop unresolved after disconnect")
-                self.stop_hand()
-                self.hand_stop_required = False
+                if not self.hold_hand():
+                    raise FeedbackUnavailable("XHand position hold not confirmed")
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
-                errors.append(("hand_stop", exc))
+                errors.append(("hand_hold", exc))
         if self.arm is not None:
             try:
-                self.arm.wait_stopped()
+                self.arm.wait_physical_stop()
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
@@ -359,14 +381,15 @@ class Robot:
             raise errors[0][1]
 
     def service_idle(self):
-        if (
-            self.runtime_state.stop_signal.is_set() or self.runtime_state.emergency_signal.is_set()
-        ):
+        stop_requested = self.runtime_state.stop_signal.is_set() or self.runtime_state.emergency_signal.is_set()
+        arm_stop_pending = self.arm is not None and not self.arm.physical_stop_confirmed
+        if stop_requested and (self.hand_stop_required or arm_stop_pending):
             self.stop()
         if self.connected:
             self.service_feedback()
 
-    def close(self):
+    def close(self, *, release_hand: bool = False):
+        """关闭设备前完成保持。调用方显式选择时提交 Passive。"""
         if self.arm is None and self.hand is None:
             return
         # 共用 stop 先通知 arm；owner 退出后的最终故障也由 close 带回。
@@ -375,12 +398,24 @@ class Robot:
         errors = []
         # disconnect 失败仍持有句柄，但驱动已撤销读写；重试关闭只释放资源。
         if self.hand is not None and self.hand.is_connected:
+            if release_hand and self.arm is not None:
+                try:
+                    self.arm.wait_physical_stop()
+                except BaseException as exc:  # noqa: BLE001 — 中断也须跳过释放并回收设备。
+                    if isinstance(exc, KeyboardInterrupt):
+                        self.runtime_state.request_emergency_stop()
+                    errors.append(("arm_stop_confirm", exc))
+                    release_hand = False
             try:
-                self.stop_hand(passive=True)
+                if release_hand:
+                    if not self.hand.release():
+                        raise RobotError("XHand release not confirmed")
+                elif self.hand_stop_required and not self.hold_hand():
+                    raise FeedbackUnavailable("XHand position hold not confirmed during close")
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
-                errors.append(("hand_passive_stop", exc))
+                errors.append(("hand_release" if release_hand else "hand_hold", exc))
         if self.arm is not None:
             try:
                 self.arm.close()

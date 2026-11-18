@@ -2,7 +2,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.robot.model import ARM_JOINT_SHAPE, HAND_JOINT_SHAPE
+from dexmani_real.robot.model import (
+    ARM_JOINT_SHAPE,
+    HAND_JOINT_SHAPE,
+    XHAND_SDK_JOINT_NAMES,
+)
 
 # 设备 owner 检查目标租期；它不代表物理停止延迟。
 COMMAND_LEASE_NS = 2_000_000_000
@@ -45,6 +49,18 @@ class CommandExpired(OperationCancelled):
     """命令未能在租约内提交；不代表设备 SDK 故障。"""
 
 
+class HandCommandUnconfirmed(OperationCancelled):
+    """XHand 收到 CRC 回复，普通动作的送达结果未知。"""
+
+    def __init__(self, consecutive_crc: int, *, persistent: bool):
+        self.persistent = persistent
+        super().__init__(f"XHand position delivery unconfirmed after {consecutive_crc} consecutive write CRC replies")
+
+
+class HandTargetRejected(ValueError):
+    """XHand 目标在发送前被拒绝。"""
+
+
 class RobotError(RuntimeError):
     """设备或执行器失败，调用方须终止本次运行。"""
 
@@ -78,13 +94,28 @@ def hand_reference_from_feedback(qpos, lower, upper) -> np.ndarray:
     return np.clip(feedback, lower, upper)
 
 
-def validate_hand_target(qpos, lower, upper) -> np.ndarray:
+def validate_hand_qpos(qpos) -> np.ndarray:
     target = np.asarray(qpos, dtype=np.float64)
-    lower, upper = np.asarray(lower), np.asarray(upper)
     if target.shape != HAND_JOINT_SHAPE:
-        raise ValueError("hand target must have shape (12,)")
-    if not np.all(np.isfinite(target)):
-        raise ValueError("hand target must be finite")
-    if np.any(target < lower - 1e-12) or np.any(target > upper + 1e-12):
-        raise ValueError("hand target violates joint limits")
+        raise ValueError(f"XHand qpos requires shape {HAND_JOINT_SHAPE} in SDK order (got {target.shape})")
+    finite = np.isfinite(target)
+    if not finite.all():
+        joints = ", ".join(f"{XHAND_SDK_JOINT_NAMES[i]}={target[i]:g}" for i in np.flatnonzero(~finite))
+        raise ValueError(f"XHand qpos has non-finite joints: {joints}")
+    return target
+
+
+def validate_hand_target(qpos, lower, upper) -> np.ndarray:
+    try:
+        target = validate_hand_qpos(qpos)
+    except (TypeError, ValueError) as exc:
+        raise HandTargetRejected(str(exc)) from exc
+    lower, upper = np.asarray(lower), np.asarray(upper)
+    outside = (target < lower) | (target > upper)
+    if outside.any():
+        joints = ", ".join(
+            f"{XHAND_SDK_JOINT_NAMES[i]}={target[i]:.12g} not in [{lower[i]:.12g}, {upper[i]:.12g}] rad"
+            for i in np.flatnonzero(outside)
+        )
+        raise HandTargetRejected(f"XHand target violates position limits: {joints}")
     return target

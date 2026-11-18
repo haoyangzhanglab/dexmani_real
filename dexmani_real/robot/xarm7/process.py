@@ -10,6 +10,7 @@ from dexmani_real.robot.xarm7.protocol import (
     READY_TIMEOUT_S,
     ArmChannels,
     HomeRequest,
+    PhysicalStopRequest,
     PrepareRequest,
     StandstillRequest,
 )
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 EXECUTOR_TIMEOUT_S = 3.0
+STOP_REPLY_GRACE_S = 0.05
 
 
 class ArmProcess:
@@ -41,6 +43,8 @@ class ArmProcess:
         )
         self.pipe, self.child_pipe = self.ctx.Pipe()
         self.process: BaseProcess | None = None
+        # 空闲轮询只确认一次；显式等待始终验证新反馈。
+        self.physical_stop_confirmed = False
 
     @property
     def is_connected(self) -> bool:
@@ -161,6 +165,7 @@ class ArmProcess:
                 raise TimeoutError("arm operation deadline expired before preparation")
             # stopped 仅由 owner 写入；它在接纳请求时失效旧确认。
             # 父进程此时清确认会使 owner 把尚未清除的 stop 当作新停止。
+            self.physical_stop_confirmed = False
             self.io.stop.clear()
 
     def request_operation(self, request: PrepareRequest | HomeRequest | StandstillRequest, *, service, abort, cancel_epoch):
@@ -273,11 +278,49 @@ class ArmProcess:
         self.io.stop.set()
 
     def wait_stopped(self, *, deadline=None):
+        """等待 Owner 处理 SDK 停止请求。"""
         deadline = time.monotonic() + EXECUTOR_TIMEOUT_S if deadline is None else deadline
-        if (self.process is not None and self.process.is_alive()
-                and not self.io.stopped.wait(max(0, deadline - time.monotonic()))):
-            raise TimeoutError("arm stop unresolved; SDK acceptance not confirmed")
+        while not self.io.stopped.is_set():
+            self.check_error()
+            if self.process is None or self.process.pid is None:
+                raise RobotError("arm owner unavailable before handling stop request")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("arm stop unresolved; SDK acceptance not confirmed")
+            self.io.stopped.wait(min(0.05, remaining))
+        self.check_error()  # Owner 先记录 stop 的故障，再置 stopped。
+
+    def wait_physical_stop(self):
+        """确认 SDK 停止已处理，再由 Owner 查询新反馈并验证停稳。"""
+        self.physical_stop_confirmed = False
+        if not self.io.stop.is_set():
+            raise OperationCancelled("arm stop was not requested")
+        self.wait_stopped()
+        if not self.is_connected:
+            raise RobotError("arm owner unavailable for physical stop verification")
+
+        deadline_ns = time.monotonic_ns() + int(EXECUTOR_TIMEOUT_S * 1e9)
+        # Owner 到达采样期限后仍需发送失败回复。
+        reply_deadline_ns = deadline_ns + round(STOP_REPLY_GRACE_S * 1e9)
+        try:
+            self.pipe.send(PhysicalStopRequest(deadline_ns))
+            while not self.pipe.poll(0.005):
+                self.check_error()
+                if not self.is_connected:
+                    raise RobotError("arm owner unavailable during physical stop verification")
+                if time.monotonic_ns() >= reply_deadline_ns:
+                    raise TimeoutError("arm physical stop unresolved: owner reply timed out")
+            error = self.pipe.recv()
+        except BaseException as exc:
+            # 未消费的晚到回复不能进入下一次操作。
+            self.io.closing.set()
+            if isinstance(exc, Exception):
+                self.check_error()
+            raise
         self.check_error()
+        if error is not None:
+            raise error
+        self.physical_stop_confirmed = True
 
     def close(self) -> None:
         self.request_stop()

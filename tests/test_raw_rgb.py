@@ -1,3 +1,4 @@
+import json
 from fractions import Fraction
 from pathlib import Path
 
@@ -12,8 +13,46 @@ from dexmani_real.data.raw import (
     RawReader,
     _VideoWriter,
 )
+from dexmani_real.data.recorder import EpisodeRecorder
+from dexmani_real.robot.commands import RobotCommand
+from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
+from dexmani_real.robot.xhand.feedback import XHandFeedback, XHandState
+from dexmani_real.runtime.observation import Observation
 
 WIDTH, HEIGHT = 32, 24
+
+
+def test_recorder_keeps_episode_crc_counts_and_unconfirmed_action(tmp_path):
+    counts = {"read_errors": 5, "read_recoveries": 2, "unconfirmed_actions": 1}
+    recorder = EpisodeRecorder(tmp_path, control_hz=20, read_xhand_crc=counts.copy)
+    recorder.start(
+        task_label="test", collection_source="policy_rollout",
+        metadata={"camera_color_height": HEIGHT, "camera_color_width": WIDTH},
+    )
+    stamp = 1_000_000_000
+    arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+    arm["timestamp_ns"] = stamp
+    row = Observation(
+        arm=arm, hand=XHandFeedback().consume(XHandState(np.zeros(12), None, None, stamp)),
+        vr=None, point_cloud=None, observation_timestamp_ns=stamp, control_timestamp_ns=stamp,
+        camera={"rgb": np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8),
+                "depth": np.zeros((HEIGHT, WIDTH), dtype=np.uint16), "timestamp_ns": stamp, "ring_sequence": 1},
+    )
+    counts.update(read_errors=7, read_recoveries=3, unconfirmed_actions=2)
+    target = RobotCommand(arm_qpos=np.ones(7), hand_qpos=np.ones(12))
+    try:
+        assert recorder.append(row, target, action_accepted=False) is None
+    finally:
+        recorder.finish(save=True, reason="test")
+
+    expected = {"read_errors": 2, "read_recoveries": 1, "unconfirmed_actions": 1}
+    assert recorder.result()["xhand_crc_counts"] == expected
+    with h5py.File(recorder.published_path / "data.h5", "r") as data:
+        assert json.loads(data["meta"].attrs["xhand_crc_counts_json"]) == expected
+        assert data["action_send_accepted"][:].tolist() == [0]
+        np.testing.assert_array_equal(data["action_hand_joint_target"][0], target.hand_qpos)
+        assert np.isnan(data["hand_contact"][:]).all()
+        assert np.isnan(data["hand_tactile_force"][:]).all()
 
 
 def write_raw_data(path: Path, offsets_ns: tuple[int, ...]) -> np.ndarray:

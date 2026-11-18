@@ -45,7 +45,7 @@ TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
 ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
     "arm_qpos": ((7,), np.dtype(np.float64)),
     "hand_qpos": ((12,), np.dtype(np.float64)),
-    # 两种触觉直接保留 Feedback 的 SDK / 255 最近有效值及其原来源时间。
+    # 触觉保留校正后 SDK / 255，无法使用的指尖以 NaN 表示。
     "hand_contact": ((5, 3), np.dtype(np.float32)),
     "hand_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
     # 绝对目标保留失败尝试，是否完整提交由 action_send_accepted 标记。
@@ -66,7 +66,7 @@ VR_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
 
 
 # 时间字段单位 ns，保留主机单调时钟的查询/接收时间，不代表同步硬件采样。
-# 来源时间必须为正；触觉时间为最后一份完整有效通道帧的查询起点。
+# 触觉时间为最老的指尖来源时间，缺少任何指尖时为 0。
 TIMING_ROW_DTYPE = np.dtype(
     [
         (name, np.dtype("<i8"))
@@ -123,8 +123,8 @@ def encode_timing_row(row):
         int(row.control_timestamp_ns),
         int(row.arm["timestamp_ns"][0]),
         int(hand["timestamp_ns"][0]),
-        int(hand["tactile_aggregate_timestamp_ns"][0]),
-        int(hand["tactile_dense_timestamp_ns"][0]),
+        int(hand["tactile_aggregate_timestamp_ns"][0].min()),
+        int(hand["tactile_dense_timestamp_ns"][0].min()),
         int(row.camera["timestamp_ns"]),
         int(row.camera["ring_sequence"]),
     )
@@ -161,7 +161,9 @@ def robot_recording_parameters(runtime: RealConfig) -> dict[str, dict[str, objec
         )},
         "hand": {name: getattr(runtime.hand, name) for name in (
             "enabled", "comm_type", "device_name", "device_id", "qpos_min_rad", "qpos_max_rad",
-            "kp", "ki", "kd", "tor_max", "feedback_max_age_s",
+            "kp", "ki", "kd", "tor_max", "feedback_max_age_s", "crc_retries", "crc_retry_interval_s",
+            "tactile_max_age_s", "tactile_calibration_samples", "tactile_calibration_timeout_s",
+            "tactile_contact_limits", "tactile_residual_limits",
             "baudrate" if runtime.hand.comm_type == "serial" else "ethercat_slave_position",
         )},
     }
@@ -172,12 +174,14 @@ def episode_recording_metadata(
     effective_parameters: Mapping[str, object],
     *,
     tactile_reset: Mapping[str, object],
+    tactile_calibration: Mapping[str, object],
 ) -> dict[str, object]:
-    """相机标定存于顶层，实验参数与本段触觉复位结果存于 JSON。"""
+    """相机标定存于顶层，实验参数与触觉校准存于 JSON。"""
     metadata = camera_metadata(camera_snapshot)
     parameters = {
         **effective_parameters,
         "tactile_reset": tactile_reset,
+        "tactile_calibration": tactile_calibration,
     }
     metadata["effective_parameters"] = json.dumps(parameters, allow_nan=False)
     return metadata
@@ -390,10 +394,12 @@ class RawWriter:
         self.row_times[self.frame_count : end] = cast(np.ndarray, self.timing_rows)[:count]
         self.frame_count = end
 
-    def finish(self, reason, *, recording_truncated_reason=None):
+    def finish(self, reason, *, recording_truncated_reason=None, xhand_crc_counts: dict[str, int]):
         self.flush()
         if recording_truncated_reason is not None:
             self.meta.attrs["recording_truncated_reason"] = recording_truncated_reason
+        if xhand_crc_counts:
+            self.meta.attrs["xhand_crc_counts_json"] = json.dumps(xhand_crc_counts)
         # 关闭资源成功与否由 recorder 监督方确认，元数据本身不代表已发布。
         self.meta.attrs["termination_reason"] = reason
 

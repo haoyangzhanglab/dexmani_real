@@ -17,12 +17,16 @@ import numpy as np
 
 from dexmani_real.config.real import load_config
 from dexmani_real.config.xhand import HandConfig
-from dexmani_real.robot.commands import OperationCancelled, validate_hand_target
+from dexmani_real.robot.commands import (
+    FeedbackUnavailable,
+    OperationCancelled,
+    validate_hand_target,
+)
 from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_TACTILE_SENSOR_FINGER_IDS,
 )
-from dexmani_real.robot.xhand.driver import COMMUNICATION_CRC_ERROR_CODE, XHand
+from dexmani_real.robot.xhand.driver import XHand
 from dexmani_real.robot.xhand.feedback import XHandState
 from dexmani_real.utils.log import configure_logging
 
@@ -114,10 +118,13 @@ class XHandDiagnostic(XHand):
         print("  joint positions (deg, SDK ids 0..11):", np.rad2deg(state.qpos).round(3).tolist())
         if finger_id in XHAND_TACTILE_SENSOR_FINGER_IDS:
             index = XHAND_TACTILE_SENSOR_FINGER_IDS.index(finger_id)
-            force = state.tactile_aggregate
-            print("  tactile aggregate (SDK units):", force[index].tolist() if force is not None else "unavailable")
-            if state.tactile_dense is not None:
-                dense = state.tactile_dense[index]
+            aggregate = state.tactile_aggregate[index] if state.tactile_aggregate is not None else None
+            if aggregate is not None and np.isfinite(aggregate).all():
+                print("  tactile aggregate (SDK units):", aggregate.tolist())
+            else:
+                print("  tactile aggregate (SDK units): unavailable")
+            dense = state.tactile_dense[index] if state.tactile_dense is not None else None
+            if dense is not None and np.isfinite(dense).all():
                 print(f"  tactile dense (SDK units): points={len(dense)} max_abs={np.abs(dense).max():.3f}")
             else:
                 print("  tactile dense (SDK units): unavailable")
@@ -131,7 +138,7 @@ class XHandDiagnostic(XHand):
             deadline_ns = min(deadline_ns, action_deadline_ns)
         while True:
             self.check_active(deadline_ns)
-            state = self.get_state()
+            state = self.get_state(deadline_ns=deadline_ns)
             now_ns = self.check_active(deadline_ns)
             # get_state 的来源时间是本轮查询起点，返回前的固定期限检查已覆盖其年龄。
             if state is not None:
@@ -141,22 +148,24 @@ class XHandDiagnostic(XHand):
     def execute_action(self, target: np.ndarray) -> None:
         """执行 action_sequence 已校验的内部目标，提交后以实测反馈确认到位。"""
         deadline_ns = time.monotonic_ns() + int(ACTION_TIMEOUT_S * 1e9)
-        self.read_fresh_state(action_deadline_ns=deadline_ns)
-        self.check_active(deadline_ns)
+        state = self.read_fresh_state(action_deadline_ns=deadline_ns)
+        feedback_deadline_ns = state.timestamp_ns + int(self.cfg.feedback_max_age_s * 1e9)
         self.motion_pending = True  # SDK 抛错也不能证明目标未送达，仍须停止收尾。
-        retry_pending = self._send_position(target) == COMMUNICATION_CRC_ERROR_CODE
+        code = self.send_position(
+            target, tor_max=self.cfg.tor_max, deadline_ns=min(deadline_ns, feedback_deadline_ns),
+            check_abort=self.check_active,
+        )
+        if code is None:
+            raise FeedbackUnavailable("XHand diagnostic position submission not confirmed")
+        if code != 0:
+            raise FeedbackUnavailable(f"XHand diagnostic position submission not confirmed (SDK code={code})")
         last_sample_ns = time.monotonic_ns()
-        print("  Position submission attempted; checking measured convergence")
+        print("  Position submission confirmed; checking measured convergence")
         tolerance_rad = np.deg2rad(self.cfg.home_tolerance_deg)
         consecutive = 0
         while True:
             state = self.read_fresh_state(action_deadline_ns=deadline_ns)
-            if retry_pending:
-                self.check_active(deadline_ns)
-                self._send_position(target)
-                retry_pending = False
-                last_sample_ns = time.monotonic_ns()
-            elif state.timestamp_ns > last_sample_ns:
+            if state.timestamp_ns > last_sample_ns:
                 last_sample_ns = state.timestamp_ns
                 error_rad = float(np.max(np.abs(state.qpos - target)))
                 consecutive = consecutive + 1 if error_rad <= tolerance_rad else 0
@@ -179,17 +188,12 @@ class XHandDiagnostic(XHand):
     def stop_action(self) -> None:
         if not self.motion_pending:
             return
-        state = None
-        try:
-            # 取消后仍须尝试停止；读取失败时以 passive 收尾并保留读取异常。
-            state = self.get_state()
-        finally:
-            self.stop(
-                None if state is None else state.qpos,
-                timestamp_ns=0 if state is None else state.timestamp_ns,
-            )
-            self.motion_pending = False
-        print("  Stop command accepted by SDK")
+        # 取消后仍查询反馈，用实测位置完成保持收尾。
+        state = self.get_state()
+        if state is None or not self.hold(state.qpos, timestamp_ns=state.timestamp_ns):
+            raise FeedbackUnavailable("XHand diagnostic position hold not confirmed")
+        self.motion_pending = False
+        print("  Position hold accepted by SDK")
 
 
 def validate_serial_port(serial_port: str) -> None:

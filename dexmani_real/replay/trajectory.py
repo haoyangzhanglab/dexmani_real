@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dexmani_real.data.raw import RawReader
+from dexmani_real.robot.commands import validate_hand_target
 from dexmani_real.runtime.preflight import (
     validate_robot_config,
     validate_xhand_target_rate,
@@ -32,7 +33,7 @@ class Trajectory:
 
 
 def load_trajectory(episode_path: str | Path, runtime: RealConfig, *, segment: int | None = None) -> Trajectory:
-    """校验配置范围，并归一 1e-6 rad 内的文件边界舍入误差。"""
+    """按 Raw 顺序读取目标，逐行校验 XHand 操作限位。"""
     validate_robot_config(runtime)
     if not runtime.hand.enabled:
         raise ValueError("replay requires XHand")
@@ -53,32 +54,23 @@ def load_trajectory(episode_path: str | Path, runtime: RealConfig, *, segment: i
         start, end = int(starts[segment]), int(ends[segment])
         hz = reader.control_hz
         validate_xhand_target_rate(hz)
-        arrays = []
-        for field, lower, upper in (
-            (
-                "action_arm_joint_target",
-                runtime.arm.joint_limit_lower,
-                runtime.arm.joint_limit_upper,
-            ),
-            (
-                "action_hand_joint_target",
-                runtime.hand.qpos_min_rad,
-                runtime.hand.qpos_max_rad,
-            ),
-        ):
-            # RawReader 统一检查当前动作语义、关节顺序及与时间行数一致的形状。
-            values = reader[field][start:end]
-            finite = np.isfinite(values).all(axis=1)
-            if not finite.all():
-                raise ValueError(f"{field} requires finite targets at row {start + np.flatnonzero(~finite)[0]}")
-            lower_bound, upper_bound = np.asarray(lower), np.asarray(upper)
-            outside = (values < lower_bound - TARGET_LIMIT_TOLERANCE_RAD) | (
-                values > upper_bound + TARGET_LIMIT_TOLERANCE_RAD
-            )
-            if outside.any():
-                row = start + np.flatnonzero(outside.any(axis=1))[0]
-                raise ValueError(f"{field} violates configured absolute limits at row {row}")
-            # 仅归一文件精度造成的边界误差；真正越界已在上面拒绝。
-            np.clip(values, lower_bound, upper_bound, out=values)
-            arrays.append(values)
-    return Trajectory(hz, *arrays)
+        # RawReader 检查绝对目标语义、关节顺序、单位及行形状。
+        arm = reader["action_arm_joint_target"][start:end]
+        finite = np.isfinite(arm).all(axis=1)
+        if not finite.all():
+            raise ValueError(f"action_arm_joint_target requires finite targets at row {start + np.flatnonzero(~finite)[0]}")
+        lower, upper = np.asarray(runtime.arm.joint_limit_lower), np.asarray(runtime.arm.joint_limit_upper)
+        outside = (arm < lower - TARGET_LIMIT_TOLERANCE_RAD) | (arm > upper + TARGET_LIMIT_TOLERANCE_RAD)
+        if outside.any():
+            row = start + np.flatnonzero(outside.any(axis=1))[0]
+            raise ValueError(f"action_arm_joint_target violates configured absolute limits at row {row}")
+        np.clip(arm, lower, upper, out=arm)
+
+        hand = reader["action_hand_joint_target"][start:end]
+        lower, upper = np.asarray(runtime.hand.qpos_min_rad), np.asarray(runtime.hand.qpos_max_rad)
+        for row, target in enumerate(hand, start=start):
+            try:
+                validate_hand_target(target, lower, upper)
+            except ValueError as exc:
+                raise ValueError(f"action_hand_joint_target at row {row}: {exc}") from exc
+    return Trajectory(hz, arm, hand)

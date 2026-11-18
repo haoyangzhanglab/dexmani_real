@@ -21,6 +21,12 @@
 
 [VR 接收端](../dexmani_real/sensor/vr.py) 提供关键点，[VRController](../dexmani_real/teleop/vr.py) 组合腕部映射与 `HandRetargeter` 输出，再由共享动作映射和遥操作循环提交、录制。重定向模块不直接发送设备命令；求解参考从实测姿态建立，仅在命令提交正常返回后更新。
 
+## 关节顺序与限位
+
+SDK、遥操作输出、Policy 和 Replay 共用 [SDK 关节表](../dexmani_real/robot/model.py) 的 12 列弧度向量。顺序为拇指 3 轴、食指 3 轴、中指 2 轴、无名指 2 轴和小指 2 轴。`HandFK` 按名称映射到 Pinocchio 的内部列，SDK 与 URDF 的关节值同号，旋转方向由 URDF 的带符号局部轴决定。HOME 配置的 `_deg` 字段先转换为弧度。
+
+额定限位来自仓库的 [右手 URDF](../assets/robots/xhand/xhand_right.urdf)，启动时与 [组合 URDF](../assets/robots/xhand/xarm7_xhand_right.urdf) 对照。实验操作限位来自 [HandConfig](../dexmani_real/config/xhand.py) 的 `qpos_min_rad` 和 `qpos_max_rad`，须在额定范围内。`Robot.validate_command()` 在发送前拒绝越界的普通目标，并报告关节名称。暂停时的实测位置保持按额定限位检查。
+
 ## 提交语义
 
 现场求解的时间间隔从上次命令提交返回算到本周期开始计算目标的时刻。`retarget` 不推进提交参考。拒绝或发送抛错也不推进。成功重发旧命令时，参考位置保持，提交时间更新。零时间间隔返回独立的参考副本，时间倒退报错。

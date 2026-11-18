@@ -192,7 +192,7 @@ class PolicySession:
                 self.runtime_state.request_quit()
                 self.summary["termination_reason"] = "startup_cancelled"
             else:
-                print("就绪：B 新段 | S/C 保存结束 | D 丢弃 | Q 保存退出 | Esc 急停退出 | 空闲 H 先臂后手回位、T 复位触觉。", flush=True)
+                print("就绪：B 新段 | S/C 保存结束 | D 丢弃 | Q 保存退出 | Esc 急停退出 | 空闲 H 回位、确认五指无接触后 T 校准触觉。", flush=True)
                 self.run_control_loop()
                 cast(Robot, self.robot).check()
         except KeyboardInterrupt as exc:
@@ -536,14 +536,15 @@ class PolicySession:
                     return None
             elif signal == "t":
                 if self.episode is not None:
-                    logger.warning("T ignored: tactile reset requires idle")
+                    logger.warning("T ignored: tactile calibration requires idle")
                     continue
                 if (self.runtime_state.cancel_epoch != cancel_epoch
                         or not self.runtime_state.requests_allow_motion()):
                     continue
                 try:
-                    logger.info("正在复位触觉，请保持手部无接触；S/Q/Esc 可中断。")
-                    robot.reset_tactile_sensors(
+                    logger.info("正在校准触觉，请保持五指无接触；S/Q/Esc 可中断。")
+                    robot.calibrate_tactile(
+                        no_contact=True,
                         cancel_epoch=cancel_epoch,
                         cancel_requested=self.home_abort_requested,
                     )

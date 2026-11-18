@@ -96,12 +96,14 @@ class SensorWorkers:
             raise errors[0][1]
 
 
-def close_runtime(runtime_state: SessionState, robot=None, *, sensors=None, keyboard=None) -> None:
+def close_runtime(
+    runtime_state: SessionState, robot=None, *, sensors=None, keyboard=None, release_hand: bool = False,
+) -> None:
     """停止后尝试全部关闭；即时锁存中断，首错传播，其余错误记录 traceback。"""
     runtime_state.stop_signal.set()
     errors = []
     for stage, close in (
-        ("robot_close", robot.close if robot is not None else None),
+        ("robot_close", (lambda: robot.close(release_hand=release_hand)) if robot is not None else None),
         ("keyboard_stop", keyboard.stop if keyboard is not None else None),
         ("sensor_shutdown", (lambda: sensors.shutdown(runtime_state)) if sensors is not None else None),
     ):

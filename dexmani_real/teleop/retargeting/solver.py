@@ -7,8 +7,12 @@ import numpy as np
 
 from dexmani_real.control.actions import StartPoseRejected
 from dexmani_real.geometry.kinematics import HandFK
-from dexmani_real.robot.commands import hand_reference_from_feedback
+from dexmani_real.robot.commands import (
+    hand_reference_from_feedback,
+    validate_hand_target,
+)
 from dexmani_real.robot.model import (
+    HAND_DOF,
     HAND_JOINT_SHAPE,
     XHAND_FINGERTIP_LINK_NAMES,
     XHAND_SDK_JOINT_NAMES,
@@ -36,17 +40,11 @@ FINGER_FRAME_NAMES = (
 class HandRetargeter:
     def __init__(self, config, hand_config):
         config.validate()
+        hand_config.validate_limits()
         self.config = config
         self.fk = HandFK()
         model = self.fk.model
         self.limits = np.column_stack((hand_config.qpos_min_rad, hand_config.qpos_max_rad))
-        model_limits = np.column_stack((
-            model.lowerPositionLimit, model.upperPositionLimit,
-        ))[self.fk.urdf_to_sdk]
-        if np.any(self.limits[:, 0] < model_limits[:, 0] - 1e-6) or np.any(
-            self.limits[:, 1] > model_limits[:, 1] + 1e-6,
-        ):
-            raise ValueError("hand command limits exceed the retargeting model limits")
         names = [
             name for pair, tip in zip(FINGER_FRAME_NAMES, XHAND_FINGERTIP_LINK_NAMES)
             for name in (*pair, tip)
@@ -54,7 +52,7 @@ class HandRetargeter:
         self.frame_ids = [model.getFrameId(name) for name in names]
         if max(self.frame_ids) >= model.nframes:
             raise ValueError("XHand retargeting frames are missing from the URDF")
-        neutral = self.fk.forward(np.zeros(12), self.frame_ids)
+        neutral = self.fk.forward(np.zeros(HAND_DOF), self.frame_ids)
         positions = neutral[:, :3, 3].reshape(5, 3, 3)
         segments = np.linalg.norm(np.diff(positions, axis=1), axis=2)
         origins, axes = self.fk.neutral_joint_geometry()
@@ -90,7 +88,7 @@ class HandRetargeter:
             flex_axes=flex_axes, limits=self.limits,
             base_directions=project_direction(base_vectors, base_axes),
         )
-        self.optimizer = nlopt.opt(nlopt.LD_SLSQP, 12)
+        self.optimizer = nlopt.opt(nlopt.LD_SLSQP, HAND_DOF)
         self.optimizer.set_maxeval(config.max_evaluations)
         self.optimizer.set_maxtime(config.max_solve_time_s)
         # 优化器的绝对目标收敛容差。
@@ -163,20 +161,16 @@ class HandRetargeter:
         status = int(self.optimizer.last_optimize_result())
         if status <= 0:
             raise RuntimeError(f"hand solver returned unsuccessful status={status}")
-        if (
-            solution.shape != HAND_JOINT_SHAPE
-            or not np.isfinite(solution).all()
-            or np.any(solution < lower - 1e-9) or np.any(solution > upper + 1e-9)
-        ):
-            raise ValueError(f"hand solver returned an invalid bounded solution (status={status})")
-        solution = np.clip(solution, lower, upper)
         if not np.isfinite(self.optimizer.last_optimum_value()):
             raise ValueError("hand solver objective is non-finite")
-        # 实测起点或最后提交参考同时作为 warm start、阻尼中心和唯一滤波状态。
-        command = self.reference_qpos + alpha * (solution - self.reference_qpos)
-        # 凸组合理论上不越限，但浮点减加可在限位上产生舍入量级的越界。
-        # 消除舍入误差，不放宽关节或最终速率限值。
-        return np.clip(command, self.limits[:, 0], self.limits[:, 1])
+        try:
+            validate_hand_target(solution, lower, upper)
+            # 实测起点或最后提交参考同时作为 warm start、阻尼中心和滤波状态。
+            command = solution if alpha == 1.0 else self.reference_qpos + alpha * (solution - self.reference_qpos)
+            return validate_hand_target(command, *self.limits.T)
+        except ValueError as exc:
+            self.rejection_reason = str(exc)
+            return None
 
     def commit(self, qpos, *, timestamp_ns):
         # 控制线程仅在发送正常返回后更新最后提交参考。

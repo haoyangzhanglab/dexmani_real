@@ -242,7 +242,7 @@ def initialize_teleop(loop, vr_process, *, cancel_epoch) -> None:
     print(
         "就绪：B 空闲时开始新段 | S/C 保存结束本段 | D 丢弃本段 | "
         "Q 保存并退出 | Esc 急停 | H 空闲时先臂后手回位 | "
-        "T 空闲时复位触觉。",
+        "T 空闲且确认五指无接触时校准触觉。",
         flush=True,
     )
 

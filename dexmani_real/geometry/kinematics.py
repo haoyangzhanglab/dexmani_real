@@ -2,13 +2,19 @@
 
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
+from math import hypot, isclose, isfinite
 
 import numpy as np
 
+from dexmani_real.robot.commands import validate_hand_qpos
 from dexmani_real.robot.model import (
+    HAND_DOF,
     XARM7_JOINT_NAMES,
     XARM7_XHAND_RIGHT_URDF_PATH,
     XHAND_FINGERTIP_LINK_NAMES,
+    XHAND_RATED_QPOS_MAX_RAD,
+    XHAND_RATED_QPOS_MIN_RAD,
+    XHAND_RIGHT_URDF_PATH,
     XHAND_SDK_JOINT_NAMES,
 )
 
@@ -19,12 +25,17 @@ def kinematic_urdf(root_link: str, *, stop_link: str | None = None) -> str:
     if root_link not in {link.attrib["name"] for link in root.findall("link")}:
         raise ValueError(f"robot URDF is missing {root_link}")
     children: dict[str, list[tuple[str, str]]] = {}
+    joint_names = set()
     for joint in root.findall("joint"):
+        name = joint.get("name")
+        if not name or name in joint_names:
+            raise ValueError(f"robot URDF contains an empty or duplicate joint name {name!r}")
+        joint_names.add(name)
         parent, child = joint.find("parent"), joint.find("child")
         if parent is None or child is None:
-            raise ValueError(f"URDF joint {joint.attrib['name']} must name its parent and child")
+            raise ValueError(f"URDF joint {name} must name its parent and child")
         children.setdefault(parent.attrib["link"], []).append(
-            (joint.attrib["name"], child.attrib["link"]),
+            (name, child.attrib["link"]),
         )
     links, joints = set(), set()
     pending = [root_link]
@@ -45,6 +56,54 @@ def kinematic_urdf(root_link: str, *, stop_link: str | None = None) -> str:
                 for geometry in (*node.findall("visual"), *node.findall("collision")):
                     node.remove(geometry)
     return ET.tostring(root, encoding="unicode")
+
+
+def validate_xhand_urdf(hand_urdf: str | None = None) -> None:
+    """核对实际使用的组合手部模型与右手 URDF 的 12 个 SDK 转动轴。"""
+    names = XHAND_SDK_JOINT_NAMES
+    if len(names) != HAND_DOF or len(set(names)) != HAND_DOF or not all(names):
+        raise ValueError(f"XHand SDK must define {HAND_DOF} unique joint names")
+
+    def active_joints(root, source):
+        joints = {}
+        for joint in root.findall("joint"):
+            name = joint.get("name")
+            if not name or name in joints:
+                raise ValueError(f"{source} contains an empty or duplicate joint name {name!r}")
+            joints[name] = joint
+        active = {name: joint for name, joint in joints.items() if joint.get("type") != "fixed"}
+        missing, extra = set(names) - active.keys(), active.keys() - set(names)
+        if missing or extra:
+            raise ValueError(f"{source} XHand joint mismatch: missing={sorted(missing)}, extra={sorted(extra)}")
+        return active
+
+    reference = active_joints(ET.parse(XHAND_RIGHT_URDF_PATH).getroot(), "right-hand URDF")
+    if hand_urdf is None:
+        hand_urdf = kinematic_urdf("right_hand_link")
+    hand = active_joints(ET.fromstring(hand_urdf), "combined URDF")
+    for name, lower, upper in zip(names, XHAND_RATED_QPOS_MIN_RAD, XHAND_RATED_QPOS_MAX_RAD, strict=True):
+        joint_frames = []
+        for joint in (reference[name], hand[name]):
+            if joint.get("type") != "revolute" or joint.find("mimic") is not None:
+                raise ValueError(f"XHand joint {name} must be an independent revolute joint in radians")
+            try:
+                axis = tuple(map(float, joint.find("axis").attrib["xyz"].split()))
+                origin = joint.find("origin")
+                rpy = tuple(map(float, origin.get("rpy", "0 0 0").split())) if origin is not None else (0.0, 0.0, 0.0)
+                limit = joint.find("limit")
+                bounds = float(limit.get("lower")), float(limit.get("upper"))
+                parent, child = joint.find("parent").attrib["link"], joint.find("child").attrib["link"]
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"XHand joint {name} has invalid axis, frame or position limits") from exc
+            if len(axis) != 3 or not isclose(hypot(*axis), 1.0, rel_tol=0, abs_tol=1e-9):
+                raise ValueError(f"XHand joint {name} must have a signed unit axis")
+            if len(rpy) != 3 or not all(map(isfinite, rpy)):
+                raise ValueError(f"XHand joint {name} must have a finite three-axis origin rotation in radians")
+            if bounds != (lower, upper):
+                raise ValueError(f"XHand joint {name} URDF limits {bounds} differ from rated limits {(lower, upper)} rad")
+            joint_frames.append((axis, parent, child, rpy))
+        if joint_frames[0] != joint_frames[1]:
+            raise ValueError(f"XHand joint {name} signed axis or joint frame differs from right-hand URDF")
 
 
 class ArmFK:
@@ -82,10 +141,12 @@ class HandFK:
         import pinocchio as pin
 
         self.pin = pin
-        self.model = pin.buildModelFromXML(kinematic_urdf("right_hand_link"))
+        urdf = kinematic_urdf("right_hand_link")
+        validate_xhand_urdf(urdf)
+        self.model = pin.buildModelFromXML(urdf)
         self.data = self.model.createData()
         active = tuple(self.model.names[1:])
-        if self.model.nq != 12 or set(active) != set(XHAND_SDK_JOINT_NAMES):
+        if self.model.nq != HAND_DOF or self.model.nv != HAND_DOF or set(active) != set(XHAND_SDK_JOINT_NAMES):
             raise ValueError("hand FK must contain the twelve XHand SDK joints")
         self.sdk_to_urdf = np.array([
             XHAND_SDK_JOINT_NAMES.index(name) for name in active
@@ -112,7 +173,7 @@ class HandFK:
     def forward(
         self, qpos: np.ndarray, frame_ids: Sequence[int], *, out: np.ndarray | None = None,
     ) -> np.ndarray:
-        q = np.asarray(qpos, dtype=np.float64)[self.sdk_to_urdf]
+        q = validate_hand_qpos(qpos)[self.sdk_to_urdf]
         self.pin.forwardKinematics(self.model, self.data, q)
         return np.stack([
             self.pin.updateFramePlacement(self.model, self.data, fid).homogeneous
@@ -123,7 +184,7 @@ class HandFK:
         self, qpos: np.ndarray, frame_ids: Sequence[int],
     ) -> tuple[np.ndarray, np.ndarray]:
         """手基座系位置及其对 SDK 顺序关节的解析导数；一次 FK 服务所有目标。"""
-        q = np.asarray(qpos, dtype=np.float64)[self.sdk_to_urdf]
+        q = validate_hand_qpos(qpos)[self.sdk_to_urdf]
         self.pin.computeJointJacobians(self.model, self.data, q)
         self.pin.updateFramePlacements(self.model, self.data)
         positions = np.stack([self.data.oMf[fid].translation for fid in frame_ids])
