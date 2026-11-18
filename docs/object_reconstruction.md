@@ -62,7 +62,7 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 
 ## 标注与查看
 
-标注要求 `rgb.mp4` 的帧数与 Raw 时间行数一致。逐帧标注完成后原子发布 `episode/hoi.h5`。默认跳过已有文件，可用 `--overwrite` 重算。重算失败时保留原标注。遮挡与恢复期间保留原始行和时间戳，并记录无效状态。
+标注要求 `rgb.mp4` 的帧数和纳秒时间戳均与 [Raw 控制时间轴](data.md#图像与模型输入) 一致。逐帧标注完成后原子发布 `episode/hoi.h5`。默认跳过与 Raw 来源时间一致的已有标注。缺少来源时间或与 Raw 错配的标注需要使用 `--overwrite` 重新标注。重算失败时保留原标注。遮挡与恢复期间保留原始行和时间戳，并记录无效状态。
 
 | 内容 | 路径或位置 |
 | --- | --- |
@@ -71,6 +71,7 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 | 逐对象有效性，bool `[T,O]` | `hoi.h5:/object_valid` |
 | 逐帧、逐对象质量指标 | `hoi.h5:/quality/` |
 | 固定模板、对象顺序及点分段 | `hoi.h5:/template/` |
+| 逐行相机来源时间及帧序列 | `hoi.h5:/camera_timing` 的 `camera_ns` 和 `camera_sequence`，读取时与 Raw 对应字段逐行核对 |
 | 相机到基座的变换 | 读取 HOI 时，`hoi.h5:/base_from_camera` 与 Raw 的 `camera_T_xarm_base_from_color` 均必填，须各自为合法刚体变换，并在现有比较容差内一致 |
 | 实际跟踪配置 | `hoi.h5` 根属性 `tracking_config` |
 
@@ -80,7 +81,7 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 
 导出 `object_pointcloud` 要求所选 Raw 的每帧物体均有效。完整性检查及分段规则见[按需导出](data.md#按需导出)。
 
-导出只对成功写入的录制统计模板摘要。若这些录制共用相同的有序局部点与 offsets，则记录 `geometry_sha256` 供接触监督训练和续训使用。混用合法模板时记录 `null`。手模板的 link 名称须有效映射到 FK。
+导出可以合并采用不同模板的录制。每帧物体点云沿用当前录制的点顺序，接触标签由对应帧的手部和物体点云生成。手模板的 link 名称须有效映射到 FK。
 
 [visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则。HOI 诊断、关节和触觉曲线与逐帧 RGB-D、几何共用帧号 `step` 和相对首帧观测的整数纳秒 `time`。关节与相机的来源时差以毫秒显示，逐物体质量和有效性按列发送。无效物体点云和不可对齐的手几何隐藏，保留对应行的时间位置。
 

@@ -39,7 +39,7 @@ from dexmani_real.geometry.camera import (
     remap_image,
     validate_distortion_model,
 )
-from dexmani_real.geometry.hoi import geometry_digest, validate_task_template
+from dexmani_real.geometry.hoi import validate_task_template
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
 from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
@@ -329,7 +329,6 @@ def prepare_raw(reader, processing, fields, clocks, hoi_devices):
         if reader.num_frames <= 0:
             raise RawDataError("episode contains no rows")
         boundaries = np.r_[reader.segment_starts, reader.num_frames]
-        template = None
         if "object_pointcloud" in fields:
             valid = read_hoi_validity(reader)
             if not valid.all():
@@ -354,7 +353,7 @@ def prepare_raw(reader, processing, fields, clocks, hoi_devices):
             )
         if "action_ode" in fields:
             alignment["action_ode"] = accepted_joint_targets(reader, boundaries, alignment)
-        return template, alignment, export_camera(reader, fields), boundaries
+        return alignment, export_camera(reader, fields), boundaries
 
 
 def export_zarr(
@@ -405,7 +404,6 @@ def export_zarr(
     ranges: list[list[int]] = []
     rejected: list[dict[str, str]] = []
     source_count = 0
-    shared_geometry: tuple[np.ndarray, np.ndarray] | None = None
     try:
         for index, episode in enumerate(selected):
             if progress_callback:
@@ -415,7 +413,7 @@ def export_zarr(
                 with raw_input():
                     reader = RawReader(episode)
                 with reader:
-                    template, alignment, camera, boundaries = prepare_raw(
+                    alignment, camera, boundaries = prepare_raw(
                         reader, processing, fields, clocks, hoi_devices,
                     )
                     specs = canonical_array_specs(fields, processing, camera)
@@ -442,21 +440,10 @@ def export_zarr(
                         hand_cloud=hand_cloud, camera=camera, alignment=alignment,
                     )
                     append_rows(arrays, offset, blocks, reader.num_frames)
-                # 整条输入与关闭成功后才提交来源、段边界及模板身份。
+                # 整条输入与关闭成功后才提交来源及段边界。
                 ends.extend((offset + boundaries[1:]).tolist())
                 sources.extend([episode.name] * (len(boundaries) - 1))
                 ranges.extend([[int(a), int(b)] for a, b in pairwise(boundaries)])
-                if template is not None and (source_count == 0 or shared_geometry is not None):
-                    points, offsets = template["points_local"], template["offsets"]
-                    if shared_geometry is None:
-                        shared_geometry = points, offsets
-                    else:
-                        shared_points, shared_offsets = shared_geometry
-                        # 比较摘要实际使用的 float32 位模式，包括正负零。
-                        if not np.array_equal(points.view(np.uint32), shared_points.view(np.uint32)) or not np.array_equal(
-                            offsets, shared_offsets,
-                        ):
-                            shared_geometry = None
                 source_count += 1
             except RawDataError as exc:
                 if arrays:
@@ -478,11 +465,8 @@ def export_zarr(
             metadata["point_cloud"] = processing_metadata(processing.pointcloud, processing.table_plane_abcd)
         if "hand_pointcloud" in fields:
             metadata["hand_pointcloud"] = {"num_points": processing.hand_pointcloud.num_points}
-        if "object_pointcloud" in fields:
-            shared_digest = geometry_digest(*shared_geometry) if shared_geometry is not None else None
-            metadata["object_pointcloud"] = {"geometry_sha256": shared_digest}
-            if hoi_devices:
-                metadata["object_pointcloud"]["max_joint_gap_s"] = processing.hoi_max_joint_gap_s
+        if hoi_devices:
+            metadata["object_pointcloud"] = {"max_joint_gap_s": processing.hoi_max_joint_gap_s}
         selection = {"rejected_episodes": rejected, "excluded_episodes": sorted(excluded)}
         root.attrs.update(**selection, source_episodes=sources, source_row_ranges=ranges, data_processing=metadata)
         root.create_group("meta").create_dataset("episode_ends", data=np.asarray(ends, dtype=np.int64))

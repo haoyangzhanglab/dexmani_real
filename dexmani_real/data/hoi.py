@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from dexmani_real.config.perception import HOI_NUM_POINTS
-from dexmani_real.data.raw import RawDataError, RawReader
+from dexmani_real.data.raw import CAMERA_TIMING_DTYPE, RawDataError, RawReader
 from dexmani_real.geometry.hoi import transform_task_points
 from dexmani_real.geometry.pose import validate_rigid_transform
 from dexmani_real.utils.io import publish
@@ -25,6 +25,7 @@ def write_hoi(
     poses,
     base_from_camera,
     *,
+    camera_timing,
     quality,
     tracking_config,
     object_valid,
@@ -35,6 +36,8 @@ def write_hoi(
     base_from_camera = validate_rigid_transform(base_from_camera, label="HOI base_from_camera")
     poses = np.asarray(poses, dtype=np.float32)
     frames = len(poses)
+    if camera_timing.shape != (frames,) or camera_timing.dtype != CAMERA_TIMING_DTYPE:
+        raise ValueError("HOI camera_timing must match the pose rows")
     expected = (frames, len(template["object_names"]))
     if poses.shape != (*expected, 4, 4):
         raise ValueError("HOI pose shape mismatch")
@@ -61,6 +64,7 @@ def write_hoi(
             data.create_dataset("object_pose_camera", data=poses)
             data.create_dataset("object_valid", data=object_valid)
             data.create_dataset("base_from_camera", data=base_from_camera)
+            data.create_dataset("camera_timing", data=camera_timing)
             saved_template = data.create_group("template")
             for key, value in template.items():
                 value = np.asarray(value)

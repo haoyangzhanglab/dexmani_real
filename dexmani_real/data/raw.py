@@ -69,7 +69,7 @@ VR_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
 # 来源时间必须为正；触觉时间为最后一份完整有效通道帧的查询起点。
 TIMING_ROW_DTYPE = np.dtype(
     [
-        (name, "<i8")
+        (name, np.dtype("<i8"))
         for name in (
             "observation_ns",
             "control_ns",
@@ -82,6 +82,9 @@ TIMING_ROW_DTYPE = np.dtype(
         )
     ]
 )
+
+CAMERA_TIMING_FIELDS = ("camera_ns", "camera_sequence")
+CAMERA_TIMING_DTYPE = np.dtype([(name, TIMING_ROW_DTYPE[name]) for name in CAMERA_TIMING_FIELDS])
 
 
 def validate_task_label(task_label) -> None:
@@ -224,6 +227,9 @@ def decode_camera_metadata(meta, *, include_depth=True, include_extrinsics=True)
     return CameraSnapshot(None, color, scale, transform)
 
 
+_RGB_TIME_BASE = Fraction(1, 1_000_000_000)
+
+
 class _VideoWriter:
     def __init__(self, path, *, fps, width, height):
         self.path = Path(path)
@@ -245,7 +251,7 @@ class _VideoWriter:
         self.stream.options = {"crf": "18", "preset": "ultrafast"}
         # 为控制和推理保留 CPU。
         self.stream.codec_context.thread_count = 1
-        self.stream.time_base = Fraction(1, 1_000_000_000)
+        self.stream.time_base = _RGB_TIME_BASE
         self.stream.codec_context.time_base = self.stream.time_base
         self.stream.codec_context.open()
         self.container.start_encoding()
@@ -257,7 +263,7 @@ class _VideoWriter:
         if self.first_control_ns is None:
             self.first_control_ns = control_ns
         av_frame.pts = control_ns - self.first_control_ns
-        av_frame.time_base = Fraction(1, 1_000_000_000)
+        av_frame.time_base = _RGB_TIME_BASE
         stream = cast("av.video.stream.VideoStream", self.stream)
         container = cast("av.container.OutputContainer", self.container)
         for packet in stream.encode(av_frame):
@@ -406,8 +412,8 @@ class RawWriter:
             self.timing_rows = None
 
 
-def open_hoi_file(path: Path, raw_meta):
-    """打开标注并核对其相机外参与 Raw 一致。"""
+def open_hoi_file(path: Path, raw_meta, raw_timing):
+    """打开标注并核对相机外参与逐行来源时间。"""
     import h5py
 
     annotations = h5py.File(path, "r")
@@ -419,6 +425,13 @@ def open_hoi_file(path: Path, raw_meta):
         annotated = validate_rigid_transform(transform[()], label="HOI base_from_camera")
         if not np.allclose(recorded, annotated, atol=ROTATION_ATOL, rtol=0):
             raise RawDataError("HOI base_from_camera conflicts with Raw camera_T_xarm_base_from_color")
+        timing = annotations.get("camera_timing")
+        if timing is None:
+            raise RawDataError(f"{path}: missing HOI camera_timing; re-annotate with --overwrite")
+        if not isinstance(timing, h5py.Dataset) or timing.shape != raw_timing.shape or timing.dtype != CAMERA_TIMING_DTYPE:
+            raise RawDataError(f"{path}: invalid HOI camera_timing; re-annotate with --overwrite")
+        if not np.array_equal(timing[:], raw_timing.fields(CAMERA_TIMING_FIELDS)[:]):
+            raise RawDataError(f"{path}: HOI camera_timing differs from Raw; re-annotate with --overwrite")
     except BaseException:
         annotations.close()
         raise
@@ -570,7 +583,7 @@ class RawReader:
     @property
     def hoi_file(self):
         if self._hoi_file is None:
-            self._hoi_file = open_hoi_file(self.path / "hoi.h5", self.meta)
+            self._hoi_file = open_hoi_file(self.path / "hoi.h5", self.meta, self["timing/rows"])
         return self._hoi_file
 
     def read_camera(self, *, include_depth=True, include_extrinsics=True) -> CameraSnapshot:
@@ -609,7 +622,7 @@ class RawReader:
         return stamps
 
     def iter_rgb_frames(self):
-        """按 Raw 行读取图像，消费结束时检查有无额外帧。"""
+        """按 Raw 行读取图像，核对纳秒 PTS，消费结束时检查帧数。"""
         import av
 
         if self.video_container is None:
@@ -621,11 +634,18 @@ class RawReader:
             stream.thread_count = 4
         self.video_container.seek(0)
         expected = (self.meta["camera_color_height"], self.meta["camera_color_width"], 3)
+        elapsed_ns = self["timing/rows"].fields("control_ns")[:]
+        elapsed_ns -= elapsed_ns[:1]
         frames = self.video_container.decode(video=0)
         for index in range(self.num_frames):
             frame = next(frames, None)
             if frame is None:
                 raise RawDataError(f"Raw {self.rgb_path}: RGB missing at row {index}")
+            if frame.time_base != _RGB_TIME_BASE or frame.pts != elapsed_ns[index]:
+                raise RawDataError(
+                    f"Raw {self.rgb_path}: RGB timestamp mismatch at row {index}: "
+                    f"expected {elapsed_ns[index]} ns, got PTS {frame.pts} with time base {frame.time_base}"
+                )
             image = frame.to_ndarray(format="rgb24")
             if image.shape != expected:
                 raise ValueError(

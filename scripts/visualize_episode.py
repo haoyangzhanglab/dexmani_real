@@ -370,7 +370,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.frame_count)
-        for step, rgb in enumerate(islice(viz.reader.iter_rgb_frames(), viz.frame_count)):
+        stop = viz.frame_count if viz.frame_count < viz.reader.num_frames else None
+        for step, rgb in enumerate(islice(viz.reader.iter_rgb_frames(), stop)):
             viz.log_step(step, rgb)
         logger.info("数据已发送，脚本结束；可在 Rerun 中继续浏览。")
     finally:

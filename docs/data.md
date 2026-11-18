@@ -20,7 +20,9 @@ Raw 动作列保存尝试提交的绝对关节目标，缺失目标记为 NaN。
 
 Raw 保留采集像素网格上的 RGB-D，解码后的有损 RGB 与现场像素值可能有差异。点云取色使用这一路 RGB-D。在线策略 RGB、Canonical RGB/depth 和 Raw 可视化使用同一针孔图像几何，沿用固定 K、原分辨率和光轴。RGB 双线性采样，depth 最近邻采样，越界填零。含图像的 Zarr 标记 `image_geometry="pinhole"`。
 
-读取深度时要求 Raw 记录对齐到彩色网格的深度及其正尺度。完整读取视频时，`rgb.mp4` 帧数必须与 `timing/rows` 一致。可视化只读取所选帧。
+读取深度时要求 Raw 记录对齐到彩色网格的深度及其正尺度。读取 RGB 时检查像素尺寸和纳秒时基，逐帧核对时间戳是否等于该行 `control_ns` 减去首行 `control_ns`。完整读取时还检查 `rgb.mp4` 帧数与 `timing/rows` 一致。限帧可视化只检查所选前缀。
+
+旧恒帧率录制的 RGB 会被拒绝。符合当前 Raw 数据结构的旧录制仍可读取关节和深度等独立字段。
 
 模型所需模态经投影进入策略历史。Raw 录制使用本次采样的实测关节、触觉和原始 RGB-D。启用录制时，普通 RGB 策略与 Raw 共用相机源帧。HOI 或场景点云策略的 RGB 跟随对应的派生观测，Raw 从相机通道单独取帧。录制所需的传感器来源也成为本段依赖。
 
@@ -34,4 +36,4 @@ Raw 保留采集像素网格上的 RGB-D，解码后的有损 RGB 与现场像�
 
 配套 Policy 的 Real 原生 ODE 读取 `action_ode`，使用 `export_zarr.py --fields joint_state point_cloud action_ode` 导出。导出器按逐行提交状态选择动作，失败行沿用上一条已接受目标并保留原时间轴。段首在首条成功命令前使用该段起始关节状态。
 
-Zarr 的 `data_processing` 保存实际使用的处理参数。开启去桌面时，归一化系数写入 `data_processing.point_cloud.table_plane_abcd`。部署对应值见 `run_config.yaml` 的 `actual_processing.point_cloud.table_plane_abcd`。开启 contact loss 的固定 1024 槽预训练及其完整续训要求共享的对象模板身份。见[模板摘要](object_reconstruction.md#标注与查看)。
+Zarr 的 `data_processing` 保存实际使用的处理参数。开启去桌面时，归一化系数写入 `data_processing.point_cloud.table_plane_abcd`。部署对应值见 `run_config.yaml` 的 `actual_processing.point_cloud.table_plane_abcd`。接触预训练按同一帧的手部和物体点云计算 1024 个有序标签。见[标注与查看](object_reconstruction.md#标注与查看)。

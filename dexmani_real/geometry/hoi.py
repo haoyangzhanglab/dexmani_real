@@ -114,15 +114,3 @@ def sample_surface_points(mesh, num_points, seed=0):
         start_idx=0,
     )
     return dense[ids]
-
-
-def geometry_digest(points, offsets) -> str:
-    """有序点及分段的数值身份：小端 float32/int64、C 顺序，不包含显示名。"""
-    import hashlib
-
-    digest = hashlib.sha256()
-    for values, dtype in ((points, "<f4"), (offsets, "<i8")):
-        array = np.asarray(values, dtype=dtype)
-        digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
-        digest.update(array.tobytes(order="C"))
-    return digest.hexdigest()

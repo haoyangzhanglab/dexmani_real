@@ -79,7 +79,7 @@ def hand_geometry(
     base_from_hand = eef_transforms @ arm_fk.eef_from_handbase
     placements = np.empty((len(base_from_hand), len(frame_ids), 4, 4), dtype=np.float64)
     for index, qpos in enumerate(hand_qpos):
-        placements[index] = hand_fk.forward(qpos, frame_ids)
+        hand_fk.forward(qpos, frame_ids, out=placements[index])
 
     if include_fingertips:
         tip_positions = placements[:, :tip_count, :3, 3]

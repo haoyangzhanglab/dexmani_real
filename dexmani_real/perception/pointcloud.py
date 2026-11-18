@@ -46,7 +46,10 @@ def filter_depth(depth_m: np.ndarray) -> np.ndarray:
         borderType=cv2.BORDER_CONSTANT,
     ))
     edge = valid & (local_count >= 3) & ((local_max - local_min) > EDGE_JUMP_M)
-    distance = np.minimum(depth_m - local_min, local_max - depth_m)
+    # 断层判定完成后，复用局部极值数组存放到前后表面的距离。
+    np.subtract(depth_m, local_min, out=local_min)
+    np.subtract(local_max, depth_m, out=local_max)
+    distance = np.minimum(local_min, local_max, out=local_min)
     trusted = valid & ~(edge & (distance > EDGE_SURFACE_BAND_M))
 
     # 正邻接与对角邻接分别计数，再合并为八邻域支持数。

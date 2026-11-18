@@ -14,7 +14,12 @@ from cordvip_geometry.camera import RGBDFrame
 from cordvip_geometry.tracking import SceneTracker, TrackingConfig, TrackingFailure
 
 from dexmani_real.data.hoi import write_hoi
-from dexmani_real.data.raw import RawReader, discover_episode_dirs
+from dexmani_real.data.raw import (
+    CAMERA_TIMING_DTYPE,
+    CAMERA_TIMING_FIELDS,
+    RawReader,
+    discover_episode_dirs,
+)
 from dexmani_real.geometry.hoi import load_hoi_task
 
 
@@ -28,17 +33,18 @@ def annotate_episodes(
 
     for episode in episodes:
         episode = Path(episode).expanduser()
-        if (episode / "hoi.h5").exists() and not overwrite:
-            print(f"跳过已有 HOI：{episode}")
-            continue
         with RawReader(episode) as reader:
+            if (episode / "hoi.h5").exists() and not overwrite:
+                _ = reader.hoi_file
+                print(f"跳过已有 HOI：{episode}")
+                continue
             if tracker is None:
                 template, mesh_paths, prompts = load_hoi_task(task)
                 names = template["object_names"]
                 tracker = SceneTracker(
                     mesh_paths, workspace=ROOT, config=tracking_config
                 )
-            poses, base_from_camera, quality, valid = track_episode(
+            poses, base_from_camera, camera_timing, quality, valid = track_episode(
                 reader, tracker, names, prompts
             )
 
@@ -47,6 +53,7 @@ def annotate_episodes(
             template,
             poses,
             base_from_camera,
+            camera_timing=camera_timing,
             quality=quality,
             object_valid=valid,
             tracking_config=asdict(tracker.config),
@@ -66,7 +73,8 @@ def track_episode(reader, tracker, names, prompts):
     depth = reader["depth"]
 
     timing = reader.read_timing(source_clocks=("camera_ns",))
-    sequences, stamps = timing["camera_sequence"], timing["camera_ns"]
+    camera_timing = timing[list(CAMERA_TIMING_FIELDS)].astype(CAMERA_TIMING_DTYPE)
+    sequences, stamps = camera_timing["camera_sequence"], camera_timing["camera_ns"]
     new_sequence = np.r_[True, sequences[1:] != sequences[:-1]]
     invalid_sequence = sequences <= 0
     invalid_sequence[1:] |= sequences[1:] < sequences[:-1]
@@ -109,7 +117,7 @@ def track_episode(reader, tracker, names, prompts):
                 poses[index, obj] = result.poses[name]
         quality.append([result.quality[name] for name in names])
 
-    return poses, camera.T_xarm_base_from_color, quality, valid
+    return poses, camera.T_xarm_base_from_color, camera_timing, quality, valid
 
 
 def main(argv=None):

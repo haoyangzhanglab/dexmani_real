@@ -109,14 +109,15 @@ class HandFK:
             axes.append(jac[3:, joint.idx_v].copy())
         return np.array(origins), np.array(axes)
 
-    def forward(self, qpos: np.ndarray, frame_ids: Sequence[int]) -> np.ndarray:
+    def forward(
+        self, qpos: np.ndarray, frame_ids: Sequence[int], *, out: np.ndarray | None = None,
+    ) -> np.ndarray:
         q = np.asarray(qpos, dtype=np.float64)[self.sdk_to_urdf]
         self.pin.forwardKinematics(self.model, self.data, q)
-        # stack 复制 placement，避免后续 FK 覆盖结果。
         return np.stack([
             self.pin.updateFramePlacement(self.model, self.data, fid).homogeneous
             for fid in frame_ids
-        ])
+        ], out=out)
 
     def positions_and_jacobians(
         self, qpos: np.ndarray, frame_ids: Sequence[int],
