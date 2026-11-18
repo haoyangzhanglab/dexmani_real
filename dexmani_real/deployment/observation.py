@@ -27,6 +27,10 @@ FIELD_DEPENDENCIES = {
     "camera_extrinsic": ("camera_static",),
 }
 
+JOINT_OBSERVATION_FIELDS = frozenset(
+    field for field, sources in FIELD_DEPENDENCIES.items() if {"arm", "hand"}.intersection(sources)
+)
+
 
 class ObservationBuilder:
     def __init__(self, info, runtime):
@@ -92,7 +96,7 @@ class ObservationBuilder:
         self.rgb_maps = init_undistort_maps(camera.color) if "rgb" in self.fields else None
         self.last_rgb_sequence = None
         self.last_rgb = None
-        requested = set(self.fields) & {"camera_intrinsic", "camera_extrinsic"}
+        requested = [name for name in self.fields if "camera_static" in FIELD_DEPENDENCIES[name]]
         if not requested:
             return
         parameters = camera_parameters_cv(

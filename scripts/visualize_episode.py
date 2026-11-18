@@ -99,24 +99,20 @@ class EpisodeVisualizer:
                 if max_frames <= 0:
                     raise ValueError("max_frames must be positive")
                 self.frame_count = min(self.frame_count, max_frames)
-            self.timestamps_s = self.reader.read_timestamps_s(stop=self.frame_count)
-            self.hoi_alignment = None
+            hoi_timing = None
+            self.hoi_alignment: dict[str, np.ndarray] = {}
             if hoi and (self.reader.path / "hoi.h5").is_file():
+                hoi_timing = self.reader.read_timing(stop=self.frame_count)
+                stamps = hoi_timing["observation_ns"]
                 self.reader["object_pointcloud"]
                 self.hoi_valid = read_hoi_validity(self.reader, stop=self.frame_count)
-                self.hoi_alignment = align_hoi_episode(
-                    self.reader, hoi_max_joint_gap_s, stop=self.frame_count,
-                )
+                self.hoi_alignment = align_hoi_episode(self.reader, hoi_timing, hoi_max_joint_gap_s)
+            else:
+                stamps = self.reader.read_observation_stamps(stop=self.frame_count)
+            # 整数相减后再换算，保留大时钟值之间的细小时间差。
+            self.timestamps_s = (stamps - stamps[0]) / 1e9
 
-            self.reader.require_fields(
-                "rgb",
-                "depth",
-                "arm_qpos",
-                "hand_qpos",
-                "hand_contact",
-                "action_arm_joint_target",
-                "action_hand_joint_target",
-            )
+            self.reader.require_fields("rgb", "depth")
 
             self.camera_model = self.reader.read_camera()
             if self.camera_model.depth_scale_m is None:
@@ -156,8 +152,8 @@ class EpisodeVisualizer:
                 recording_id=rec_id,
                 spawn=True,
             )
-            # 同一份定义供布局、标签和批量发送使用，数组仅保留引用。
-            self.series = []
+            series = []
+            series_groups: dict[str, list[str]] = {}
             force_labels = tuple(f"{axis} (SDK / 255)" for axis in ("Fx", "Fy", "Fz"))
             for group, path, key, labels in (
                 ("State", "state/arm_qpos", "arm_qpos", None),
@@ -165,18 +161,15 @@ class EpisodeVisualizer:
                 ("Action", "action/action_arm_joint_target", "action_arm_joint_target", None),
                 ("Action", "action/action_hand_joint_target", "action_hand_joint_target", None),
                 ("Contact Force", "state/hand_contact_mag", "hand_contact_mag",
-                 [f"{finger} (SDK / 255)" for finger in TACTILE_FINGER_ORDER.split(",")]),
+                 tuple(f"{finger} (SDK / 255)" for finger in TACTILE_FINGER_ORDER.split(","))),
                 ("Contact Force", "state/hand_force_thumb", "hand_force_thumb", force_labels),
                 ("Contact Force", "state/hand_force_index", "hand_force_index", force_labels),
             ):
                 values = self.state[key]
                 if labels is None:
-                    labels = [str(i) for i in range(values.shape[1])]
-                self.series.append((group, path, values, labels))
-            series_groups: dict[str, list[str]] = {}
-            for group, path, _, _ in self.series:
+                    labels = tuple(str(i) for i in range(values.shape[1]))
+                series.append((path, values, labels))
                 series_groups.setdefault(group, []).append(path)
-            # 当前布局覆盖 viewer 记忆的旧布局。
             rr.send_blueprint(
                 episode_blueprint(
                     series_groups.items(),
@@ -184,7 +177,7 @@ class EpisodeVisualizer:
                 ),
                 make_active=True, make_default=True,
             )
-            self.log_recording_data()
+            self.log_recording_data(series, hoi_timing)
         except BaseException as exc:
             self.close(exc)
             raise
@@ -201,14 +194,47 @@ class EpisodeVisualizer:
 
         return state
 
-    def log_recording_data(self) -> None:
+    def log_recording_data(
+        self, series: list[tuple[str, np.ndarray, tuple[str, ...]]], hoi_timing: np.ndarray | None,
+    ) -> None:
         steps = np.arange(self.frame_count)
-        for _, path, values, labels in self.series:
+        for path, values, labels in series:
             log_series(
                 path, values, labels=labels, steps=steps,
                 timestamps_s=self.timestamps_s,
             )
         log_camera_geometry(self.camera_model.color, self.T_xarm_base_from_color)
+        if hoi_timing is None:
+            return
+
+        alignment = self.hoi_alignment
+        diagnostics = {
+            "hoi/alignment_available": (
+                np.isfinite(alignment["arm_qpos"]).all(axis=1)
+                & np.isfinite(alignment["hand_qpos"]).all(axis=1)
+            ),
+            "hoi/valid": self.hoi_valid,
+        }
+        camera_ns = hoi_timing["camera_ns"]
+        for device in ("arm", "hand"):
+            diagnostics[f"hoi/{device}_source_offset_ms"] = (hoi_timing[f"{device}_ns"] - camera_ns) / 1e6
+
+        annotations = self.reader.hoi_file
+        expected = (self.frame_count, annotations["object_valid"].shape[1])
+        for name, dataset in annotations["quality"].items():
+            quality = dataset[: self.frame_count]
+            if quality.shape != expected:
+                raise ValueError(f"Invalid HOI quality/{name}: expected selected shape {expected}")
+            for index, values in enumerate(quality.T):
+                # 跟踪后端以 -1 标记未计算的指标。
+                diagnostics[f"hoi/object_{index}/{name}"] = np.where(values == -1, np.nan, values)
+
+        indexes = [
+            self.rr.TimeSequenceColumn("step", steps),
+            self.rr.TimeSecondsColumn("time", self.timestamps_s),
+        ]
+        for entity, values in diagnostics.items():
+            self.rr.send_columns(entity, indexes=indexes, columns=self.rr.Scalar.columns(scalar=values))
 
     def log_step(self, step_idx: int, rgb: np.ndarray) -> None:
         self.rr.set_time_sequence("step", step_idx)
@@ -216,8 +242,7 @@ class EpisodeVisualizer:
         depth = self.log_camera(step_idx, rgb)
         self.log_pointcloud(rgb, depth)
         self.log_hand_geometry(step_idx)
-        if self.hoi_alignment is not None:
-            self.log_hoi_diagnostics(step_idx, self.hoi_alignment)
+        if self.hoi_alignment:
             points = None
             if self.hoi_valid[step_idx]:
                 points = self.reader["object_pointcloud"][step_idx]
@@ -226,10 +251,9 @@ class EpisodeVisualizer:
                         f"object_pointcloud contains nonfinite coordinates at row {step_idx}"
                     )
             log_points("object_pointcloud", points, colors=[255, 170, 0])
-            self.rr.log("hoi/valid", self.rr.Scalar(int(self.hoi_valid[step_idx])))
 
     def log_hand_geometry(self, step_idx: int) -> None:
-        joints = self.state if self.hoi_alignment is None else self.hoi_alignment
+        joints = self.hoi_alignment or self.state
         arm = joints["arm_qpos"][step_idx]
         hand = joints["hand_qpos"][step_idx]
         pose = self.arm_fk.forward(arm) if np.isfinite(arm).all() else None
@@ -251,24 +275,6 @@ class EpisodeVisualizer:
             "eef", pose[None, :3, 3] if pose is not None else None,
             colors=[EEF_COLOR], radii=0.020,
         )
-
-    def log_hoi_diagnostics(self, step_idx: int, alignment: dict) -> None:
-        available = int(
-            all(
-                np.isfinite(alignment[f"{device}_qpos"][step_idx]).all()
-                for device in ("arm", "hand")
-            )
-        )
-        self.rr.log("hoi/alignment_available", self.rr.Scalar(available))
-        timing = self.reader["timing/rows"][step_idx]
-        for device in ("arm", "hand"):
-            offset_ms = (int(timing[f"{device}_ns"]) - int(timing["camera_ns"])) / 1e6
-            self.rr.log(f"hoi/{device}_source_offset_ms", self.rr.Scalar(offset_ms))
-        for name, values in self.reader.hoi_file["quality"].items():
-            for index, value in enumerate(values[step_idx]):
-                # −1 是未计算占位值；画成缺口，避免误报质量下降或沿用上一帧。
-                measured = np.nan if value == -1 else float(value)
-                self.rr.log(f"hoi/object_{index}/{name}", self.rr.Scalar(measured))
 
     def log_camera(self, step_idx: int, rgb: np.ndarray) -> np.ndarray:
         depth = np.asarray(self.reader["depth"][step_idx])

@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.deployment import ExecutionConfig
+from dexmani_real.deployment.observation import JOINT_OBSERVATION_FIELDS
 from dexmani_real.robot.commands import COMMAND_LEASE_NS
 from dexmani_real.runtime.preflight import validate_robot_config, validate_xhand_target_rate
 from dexmani_real.utils.timing import validate_joint_gap
@@ -22,7 +23,7 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
         raise NotImplementedError("Policy does not support RTC")
 
     if "object_pointcloud" in info.observation_fields:
-        if {"hand_pointcloud", "joint_state", "fingertip_xyz", "eef_pose"}.intersection(info.observation_fields):
+        if JOINT_OBSERVATION_FIELDS.intersection(info.observation_fields):
             validate_joint_gap(execution.hoi_max_joint_gap_s)
         age = execution.hoi_max_age_s
         if type(age) not in (int, float) or not math.isfinite(age) or age <= 0:
@@ -98,36 +99,18 @@ def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
     return runtime
 
 
-def resolve_hoi_inputs(info, task_dir):
-    """解析并加载 HOI 任务模板；模板错误在设备连接前失败。"""
-    from pathlib import Path
-
-    if "object_pointcloud" not in info.observation_fields:
-        return None
-    if task_dir is None:
-        raise ValueError("HOI policy requires explicit task_dir (--task-dir)")
-    from dexmani_real.geometry.hoi import load_task_template
-    task = Path(task_dir).expanduser().resolve()
-    return task, load_task_template(task)
-
-
 def collect_data_processing(info, runtime):
     """记录实际使用的特征处理；已知训练差异仅供实验记录。"""
     from dexmani_real.perception.pointcloud import processing_metadata
 
     actual = {}
-    if "point_cloud" in info.observation_fields:
+    fields = info.observation_fields
+    if "point_cloud" in fields:
         actual["point_cloud"] = processing_metadata(runtime.pointcloud)
-    if "hand_pointcloud" in info.observation_fields:
-        actual["hand_pointcloud"] = dict(
-            num_points=runtime.hand_pointcloud.num_points,
-        )
-    if "object_pointcloud" in info.observation_fields and set(info.observation_fields) & {
-        "hand_pointcloud", "joint_state", "fingertip_xyz", "eef_pose",
-    }:
-        actual["object_pointcloud"] = {
-            "max_joint_gap_s": runtime.execution.hoi_max_joint_gap_s,
-        }
+    if "hand_pointcloud" in fields:
+        actual["hand_pointcloud"] = {"num_points": runtime.hand_pointcloud.num_points}
+    if "object_pointcloud" in fields and JOINT_OBSERVATION_FIELDS.intersection(fields):
+        actual["object_pointcloud"] = {"max_joint_gap_s": runtime.execution.hoi_max_joint_gap_s}
     if info.data_processing is None:
         print("训练处理参数：未记录；本次实际参数单独保存。")
         return actual

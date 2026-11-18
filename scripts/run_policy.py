@@ -83,7 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output", type=Path, default=None,
-        help="Output root; defaults to checkout/rollouts with --record-raw; output failures end the session",
+        help=(
+            "Session output root. With --record-raw it defaults to rollouts/ in the current working directory. "
+            "Without either option, results go to the terminal."
+        ),
     )
     parser.add_argument("--camera-calibration", type=Path, default=None)
     parser.add_argument(

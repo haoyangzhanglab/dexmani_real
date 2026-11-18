@@ -13,25 +13,23 @@ from dexmani_real.config.perception import HOI_NUM_POINTS
 logger = logging.getLogger(__name__)
 
 
-def run_hoi_worker(shared, camera, task, template, *, tracking_config=None):
+def run_hoi_worker(shared, camera, template, mesh_paths, prompts, *, tracking_config=None):
     root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(root / "third_party/cordvip_geometry/src"))
     from cordvip_geometry.camera import RGBDFrame
     from cordvip_geometry.tracking import SceneTracker, TrackingConfig, TrackingFailure
 
-    from dexmani_real.geometry.hoi import task_objects, transform_task_points
+    from dexmani_real.geometry.hoi import transform_task_points
 
     def terminate(signum, frame):
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, terminate)
-    by_name = {obj["name"]: obj for obj in task_objects(task)}
-    prompts = {name: by_name[name]["prompt"] for name in template["object_names"]}
     publish_rgb = "rgb" in shared.hoi_ring.field_names
     epoch = last_sequence = 0
     first = True
     tracker = SceneTracker(
-        {name: task / name / "mesh/mesh_m.obj" for name in prompts},
+        mesh_paths,
         workspace=root,
         config=tracking_config if tracking_config is not None else TrackingConfig(),
     )

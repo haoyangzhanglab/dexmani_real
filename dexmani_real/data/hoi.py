@@ -97,13 +97,12 @@ def write_hoi(
 
 
 def align_hoi_episode(
-    reader: RawReader, max_gap_s: float, *, devices: tuple[str, ...] = ("arm", "hand"),
-    stop: int | None = None,
+    reader: RawReader, timing: np.ndarray, max_gap_s: float,
 ) -> dict[str, np.ndarray]:
-    """对齐查看范围；必要时只向同一原生段内读取右邻点，无法对齐处保留 NaN。"""
+    """对齐已校验的时间前缀；只在同一原生段内读取所需邻点。"""
     validate_joint_gap(max_gap_s)
-    timing = reader.read_timing(stop=stop)
     count = len(timing)
+    devices = ("arm", "hand")
     for key in ("camera_ns", *(f"{device}_ns" for device in devices)):
         if np.any(timing[key] <= 0) or np.any(timing[key] > timing["observation_ns"]):
             raise ValueError(f"Invalid HOI source timestamp: {key}")
@@ -158,8 +157,8 @@ def read_hoi_validity(reader: RawReader, stop: int | None = None) -> np.ndarray:
     data = reader.hoi_file
     objects = data["object_valid"]
     names = data["template/object_names"]
-    if not isinstance(names, h5py.Dataset) or names.ndim != 1:
-        raise RawDataError("HOI template/object_names must be a one-dimensional dataset")
+    if not isinstance(names, h5py.Dataset) or names.ndim != 1 or not len(names):
+        raise RawDataError("HOI template/object_names must be a nonempty one-dimensional dataset")
     if (
         not isinstance(objects, h5py.Dataset)
         or objects.dtype != bool

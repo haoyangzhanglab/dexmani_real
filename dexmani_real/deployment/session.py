@@ -29,9 +29,9 @@ from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import (
     collect_data_processing,
     resolve_deployment_config,
-    resolve_hoi_inputs,
 )
 from dexmani_real.deployment.rollout import EpisodeResult, Rollout, utc_now
+from dexmani_real.geometry.hoi import load_hoi_task
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import (
     FeedbackUnavailable,
@@ -53,7 +53,6 @@ from dexmani_real.runtime.lifecycle import (
     close_runtime,
 )
 from dexmani_real.runtime.observation import (
-    RAW_RECORDING_NEEDS,
     check_device_feedback,
     check_observation,
     read_observation,
@@ -122,8 +121,9 @@ class PolicySession:
         self.device, self.seed = device, seed
         self.max_duration_s, self.num_episodes = max_duration_s, num_episodes
         self.record_raw = record_raw
-        self.output_root = (Path(output_root) if output_root is not None else
-                            Path(__file__).resolve().parents[2] / "rollouts" if record_raw else None)
+        if output_root is None and record_raw:
+            output_root = Path.cwd() / "rollouts"
+        self.output_root = Path(output_root) if output_root is not None else None
         self.output_dir: Path | None = None
         self.camera_calibration_path = camera_calibration_path
         self.camera_snapshot: CameraSnapshot | None = None
@@ -160,7 +160,7 @@ class PolicySession:
                                  if self.table_plane_abcd is not None else None),
             "num_episodes": self.num_episodes, "max_duration_s": self.max_duration_s,
             "record_raw": self.record_raw,
-            "task_dir": (str(self.hoi_inputs[0]) if self.hoi_inputs is not None else None),
+            "task_dir": str(self.task_dir) if self.observations.needs.hoi else None,
         }
         write_yaml(payload, self.output_dir / "run_config.yaml")
 
@@ -223,16 +223,18 @@ class PolicySession:
         self.info = self.wait_model()
         declared_execution = self.runtime.execution
         self.runtime = resolve_deployment_config(self.info, self.runtime)
-        self.hoi_inputs = resolve_hoi_inputs(self.info, self.task_dir)
         if self.profiler is not None:
             self.profiler.configure(self.runtime, control_hz=1 / self.runtime.execution.control_dt_s,
                                     mode=self.runtime.execution.mode)
         self.observations = ObservationBuilder(self.info, self.runtime)
+        needs = self.observations.needs
+        if needs.hoi:
+            if self.task_dir is None:
+                raise ValueError("HOI policy requires explicit task_dir (--task-dir)")
+            self.task_dir = Path(self.task_dir).expanduser().resolve()
+            self.hoi_inputs = load_hoi_task(self.task_dir)
         self.actual_processing = collect_data_processing(self.info, self.runtime)
-        model_needs = self.observations.needs
-        self.sensor_needs = model_needs.union(RAW_RECORDING_NEEDS) if self.record_raw else model_needs
-        needs = self.sensor_needs
-        camera_required = needs.camera_worker or self.observations.camera_static
+        camera_required = needs.camera_worker or self.record_raw or self.observations.camera_static
         if camera_required:
             self.runtime.camera.validate()
         runtime = self.runtime
@@ -247,9 +249,9 @@ class PolicySession:
             execution["prefetch_steps"] = runtime.execution.prefetch_steps
         if runtime.execution.mode == "rtc":
             execution["rtc_guidance_cap"] = runtime.execution.rtc_guidance_cap
-        if model_needs.hoi:
+        if needs.hoi:
             execution["hoi_max_age_s"] = runtime.execution.hoi_max_age_s
-        if model_needs.hoi_joint_devices:
+        if needs.hoi_joint_devices:
             execution["hoi_max_joint_gap_s"] = runtime.execution.hoi_max_joint_gap_s
         self.effective_parameters = {
             "policy": policy_parameters,
@@ -295,16 +297,15 @@ class PolicySession:
         print(f"输出：{self.output_dir}" if self.output_dir is not None else "输出：仅终端")
 
         self.process_context = mp.get_context("spawn")
-        channels = (
+        self.sensors.channels = (
             SensorChannels(
                 self.process_context, camera=self.runtime.camera,
-                depth_enabled=needs.hoi or needs.point_cloud or "depth" in needs.camera_fields,
+                depth_enabled=self.record_raw or needs.hoi or needs.point_cloud,
                 hoi=needs.hoi,
                 pointcloud_num_points=self.runtime.pointcloud.num_points if needs.point_cloud else None,
-                include_derived_rgb="rgb" in model_needs.camera_fields,
+                include_derived_rgb="rgb" in needs.camera_fields,
             ) if camera_required else None
         )
-        self.sensors.channels = channels
         self.robot = Robot(
             self.runtime.arm, self.runtime.hand, runtime_state=self.runtime_state,
             check_services=self.check_services,
@@ -319,14 +320,14 @@ class PolicySession:
         return True
 
     def start_devices(self):
-        needs = self.sensor_needs
+        needs = self.observations.needs
         robot = cast(Robot, self.robot)
         self.check_startup()
         robot.connect()
         # 后续初始化可能阻塞超过反馈 TTL；保持停止，由有界观测等待接纳新帧。
         robot.stop()
         self.check_startup()
-        if needs.camera_worker or self.observations.camera_static:
+        if self.sensors.channels is not None:
             self.sensors.start(
                 self.process_context.Process(
                     name="camera",
@@ -343,9 +344,13 @@ class PolicySession:
                 require_extrinsics=needs_extrinsics,
                 include_extrinsics=needs_extrinsics or self.record_raw,
             )
+            if not (needs.camera_worker or self.record_raw):
+                self.sensors.shutdown(self.runtime_state)
+                self.sensors.channels = None
         self.observations.configure_camera(self.camera_snapshot)
         if needs.hoi:
             from dexmani_real.perception.hoi_worker import run_hoi_worker
+
             channels = self.sensors.channels
             self.sensors.start(self.process_context.Process(
                 name="hoi", target=run_hoi_worker,
@@ -376,9 +381,6 @@ class PolicySession:
                 timeout_s=POINTCLOUD_READY_TIMEOUT_S,
                 may_start=self.startup_allowed,
             )
-        if self.observations.camera_static and not needs.camera_worker:
-            self.sensors.shutdown(self.runtime_state)
-            self.sensors.channels = None
         self.check_startup()
         self.save_run_config()
         if not needs.hoi:

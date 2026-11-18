@@ -31,14 +31,21 @@ def task_objects(task):
     return objects
 
 
-def load_task_template(task):
+def load_hoi_task(
+    task: str | Path,
+) -> tuple[dict[str, np.ndarray], dict[str, Path], dict[str, str]]:
+    """加载已校验的模板及按模板顺序排列的跟踪输入。"""
     task = Path(task)
     with np.load(task / "hoi/template.npz", allow_pickle=False) as saved:
         template = {key: saved[key] for key in ("points_local", "offsets", "object_names")}
     validate_task_template(template)
-    if set(template["object_names"]) != {obj["name"] for obj in task_objects(task)}:
+    names = template["object_names"].tolist()
+    prompts_by_name = {obj["name"]: obj["prompt"] for obj in task_objects(task)}
+    if set(names) != prompts_by_name.keys():
         raise ValueError("模板对象与任务对象不对应")
-    return template
+    mesh_paths = {name: task / name / "mesh/mesh_m.obj" for name in names}
+    prompts = {name: prompts_by_name[name] for name in names}
+    return template, mesh_paths, prompts
 
 
 def validate_task_template(template):

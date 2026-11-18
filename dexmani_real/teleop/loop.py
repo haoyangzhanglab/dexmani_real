@@ -5,7 +5,7 @@ import sys
 import time
 from collections.abc import Sequence
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 from dexmani_real.control.actions import StartPoseRejected
 from dexmani_real.control.ik import IKReferenceError
@@ -65,8 +65,10 @@ class TeleopLoop:
         self.runtime = runtime
         self.robot = robot
         self.sensors = sensors
-        record_needs = RAW_RECORDING_NEEDS if recording_dir is not None else ObservationNeeds()
-        self.capture_needs = ObservationNeeds(vr=True).union(record_needs)
+        self.capture_needs = (
+            replace(RAW_RECORDING_NEEDS, vr=True)
+            if recording_dir is not None else ObservationNeeds(vr=True)
+        )
         self.controller = controller
         self.recording_dir = recording_dir
         self.max_duration_s = max_duration_s

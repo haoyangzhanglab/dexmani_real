@@ -22,13 +22,15 @@ flowchart TB
 
 启用 Raw 录制且策略使用 HOI 或场景点云时，两路共享本次关节采样，Raw 单独读取相机帧，因此 Raw RGB 与模型使用的 RGB 可能来自不同帧。
 
+相机只用于静态标定时，取得参数后即关闭。启用 Raw 时持续采集 RGB-D，包括模型只消费静态标定的情况。
+
 观测按模型需求组合图像、关节、触觉和点云。调度器从预测序列中选择当前动作；关节动作经限位后提交，末端动作通过共享局部 IK 转为关节目标，再交由设备执行。
 
 Checkpoint 描述模型的观测字段、动作、RGB 预处理和控制周期。[RealConfig](../dexmani_real/config/real.py) 与本地标定提供设备、传感器和运动限制等实验设置。执行周期和每次执行的动作步数默认取自 Checkpoint，也可由实验配置指定。连接设备前，部署检查有效的 `execution.control_dt_s` 严格短于 2 秒命令租约。
 
-现场部署将 HOI（`object_pointcloud`）和场景点云（`point_cloud`）作为互斥输入。HOI 策略必须显式提供任务资产目录：`python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick`；Python 使用 `PolicySession(runtime, checkpoint, task_dir="/data/tasks/pick").run()`。该目录与离线准备、模板采样及标注共用，支持 `~`，相对路径以 cwd 为准。Checkpoint 的 `task_name` 保留实验标签含义，不参与资产路径推导，也无需与目录名一致。缺失目录或模板错误在连接设备前报告。非 HOI 策略不要求、也不读取任务资产；`--print-config` 仅检查声明配置。已有 `run_config.yaml` 记录实际使用的 `task_dir`。
+HOI（`object_pointcloud`）与场景点云（`point_cloud`）是互斥输入。HOI 策略通过 CLI 的 `--task-dir` 或 `PolicySession(..., task_dir=...)` 指定与离线标注共用的任务资产目录。目录支持 `~`，相对路径基于当前工作目录。部署在创建设备前解析并校验任务，`run_config.yaml` 记录实际目录。Checkpoint 的 `task_name` 用作实验标签。
 
-场景点云使用 `RealConfig.pointcloud`，手表面点云使用 `RealConfig.hand_pointcloud`。指尖 FK 与数据导出共用机器人模型中的固定五指顺序（thumb、index、middle、ring、pinky）。普通策略允许调整合法采样与几何参数进行研究，处理记录的差异不会阻止部署，部署不计算或比较模板摘要；这不保证调整后的任务表现。模型实际输入输出形状、动作单位、坐标和本地模板合法性仍须满足消费者要求。部署分别保存 `training_processing` 与 `actual_processing`，已知差异会显示，缺少训练研究记录则为 None。现场相机与桌面标定使用当前值。
+场景点云使用 `RealConfig.pointcloud`，手表面点云使用 `RealConfig.hand_pointcloud`。指尖 FK 与数据导出共用固定五指顺序（thumb、index、middle、ring、pinky）。部署使用当前几何参数和标定，分别记录 `training_processing` 与 `actual_processing`，有差异时在终端提示。
 
 所有策略 RGB 在进入历史前统一为针孔图像，同一相机来源序号复用矫正结果。Policy 在该网格上继续做投影和 resize 坐标变换。图像几何与录制路径见[实验数据](data.md#图像与模型输入)。
 
@@ -39,7 +41,7 @@ Checkpoint 描述模型的观测字段、动作、RGB 预处理和控制周期�
 | 模块 | 职责 |
 | --- | --- |
 | [session.py](../dexmani_real/deployment/session.py) | 管理模型、设备和传感器，组织多段评估与结果汇总。 |
-| [preflight.py](../dexmani_real/deployment/preflight.py) | 合并模型描述与本地配置，检查部署条件，加载所需任务模板。 |
+| [preflight.py](../dexmani_real/deployment/preflight.py) | 合并模型描述与本地配置，检查部署条件并记录实际处理参数。 |
 | [observation.py](../dexmani_real/deployment/observation.py) | 将观测投影为历史快照，并从历史窗口构建模型输入。 |
 | [inference.py](../dexmani_real/deployment/inference.py) | 加载、预热模型，并执行预测。 |
 | [schedule.py](../dexmani_real/deployment/schedule.py) | 计算控制时刻与动作序列接续位置。 |
@@ -75,6 +77,8 @@ Checkpoint 描述模型的观测字段、动作、RGB 预处理和控制周期�
 ## 观测与录制
 
 HOI 的关节与 FK 观测使用按相机来源时间对齐的关节，设备反馈检查使用最新实测值。对齐暂不可用或 HOI 点云过期时进入下述恢复流程。对齐规则见[物体重建与 HOI](object_reconstruction.md#跟踪与时间对齐)。
+
+用 `--output` 或 Python 的 `output_root` 可显式指定会话输出根目录。省略路径时，启用 Raw 的会话默认写入当前工作目录下的 `rollouts/`，关闭 Raw 的会话仅输出到终端。
 
 启用会话输出目录时，`run_config.yaml` 保存会话实际配置、相机标定和训练与部署各自的处理参数，`session_result.json` 保存运行结果。Raw Episode 各自保存标定及实验参数，结构见[实验数据](data.md#raw-episode)。
 

@@ -17,7 +17,7 @@ from cordvip_geometry.camera import RGBDFrame, RGBDRectifier, camera_rays
 from cordvip_geometry.mesh import MeshRaycaster, scale_mesh
 from cordvip_geometry.tracking import SceneResult, TrackingConfig, TrackingFailure
 
-from dexmani_real.geometry.hoi import sample_mesh_surface
+from dexmani_real.geometry.hoi import load_hoi_task, sample_mesh_surface
 
 
 def script(name):
@@ -258,7 +258,6 @@ def test_template_and_raw_roundtrip(tmp_path):
     import h5py
 
     from dexmani_real.data.hoi import write_hoi
-    from dexmani_real.geometry.hoi import load_task_template
 
     task = tmp_path / "task"
     mesh_dir = task / "apple/mesh"
@@ -267,7 +266,7 @@ def test_template_and_raw_roundtrip(tmp_path):
     trimesh.creation.box(extents=(0.1, 0.1, 0.1)).export(mesh_dir / "mesh_m.obj")
     module = script("sample_template")
     module.sample_template(task)
-    template = load_task_template(task)
+    template, _, _ = load_hoi_task(task)
     original = (task / "hoi/template.npz").read_bytes()
     module.sample_template(task)
     assert (task / "hoi/template.npz").read_bytes() == original
@@ -305,7 +304,6 @@ def annotated_episode(task_template):
     from dexmani_real.data.hoi import write_hoi
     from dexmani_real.data.raw import RawWriter, camera_metadata
     from dexmani_real.geometry.camera import CameraIntrinsics, CameraSnapshot
-    from dexmani_real.geometry.hoi import load_task_template
     from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
     from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
 
@@ -333,7 +331,7 @@ def annotated_episode(task_template):
         writer.finish("user_stop")
     finally:
         writer.close()
-    template = load_task_template(task_template)
+    template, _, _ = load_hoi_task(task_template)
     kwargs = dict(
         quality=[[{"iou": 1.0}, {"iou": None}], [{}, {}], [{"iou": 0.5}, {}]],
         object_valid=np.ones((3, 2), bool), tracking_config={},
@@ -434,7 +432,7 @@ def test_hoi_explicit_recompute_preserves_raw_and_reader_snapshot(annotated_epis
     assert {name: (episode / name).read_bytes() for name in raw_before} == raw_before
 
 
-@pytest.mark.parametrize("kind", ["scalar", "group"])
+@pytest.mark.parametrize("kind", ["scalar", "group", "empty"])
 def test_hoi_validity_reports_malformed_object_names(annotated_episode, kind):
     import h5py
     from dexmani_real.data.hoi import read_hoi_validity
@@ -445,6 +443,10 @@ def test_hoi_validity_reports_malformed_object_names(annotated_episode, kind):
         del data["template/object_names"]
         if kind == "scalar":
             data["template/object_names"] = "apple"
+        elif kind == "empty":
+            data.create_dataset("template/object_names", shape=(0,), dtype=h5py.string_dtype())
+            del data["object_valid"]
+            data.create_dataset("object_valid", shape=(3, 0), dtype=bool)
         else:
             group = data.create_group("template/object_names")
             group.create_group("apple")
@@ -485,17 +487,17 @@ def test_geometry_digest_uses_ordered_numeric_values():
 def test_tracking_prompts_are_nonempty_and_unique(task_template, prompts):
     import json
     from cordvip_geometry.tracking import SceneTracker
-    from dexmani_real.geometry.hoi import load_task_template
 
     names = ["banana", "apple"]
     (task_template / "task.json").write_text(json.dumps({
         "objects": [{"name": name, "prompt": prompt} for name, prompt in zip(names, prompts)],
     }))
-    assert list(load_task_template(task_template)["object_names"]) == names
+    template, _, task_prompts = load_hoi_task(task_template)
+    assert list(template["object_names"]) == names
     tracker = SceneTracker.__new__(SceneTracker)
     tracker.trackers = dict.fromkeys(names)
     with pytest.raises(ValueError, match="Prompts"):
-        tracker.initialize(None, dict(zip(names, prompts)))
+        tracker.initialize(None, task_prompts)
 
 
 def test_batched_template_transform():
@@ -544,22 +546,22 @@ def task_template(tmp_path):
 
 def test_template_reuse_and_explicit_overwrite(task_template):
     import json
-    from dexmani_real.geometry.hoi import load_task_template
 
     task = task_template
-    template = load_task_template(task)
+    template, _, _ = load_hoi_task(task)
     np.testing.assert_array_equal(template["object_names"], ["banana", "apple"])
     assert set(template) == {"points_local", "offsets", "object_names"}
     # task.json 重排不改变已有模板的对象顺序和点序。
     (task / "task.json").write_text(json.dumps({"objects": [{"name": "apple"}, {"name": "banana"}]}))
-    np.testing.assert_array_equal(load_task_template(task)["object_names"], ["banana", "apple"])
+    reused, _, _ = load_hoi_task(task)
+    np.testing.assert_array_equal(reused["object_names"], ["banana", "apple"])
     mesh_path = task / "apple/mesh/mesh_m.obj"
     trimesh.creation.box(extents=(0.2, 0.1, 0.1)).export(mesh_path)
     original = (task / "hoi/template.npz").read_bytes()
     script("sample_template").sample_template(task)
     assert (task / "hoi/template.npz").read_bytes() == original
     script("sample_template").sample_template(task, overwrite=True)
-    updated = load_task_template(task)
+    updated, _, _ = load_hoi_task(task)
     np.testing.assert_array_equal(updated["object_names"], ["apple", "banana"])
     apple = list(updated["object_names"]).index("apple")
     segment = slice(updated["offsets"][apple], updated["offsets"][apple + 1])
@@ -799,30 +801,73 @@ def test_prepare_task_requires_scale_before_models(tmp_path):
         script("prepare_task").prepare_task(str(tmp_path))
 
 
-def test_offline_uses_template_order(monkeypatch, tmp_path):
-    module = script("annotate_episodes")
-    template = {"object_names": ["banana", "apple"]}
+def test_online_offline_use_template_order(monkeypatch, task_template):
+    import json
 
+    import h5py
+    from cordvip_geometry import tracking
+
+    from dexmani_real.geometry import hoi
+    from dexmani_real.perception.hoi_worker import run_hoi_worker
+
+    module = script("annotate_episodes")
+    task = task_template
+    (task / "task.json").write_text(json.dumps({
+        "objects": [{"name": "apple", "prompt": "red apple"}, {"name": "banana"}],
+    }))
+    episode = task / "episode"
+    episode.mkdir()
+    load_npz = Mock(wraps=np.load)
+    load_objects = Mock(wraps=hoi.task_objects)
+    monkeypatch.setattr(np, "load", load_npz)
+    monkeypatch.setattr(hoi, "task_objects", load_objects)
     monkeypatch.setattr(module, "RawReader", FakeRawReader)
-    monkeypatch.setattr(module, "load_task_template", lambda task: template)
-    monkeypatch.setattr(
-        module,
-        "task_objects",
-        lambda task: [{"name": n, "prompt": n} for n in ["apple", "banana"]],
+    monkeypatch.setattr("signal.signal", lambda *args: None)
+    expected_names = ["banana", "apple"]
+    poses = {name: np.eye(4) for name in expected_names}
+    poses["banana"][0, 3], poses["apple"][0, 3] = 1, 2
+    result = SceneResult(poses, {name: {} for name in expected_names}, dict.fromkeys(expected_names, True))
+
+    def initialize(frame, prompts):
+        assert list(prompts.items()) == [("banana", "banana"), ("apple", "red apple")]
+        return result
+
+    def make_tracker(paths, *, workspace, config):
+        assert list(paths.items()) == [(name, task / name / "mesh/mesh_m.obj") for name in expected_names]
+        return SimpleNamespace(initialize=initialize, track=lambda frame: result, config=config)
+
+    tracker = Mock(side_effect=make_tracker)
+    monkeypatch.setattr(module, "SceneTracker", tracker)
+    monkeypatch.setattr(tracking, "SceneTracker", tracker)
+    module.annotate_episodes([episode], task)
+    load_npz.assert_called_once_with(task / "hoi/template.npz", allow_pickle=False)
+    load_objects.assert_called_once_with(task)
+
+    template, mesh_paths, prompts = load_hoi_task(task)
+    shared = SimpleNamespace(
+        is_running=SimpleNamespace(value=True), hoi_ready=SimpleNamespace(value=False),
+        hoi_request=SimpleNamespace(read=lambda: ({"episode_id": 1, "after_ns": 0, "after_sequence": 0}, 1)),
+        camera_ring=SimpleNamespace(read=lambda: ({
+            "rgb": np.zeros((2, 2, 3), np.uint8), "depth": np.ones((2, 2), np.uint16),
+            "timestamp_ns": 1,
+        }, 1)),
     )
 
-    def tracker(paths, **kwargs):
-        assert list(paths) == ["banana", "apple"]
-        return SimpleNamespace(config=TrackingConfig())
+    def write(**row):
+        shared.is_running.value = False
 
-    def track(reader, tracker, names, prompts):
-        assert list(names) == list(prompts) == ["banana", "apple"]
-        return np.zeros((3, 2, 4, 4)), np.eye(4), [], np.ones((3, 2), bool)
-
-    monkeypatch.setattr(module, "SceneTracker", tracker)
-    monkeypatch.setattr(module, "track_episode", track)
-    monkeypatch.setattr(module, "write_hoi", lambda *args, **kwargs: None)
-    module.annotate_episodes([tmp_path / "episode"], str(tmp_path))
+    shared.hoi_ring = SimpleNamespace(field_names=(), write=Mock(side_effect=write))
+    run_hoi_worker(shared, FakeRawReader().read_camera(), template, mesh_paths, prompts)
+    assert load_npz.call_count == load_objects.call_count == tracker.call_count == 2
+    online = shared.hoi_ring.write.call_args.kwargs
+    assert online["valid"]
+    expected_points = template["points_local"].copy()
+    split = template["offsets"][1]
+    expected_points[:split, 0] += 1
+    expected_points[split:, 0] += 2
+    np.testing.assert_array_equal(online["object_pointcloud"], expected_points)
+    with h5py.File(episode / "hoi.h5", "r") as data:
+        np.testing.assert_array_equal(data["object_pointcloud"][0], expected_points)
 
 
 def test_shape_loader_preserves_environment(monkeypatch, tmp_path):
@@ -1141,13 +1186,14 @@ def test_pose_quality_requires_two_sided_evidence():
 def test_joint_interpolation_boundaries_and_conflicts():
     from dexmani_real.utils.timing import interpolate_joints
 
-    stamps = np.array([100, 150, 150, 200]) * 1_000_000
-    q = np.array([[0.0], [1.0], [1.0], [2.0]])
-    target = np.array([90, 100, 125, 200, 210]) * 1_000_000
+    stamps = np.array([100, 150, 150, 200, 200]) * 1_000_000
+    q = np.array([[0.0], [1.0], [1.0], [2.0], [2.0]])
+    target = np.array([90, 100, 125, 150, 175, 200, 210]) * 1_000_000
     values, valid = interpolate_joints(stamps, q, target, 0.1)
-    np.testing.assert_array_equal(valid, [False, True, True, True, False])
-    np.testing.assert_allclose(values[valid, 0], [0, 0.5, 2])
-    assert not interpolate_joints(stamps, q, [125_000_000], 0.01)[1][0]
+    np.testing.assert_array_equal(valid, [False, True, True, True, True, True, False])
+    np.testing.assert_allclose(values[:, 0], [np.nan, 0, 0.5, 1, 1.5, 2, np.nan])
+    too_wide, valid = interpolate_joints(stamps, q, [175_000_000], 0.01)
+    assert not valid[0] and np.isnan(too_wide[0]).all()
     q[2] = 3
     with pytest.raises(ValueError, match="Conflicting"):
         interpolate_joints(stamps, q, target, 0.1)
@@ -1352,12 +1398,8 @@ def test_initialization_failure_retries_offline():
 def test_worker_retries_initial_registration(monkeypatch, tmp_path):
     from cordvip_geometry import tracking
 
-    from dexmani_real.geometry import hoi
     from dexmani_real.perception.hoi_worker import run_hoi_worker
 
-    monkeypatch.setattr(
-        hoi, "task_objects", lambda task: [{"name": "apple", "prompt": "apple"}]
-    )
     monkeypatch.setattr(RGBDFrame, "from_camera", lambda *args, **kwargs: object())
     monkeypatch.setattr("signal.signal", lambda *args: None)
     calls, written = [], []
@@ -1396,7 +1438,8 @@ def test_worker_retries_initial_registration(monkeypatch, tmp_path):
         offsets=[0, 1024],
     )
     run_hoi_worker(
-        shared, SimpleNamespace(T_xarm_base_from_color=np.eye(4)), tmp_path, template
+        shared, SimpleNamespace(T_xarm_base_from_color=np.eye(4)), template,
+        {"apple": tmp_path / "apple/mesh/mesh_m.obj"}, {"apple": "apple"},
     )
     assert calls == ["initialize", "initialize"]
     assert [r["valid"] for r in written] == [False, True]
@@ -1410,13 +1453,11 @@ def test_worker_backend_failure_exits_without_invalid_frame(
 ):
     from cordvip_geometry import tracking
 
-    from dexmani_real.geometry import hoi
     from dexmani_real.perception.hoi_worker import run_hoi_worker
 
     scene, frame, _, _, _ = recovery_scene
     names = list(scene.trackers)
     monkeypatch.setattr(tracking, "SceneTracker", lambda *a, **kw: scene)
-    monkeypatch.setattr(hoi, "task_objects", lambda task: [{"name": n, "prompt": n} for n in names])
     monkeypatch.setattr("signal.signal", lambda *args: None)
     failed = Mock(side_effect=backend_error)
     if stage == "initialize":
@@ -1443,7 +1484,10 @@ def test_worker_backend_failure_exits_without_invalid_frame(
         object_names=names, points_local=np.ones((1024, 3), np.float32), offsets=[0, 512, 1024]
     )
     with pytest.raises(type(backend_error)) as error:
-        run_hoi_worker(shared, camera, tmp_path, template)
+        run_hoi_worker(
+            shared, camera, template,
+            {name: tmp_path / name / "mesh/mesh_m.obj" for name in names}, {name: name for name in names},
+        )
     assert error.value is backend_error
     failed.assert_called_once()
     published = int(stage == "track")
@@ -1811,42 +1855,6 @@ def test_annotator_skips_existing_file_without_loading_inputs(monkeypatch, tmp_p
     assert (tmp_path / "hoi.h5").read_bytes() == b"do not inspect or change"
 
 
-def test_viewer_keeps_joint_alignment_separate_from_object_validity(monkeypatch):
-    from scripts import visualize_episode as module
-
-    viewer = module.EpisodeVisualizer.__new__(module.EpisodeVisualizer)
-    logged, clouds = {}, []
-    viewer.rr = SimpleNamespace(
-        Scalar=lambda value: value,
-        log=lambda name, value: logged.update({name: value}),
-        set_time_sequence=lambda *args: None,
-        set_time_seconds=lambda *args: None,
-    )
-    viewer.hoi_alignment = {
-        "arm_qpos": np.zeros((1, 7)),
-        "hand_qpos": np.zeros((1, 12)),
-    }
-    viewer.reader = {"timing/rows": [{"camera_ns": 1, "arm_ns": 1, "hand_ns": 1}]}
-
-    class Reader(dict):
-        hoi_file = {"quality": {}}
-
-    viewer.reader = Reader(viewer.reader)
-    viewer.log_hoi_diagnostics(0, viewer.hoi_alignment)
-    assert logged["hoi/alignment_available"] == 1
-    viewer.hoi_valid = [False]
-    viewer.timestamps_s = [0]
-    viewer.log_camera = lambda *args: None
-    viewer.log_pointcloud = lambda *args: None
-    viewer.log_hand_geometry = lambda *args: None
-    monkeypatch.setattr(
-        module, "log_points", lambda name, points, **kwargs: clouds.append(points)
-    )
-    # 无效帧无需读取物体点云，且须清除上一帧显示。
-    viewer.log_step(0, np.zeros((1, 1, 3), np.uint8))
-    assert clouds == [None] and logged["hoi/valid"] == 0
-
-
 @pytest.mark.parametrize("offset", [-0.1, 0.1])
 def test_depth_gate_counts_both_directions(offset):
     from cordvip_geometry.tracking import pose_depth_quality
@@ -1998,7 +2006,6 @@ def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_
     from dexmani_real.data.export import ExportConfig, export_zarr
     from dexmani_real.data.hoi import write_hoi
     from dexmani_real.data.raw import TIMING_ROW_DTYPE
-    from dexmani_real.geometry import hoi
     from dexmani_real.ipc.sensors import SensorChannels
     from dexmani_real.perception.hoi_worker import run_hoi_worker
     from dexmani_real.runtime.observation import check_hoi_status
@@ -2087,9 +2094,6 @@ def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_
     for mask in masks.values():
         mask[:] = True
     monkeypatch.setattr(tracking, "SceneTracker", lambda *a, **kw: scene)
-    monkeypatch.setattr(
-        hoi, "task_objects", lambda task: [{"name": n, "prompt": n} for n in names]
-    )
     monkeypatch.setattr("signal.signal", lambda *a: None)
     shared = SensorChannels(mp.get_context("spawn"), hoi=True)
     shared.hoi_request.write(episode_id=1, after_sequence=0, after_ns=0)
@@ -2116,7 +2120,9 @@ def test_online_offline_event_schedule_matches(recovery_scene, monkeypatch, tmp_
 
     monkeypatch.setattr(shared.hoi_ring, "write", write)
     run_hoi_worker(
-        shared, Reader().read_camera(), tmp_path, template, tracking_config=scene.config
+        shared, Reader().read_camera(), template,
+        {name: tmp_path / name / "mesh/mesh_m.obj" for name in names}, scene.prompts,
+        tracking_config=scene.config,
     )
     assert calls == [1, 3, 4, 5]
     assert [r["source_camera_sequence"] for r in written] == [1, 2, 3, 4, 5, 6]
@@ -2202,39 +2208,62 @@ def test_event_resets_keyframe_interval_and_initialization(recovery_scene):
     assert not scene.frame_cache
 
 
-def test_viewer_reads_current_quality_and_marks_unmeasured_values():
-    from scripts.visualize_episode import EpisodeVisualizer
+def test_viewer_batches_diagnostics_on_both_timelines(monkeypatch):
+    from scripts import visualize_episode as visual
+    from dexmani_real.data.raw import TIMING_ROW_DTYPE
 
-    logged = {}
-    viewer = EpisodeVisualizer.__new__(EpisodeVisualizer)
+    sent = Mock()
+    viewer = visual.EpisodeVisualizer.__new__(visual.EpisodeVisualizer)
     viewer.rr = SimpleNamespace(
-        Scalar=float, log=lambda name, value: logged.update({name: value})
+        Scalar=SimpleNamespace(columns=lambda *, scalar: scalar),
+        send_columns=sent,
+        TimeSequenceColumn=lambda name, values: (name, values),
+        TimeSecondsColumn=lambda name, values: (name, values),
     )
+    monkeypatch.setattr(visual, "log_camera_geometry", Mock())
+    viewer.camera_model = SimpleNamespace(color=None)
+    viewer.T_xarm_base_from_color = None
+    viewer.frame_count = 2
+    viewer.timestamps_s = np.array([0., 0.05])
+    viewer.hoi_alignment = {"arm_qpos": np.zeros((2, 7)), "hand_qpos": np.zeros((2, 12))}
+    viewer.hoi_alignment["hand_qpos"][1] = np.nan
+    viewer.hoi_valid = np.array([False, True])
 
-    class Reader(dict):
-        hoi_file = {
-            "quality": {
-                "iou": np.array([[-1.0, 0.75]]),
-                "mask_source": np.array([[0.0, 1.0]]),
-                "depth_fraction": np.array([[0.8, 0.9]]),
-                "depth_coverage": np.array([[0.0, 0.7]]),
-            }
-        }
+    quality = {
+        "iou": np.array([[-1.0, 0.75], [0.4, np.nan], [1.0, 1.0]]),
+        "mask_source": np.array([[0, 1], [1, -1], [0, 0]]),
+    }
+    annotations = {"object_valid": np.ones((3, 2), bool), "quality": quality}
+    viewer.reader = SimpleNamespace(hoi_file=annotations)
 
-    viewer.reader = Reader(
-        {"timing/rows": [{"arm_ns": 1, "hand_ns": 1, "camera_ns": 1}]}
-    )
-    alignment = {"arm_qpos": np.zeros((1, 7)), "hand_qpos": np.zeros((1, 12))}
-    viewer.log_hoi_diagnostics(0, alignment)
-    assert np.isnan(logged["hoi/object_0/iou"])
-    assert logged["hoi/object_1/iou"] == 0.75
-    assert logged["hoi/object_0/mask_source"] == 0
-    assert logged["hoi/object_0/depth_fraction"] == 0.8
-    assert logged["hoi/object_0/depth_coverage"] == 0.0
-    assert logged["hoi/object_1/depth_coverage"] == 0.7
-    del viewer.reader.hoi_file["quality"]
-    with pytest.raises(KeyError, match="quality"):
-        viewer.log_hoi_diagnostics(0, alignment)
+    timing = np.zeros(2, dtype=TIMING_ROW_DTYPE)
+    timing["camera_ns"] = 2**54 + np.arange(2) * 50_000_000
+    timing["arm_ns"] = timing["camera_ns"] + [1, -1_000_001]
+    timing["hand_ns"] = timing["camera_ns"] + [-3, 0]
+    viewer.log_recording_data([], timing)
+    expected = {
+        "hoi/alignment_available": [1, 0],
+        "hoi/valid": [0, 1],
+        "hoi/arm_source_offset_ms": [0.000001, -1.000001],
+        "hoi/hand_source_offset_ms": [-0.000003, 0.0],
+        "hoi/object_0/iou": [np.nan, 0.4],
+        "hoi/object_1/iou": [0.75, np.nan],
+        "hoi/object_0/mask_source": [0, 1],
+        "hoi/object_1/mask_source": [1, np.nan],
+    }
+    assert sent.call_count == len(expected)
+    for entry in sent.call_args_list:
+        entity, = entry.args
+        (step_name, steps), (time_name, times) = entry.kwargs["indexes"]
+        assert (step_name, time_name) == ("step", "time")
+        np.testing.assert_array_equal(steps, [0, 1])
+        np.testing.assert_array_equal(times, viewer.timestamps_s)
+        np.testing.assert_array_equal(entry.kwargs["columns"], expected.pop(entity))
+    iou = quality["iou"]
+    for bad in (iou[:1], iou[:, :1]):
+        quality["iou"] = bad
+        with pytest.raises(ValueError, match="quality/iou"):
+            viewer.log_recording_data([], timing)
 
 
 @pytest.mark.parametrize("missing", [np.nan, 0.0])
@@ -2775,8 +2804,6 @@ def test_multiple_moving_objects_share_one_batch_per_frame(recovery_scene, monke
 
 @pytest.mark.parametrize("info", [False, True])
 def test_visualizer_can_bypass_corrupt_hoi(annotated_episode, monkeypatch, info):
-    import h5py
-
     from scripts import visualize_episode as visual
     from dexmani_real.utils import log
 
@@ -2786,56 +2813,35 @@ def test_visualizer_can_bypass_corrupt_hoi(annotated_episode, monkeypatch, info)
     (episode / "hoi.h5").write_bytes(b"corrupt annotation")
     _disable_viewer(monkeypatch, visual)
 
-    def unexpected_hoi(*args, **kwargs):
-        raise AssertionError("Raw viewing must not consume HOI")
-
-    monkeypatch.setattr(visual, "align_hoi_episode", unexpected_hoi)
-    monkeypatch.setattr(visual, "read_hoi_validity", unexpected_hoi)
-    monkeypatch.setattr(visual.EpisodeVisualizer, "log_hoi_diagnostics", unexpected_hoi)
-    opened = []
-    original = h5py.File
-
-    def open_file(path, *args, **kwargs):
-        opened.append(Path(path).name)
-        return original(path, *args, **kwargs)
-
-    monkeypatch.setattr(h5py, "File", open_file)
     args = [str(episode), "--no-hoi", "--max-frames", "1", "--no-point-cloud"]
     if info:
         args.append("--info")
     assert visual.main(args) == 0
-    assert "hoi.h5" not in opened
     with pytest.raises(OSError):
         visual.main([arg for arg in args if arg != "--no-hoi"])
 
 
-@pytest.mark.parametrize("step_ns", [0, -1])
-@pytest.mark.parametrize("mode", ["disabled", "missing"])
-def test_visualizer_rejects_invalid_observation_clock_without_hoi(
-    annotated_episode, monkeypatch, step_ns, mode,
-):
+def test_visualizer_rejects_invalid_observation_clock_without_hoi(annotated_episode, monkeypatch):
     import h5py
     import rerun as rr
 
     from scripts import visualize_episode as visual
 
     episode, *_ = annotated_episode
-    if mode == "missing":
-        (episode / "hoi.h5").unlink()
     with h5py.File(episode / "data.h5", "r+") as data:
         rows = data["timing/rows"][:]
-        rows["observation_ns"][1] = rows["observation_ns"][0] + step_ns
+        rows["observation_ns"][1] = rows["observation_ns"][0]
         data["timing/rows"][:] = rows
     monkeypatch.setattr(rr, "init", lambda *a, **kw: pytest.fail("started display with invalid clock"))
     monkeypatch.setattr(rr, "disconnect", lambda *a, **kw: None)
     with pytest.raises(ValueError) as error:
-        visual.EpisodeVisualizer(str(episode), hoi=mode != "disabled", table_plane_path=None)
+        visual.EpisodeVisualizer(str(episode), hoi=False, table_plane_path=None)
     assert str(error.value) == f"Raw {episode.resolve()}: observation_clock_not_increasing at row 1"
 
 
 def _disable_viewer(monkeypatch, visual):
     import rerun as rr
-    for name in ("init", "send_blueprint", "disconnect", "log", "set_time_sequence", "set_time_seconds"):
+    for name in ("init", "send_blueprint", "disconnect", "log", "send_columns", "set_time_sequence", "set_time_seconds"):
         monkeypatch.setattr(rr, name, lambda *a, **kw: None)
     for name in ("log_rgbd", "log_series", "log_camera_geometry", "log_points"):
         monkeypatch.setattr(visual, name, lambda *a, **kw: None)
@@ -2851,26 +2857,42 @@ def test_visualizer_reads_only_consumed_prefix(annotated_episode, monkeypatch):
         data["arm_qpos"][2] = np.nan
         rows = data["timing/rows"][:]
         rows["control_ns"][2] = -1
+        rows["observation_ns"] = 2**60 + np.arange(3, dtype=np.int64)
         data["timing/rows"][:] = rows
+    with h5py.File(episode / "hoi.h5", "r+") as annotations:
+        annotations["object_valid"][1] = False
+        annotations["object_pointcloud"][1] = np.nan
     _disable_viewer(monkeypatch, visual)
+    clouds = []
+
+    def log_points(name, points, **kwargs):
+        if name == "object_pointcloud":
+            clouds.append(points)
+
+    monkeypatch.setattr(visual, "log_points", log_points)
     original = h5py.Dataset.__getitem__
     reads = []
 
     def read(dataset, key, **kwargs):
-        if dataset.name in {"/arm_qpos", "/hand_qpos", "/object_valid", "/timing/rows"}:
+        if dataset.name in {"/arm_qpos", "/hand_qpos", "/object_valid", "/timing/rows", "/quality/iou"}:
             reads.append((dataset.name, key))
-            assert (isinstance(key, slice) and key.stop == 1) or key == 0
+            assert isinstance(key, slice) and key.stop == 2
         return original(dataset, key, **kwargs)
 
     monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
-    viewer = visual.EpisodeVisualizer(str(episode), table_plane_path=None, max_frames=1)
+    viewer = visual.EpisodeVisualizer(str(episode), table_plane_path=None, max_frames=2)
     try:
-        assert len(viewer.timestamps_s) == len(viewer.hoi_valid) == 1
-        assert all(len(q) == 1 for q in viewer.hoi_alignment.values())
-        viewer.log_step(0, next(viewer.reader.iter_rgb_frames()))
+        np.testing.assert_array_equal(viewer.timestamps_s, [0.0, 1e-9])
+        assert len(viewer.hoi_valid) == 2
+        assert all(len(q) == 2 for q in viewer.hoi_alignment.values())
+        images = iter(viewer.reader.iter_rgb_frames())
+        for step in range(2):
+            viewer.log_step(step, next(images))
     finally:
         viewer.close()
-    assert {name for name, _ in reads} == {"/arm_qpos", "/hand_qpos", "/object_valid", "/timing/rows"}
+    assert [name for name, _ in reads].count("/timing/rows") == 1
+    assert [name for name, _ in reads].count("/quality/iou") == 1
+    assert len(clouds) == 2 and np.isfinite(clouds[0]).all() and clouds[1] is None
 
 
 @pytest.mark.parametrize("devices", [("arm",), ("arm", "hand")])

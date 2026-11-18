@@ -15,7 +15,7 @@ from dexmani_real.deployment.observation import ObservationBuilder
 from dexmani_real.deployment.preflight import resolve_deployment_config
 from dexmani_real.geometry.camera import CameraIntrinsics
 from dexmani_real.robot.model import XHAND_FINGERTIP_LINK_NAMES
-from dexmani_real.runtime.observation import RAW_RECORDING_NEEDS, ObservationNeeds
+from dexmani_real.runtime.observation import ObservationNeeds
 
 
 @pytest.fixture
@@ -96,7 +96,6 @@ def test_rgb_cloud_and_camera_parameters(info):
 def test_depth_is_recording_input_only(info):
     with pytest.raises(ValueError, match='no live producer.*depth'):
         ObservationBuilder(replace(info, observation_fields=('depth',)), RealConfig())
-    assert 'depth' in RAW_RECORDING_NEEDS.camera_fields
 
 
 def test_hoi_projection_uses_aligned_joints_without_changing_feedback():
@@ -120,7 +119,6 @@ def test_hoi_eef_projection_requires_only_arm_history(info):
         replace(info, observation_fields=("eef_pose", "object_pointcloud")), RealConfig()
     )
     assert builder.needs.hoi_joint_devices == ("arm",)
-    assert builder.needs.union(RAW_RECORDING_NEEDS).hoi_joint_devices == ("arm",)
     row = SimpleNamespace(
         hoi={"object_pointcloud": np.zeros((1024, 3), np.float32)},
         aligned_joints={"arm_qpos": np.zeros(7)},
@@ -337,21 +335,3 @@ def test_rtc_warmup_preserves_rng_and_episode_reset(fail):
         assert torch.equal(first, second)
     finally:
         worker.close().result()
-
-
-def test_deployment_processing_does_not_hash_geometry(info, monkeypatch, capsys):
-    from dexmani_real.deployment.preflight import collect_data_processing
-
-    def unexpected_hash(*args):
-        raise AssertionError("ordinary deployment does not consume geometry hashes")
-
-    monkeypatch.setattr("dexmani_real.geometry.hoi.geometry_digest", unexpected_hash)
-    info = replace(info, observation_fields=("hand_pointcloud", "object_pointcloud"),
-                   data_processing={
-                       "hand_pointcloud": {"num_points": 1024},
-                       "object_pointcloud": {"geometry_sha256": "a" * 64, "max_joint_gap_s": .10},
-                   })
-    actual = collect_data_processing(info, RealConfig())
-    assert actual == {"hand_pointcloud": {"num_points": 1024},
-                      "object_pointcloud": {"max_joint_gap_s": .10}}
-    assert capsys.readouterr().out == ""

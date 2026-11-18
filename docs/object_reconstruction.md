@@ -12,7 +12,7 @@ HOI（Hand–Object Interaction，手物交互）观测用手部与物体点云�
 
 通用场景 `point_cloud` 由 `PointCloudProcessor` 处理 RGB-D，包含深度滤波、桌面裁剪、体素降采样和离群点过滤；HOI 点云直接使用固定 CAD/URDF 表面模板。
 
-任务模板保存 `points_local`、`object_names` 和 `offsets`，加载时检查数组结构及对象对应关系。
+任务模板保存 `points_local`、`object_names` 和 `offsets`。部署与离线标注共用任务解析，核对模板和 `task.json` 的对象集合，按模板顺序匹配网格和 prompt。
 
 通用场景点云在过滤后无有效点时返回 float32 `[0,6]`；非空但不足目标点数时循环重复已有 XYZRGB，超过目标点数时执行 FPS。重复填充仅满足输出形状，不增加真实几何信息。
 
@@ -82,9 +82,9 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 
 导出完成时，若接纳的采集具有相同的有序局部点与 offsets，则计算一次 `geometry_sha256` 供接触监督训练和续训使用。混用合法模板时记录 `null`。手模板的 link 名称须有效映射到 FK。
 
-[visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则，显示手物几何、有效性、逐物体质量及原始来源时差。无效物体点云和不可对齐的手几何隐藏，保留对应行的时间位置，其余帧继续显示。
+[visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则。HOI 查看时，同一批时间行供时间轴、关节对齐和来源时差使用，逐物体质量和有效性按列发送。图像和几何逐帧显示。无效物体点云和不可对齐的手几何隐藏，保留对应行的时间位置。
 
-可视化启动前要求展示范围内的 `observation_ns` 严格递增，包括未使用 HOI 的情况。
+可视化启动前要求展示范围内的 `observation_ns` 严格递增。查看 HOI 时同时校验控制时钟。
 
 - `--max-frames N` 只加载展示前缀；关节插值可读取同一原生段内所需的邻点。
 - `--no-hoi`（Python 参数 `hoi=False`）完全绕过标注，手部几何使用 Raw 关节；与 `--info` 组合也不打开 HOI 文件。
@@ -97,7 +97,7 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 | [geometry/hoi.py](../dexmani_real/geometry/hoi.py) | 任务资产、固定采样及点云坐标变换 |
 | [perception/hoi_worker.py](../dexmani_real/perception/hoi_worker.py) | 在线物体点云生成 |
 | [perception/hand_cloud.py](../dexmani_real/perception/hand_cloud.py) | 手部模板加载与 FK 几何 |
-| [utils/timing.py](../dexmani_real/utils/timing.py) | 在线、离线共用的关节插值 |
+| [utils/timing.py](../dexmani_real/utils/timing.py) | 时钟调度、来源时效及离线批量关节插值 |
 | [data/hoi.py](../dexmani_real/data/hoi.py)、[data/export.py](../dexmani_real/data/export.py) | 标注发布、区间对齐与训练数据导出 |
 
 实现借鉴 [GALATEA `36b90481` 的遮挡感知轮廓评估](https://github.com/boyuan-an/GALATEA/blob/36b90481ba458d9beb5b6ac1396c639ea49a4747/recon/galatea_recon/pipeline/object_quality.py) 和固定表面点采样思路，以实测 RGB-D 和机器人 FK 为依据。

@@ -557,27 +557,19 @@ class RawReader:
             import h5py
             if not isinstance(array, h5py.Dataset):
                 raise RawDataError(f"Raw {name}: expected a dataset")
-            spec = (
-                ((), TIMING_ROW_DTYPE) if name == "timing/rows"
-                else ROBOT_DATASET_SPECS.get(name, VR_DATASET_SPECS.get(name))
-            )
-            if name == "depth":
-                expected = (
-                    self.num_frames,
-                    self.meta["camera_color_height"],
-                    self.meta["camera_color_width"],
-                )
-                if array.shape != expected or array.dtype != np.uint16:
-                    raise ValueError(f"Raw {self.path}: depth must be uint16 {expected}")
-            if name == "object_pointcloud" and (
-                array.shape != (self.num_frames, HOI_NUM_POINTS, 3) or array.dtype != np.float32
-            ):
-                raise ValueError("Raw hoi.h5/object_pointcloud: shape/dtype 错误")
+            if name == "timing/rows":
+                spec = (), TIMING_ROW_DTYPE
+            elif name == "depth":
+                spec = (self.meta["camera_color_height"], self.meta["camera_color_width"]), np.dtype(np.uint16)
+            elif name == "object_pointcloud":
+                spec = (HOI_NUM_POINTS, 3), np.dtype(np.float32)
+            else:
+                spec = ROBOT_DATASET_SPECS.get(name, VR_DATASET_SPECS.get(name))
             if spec is not None:
                 shape, dtype = spec
-                valid_dtype = array.dtype.kind == "f" if dtype.kind == "f" else array.dtype == dtype
-                if array.shape != (self.num_frames, *shape) or not valid_dtype:
-                    raise ValueError(f"Raw {name}: incompatible shape/dtype")
+                expected = (self.num_frames, *shape)
+                if array.shape != expected or array.dtype != dtype:
+                    raise RawDataError(f"Raw {name}: expected shape {expected} and dtype {dtype}")
             self.dataset_cache[name] = array
         return self.dataset_cache[name]
 
@@ -618,12 +610,11 @@ class RawReader:
                 f"got {divisor!r}"
             )
 
-    def read_timestamps_s(self, stop: int | None = None) -> np.ndarray:
-        """校验观测时间前缀严格递增，并返回相对首帧的秒数。"""
+    def read_observation_stamps(self, stop: int | None = None) -> np.ndarray:
+        """只读取观测时钟，校验所选时间戳严格递增。"""
         stamps = self["timing/rows"].fields("observation_ns")[:stop]
         self._validate_observation_clock(stamps)
-        # 先减整数时钟，避免长时间运行后的浮点精度损失。
-        return (stamps - stamps[0]) / 1e9 if stamps.size else np.empty(0, dtype=np.float64)
+        return stamps
 
     def iter_rgb_frames(self):
         import av

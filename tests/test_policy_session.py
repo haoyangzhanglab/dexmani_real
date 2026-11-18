@@ -79,7 +79,9 @@ def test_session_defaults_and_explicit_unbounded_budget(monkeypatch, tmp_path):
     )
     assert unlimited.max_duration_s is unlimited.num_episodes is None
     assert unlimited.camera_calibration_path == tmp_path / "camera.json"
-    assert unlimited.output_root == Path(session.__file__).resolve().parents[2] / "rollouts"
+    assert unlimited.output_root == tmp_path / "rollouts"
+    explicit = session.PolicySession(runtime, "policy.pt", record_raw=True, output_root="custom")
+    assert explicit.output_root == Path("custom")
 
 
 def load_cli(name="run_policy.py"):
@@ -120,30 +122,30 @@ def test_print_config_does_not_create_session(monkeypatch, capsys):
     constructor.assert_not_called()
 
 
-@pytest.mark.parametrize("task_dir", [None, "missing", "bad-template"])
+@pytest.mark.parametrize("task_dir", [None, "missing", "bad-template", "mismatched-objects"])
 def test_hoi_task_errors_precede_robot_creation(policy_session, policy_info, monkeypatch, tmp_path, task_dir):
     monkeypatch.chdir(tmp_path)
     if task_dir == "bad-template":
         (tmp_path / task_dir / "hoi").mkdir(parents=True)
         (tmp_path / task_dir / "hoi/template.npz").write_bytes(b"invalid template")
+    elif task_dir == "mismatched-objects":
+        task = tmp_path / task_dir
+        (task / "hoi").mkdir(parents=True)
+        np.savez(task / "hoi/template.npz", points_local=np.zeros((1024, 3), np.float32),
+                 offsets=np.array([0, 1024]), object_names=np.array(["apple"]))
+        (task / "task.json").write_text(json.dumps({"objects": [{"name": "banana"}]}))
     policy_session.task_dir = task_dir
     policy_session.wait_model = lambda: replace(policy_info, observation_fields=("object_pointcloud",))
     monkeypatch.setattr(session, "PolicyWorker", Mock())
     robot = Mock(side_effect=AssertionError("task errors must precede Robot creation"))
     monkeypatch.setattr(session, "Robot", robot)
-    expected = ValueError if task_dir is None or task_dir == "bad-template" else FileNotFoundError
+    channels = Mock(side_effect=AssertionError("task errors must precede sensor allocation"))
+    monkeypatch.setattr(session, "SensorChannels", channels)
+    expected = FileNotFoundError if task_dir == "missing" else ValueError
     with pytest.raises(expected):
         policy_session.prepare_resources()
     robot.assert_not_called()
-
-
-def test_non_hoi_policy_does_not_read_task_assets(policy_session, policy_info, monkeypatch):
-    policy_session.task_dir = object()  # 任何 Path 转换或文件读取都会失败。
-    policy_session.wait_model = lambda: policy_info
-    monkeypatch.setattr(session, "PolicyWorker", Mock())
-    monkeypatch.setattr(session, "Robot", Mock())
-    policy_session.prepare_resources()
-    assert policy_session.hoi_inputs is None
+    channels.assert_not_called()
 
 
 @pytest.mark.parametrize("field,ring_name", [("point_cloud", "pointcloud_ring"), ("object_pointcloud", "hoi_ring")])
@@ -153,11 +155,10 @@ def test_policy_derived_channel_carries_only_requested_rgb(
 ):
     runtime = policy_session.runtime
     policy_session.runtime = replace(runtime, camera=replace(runtime.camera, width=4, height=3))
-    policy_session.record_raw = True
-    policy_session.output_root = tmp_path
+    policy_session.task_dir = tmp_path
     fields = (field, "rgb") if include_rgb else (field,)
     policy_session.wait_model = lambda: replace(policy_info, observation_fields=fields)
-    monkeypatch.setattr(session, "resolve_hoi_inputs", Mock())
+    monkeypatch.setattr(session, "load_hoi_task", Mock())
     monkeypatch.setattr(session, "PolicyWorker", Mock())
     monkeypatch.setattr(session, "Robot", Mock())
     policy_session.prepare_resources()
@@ -169,6 +170,53 @@ def test_policy_derived_channel_carries_only_requested_rgb(
     assert ("rgb" in ring.field_names) is include_rgb
     if include_rgb:
         assert ring.dtype["rgb"] == channels.camera_ring.dtype["rgb"]
+
+
+@pytest.mark.parametrize("field,record_raw,camera_fields,keep_camera", [
+    ("joint_state", False, None, False),
+    ("joint_state", True, {"timestamp_ns", "rgb", "depth"}, True),
+    ("rgb", False, {"timestamp_ns", "rgb"}, True),
+    ("camera_intrinsic", False, {"timestamp_ns", "rgb"}, False),
+    ("camera_intrinsic", True, {"timestamp_ns", "rgb", "depth"}, True),
+])
+def test_policy_camera_lifecycle(
+    policy_session, policy_info, monkeypatch, tmp_path, field, record_raw, camera_fields, keep_camera,
+):
+    monkeypatch.chdir(tmp_path)
+    runtime = policy_session.runtime
+    policy_session.runtime = replace(runtime, camera=replace(runtime.camera, width=4, height=3))
+    policy_session.record_raw = record_raw
+    policy_session.task_dir = tmp_path / "missing"
+    policy_session.wait_model = lambda: replace(policy_info, observation_fields=(field,))
+    monkeypatch.setattr(session, "PolicyWorker", Mock())
+    monkeypatch.setattr(session, "Robot", Mock())
+    policy_session.prepare_resources()
+    policy_session.sensors.start = Mock()
+    policy_session.warmup_policy = Mock()
+    scale = .001 if record_raw else None
+    camera = CameraSnapshot(
+        "camera-123", CameraIntrinsics(4, 3, 4., 4., 2., 1., "none", (0.,) * 5), scale, None,
+    )
+    snapshot = Mock(return_value=camera)
+    monkeypatch.setattr(session, "snapshot_camera_parameters", snapshot)
+    channels = policy_session.sensors.channels
+    if camera_fields is not None:
+        assert channels.camera_ring.field_names == camera_fields
+    policy_session.start_devices()
+    if camera_fields is None:
+        assert channels is None
+        policy_session.sensors.start.assert_not_called()
+        snapshot.assert_not_called()
+    else:
+        assert policy_session.sensors.start.call_args.args[0].name == "camera"
+        snapshot.assert_called_once_with(
+            channels, None, require_extrinsics=False, include_extrinsics=record_raw,
+        )
+        assert policy_session.camera_snapshot is camera
+        assert bool(channels.is_running.value) is keep_camera
+    assert policy_session.sensors.channels is (channels if keep_camera else None)
+    if field == "camera_intrinsic":
+        assert "camera_intrinsic" in policy_session.observations.camera_parameters
 
 
 @pytest.mark.parametrize("explicit,dt,period_ns", [
@@ -209,14 +257,31 @@ def test_hoi_session_uses_explicit_task_and_records_path(
         policy_info, observation_fields=("object_pointcloud",), task_name="independent/experiment label",
     )
     monkeypatch.setattr(session, "PolicyWorker", Mock())
-    monkeypatch.setattr(session, "SensorChannels", Mock())
+    channels = Mock(hoi_ready=SimpleNamespace(value=True))
+    monkeypatch.setattr(session, "SensorChannels", Mock(return_value=channels))
     robot = Mock()
     monkeypatch.setattr(session, "Robot", robot)
     policy_session.prepare_resources()
-    assert policy_session.hoi_inputs[0] == task
-    np.testing.assert_array_equal(policy_session.hoi_inputs[1]["object_names"], ["apple"])
+    assert policy_session.task_dir == task
+    template, mesh_paths, prompts = policy_session.hoi_inputs
+    np.testing.assert_array_equal(template["object_names"], ["apple"])
+    assert mesh_paths == {"apple": task / "apple/mesh/mesh_m.obj"}
+    assert prompts == {"apple": "apple"}
     robot.return_value.connect.assert_not_called()
-    policy_session.save_run_config()
+    camera = CameraSnapshot(
+        "camera-123", CameraIntrinsics(4, 3, 4., 4., 2., 1., "none", (0.,) * 5), .001, np.eye(4),
+    )
+    monkeypatch.setattr(session, "snapshot_camera_parameters", Mock(return_value=camera))
+    policy_session.process_context = Mock()
+    policy_session.sensors.start = Mock()
+    policy_session.start_devices()
+    from dexmani_real.perception.hoi_worker import run_hoi_worker
+
+    worker = policy_session.process_context.Process.call_args.kwargs
+    assert worker["target"] is run_hoi_worker
+    args = worker["args"]
+    assert args[:2] == (channels, camera)
+    assert all(value is expected for value, expected in zip(args[2:], policy_session.hoi_inputs, strict=True))
     import yaml
 
     saved = yaml.safe_load((policy_session.output_dir / "run_config.yaml").read_text())
@@ -249,6 +314,7 @@ def test_declared_config_does_not_require_json_values(tmp_path, capsys, script):
 @pytest.mark.parametrize("action_mode", ["joint", "eef"])
 @pytest.mark.parametrize("record_raw", [False, True])
 def test_policy_records_only_used_parameters(monkeypatch, tmp_path, policy_info, action_mode, record_raw):
+    monkeypatch.chdir(tmp_path)
     runtime = RealConfig()
     runtime = replace(runtime, arm=replace(runtime.arm, homing=object()),
                       hand=replace(runtime.hand, home_tor_max=object()),
@@ -262,11 +328,13 @@ def test_policy_records_only_used_parameters(monkeypatch, tmp_path, policy_info,
     )
     configured = session.PolicySession(
         runtime, "policy.pt", device="cpu", seed=7, max_duration_s=12,
-        output_root=tmp_path, record_raw=record_raw,
+        output_root="explicit", record_raw=record_raw,
     )
     configured.keyboard = Mock(check_health=Mock(return_value=True))
     configured.wait_model = lambda: policy_info
     configured.prepare_resources()
+    assert configured.output_dir.parent == tmp_path / "explicit"
+    assert not (tmp_path / "rollouts").exists()
     parameters = configured.effective_parameters
     expected_policy = asdict(policy_info)
     expected_policy.pop("data_processing")
@@ -301,6 +369,8 @@ def test_policy_records_only_used_parameters(monkeypatch, tmp_path, policy_info,
     assert saved["actual_processing"] == {}
     assert saved["task_dir"] is None
     assert "data_processing" not in saved
+    configured.save_results()
+    assert (configured.output_dir / "session_result.json").is_file()
 
 
 @pytest.mark.parametrize("port", [None, 8124])

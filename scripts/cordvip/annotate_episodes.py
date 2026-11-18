@@ -15,7 +15,7 @@ from cordvip_geometry.tracking import SceneTracker, TrackingConfig, TrackingFail
 
 from dexmani_real.data.hoi import write_hoi
 from dexmani_real.data.raw import RawReader, discover_episode_dirs
-from dexmani_real.geometry.hoi import load_task_template, task_objects
+from dexmani_real.geometry.hoi import load_hoi_task
 
 
 def annotate_episodes(
@@ -33,11 +33,8 @@ def annotate_episodes(
             continue
         with RawReader(episode) as reader:
             if tracker is None:
-                template = load_task_template(task)
+                template, mesh_paths, prompts = load_hoi_task(task)
                 names = template["object_names"]
-                by_name = {obj["name"]: obj for obj in task_objects(task)}
-                mesh_paths = {name: task / name / "mesh/mesh_m.obj" for name in names}
-                prompts = {name: by_name[name]["prompt"] for name in names}
                 tracker = SceneTracker(
                     mesh_paths, workspace=ROOT, config=tracking_config
                 )

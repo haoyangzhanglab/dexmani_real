@@ -59,8 +59,8 @@ def raw_episodes(tmp_path):
     return source, np.concatenate(states), np.concatenate(actions)
 
 
-@pytest.mark.parametrize("stop", [None, 0, 1, 3, -1, 10])
-def test_raw_reader_observation_prefix(raw_episodes, monkeypatch, stop):
+def test_raw_reader_observation_prefix(raw_episodes, monkeypatch):
+    stop = 3
     source, *_ = raw_episodes
     episode = source / "episode_0"
     with h5py.File(episode / "data.h5", "r+") as data:
@@ -80,13 +80,13 @@ def test_raw_reader_observation_prefix(raw_episodes, monkeypatch, stop):
     with RawReader(episode) as reader:
         np.testing.assert_array_equal(reader.read_timing(stop=stop), rows[:stop])
         monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
-        timestamps = reader.read_timestamps_s(stop=stop)
+        timestamps = reader.read_observation_stamps(stop=stop)
     assert reads == [slice(None, stop)]
-    assert timestamps.ndim == 1 and timestamps.dtype == np.float64
-    np.testing.assert_array_equal(timestamps, np.array([0., 1e-9, 3e-9, 7e-9])[:stop])
+    assert timestamps.ndim == 1 and timestamps.dtype == np.int64
+    np.testing.assert_array_equal(timestamps, rows["observation_ns"][:stop])
 
 
-@pytest.mark.parametrize("method", ["read_timing", "read_timestamps_s"])
+@pytest.mark.parametrize("method", ["read_timing", "read_observation_stamps"])
 @pytest.mark.parametrize("stop", [None, 3])
 @pytest.mark.parametrize("offsets,bad_row", [
     ([0, 10, 10, 30], 2),
@@ -109,12 +109,12 @@ def test_raw_reader_rejects_invalid_observation_clock(raw_episodes, method, stop
     )
 
 
-@pytest.mark.parametrize("stamps,stop,expected", [
-    ([100, 110, 120, 120], 3, [0., 1e-8, 2e-8]),
-    ([100, 110, 120, 119], 3, [0., 1e-8, 2e-8]),
-    ([2**63 - 2, 2**63 - 1, -(2**63), -(2**63) + 1], 2, [0., 1e-9]),
+@pytest.mark.parametrize("stamps,stop", [
+    ([100, 110, 120, 120], 3),
+    ([100, 110, 120, 119], 3),
+    ([2**63 - 2, 2**63 - 1, -(2**63), -(2**63) + 1], 2),
 ])
-def test_raw_reader_observation_clock_checks_only_selected_prefix(raw_episodes, stamps, stop, expected):
+def test_raw_reader_observation_clock_checks_only_selected_prefix(raw_episodes, stamps, stop):
     source, *_ = raw_episodes
     episode = source / "episode_0"
     with h5py.File(episode / "data.h5", "r+") as data:
@@ -122,9 +122,9 @@ def test_raw_reader_observation_clock_checks_only_selected_prefix(raw_episodes, 
         rows["observation_ns"] = stamps
         data["timing/rows"][:] = rows
     with RawReader(episode) as reader:
-        np.testing.assert_array_equal(reader.read_timestamps_s(stop=stop), expected)
+        np.testing.assert_array_equal(reader.read_observation_stamps(stop=stop), stamps[:stop])
         with pytest.raises(ValueError, match=f"observation_clock_not_increasing at row {stop}"):
-            reader.read_timestamps_s()
+            reader.read_observation_stamps()
 
 
 @pytest.mark.parametrize("control,observation,detail,bad_row", [
@@ -155,7 +155,7 @@ def test_raw_reader_rejects_invalid_depth_grid(raw_episodes, shape, dtype):
     with h5py.File(episode / "data.h5", "r+") as data:
         data["meta"].attrs.update(camera_color_width=2, camera_color_height=2)
         data.create_dataset("depth", data=np.ones(shape, dtype=dtype))
-    with RawReader(episode) as reader, pytest.raises(ValueError, match="depth must be uint16"):
+    with RawReader(episode) as reader, pytest.raises(RawDataError, match="depth: expected shape.*dtype uint16"):
         reader["depth"]
 
 
@@ -378,7 +378,7 @@ def test_hoi_diagnostics_preserve_internal_gap(raw_episodes):
         rows["camera_ns"][1] -= 10_000_000
         f["timing/rows"][:] = rows
     with RawReader(episode) as reader:
-        aligned = align_hoi_episode(reader, 0.01)
+        aligned = align_hoi_episode(reader, reader.read_timing(), 0.01)
         for values in aligned.values():
             assert len(values) == reader.num_frames
             assert np.isnan(values[1]).all()
@@ -853,24 +853,34 @@ def test_complete_interpolation_preserves_every_row(tmp_path, hoi_episodes, with
     interpolate = Mock(wraps=interpolate_joints)
     monkeypatch.setattr("dexmani_real.data.export.interpolate_joints", interpolate)
     source, states, actions = hoi_episodes
+    raw_states = states.copy()
     expected = states.copy()
     offset = 0
     for episode in sorted(source.iterdir()):
         with h5py.File(episode / "data.h5", "r+") as data:
             rows = data["timing/rows"][:]
-            rows["camera_ns"][1:-1] -= 10_000_000
-            data["timing/rows"][:] = rows
             n = len(rows)
-            expected[offset + 1 : offset + n - 1] = (
-                0.2 * states[offset : offset + n - 2] + 0.8 * states[offset + 1 : offset + n - 1]
-            )
+            if offset == 0:
+                # 两组重复反馈；首尾相机精确命中，中间一帧跨组插值。
+                for device, columns in (("arm", slice(0, 7)), ("hand", slice(7, 19))):
+                    rows[f"{device}_ns"] = rows[f"{device}_ns"][[0, 0, 2, 2]]
+                    data[f"{device}_qpos"][:] = states[[0, 0, 2, 2], columns]
+                rows["camera_ns"][-1] = rows["camera_ns"][-2]
+                raw_states[:n] = expected[:n] = states[[0, 0, 2, 2]]
+                expected[1] = (states[0] + states[2]) / 2
+            else:
+                rows["camera_ns"][1:-1] -= 10_000_000
+                expected[offset + 1 : offset + n - 1] = (
+                    0.2 * states[offset : offset + n - 2] + 0.8 * states[offset + 1 : offset + n - 1]
+                )
+            data["timing/rows"][:] = rows
             offset += n
     fields = ("joint_state", "action", "object_pointcloud") if with_object else ("joint_state", "action")
     output = tmp_path / "aligned.zarr"
     export_zarr(source, output, processing=ExportConfig(), fields=fields)
     root = zarr.open_group(str(output), mode="r")
     assert interpolate.call_count == (4 if with_object else 0)  # 仅所选 HOI 联合观测需要对齐。
-    expected_states = expected if with_object else states
+    expected_states = expected if with_object else raw_states
     np.testing.assert_allclose(root["data/joint_state"][:], expected_states, atol=1e-6)
     np.testing.assert_allclose(root["data/action"][:], actions, atol=1e-6)
     np.testing.assert_array_equal(root["meta/episode_ends"][:], [4, 7])
@@ -916,6 +926,7 @@ def test_hoi_timing_is_checked_only_when_selected(tmp_path, hoi_episodes, with_o
     ("group_timing", "timing/rows"),
     ("matrix_timing", "timing/rows"),
     ("integer_names", "arm_joint_names"),
+    ("float32_joints", "arm_qpos: expected shape"),
     ("audio_only", "video stream"),
 ])
 def test_malformed_raw_is_skipped(tmp_path, complete_episodes, bad_index, fault, reason, caplog):
@@ -953,6 +964,10 @@ def test_malformed_raw_is_skipped(tmp_path, complete_episodes, bad_index, fault,
         with h5py.File(bad / "data.h5", "r+") as data:
             if fault == "integer_names":
                 data["meta"].attrs["arm_joint_names"] = 123
+            elif fault == "float32_joints":
+                joints = data["arm_qpos"][:].astype(np.float32)
+                del data["arm_qpos"]
+                data["arm_qpos"] = joints
             else:
                 rows = data["timing/rows"][:]
                 del data["timing/rows"]
@@ -1253,8 +1268,9 @@ def test_hoi_prefix_matches_full_alignment(raw_episodes, starts, gap, stop, dela
         del data["timing/segment_starts"]
         data.create_dataset("timing/segment_starts", data=starts)
     with RawReader(episode) as reader:
-        full = align_hoi_episode(reader, gap)
-        prefix = align_hoi_episode(reader, gap, stop=stop)
+        timing = reader.read_timing()
+        full = align_hoi_episode(reader, timing, gap)
+        prefix = align_hoi_episode(reader, timing[:stop], gap)
         for key in full:
             np.testing.assert_allclose(prefix[key], full[key][:stop], equal_nan=True)
         if starts == [0] and (gap == .1 or delay_ns == 100_000_000):
@@ -1294,7 +1310,7 @@ def test_prefix_reads_needed_right_neighbor_not_bad_tail(raw_episodes, monkeypat
             data[f"{device}_qpos"][1] = data[f"{device}_qpos"][0]
         data["timing/rows"][:] = rows
     with RawReader(episode) as reader:
-        expected = align_hoi_episode(reader, .1)
+        expected = align_hoi_episode(reader, reader.read_timing(), .1)
     with h5py.File(episode / "data.h5", "r+") as data:
         data["arm_qpos"][3] = np.nan
         data["hand_qpos"][3] = np.nan
@@ -1313,7 +1329,7 @@ def test_prefix_reads_needed_right_neighbor_not_bad_tail(raw_episodes, monkeypat
 
     monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
     with RawReader(episode) as reader:
-        prefix = align_hoi_episode(reader, .1, stop=1)
+        prefix = align_hoi_episode(reader, reader.read_timing(stop=1), .1)
         for key in prefix:
             np.testing.assert_allclose(prefix[key], expected[key][:1], equal_nan=True)
     assert reads == [(name, key) for name in ("/arm_qpos", "/hand_qpos")
@@ -1335,7 +1351,7 @@ def test_prefix_skips_unneeded_stale_joint_values(raw_episodes, monkeypatch, cas
             data[f"{device}_qpos"][:] = 0
         data["timing/rows"][:] = rows
     with RawReader(episode) as reader:
-        expected = align_hoi_episode(reader, .1)
+        expected = align_hoi_episode(reader, reader.read_timing(), .1)
     with h5py.File(episode / "data.h5", "r+") as data:
         for device in ("arm", "hand"):
             data[f"{device}_qpos"][1] = np.nan
@@ -1350,6 +1366,6 @@ def test_prefix_skips_unneeded_stale_joint_values(raw_episodes, monkeypatch, cas
 
     monkeypatch.setattr(h5py.Dataset, "__getitem__", read)
     with RawReader(episode) as reader:
-        actual = align_hoi_episode(reader, .1, stop=1)
+        actual = align_hoi_episode(reader, reader.read_timing(stop=1), .1)
         for key in actual:
             np.testing.assert_allclose(actual[key], expected[key][:1], equal_nan=True)

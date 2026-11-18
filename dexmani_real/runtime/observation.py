@@ -32,28 +32,6 @@ class ObservationNeeds:
     def camera_worker(self):
         return bool(self.camera_fields) or self.point_cloud or self.hoi
 
-    def union(self, other):
-        return ObservationNeeds(
-            camera_fields=tuple(
-                name
-                for name in ("rgb", "depth")
-                if name in self.camera_fields or name in other.camera_fields
-            ),
-            hoi=self.hoi or other.hoi,
-            hoi_joint_devices=tuple(
-                name
-                for name in ("arm", "hand")
-                if name in self.hoi_joint_devices or name in other.hoi_joint_devices
-            ),
-            point_cloud=self.point_cloud or other.point_cloud,
-            vr=self.vr or other.vr,
-            required_tactile=tuple(
-                channel
-                for channel in ("aggregate", "dense")
-                if channel in self.required_tactile or channel in other.required_tactile
-            ),
-        )
-
 
 RAW_RECORDING_NEEDS = ObservationNeeds(
     camera_fields=("rgb", "depth"),

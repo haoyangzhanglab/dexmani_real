@@ -49,15 +49,13 @@ def interpolate_joints(stamps, positions, targets, max_gap_s):
         or positions.ndim != 2
         or len(positions) != len(stamps)
         or np.any(stamps <= 0)
-        or np.any(np.diff(stamps) < 0)
+        or np.any(stamps[1:] < stamps[:-1])
         or not np.isfinite(positions).all()
     ):
         raise ValueError("Invalid joint history")
-    duplicate = np.diff(stamps) == 0
+    duplicate = stamps[1:] == stamps[:-1]
     if np.any(np.any(positions[1:] != positions[:-1], axis=1) & duplicate):
         raise ValueError("Conflicting joint states at the same timestamp")
-    keep = np.r_[True, ~duplicate]
-    stamps, positions = stamps[keep], positions[keep]
     right = np.searchsorted(stamps, targets).clip(0, len(stamps) - 1)
     exact = stamps[right] == targets
     left = np.where(exact, right, np.maximum(0, right - 1))

@@ -127,6 +127,15 @@ def test_freshness_uses_source_stamps_without_extra_ring_reads(monkeypatch, fiel
     now = env.clock.now
     env.robot.arm_age = 30_000_000
     env.robot.hand_age = 40_000_000
+    read_state = env.robot.read_state
+
+    def distinct_tactile_stamps():
+        state = read_state()
+        state.hand["tactile_aggregate_timestamp_ns"] = now - 10_000_000
+        state.hand["tactile_dense_timestamp_ns"] = now - 20_000_000
+        return state
+
+    monkeypatch.setattr(env.robot, "read_state", distinct_tactile_stamps)
     getattr(env.channels, f"{source}_ring").data["timestamp_ns"] = now - age * 1_000_000
     rings = [
         env.channels.hoi_ring,
@@ -150,8 +159,8 @@ def test_freshness_uses_source_stamps_without_extra_ring_reads(monkeypatch, fiel
         ("hand", 40),
         ("camera", age),
         (source, age),
-        ("tactile_aggregate", 0),
-        ("tactile_dense", 0),
+        ("tactile_aggregate", 10),
+        ("tactile_dense", 20),
     ):
         assert result[f"sensor_age_ms.{name}"]["mean"] == expected
     env.rollout.profiler = profile

@@ -18,9 +18,10 @@ from dexmani_real.config.perception import (
     HOI_NUM_POINTS,
 )
 from dexmani_real.geometry.hoi import (
-    load_task_template,
+    load_hoi_task,
     sample_surface_points,
     task_objects,
+    validate_task_template,
 )
 from dexmani_real.utils.io import publish
 
@@ -48,7 +49,7 @@ def sample_template(task, *, overwrite=False):
     output = task / "hoi"
     path = output / "template.npz"
     if path.exists() and not overwrite:
-        load_task_template(task)
+        load_hoi_task(task)
         return output
     names = [obj["name"] for obj in task_objects(task)]
     meshes = [load_mesh(task / name / "mesh/mesh_m.obj") for name in names]
@@ -56,16 +57,17 @@ def sample_template(task, *, overwrite=False):
     points = [
         sample_surface_points(mesh, int(count), seed=0) for mesh, count in zip(meshes, counts)
     ]
+    template = {
+        "points_local": np.concatenate(points),
+        "object_names": np.asarray(names),
+        "offsets": np.r_[0, np.cumsum(counts)].astype(np.int64),
+    }
+    validate_task_template(template)
     output.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".template.npz.", dir=output)
     try:
         with os.fdopen(fd, "wb") as stream:
-            np.savez(
-                stream,
-                points_local=np.concatenate(points),
-                object_names=np.asarray(names),
-                offsets=np.r_[0, np.cumsum(counts)].astype(np.int64),
-            )
+            np.savez(stream, **template)
         if overwrite:
             os.replace(temporary, path)
         else:

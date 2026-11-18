@@ -26,6 +26,8 @@ from dexmani_real.robot.commands import (
     OperationCancelled,
     RobotError,
 )
+from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
+from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
 from dexmani_real.runtime.observation import (
     ObservationNeeds,
     check_device_feedback,
@@ -124,18 +126,12 @@ class FakeRobot:
         self.feedback_next_ns = self.clock.now + 10_000_000
 
     def read_state(self):
-        def frame(size, age):
-            value = np.zeros(1, dtype=[
-                ("timestamp_ns", "i8"), ("qpos", "f8", (size,)),
-                ("tactile_aggregate_timestamp_ns", "i8"),
-                ("tactile_dense_timestamp_ns", "i8"),
-            ])
-            value["timestamp_ns"] = self.clock.now - age
-            value["tactile_aggregate_timestamp_ns"] = self.clock.now
-            value["tactile_dense_timestamp_ns"] = self.clock.now
-            return value
-
-        arm, hand = frame(7, self.arm_age), frame(12, self.hand_age)
+        arm, hand = np.zeros(1, ARM_STATE_DTYPE), np.zeros(1, HAND_STATE_DTYPE)
+        arm["timestamp_ns"] = self.clock.now - self.arm_age
+        hand["timestamp_ns"] = self.clock.now - self.hand_age
+        hand["tactile_aggregate_timestamp_ns"] = hand["tactile_dense_timestamp_ns"] = self.clock.now
+        hand["tactile_aggregate"] = 0.25
+        hand["tactile_dense"] = 0.5
         hand["qpos"][0] = self.hand_qpos
         return SimpleNamespace(arm=arm, hand=None if self.missing_hand else hand)
 
@@ -183,7 +179,7 @@ def env(monkeypatch, record_raw, observation_fields):
         n_obs_steps=2, action_mode="joint", requires_prev_action=True,
     )
     observations = ObservationBuilder(info, runtime)
-    if "rgb" in observation_fields:
+    if "rgb" in observation_fields or observations.camera_static:
         observations.configure_camera(CameraSnapshot(
             "test", CameraIntrinsics(2, 2, 2., 2., 1., 1., "none", (0.,) * 5), .001, None,
         ))
@@ -290,6 +286,8 @@ def test_read_modes_preserve_camera_source_and_nonvisual_inputs(
 
 @pytest.mark.parametrize("record_raw", [False, True])
 @pytest.mark.parametrize("observation_fields,source", [
+    (("joint_state",), None),
+    (("joint_state", "camera_intrinsic"), None),
     (("joint_state", "rgb"), "camera"),
     (("joint_state", "rgb", "point_cloud"), "pointcloud"),
     (("joint_state", "rgb", "object_pointcloud"), "hoi"),
@@ -297,10 +295,11 @@ def test_read_modes_preserve_camera_source_and_nonvisual_inputs(
 def test_rollout_routes_model_and_raw_camera_frames(env, monkeypatch, record_raw, source):
     camera = env.channels.camera_ring
     camera.latest_sequence = 8
-    model_source = getattr(env.channels, f"{source}_ring")
-    model_source.data["rgb"] = np.full((2, 2, 3), 7, np.uint8)
-    if source != "camera":
-        model_source.data["source_camera_sequence"] = 6
+    if source is not None:
+        model_source = getattr(env.channels, f"{source}_ring")
+        model_source.data["rgb"] = np.full((2, 2, 3), 7, np.uint8)
+        if source != "camera":
+            model_source.data["source_camera_sequence"] = 6
     read_state = Mock(wraps=env.robot.read_state)
     monkeypatch.setattr(env.robot, "read_state", read_state)
 
@@ -308,14 +307,24 @@ def test_rollout_routes_model_and_raw_camera_frames(env, monkeypatch, record_raw
     read_state.assert_called_once_with()
     assert raw.arm is row.arm and raw.hand is row.hand
     assert raw.control_timestamp_ns == row.control_timestamp_ns
-    assert row.camera["rgb"] is model_source.data["rgb"]
-    assert row.camera["ring_sequence"] == (8 if source == "camera" else 6)
-    assert (raw is row) is (source == "camera" or not record_raw)
+    projected = env.rollout.observations.project(row)
+    if source is not None:
+        assert row.camera["rgb"] is model_source.data["rgb"]
+        assert row.camera["ring_sequence"] == (8 if source == "camera" else 6)
+        np.testing.assert_array_equal(projected["rgb"], model_source.data["rgb"])
+    elif not record_raw:
+        assert row.camera is None
+    else:
+        assert "rgb" not in projected
+    assert (raw is row) is (source in (None, "camera") or not record_raw)
     if record_raw:
         assert raw.camera["ring_sequence"] == 8
         assert raw.camera["rgb"] is camera.data["rgb"]
         assert raw.camera["depth"] is camera.data["depth"]
         assert camera.reads == [("timestamp_ns", "rgb", "depth")]
+        assert env.rollout.recording_issue(raw) is None
+        assert np.all(raw.hand["tactile_aggregate"] == 0.25)
+        assert np.all(raw.hand["tactile_dense"] == 0.5)
     elif source == "camera":
         assert camera.reads == [("timestamp_ns", "rgb")]
     else:
@@ -1179,8 +1188,6 @@ def test_published_recording_gap_is_a_segment_not_truncation(tmp_path):
     from dexmani_real.data.raw import RawReader, camera_metadata
     from dexmani_real.data.recorder import format_recording_result
     from dexmani_real.robot.commands import RobotCommand
-    from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
-    from dexmani_real.robot.xhand.feedback import HAND_STATE_DTYPE
     from dexmani_real.runtime.observation import Observation
 
     camera = CameraSnapshot(None, CameraIntrinsics(16, 16, 20, 20, 8, 8, "none", (0.,) * 5), .001, None)

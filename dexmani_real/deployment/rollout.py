@@ -88,11 +88,14 @@ class Rollout:
                 devices=model_needs.hoi_joint_devices,
             )
         self.observations = observations
-        self.read_needs = model_needs.union(RAW_RECORDING_NEEDS) if record_raw else model_needs
         self.read_raw_camera = record_raw and (model_needs.hoi or model_needs.point_cloud)
         if self.read_raw_camera:
             # 派生 Ring 只提供模型图像，Raw RGB-D 由相机 Ring 提供。
-            self.read_needs = replace(self.read_needs, camera_fields=model_needs.camera_fields)
+            self.read_needs = replace(model_needs, required_tactile=RAW_RECORDING_NEEDS.required_tactile)
+        elif record_raw:
+            self.read_needs = RAW_RECORDING_NEEDS
+        else:
+            self.read_needs = model_needs
         self.action_mapper, self.model = action_mapper, model
         self.recorder: EpisodeRecorder | None = None
         self.output_dir, self.record_raw = output_dir, record_raw

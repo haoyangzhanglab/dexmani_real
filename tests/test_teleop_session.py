@@ -75,7 +75,7 @@ def test_vr_control_period_must_fit_target_lease(monkeypatch, hz, period_ns):
 
 
 @pytest.fixture
-def teleop():
+def teleop(recording_dir=None):
     runtime = RealConfig()
     runtime = replace(runtime, hand=replace(runtime.hand, enabled=False))
     state = SessionState(stop_signal=threading.Event(), emergency_signal=threading.Event())
@@ -106,9 +106,17 @@ def teleop():
         state, runtime, robot, task_label="test", controller=controller,
         control_dt_ns=sampling_clock_ns(runtime.teleop.control_hz),
         sensors=SensorWorkers(SimpleNamespace(vr_ring=vr_ring)),
-        recording_dir=None, max_duration_s=10, keyboard=keys, audio=Mock(),
+        recording_dir=recording_dir, max_duration_s=10, keyboard=keys, audio=Mock(),
     )
     return loop
+
+
+@pytest.mark.parametrize("record", [False, True])
+def test_teleop_capture_needs(tmp_path, record):
+    loop = teleop.__wrapped__(recording_dir=tmp_path if record else None)
+    assert loop.capture_needs.vr
+    assert loop.capture_needs.camera_fields == (("rgb", "depth") if record else ())
+    assert loop.capture_needs.required_tactile == (("aggregate", "dense") if record else ())
 
 
 @pytest.fixture
@@ -197,21 +205,22 @@ def test_revoked_start_does_not_enter_or_cleanup_episode(teleop):
 
 
 @pytest.mark.parametrize("retargeting", [False, True])
-def test_recording_parameters_and_start_failure_cleanup(teleop, monkeypatch, tmp_path, retargeting):
-    teleop.recording_dir = tmp_path
-    teleop.camera_snapshot = CameraSnapshot(
+def test_recording_parameters_and_start_failure_cleanup(monkeypatch, tmp_path, retargeting):
+    loop = teleop.__wrapped__(recording_dir=tmp_path)
+    loop.start_observation = Mock(return_value=object())
+    loop.camera_snapshot = CameraSnapshot(
         "camera-123", CameraIntrinsics(16, 16, 20., 20., 8., 8., "none", (0.,) * 5), .001, np.eye(4),
     )
-    teleop.robot.hand.tactile_reset_metadata = {
+    loop.robot.hand.tactile_reset_metadata = {
         "hand_tactile_reset_time_ns": 123456789, "hand_tactile_reset_result": {2: 0},
     }
-    teleop.controller.rotation.as_matrix.return_value = np.eye(3)
+    loop.controller.rotation.as_matrix.return_value = np.eye(3)
     calibration = SimpleNamespace(bone_lengths=np.arange(20) / 100, palm_width=.08)
-    teleop.controller.hand_retargeter = SimpleNamespace(calibration=calibration) if retargeting else None
-    teleop.runtime = replace(
-        teleop.runtime, arm=replace(teleop.runtime.arm, homing=object()),
-        environment=replace(teleop.runtime.environment, home_model_confirmed=object(), static_boxes=(object(),)),
-        execution=replace(teleop.runtime.execution, rtc_guidance_cap=object()),
+    loop.controller.hand_retargeter = SimpleNamespace(calibration=calibration) if retargeting else None
+    loop.runtime = replace(
+        loop.runtime, arm=replace(loop.runtime.arm, homing=object()),
+        environment=replace(loop.runtime.environment, home_model_confirmed=object(), static_boxes=(object(),)),
+        execution=replace(loop.runtime.execution, rtc_guidance_cap=object()),
     )
     recorder = Mock(
         error=RecordingError("writer failed"),
@@ -220,12 +229,12 @@ def test_recording_parameters_and_start_failure_cleanup(teleop, monkeypatch, tmp
         result=Mock(return_value=None),
     )
     monkeypatch.setattr(loop_module, "EpisodeRecorder", Mock(return_value=recorder))
-    teleop.run_episode(teleop.runtime_state.cancel_epoch)
+    loop.run_episode(loop.runtime_state.cancel_epoch)
     metadata = recorder.start.call_args.kwargs["metadata"]
     parameters = json.loads(metadata["effective_parameters"])
-    camera = camera_metadata(teleop.camera_snapshot)
+    camera = camera_metadata(loop.camera_snapshot)
     assert {key: metadata[key] for key in camera} == camera
-    runtime = teleop.runtime
+    runtime = loop.runtime
     expected = {
         **robot_recording_parameters(runtime),
         "teleop": asdict(runtime.teleop), "max_duration_s": 10,
@@ -236,7 +245,7 @@ def test_recording_parameters_and_start_failure_cleanup(teleop, monkeypatch, tmp
         },
         "camera_config": asdict(runtime.camera),
         "vr": asdict(runtime.vr), "vr_to_robot_rotation": np.eye(3).tolist(),
-        "tactile_reset": teleop.robot.hand.tactile_reset_metadata,
+        "tactile_reset": loop.robot.hand.tactile_reset_metadata,
     }
     if retargeting:
         expected.update(
@@ -245,11 +254,11 @@ def test_recording_parameters_and_start_failure_cleanup(teleop, monkeypatch, tmp
         )
     assert parameters == json.loads(json.dumps(expected, allow_nan=False))
     recorder.finish.assert_called_once_with(save=True, reason="failed", wait=False)
-    teleop.robot.prepare_streaming.assert_not_called()
-    teleop.robot.send_action.assert_not_called()
-    assert teleop.recorder is None
-    assert teleop.episode_cancel_epoch is None
-    assert teleop.session_failed
+    loop.robot.prepare_streaming.assert_not_called()
+    loop.robot.send_action.assert_not_called()
+    assert loop.recorder is None
+    assert loop.episode_cancel_epoch is None
+    assert loop.session_failed
 
 
 @pytest.mark.parametrize("outcome", ["success", "before_stop", "epoch", "poll_fault", "stop_fault"])
