@@ -324,7 +324,10 @@ def annotated_episode(task_template):
                             rgb=np.full((32, 32, 3), 90, np.uint8),
                             depth=np.full((32, 32), 600, np.uint16)),
             )
-            writer.append_frame(row, SimpleNamespace(arm_qpos=np.zeros(7), hand_qpos=np.zeros(12)))
+            writer.append_frame(
+                row, SimpleNamespace(arm_qpos=np.zeros(7), hand_qpos=np.zeros(12)),
+                segment_start=False, action_accepted=True,
+            )
         writer.finish("user_stop")
     finally:
         writer.close()

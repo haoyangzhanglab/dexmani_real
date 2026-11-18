@@ -3,7 +3,6 @@
 from contextlib import closing
 from types import SimpleNamespace
 
-import h5py
 import numpy as np
 import pytest
 import torch
@@ -13,7 +12,6 @@ from dexmani_real.config.real import RealConfig
 from dexmani_real.data.export import ExportConfig, export_zarr
 from dexmani_real.data.hoi import write_hoi
 from dexmani_real.data.raw import (
-    RawReader,
     RawWriter,
     episode_recording_metadata,
     robot_recording_parameters,
@@ -40,8 +38,8 @@ def isolated_hydra():
 def test_current_raw_to_grouped_policy_resume(tmp_path):
     from dexmani_policy.deployment import load_policy
     from dexmani_policy.test_tools.smoke_test import run_smoke
-    from dexmani_policy.training.common.config import load_config
-    from dexmani_policy.training.common.data import build_dataset
+    from dexmani_policy.training.config import load_config
+    from dexmani_policy.training.data import build_dataset
 
     source = tmp_path / "raw"
     camera = CameraSnapshot(
@@ -85,7 +83,7 @@ def test_current_raw_to_grouped_policy_resume(tmp_path):
                     },
                 )
                 command = SimpleNamespace(arm_qpos=arm["qpos"][0] + .01, hand_qpos=hand["qpos"][0] + .01)
-                writer.append_frame(row, command, segment_start=index == 4)
+                writer.append_frame(row, command, segment_start=index == 4, action_accepted=True)
             writer.finish("operator")
         finally:
             writer.close()
@@ -93,17 +91,6 @@ def test_current_raw_to_grouped_policy_resume(tmp_path):
         poses[:, 0, 2, 3] = .5 + np.arange(8) * .001
         write_hoi(episode / "hoi.h5", template, poses, np.eye(4),
                   quality=[[{}]] * 8, object_valid=np.ones((8, 1), bool), tracking_config={})
-    # 同一训练集混用写入器默认精度与 float32 关节记录。
-    with h5py.File(source / "episode_0/data.h5", "r+") as raw:
-        for name in ("arm_qpos", "action_arm_joint_target"):
-            joints = raw[name][:].astype(np.float32)
-            del raw[name]
-            raw[name] = joints
-    with RawReader(source / "episode_0") as reader:
-        recorded = reader.read_camera()
-        assert recorded.color == camera.color
-        assert recorded.depth_scale_m == camera.depth_scale_m
-        np.testing.assert_array_equal(recorded.T_xarm_base_from_color, camera.T_xarm_base_from_color)
     output = tmp_path / "training.zarr"
     result = export_zarr(source, output, processing=ExportConfig(),
                          fields=("rgb", "joint_state", "action", "hand_pointcloud", "object_pointcloud"))

@@ -84,9 +84,10 @@ ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
     # 两种触觉直接保留 Feedback 的 SDK / 255 最近有效值及其原来源时间。
     "hand_contact": ((5, 3), np.dtype(np.float32)),
     "hand_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
-    # 记录最终提交的绝对目标，包括失败的提交尝试。
+    # 绝对目标保留失败尝试，是否完整提交由 action_send_accepted 标记。
     "action_arm_joint_target": ((7,), np.dtype(np.float64)),
     "action_hand_joint_target": ((12,), np.dtype(np.float64)),
+    "action_send_accepted": ((), np.dtype(np.int8)),
 }
 
 
@@ -384,8 +385,9 @@ class RawWriter:
         )
         self.video.open()
 
-    def append_frame(self, row, command, segment_start=False):
+    def append_frame(self, row, command, segment_start: bool, action_accepted: bool):
         values = encode_raw_row(row, command)
+        values["action_send_accepted"] = int(action_accepted)
         if "vr_landmarks" in self.datasets:
             values.update({name: row.vr[name.removeprefix("vr_")] for name in VR_DATASET_SPECS})
         rgb, depth = row.camera["rgb"], row.camera["depth"]

@@ -72,6 +72,7 @@ class ExportConfig:
 FIELD_INPUTS = {
     "joint_state": ("arm_qpos", "hand_qpos"),
     "action": ("action_arm_joint_target", "action_hand_joint_target"),
+    "action_ode": (),
     "action_ee": ("action_arm_joint_target", "action_hand_joint_target"),
     "eef_pose": ("arm_qpos",),
     "fingertip_xyz": ("arm_qpos", "hand_qpos"),
@@ -134,7 +135,7 @@ def export_camera(reader, fields):
 def canonical_array_specs(fields, processing, camera):
     shapes = {
         "object_pointcloud": (HOI_NUM_POINTS, 3),
-        "joint_state": (19,), "action": (19,), "action_ee": (21,),
+        "joint_state": (19,), "action": (19,), "action_ode": (19,), "action_ee": (21,),
         "finger_tactile_force": (5, 3), "taxel_tactile_force": (5, 120, 3),
         "fingertip_xyz": (5, 3), "eef_pose": (9,),
         "camera_intrinsic": (9,), "camera_extrinsic": (12,),
@@ -228,6 +229,8 @@ def iter_canonical_blocks(
             block["joint_state"] = np.concatenate((raw["arm_qpos"], raw["hand_qpos"]), axis=1, dtype=np.float32)
         if "action" in fields:
             block["action"] = np.concatenate((raw["action_arm_joint_target"], raw["action_hand_joint_target"]), axis=1, dtype=np.float32)
+        if "action_ode" in fields:
+            block["action_ode"] = alignment["action_ode"][start:end]
         if "action_ee" in fields:
             poses = eef_poses(raw["action_arm_joint_target"], arm_fk=arm_fk)
             block["action_ee"] = np.concatenate((encode_eef_pose(poses), raw["action_hand_joint_target"]), axis=1, dtype=np.float32)
@@ -290,6 +293,38 @@ def raw_input():
         raise
 
 
+def accepted_joint_targets(reader, boundaries, alignment):
+    if "action_send_accepted" not in reader.data_file:
+        raise RawDataError("action_ode requires recorded per-row action_send_accepted; recollect this Raw")
+    status = reader["action_send_accepted"][:]
+    accepted = status == 1
+    unknown = np.flatnonzero((status != 0) & ~accepted)
+    if len(unknown):
+        raise RawDataError(f"action_ode has unknown submission status at row {unknown[0]}")
+    attempts = np.concatenate((
+        reader["action_arm_joint_target"][:], reader["action_hand_joint_target"][:],
+    ), axis=1, dtype=np.float32)
+    invalid = np.flatnonzero(accepted & ~np.isfinite(attempts).all(axis=1))
+    if len(invalid):
+        raise RawDataError(f"action_ode requires a complete finite target at accepted row {invalid[0]}")
+
+    targets = np.empty_like(attempts)
+    for start, end in pairwise(boundaries):
+        latest = np.maximum.accumulate(np.where(accepted[start:end], np.arange(start, end), -1))
+        has_target = latest >= 0
+        segment = targets[start:end]
+        segment[has_target] = attempts[latest[has_target]]
+        if not has_target[0]:
+            # Use the same segment-start anchor as ODEDataset.
+            arm = alignment["arm_qpos"] if "arm_qpos" in alignment else reader["arm_qpos"]
+            hand = alignment["hand_qpos"] if "hand_qpos" in alignment else reader["hand_qpos"]
+            initial = np.concatenate((arm[start], hand[start]), dtype=np.float32)
+            if not np.isfinite(initial).all():
+                raise RawDataError(f"action_ode requires finite initial joint state at row {start}")
+            segment[~has_target] = initial
+    return targets
+
+
 def prepare_raw(reader, processing, fields, clocks, hoi_devices):
     """验证完整 Raw，并准备低维关节对齐；RGB-D 仍在写入时单遍读取。"""
     with raw_input():
@@ -320,6 +355,8 @@ def prepare_raw(reader, processing, fields, clocks, hoi_devices):
                 reader, timing, boundaries, processing.hoi_max_joint_gap_s,
                 devices=hoi_devices, require_complete=True,
             )
+        if "action_ode" in fields:
+            alignment["action_ode"] = accepted_joint_targets(reader, boundaries, alignment)
         return template, alignment, export_camera(reader, fields), boundaries
 
 
@@ -338,6 +375,8 @@ def export_zarr(
         "object_pointcloud": "camera_ns",
     }
     clocks = {source_clocks[name] for name in inputs if name in source_clocks}
+    if "action_ode" in fields:
+        clocks.update(("arm_ns", "hand_ns"))
     hoi_devices = tuple(
         device for device in ("arm", "hand")
         if "object_pointcloud" in inputs and f"{device}_qpos" in inputs
@@ -435,6 +474,8 @@ def export_zarr(
         if root is None:
             raise ValueError(f"all Raw episodes rejected: {rejected}")
         metadata = {}
+        if "action_ode" in fields:
+            metadata["action_ode"] = {"semantics": "held_accepted_joint_target"}
         if "point_cloud" in fields:
             metadata["point_cloud"] = processing_metadata(processing.pointcloud, processing.table_plane_abcd)
         if "hand_pointcloud" in fields:

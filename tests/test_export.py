@@ -59,21 +59,59 @@ def raw_episodes(tmp_path):
     return source, np.concatenate(states), np.concatenate(actions)
 
 
-def test_export_accepts_float32_arm_qpos(tmp_path, raw_episodes):
-    source, states, _ = raw_episodes
+def test_ode_export_preserves_failed_rows_and_segment_anchors(tmp_path, raw_episodes):
+    from dexmani_policy.datasets.variants.ode import ODEDataset
+
+    source, states, attempts = raw_episodes
     with h5py.File(source / "episode_0/data.h5", "r+") as data:
-        joints = data["arm_qpos"][:].astype(np.float32)
-        del data["arm_qpos"]
-        data["arm_qpos"] = joints
+        data["action_send_accepted"] = np.array([1, 0, 1, 0], dtype=np.int8)
+    with h5py.File(source / "episode_1/data.h5", "r+") as data:
+        data["action_send_accepted"] = np.array([0, 0, 1], dtype=np.int8)
+    result = export_zarr(
+        source, tmp_path / "ode.zarr", processing=ExportConfig(),
+        fields=("joint_state", "action", "action_ode"),
+    )
+    root = zarr.open_group(result["path"], mode="r")
+    np.testing.assert_array_equal(root["data/action"][:], attempts.astype(np.float32))
+    targets = np.stack([attempts[0], attempts[0], attempts[2], attempts[2], states[4], states[4], attempts[6]])
+    np.testing.assert_array_equal(root["data/action_ode"][:], targets.astype(np.float32))
+    np.testing.assert_array_equal(root["meta/episode_ends"][:], [4, 7])
+    dataset = ODEDataset(
+        result["path"], sensor_modalities=["joint_state"], horizon=2,
+        obs_horizon=1, pad_after=1,
+    )
+    for index, expected in enumerate([states[0], attempts[0], attempts[0], attempts[2], states[4], states[4], states[4]]):
+        np.testing.assert_array_equal(dataset[index]["prev_action"].numpy(), expected.astype(np.float32))
+    with h5py.File(source / "episode_0/data.h5", "r+") as data:
+        data["action_hand_joint_target"][1] = np.nan
+    result = export_zarr(source, tmp_path / "held.zarr", processing=ExportConfig(), fields=("action_ode",))
+    np.testing.assert_array_equal(zarr.open_group(result["path"], mode="r")["data/action_ode"][:], targets.astype(np.float32))
+
+    with h5py.File(source / "episode_0/data.h5", "r+") as data:
+        del data["action_send_accepted"]
+    with h5py.File(source / "episode_1/data.h5", "r+") as data:
+        data["action_send_accepted"][0] = 2
+    with pytest.raises(ValueError, match="action_send_accepted.*unknown submission status"):
+        export_zarr(source, tmp_path / "unknown.zarr", processing=ExportConfig(), fields=("action_ode",))
+
+
+def test_export_accepts_float32_joint_arrays(tmp_path, raw_episodes):
+    source, states, actions = raw_episodes
+    with h5py.File(source / "episode_0/data.h5", "r+") as data:
+        for name in ("arm_qpos", "action_arm_joint_target"):
+            values = data[name][:].astype(np.float32)
+            del data[name]
+            data[name] = values
 
     result = export_zarr(
-        source, tmp_path / "joints.zarr", processing=ExportConfig(), fields=("joint_state",),
+        source, tmp_path / "joints.zarr", processing=ExportConfig(), fields=("joint_state", "action"),
     )
     root = zarr.open_group(result["path"], mode="r")
     assert root.attrs["source_episodes"] == ["episode_0", "episode_1"]
     assert result["total_frames"] == 7
     np.testing.assert_array_equal(root["meta/episode_ends"][:], [4, 7])
     np.testing.assert_array_equal(root["data/joint_state"][:], states.astype(np.float32))
+    np.testing.assert_array_equal(root["data/action"][:], actions.astype(np.float32))
     root.store.close()
 
 
@@ -290,6 +328,29 @@ def hoi_episodes(raw_episodes):
             object_valid=np.ones((count, 1), bool),
         )
     return source, states, actions
+
+
+def test_ode_initial_hold_uses_exported_joint_state(tmp_path, hoi_episodes):
+    from dexmani_policy.datasets.variants.ode import ODEDataset
+
+    source, states, _ = hoi_episodes
+    episode = source / "episode_0"
+    with h5py.File(episode / "data.h5", "r+") as data:
+        rows = data["timing/rows"][:]
+        for clock in ("arm_ns", "hand_ns"):
+            rows[clock][0] -= 10_000_000
+        data["timing/rows"][:] = rows
+        data["action_send_accepted"] = np.array([0, 0, 1, 0], dtype=np.int8)
+    output = tmp_path / "aligned.zarr"
+    export_zarr(episode, output, processing=ExportConfig(),
+                fields=("joint_state", "object_pointcloud", "action_ode"))
+    root = zarr.open_group(str(output), mode="r")
+    initial = root["data/joint_state"][0]
+    np.testing.assert_allclose(initial, (5 * states[0] + states[1]) / 6, atol=1e-7)
+    np.testing.assert_array_equal(root["data/action_ode"][:2], np.stack([initial, initial]))
+    dataset = ODEDataset(output, sensor_modalities=["joint_state"], horizon=1, obs_horizon=1)
+    for index in (0, 2):
+        np.testing.assert_array_equal(dataset[index]["prev_action"].numpy(), initial)
 
 
 @pytest.mark.parametrize("with_object", [False, True])
@@ -665,6 +726,7 @@ def complete_episodes(raw_episodes):
     for episode in source.iterdir():
         with h5py.File(episode / "data.h5", "r+") as data:
             n = len(data["timing/rows"])
+            data.create_dataset("action_send_accepted", data=np.ones(n, dtype=np.int8))
             data["meta"].attrs.update(camera_metadata(camera))
             data["meta"].attrs.update(
                 hand_tactile_finger_order=TACTILE_FINGER_ORDER, hand_tactile_scale_divisor=255
@@ -781,7 +843,7 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
     from dexmani_policy.datasets.episode_store import EpisodeStore
     from dexmani_policy.datasets.preprocess.contact_map import generate
     from dexmani_policy.datasets.pretrain.cordvip import CordViPPretrainDataset
-    from dexmani_policy.training.common.data import record_data_processing
+    from dexmani_policy.training.data import record_data_processing
     from dexmani_policy.training.pretrain.hand_prior.vqvae import prepare_hand_data
     from omegaconf import OmegaConf
 
@@ -802,7 +864,7 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
     generate(output, derived)
     source = EpisodeStore(output)
     result = EpisodeStore(derived)
-    assert result.attrs == source.attrs
+    assert dict(result.attrs) == {**dict(source.attrs), "source_zarr_path": str(output)}
     demo = DemonstrationDataset(str(output), sensor_modalities=["joint_state"],
                                 obs_horizon=2, horizon=2, seed=7, val_episodes=1, max_train_episodes=1)
     pretrain = CordViPPretrainDataset(derived, contact_loss_weight=1.0, seed=7,

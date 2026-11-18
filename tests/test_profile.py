@@ -457,7 +457,7 @@ def test_recorder_preserves_rows_finish_and_gap_with_fake_writer(monkeypatch, tm
         def open(self, metadata):
             self.trace.append("open")
 
-        def append_frame(self, row, command, gap):
+        def append_frame(self, row, command, gap, action_accepted):
             self.trace.append((row.control_timestamp_ns, gap))
             self.buffered += 1
 
@@ -479,7 +479,7 @@ def test_recorder_preserves_rows_finish_and_gap_with_fake_writer(monkeypatch, tm
         for index in range(3):
             if index == 1:
                 recorder.mark_gap()
-            assert call(profile, "recorder_append_ms", recorder.append, row) is None
+            assert call(profile, "recorder_append_ms", recorder.append, row, action_accepted=False) is None
         assert call(
             profile,
             "recorder_finish_call_ms",
@@ -515,8 +515,8 @@ def test_recorder_queue_full_is_counted_without_capacity_changes(tmp_path):
     row = Observation(np.zeros(1), None, None, None, None, 100)
     assert recorder.queue.maxsize == 16
     for _ in range(16):
-        assert recorder.append(row) is None
-    assert recorder.append(row) == "recording_queue_full"
+        assert recorder.append(row, action_accepted=False) is None
+    assert recorder.append(row, action_accepted=False) == "recording_queue_full"
     assert recorder.recording_truncated_reason == "recording_queue_full"
     assert profile.counters["recorder_queue_full"] == profile.counters["recording_truncations"] == 1
     assert (

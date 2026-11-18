@@ -545,7 +545,7 @@ class Rollout:
                 return None
         return command
 
-    def record_row(self, row, attempted_command, *, quality_issue):
+    def record_row(self, row, attempted_command, *, quality_issue, action_accepted):
         primary_error = sys.exc_info()[1]
         if primary_error is not None:
             self.runtime_state.stop_signal.set()
@@ -553,7 +553,7 @@ class Rollout:
             try:
                 issue = call(
                     self.profiler, "recorder_append_ms", self.recorder.append,
-                    row, attempted_command, quality_issue=quality_issue,
+                    row, attempted_command, quality_issue=quality_issue, action_accepted=action_accepted,
                 )
                 if issue is not None:
                     self.stop(issue)
@@ -681,6 +681,7 @@ class Rollout:
             row, raw = self.sample_observation()
             quality_issue = self.recording_issue(raw) if self.recorder is not None else None
             attempted = None
+            action_accepted = False
             try:
                 if quality_issue is not None:
                     self.stop(quality_issue)
@@ -715,6 +716,7 @@ class Rollout:
                     self.profiler, "robot_send_action_ms", self.robot.send_action,
                     command, expires_ns=now + COMMAND_LEASE_NS,
                 )
+                action_accepted = True
                 if self.duration_expired():
                     return
                 if self.policy_info.requires_prev_action:
@@ -735,4 +737,4 @@ class Rollout:
                 if self.state == "RUNNING" or attempted is not None:
                     if skipped and was_running and self.recorder is not None:
                         self.recorder.mark_gap()
-                    self.record_row(raw, attempted, quality_issue=quality_issue)
+                    self.record_row(raw, attempted, quality_issue=quality_issue, action_accepted=action_accepted)

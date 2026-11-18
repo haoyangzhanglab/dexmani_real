@@ -1124,8 +1124,8 @@ def test_real_recorder_preserves_raw_source_and_segment_boundary(env, tmp_path, 
     env.rollout.recorder = recorder
     env.rollout.plan = ActionChunk(np.full((8, 19), 0.1), 0)
     env.rollout.step()
-    _, command, segment_start = recorder.queue.get_nowait()
-    assert command is not None and not segment_start
+    _, command, segment_start, accepted = recorder.queue.get_nowait()
+    assert command is not None and not segment_start and accepted
 
     ready_to_send(env)
     assert recorder.queue.empty() and recorder.pending_segment_start
@@ -1150,8 +1150,9 @@ def test_real_recorder_preserves_raw_source_and_segment_boundary(env, tmp_path, 
             env.rollout.step()
     else:
         env.rollout.step()
-    raw, command, segment_start = recorder.queue.get_nowait()
+    raw, command, segment_start, accepted = recorder.queue.get_nowait()
     assert segment_start
+    assert accepted is (outcome != "failure")
     assert len(attempted) == 1 and command is attempted[0]
     assert raw.hoi is None and raw.camera["ring_sequence"] == 2
     assert raw.camera["timestamp_ns"] == observed_ns - 10_000_000
@@ -1164,8 +1165,8 @@ def test_real_recorder_preserves_raw_source_and_segment_boundary(env, tmp_path, 
     if outcome == "success":
         env.advance()
         env.rollout.step()
-        _, command, segment_start = recorder.queue.get_nowait()
-        assert command is not None and not segment_start
+        _, command, segment_start, accepted = recorder.queue.get_nowait()
+        assert command is not None and not segment_start and accepted
         assert recorder.queue.empty()
 
 
@@ -1174,9 +1175,9 @@ def test_recording_queue_full_keeps_termination_reason_after_gap(env, tmp_path):
     recorder.is_recording = True
     _, raw = env.rollout.read_observations()
     for _ in range(recorder.queue.maxsize):
-        assert recorder.append(raw) is None
+        assert recorder.append(raw, action_accepted=False) is None
     recorder.mark_gap()
-    assert recorder.append(raw) == "recording_queue_full"
+    assert recorder.append(raw, action_accepted=False) == "recording_queue_full"
     assert not recorder.is_recording
     recorder.mark_gap()
     assert recorder.result()["recording_truncated_reason"] == "recording_queue_full"
@@ -1210,7 +1211,8 @@ def test_published_recording_gap_is_a_segment_not_truncation(tmp_path):
                     "rgb": np.full((16, 16, 3), 100, np.uint8), "depth": np.full((16, 16), 500, np.uint16),
                 },
             )
-            assert recorder.append(row, RobotCommand(arm_qpos=np.zeros(7), hand_qpos=np.zeros(12))) is None
+            command = RobotCommand(arm_qpos=np.zeros(7), hand_qpos=np.zeros(12))
+            assert recorder.append(row, command, action_accepted=index == 0) is None
     finally:
         recorder.finish(save=True, reason="operator")
     result = recorder.result()
@@ -1219,6 +1221,7 @@ def test_published_recording_gap_is_a_segment_not_truncation(tmp_path):
     assert level == logging.INFO and "保存成功" in description
     with RawReader(result["path"]) as reader:
         np.testing.assert_array_equal(reader.segment_starts, [0, 1])
+        np.testing.assert_array_equal(reader["action_send_accepted"][:], [1, 0])
         assert reader.meta["termination_reason"] == "operator"
         assert "recording_truncated_reason" not in reader.meta
         assert len(list(reader.iter_rgb_frames())) == 2

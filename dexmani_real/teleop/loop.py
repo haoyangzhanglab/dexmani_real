@@ -472,6 +472,7 @@ class TeleopLoop:
     def execute_control_step(self, row):
         episode_cancel_epoch = self.episode_cancel_epoch
         command = None
+        action_accepted = False
         compute_start_ns = time.monotonic_ns()
         first_target = self.last_command is None
         try:
@@ -521,6 +522,7 @@ class TeleopLoop:
                 self.profiler, "robot_send_action_ms", self.robot.send_action,
                 command, expires_ns=expires_ns,
             )
+            action_accepted = True
             submit_end_ns = time.monotonic_ns()
             self.controller.commit(command, eef_pose=eef_pose, submit_end_ns=submit_end_ns, measured_qpos=row.arm["qpos"][0])
             self.last_command = command
@@ -544,7 +546,10 @@ class TeleopLoop:
             if self.recorder is not None and command is not None:
                 try:
                     # 仅真实提交尝试生成动作行，包含抛错前可能已发生的部分提交。
-                    issue = call(self.profiler, "recorder_append_ms", self.recorder.append, row, command)
+                    issue = call(
+                        self.profiler, "recorder_append_ms", self.recorder.append,
+                        row, command, action_accepted=action_accepted,
+                    )
                     if issue is not None:
                         self.request_episode_end(issue)
                 except BaseException as exc:

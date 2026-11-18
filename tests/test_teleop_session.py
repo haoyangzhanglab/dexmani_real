@@ -354,7 +354,8 @@ def test_failed_submission_records_attempt_without_advancing_state(active_teleop
     with pytest.raises(RobotError) as caught:
         teleop.execute_control_step(row)
     assert caught.value is failure
-    recorded, command, _ = recorder.queue.get_nowait()
+    recorded, command, _, accepted = recorder.queue.get_nowait()
+    assert accepted is False
     assert command is teleop.robot.send_action.call_args.args[0]
     np.testing.assert_array_equal(command.arm_qpos, np.full(7, .1))
     assert recorded.control_timestamp_ns == row.control_timestamp_ns
