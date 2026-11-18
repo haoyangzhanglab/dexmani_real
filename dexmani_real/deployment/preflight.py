@@ -7,10 +7,15 @@ import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
+
 from dexmani_real.config.deployment import ExecutionConfig
 from dexmani_real.deployment.observation import JOINT_OBSERVATION_FIELDS
 from dexmani_real.robot.commands import COMMAND_LEASE_NS
-from dexmani_real.runtime.preflight import validate_robot_config, validate_xhand_target_rate
+from dexmani_real.runtime.preflight import (
+    validate_robot_config,
+    validate_xhand_target_rate,
+)
 from dexmani_real.utils.timing import validate_joint_gap
 
 if TYPE_CHECKING:
@@ -125,8 +130,14 @@ def collect_data_processing(info, runtime, *, table_plane_abcd=None, template=No
         for key, value in values.items():
             if key not in saved:
                 continue
-            if saved[key] is None:
+            saved_value = saved[key]
+            if saved_value is None:
                 logger.info("训练处理参数未确定 %s.%s", name, key)
-            elif value != saved[key]:
-                logger.info("处理参数差异 %s.%s: training=%r, actual=%r", name, key, saved[key], value)
+                continue
+            if (name, key) == ("point_cloud", "table_plane_abcd"):
+                differs = not np.allclose(value, saved_value, rtol=0, atol=1e-12)
+            else:
+                differs = value != saved_value
+            if differs:
+                logger.info("处理参数差异 %s.%s: training=%r, actual=%r", name, key, saved_value, value)
     return actual

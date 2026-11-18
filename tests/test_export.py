@@ -363,8 +363,11 @@ def test_hoi_export_allows_legal_templates_and_records_shared_geometry(tmp_path,
     from dexmani_real.data.hoi import write_hoi
 
     source, _, _ = hoi_episodes
-    template = dict(points_local=np.zeros((1024, 3), np.float32),
-                    offsets=np.array([0, 1024]), object_names=np.array(["object"]))
+    template = {
+        "points_local": np.zeros((1024, 3), np.float32),
+        "offsets": np.array([0, 1024]),
+        "object_names": np.array(["object"]),
+    }
     if key == "object_names":
         template[key] = np.array(["renamed_object"])
     elif key == "offsets":
@@ -730,6 +733,7 @@ def test_fixed_modalities_produce_one_requested_store(tmp_path, complete_episode
 @pytest.mark.parametrize("bad_index", [0, 1, 2])
 def test_video_row_errors_roll_back_and_continue(tmp_path, complete_episodes, monkeypatch, fault, bad_index):
     import shutil
+
     from dexmani_real.data.raw import _VideoWriter
 
     source = complete_episodes
@@ -773,8 +777,8 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
         load_checkpoint,
         save_checkpoint,
     )
-    from dexmani_policy.datasets.episode_store import EpisodeStore
     from dexmani_policy.datasets.demonstration import DemonstrationDataset
+    from dexmani_policy.datasets.episode_store import EpisodeStore
     from dexmani_policy.datasets.preprocess.contact_map import generate
     from dexmani_policy.datasets.pretrain.cordvip import CordViPPretrainDataset
     from dexmani_policy.training.common.data import record_data_processing
@@ -811,9 +815,9 @@ def test_processing_survives_contact_and_checkpoint(tmp_path, complete_episodes,
         for start, stop, *_ in dataset.sampler.indices:
             assert not start < 2 < stop
             assert not start < 4 < stop
-    hand_cfg = OmegaConf.create({"dataset": dict(
-        zarr_path=str(output), seed=7, val_episodes=1, max_train_episodes=1,
-    )})
+    hand_cfg = OmegaConf.create({"dataset": {
+        "zarr_path": str(output), "seed": 7, "val_episodes": 1, "max_train_episodes": 1,
+    }})
     train_hand, val_hand, normalizer = prepare_hand_data(hand_cfg)
     train_hand = normalizer["hand"].unnormalize(train_hand).numpy()
     val_hand = normalizer["hand"].unnormalize(val_hand).numpy()
@@ -1461,7 +1465,8 @@ def test_pointcloud_export_records_normalized_table_plane(tmp_path, complete_epi
         result = export_zarr(complete_episodes, tmp_path / f"{height}.zarr", fields=("point_cloud",),
                              processing=ExportConfig(pointcloud=config, table_plane_abcd=(0, 0, 2, -2 * height)))
         attrs = zarr.open_group(result["path"], mode="r").attrs
-        assert attrs["data_processing"]["point_cloud"]["table_plane_abcd"] == attrs["table_plane_abcd"] == [0, 0, 1, -height]
+        assert attrs["data_processing"]["point_cloud"]["table_plane_abcd"] == [0, 0, 1, -height]
+        assert "table_plane_abcd" not in attrs
     with pytest.raises(ValueError, match="upward"):
         export_zarr(complete_episodes, tmp_path / "invalid.zarr", fields=("point_cloud",),
                     processing=ExportConfig(pointcloud=config, table_plane_abcd=(0, 0, -1, .05)))

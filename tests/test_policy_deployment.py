@@ -280,21 +280,31 @@ def test_hoi_warmup_commits_only_successful_uncancelled_result(fault):
 def test_processing_records_differences_without_rejecting(info, caplog):
     from dexmani_real.deployment.preflight import collect_data_processing
     from dexmani_real.perception.pointcloud import processing_metadata
+    from dexmani_real.utils.table_plane import normalize_table_plane
 
     runtime = RealConfig()
     caplog.set_level("INFO", logger="dexmani_real.deployment.preflight")
-    plane = (0, 0, 1, -.02)
+    coefficients = (0.1, 0.2, 1.0, -0.4)
+    plane = normalize_table_plane(coefficients)
     saved = {"point_cloud": processing_metadata(runtime.pointcloud, plane)}
     info = replace(info, data_processing=saved)
     assert collect_data_processing(info, runtime, table_plane_abcd=plane) == saved
+
+    scaled_plane = normalize_table_plane(tuple(3 * value for value in coefficients))
+    actual = collect_data_processing(info, runtime, table_plane_abcd=scaled_plane)
+    assert actual["point_cloud"]["table_plane_abcd"] == list(scaled_plane)
+    assert "处理参数差异" not in caplog.text
+
     changed = replace(runtime, pointcloud=replace(runtime.pointcloud, num_points=17))
     assert collect_data_processing(info, changed, table_plane_abcd=plane) == {
         "point_cloud": processing_metadata(changed.pointcloud, plane),
     }
-    assert "处理参数差异 point_cloud" in caplog.text
-    other_plane = (0, 0, 1, -.03)
-    actual = collect_data_processing(info, runtime, table_plane_abcd=other_plane)
-    assert actual["point_cloud"]["table_plane_abcd"] == list(other_plane)
+    assert "处理参数差异 point_cloud.config" in caplog.text
+
+    caplog.clear()
+    offset_plane = (*plane[:3], plane[3] - 0.01)
+    actual = collect_data_processing(info, runtime, table_plane_abcd=offset_plane)
+    assert actual["point_cloud"]["table_plane_abcd"] == list(offset_plane)
     assert "差异 point_cloud.table_plane_abcd" in caplog.text
 
 

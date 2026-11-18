@@ -28,8 +28,7 @@ def load_table_plane(path: str | Path | None) -> tuple[float, float, float, floa
     plane_path = resolve_table_plane_path(path)
     with plane_path.open(encoding="utf-8") as stream:
         plane = json.load(stream)
-    coefficients = (float(plane["a"]), float(plane["b"]), float(plane["c"]), float(plane["d"]))
-    return normalize_table_plane(coefficients)
+    return normalize_table_plane((plane["a"], plane["b"], plane["c"], plane["d"]))
 
 
 def normalize_table_plane(coefficients) -> tuple[float, float, float, float]:
@@ -39,7 +38,7 @@ def normalize_table_plane(coefficients) -> tuple[float, float, float, float]:
     norm = np.linalg.norm(plane[:3])
     if norm <= 1e-9 or plane[2] / norm <= 0:
         raise ValueError("table plane must have an upward non-zero normal")
-    # JSON 与 Python 入口共用此表示，已归一化的系数保持逐位一致。
+    # 法向长度已在浮点精度内等于 1 时，直接复用原系数。
     if abs(norm - 1.0) > np.finfo(float).eps:
         plane = plane / norm
     a, b, c, d = plane

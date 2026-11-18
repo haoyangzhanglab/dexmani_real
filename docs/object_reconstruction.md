@@ -71,7 +71,7 @@ HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来�
 | 逐对象有效性，bool `[T,O]` | `hoi.h5:/object_valid` |
 | 逐帧、逐对象质量指标 | `hoi.h5:/quality/` |
 | 固定模板、对象顺序及点分段 | `hoi.h5:/template/` |
-| 相机到基座的变换 | `hoi.h5:/base_from_camera`，必须与 Raw 的 `camera_T_xarm_base_from_color` 一致 |
+| 相机到基座的变换 | 读取 HOI 时，`hoi.h5:/base_from_camera` 与 Raw 的 `camera_T_xarm_base_from_color` 均必填，须各自为合法刚体变换，并在现有比较容差内一致 |
 | 实际跟踪配置 | `hoi.h5` 根属性 `tracking_config` |
 
 `quality` 组始终存在，可以为空。缺失或为 `None` 的指标保存为 NaN；纯深度路径未计算的 Mask 指标为 −1，可视化均显示为曲线缺口。指标含义见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)。

@@ -12,7 +12,7 @@ Raw 写入时，关节、绝对关节目标、VR 腕部位姿和手部关键点�
 
 `timing/rows` 保留控制采样时刻、观测完成时刻及各来源的主机单调时钟时间，单位为纳秒。相机派生观测沿用相机来源时间，重复读取保留原时间。多来源观测按这些时间做软件对齐，时间戳记录的是主机侧查询或接收时刻。
 
-实测关节和指令提交尝试分别保存。动作是尝试提交的绝对关节目标，包含发送失败的尝试。实际位置由反馈列提供。若一行没有提交某个执行器的目标，该执行器的动作列为 NaN。
+Raw 动作列保存控制层尝试提交的组合命令中的绝对关节目标，包括失败尝试中的目标。该行没有组合命令，或组合命令未携带某执行器的目标时，对应列为 NaN。实际关节位置由反馈列提供。
 
 `timing/segment_starts` 记录连续段首行。跳槽或 HOI HOLD 产生录制间断时，下一个接纳的行开始新段。队列满或录制来源失效则停止接纳并记录 `recording_truncated_reason`。Replay 只执行选定连续段的关节目标，运行前需将机器人就位到该段起点。
 
@@ -30,4 +30,4 @@ Raw 保留采集像素网格上的 RGB-D，解码后的有损 RGB 与现场像�
 - 所选数据缺失、损坏或所需的 HOI 关节对齐无法覆盖整段时，整条 Raw 回滚并继续处理其他采集。完整有效的截断前缀仍可导出。没有可用采集时导出失败。
 - 根属性 `rejected_episodes` 保存被拒的入口名和原因，`excluded_episodes` 保存显式排除的入口名。排除后仍有两个入口指向同一目录时会报错。
 
-`data_processing` 保存实际使用的处理参数。开启去桌面时，归一化系数写入 `data_processing.point_cloud.table_plane_abcd`；部署对应值见 `run_config.yaml` 的 `actual_processing.point_cloud.table_plane_abcd`。开启 contact loss 的固定 1024 槽预训练及其完整续训要求共享的对象模板身份。见[模板摘要](object_reconstruction.md#标注与查看)。
+Zarr 的 `data_processing` 保存实际使用的处理参数。开启去桌面时，归一化系数写入 `data_processing.point_cloud.table_plane_abcd`。部署对应值见 `run_config.yaml` 的 `actual_processing.point_cloud.table_plane_abcd`。开启 contact loss 的固定 1024 槽预训练及其完整续训要求共享的对象模板身份。见[模板摘要](object_reconstruction.md#标注与查看)。

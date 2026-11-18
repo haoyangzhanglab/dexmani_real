@@ -437,8 +437,6 @@ def export_zarr(
         metadata = {}
         if "point_cloud" in fields:
             metadata["point_cloud"] = processing_metadata(processing.pointcloud, processing.table_plane_abcd)
-            if processing.pointcloud.remove_table:
-                root.attrs["table_plane_abcd"] = metadata["point_cloud"]["table_plane_abcd"]
         if "hand_pointcloud" in fields:
             metadata["hand_pointcloud"] = {"num_points": processing.hand_pointcloud.num_points}
         if "object_pointcloud" in fields:
