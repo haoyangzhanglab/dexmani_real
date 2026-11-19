@@ -114,8 +114,6 @@ XHand 诊断的 `--read-only` 不发送诊断运动目标，但仍会连接和�
 
 主进程持有会话与 XHand I/O；机械臂 SDK、相机、VR 与启用的感知任务运行在子进程；策略推理和录制各有自己的工作线程。设备 SDK 留在驱动层，动作映射只生成目标，实际发送归 `Robot`。新增实验优先修改配置和对应流程，独立算法放入现有几何或感知模块。
 
-在仓库根目录运行 `python -m pytest -q -p no:cacheprovider` 验证离线测试。pytest 默认收集 `tests/`，几何回归使用仓库内的 CordViP 源码。依赖安装见 [CPU workflow](.github/workflows/cpu.yml)。
-
 ## 主题文档
 
 - [手部重定向](docs/hand_retargeting.md)：人体关键点到 XHand 关节目标的映射。

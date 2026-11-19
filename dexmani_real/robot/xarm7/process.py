@@ -12,7 +12,6 @@ from dexmani_real.robot.xarm7.protocol import (
     HomeRequest,
     PhysicalStopRequest,
     PrepareRequest,
-    StandstillRequest,
 )
 
 if TYPE_CHECKING:
@@ -175,7 +174,7 @@ class ArmProcess:
             self.physical_stop_confirmed = False
             self.io.stop.clear()
 
-    def request_operation(self, request: PrepareRequest | HomeRequest | StandstillRequest, *, service, abort, cancel_epoch):
+    def request_operation(self, request: PrepareRequest | HomeRequest, *, service, abort, cancel_epoch):
         """普通取消确认停止并消费回复后抛出；其他失败关闭 owner。"""
         deadline_ns = request.deadline_ns
         # 生命周期仅由一个父控制流程顺序调用；局部事实只决定异常收尾。
@@ -262,9 +261,6 @@ class ArmProcess:
             abort=lambda: self.runtime_state.cancel_epoch != cancel_epoch or self.io.stop.is_set(),
             cancel_epoch=cancel_epoch,
         )
-
-    def settle(self, cancel_epoch, *, service, abort, deadline_ns):
-        self.request_operation(StandstillRequest(deadline_ns), service=service, abort=abort, cancel_epoch=cancel_epoch)
 
     def publish_home_hand_stamp(self, stamp):
         value = self.io.home_hand_stamp

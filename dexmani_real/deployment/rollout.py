@@ -264,13 +264,16 @@ class Rollout:
                 int(row.arm["timestamp_ns"][0]) >= after_ns
                 and row.hand is not None and int(row.hand["timestamp_ns"][0]) >= after_ns
             )
-            if issue is None and joints_ready and not self.robot.hand_feedback_pending:
-                self.preparation_issue = None
-                break
+            ready = issue is None and joints_ready and not self.robot.hand_feedback_pending
             if time.monotonic_ns() >= until:
-                self.preparation_issue = issue or "initial_joint_feedback_unavailable"
+                self.preparation_issue = issue or (
+                    "initial_observation_timeout" if ready else "initial_joint_feedback_unavailable"
+                )
                 logger.warning("本轮未开始：%s；等待停止与收尾。", self.preparation_issue)
                 return None
+            if ready:
+                self.preparation_issue = None
+                break
             time.sleep(0.005)
         if self.policy_info.action_mode == "eef":
             try:
@@ -378,7 +381,7 @@ class Rollout:
         if self.query is not None:
             self.query.result = actions
 
-    def _submit_prediction(self, slot: int, *, handoff_slot=None, prefix=None) -> None:
+    def _submit_prediction(self, slot: int, *, handoff_slot=None, prefix=None) -> bool:
         kwargs = {} if prefix is None else {
             "rtc_prefix": prefix,
             "delay_steps": min(self.execution.prefetch_steps, len(prefix)),
@@ -393,6 +396,8 @@ class Rollout:
             slot + first_action_offset + self.policy_info.future_steps
         ) * self.dt_ns
         self.check_motion()
+        if time.monotonic_ns() >= deadline_ns:
+            return False
         self.model.predict(rows, reset_episode=self.reset_pending, **kwargs)
         self.reset_pending = False
         self.query = Prediction(
@@ -401,6 +406,7 @@ class Rollout:
             deadline_ns=deadline_ns,
             request_cursor=self.cursor,
         )
+        return True
 
     def map_command(self, action, row):
         mode = self.policy_info.action_mode
@@ -459,9 +465,8 @@ class Rollout:
         plan = self.plan
         query = self.query
         if plan is None:
-            if query is None:
-                self._submit_prediction(slot)
-            elif now >= query.deadline_ns:
+            expired = not self._submit_prediction(slot) if query is None else now >= query.deadline_ns
+            if expired:
                 self.stop("prediction_expired")
             return None
         mode = self.execution.mode
@@ -472,6 +477,7 @@ class Rollout:
                 self.stop("prediction exhausted")
             return None
         if query is None and mode != "sync" and index >= limit - self.execution.prefetch_steps:
+            # 预取未入队时，仍由当前计划决定本槽动作。
             if mode == "rtc":
                 self._submit_prediction(slot, prefix=plan.actions[index:].copy())
             else:

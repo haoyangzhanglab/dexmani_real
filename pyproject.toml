@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-interactive = ["pynput>=1.7"]
+interactive = ["pynput>=1.7.7"]
 control = ["ruckig==0.17.3", "nlopt==2.7.1"]
 geometry = ["trimesh>=4"]
 visualization = [
@@ -39,7 +39,3 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "dexmani_real.config.calibration_data" = ["*.json"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["third_party/cordvip_geometry/src"]

@@ -98,10 +98,13 @@ class KeyboardTeleop:
         if not (self.runtime_state.cancel_epoch == startup_epoch and self.runtime_state.requests_allow_motion()):
             raise OperationCancelled("startup cancelled")
         self.prepare_jog(startup_epoch)
-        print("WASD/arrows and IJKL: jog; R: validated arm then hand HOME; Q: exit; ESC: emergency stop")
         print(
-            "Jog is ready. Release jog keys to brake and hold. "
-            "Workspace rejection brakes and holds; invalid references end the session."
+            "WASD、方向键和 IJKL 用于点动。按 Q 退出，按 Esc 急停。"
+            + ("按 R 让机械臂和灵巧手依次回零。" if self.runtime.hand.enabled else "按 R 让机械臂回零。")
+        )
+        print(
+            "点动就绪。松开所有点动键或点动目标被拒绝时，机械臂减速停稳并保持位置。"
+            "关节反馈或控制参考失效时，程序停止机械臂并退出遥操作。"
         )
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
 
@@ -153,7 +156,7 @@ class KeyboardTeleop:
                 return
             self.runtime_state.stop_signal.set()
             cancel_epoch = self.runtime_state.cancel_epoch
-        logger.info("Returning home...")
+        logger.info("Returning home..." if self.runtime.hand.enabled else "Returning arm home...")
 
         def cancelled():
             self.robot.check()

@@ -74,14 +74,11 @@ class HandConfig:
     tactile_residual_limits: tuple[float, float] = (5.0, 5.0)
     crc_retries: int = 1
     crc_retry_interval_s: float = 0.05
-    home_timeout_s: float | None = None
-    home_max_step_deg: float | None = None
-    home_tor_max: int | None = None
     home_tolerance_deg: float = 5.0
 
     def __post_init__(self) -> None:
         # 配置保留原生整数表示，SDK 参数及 JSON/YAML 归档无需各自适配 NumPy。
-        for name in ("baudrate", "device_id", "ethercat_slave_position", "ki", "kd", "home_tor_max"):
+        for name in ("baudrate", "device_id", "ethercat_slave_position", "ki", "kd"):
             value = getattr(self, name)
             if isinstance(value, np.integer):
                 object.__setattr__(self, name, int(value))
@@ -163,8 +160,5 @@ class HandConfig:
 
     def validate_home(self) -> None:
         validate_hand_target(self.home_qpos_rad, self.qpos_min_rad, self.qpos_max_rad)
-        if type(self.home_tor_max) is not int or not 0 < self.home_tor_max <= 400:
-            raise ValueError("HOME output limit requires a tested integer in [1, 400]")
-        for value in (self.home_timeout_s, self.home_tolerance_deg, self.home_max_step_deg):
-            if value is None or not isfinite(value) or value <= 0:
-                raise ValueError("hand HOME timeout, tolerance and step must be configured, finite and positive")
+        if not isfinite(self.home_tolerance_deg) or self.home_tolerance_deg <= 0:
+            raise ValueError("hand.home_tolerance_deg must be finite and positive")

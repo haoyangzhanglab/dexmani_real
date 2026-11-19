@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """连接 XHand1 并读取设备状态。默认执行 HOME → fist → palm → V → OK → HOME，到位后各停留 1 秒。"""
 
 from __future__ import annotations

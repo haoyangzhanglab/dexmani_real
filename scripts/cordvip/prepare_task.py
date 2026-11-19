@@ -11,7 +11,12 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 
 from cordvip_geometry.mesh import load_mesh, scale_mesh, validate_scale
-from cordvip_geometry.weights import DEFAULT_MODELS_DIR, resolve_sam_model
+from cordvip_geometry.weights import (
+    DEFAULT_MODELS_DIR,
+    GROUNDING_WEIGHTS_DIR,
+    SHAPE_WEIGHTS_DIR,
+    resolve_sam_model,
+)
 
 from dexmani_real.geometry.hoi import TASK_MESH_PATH, task_objects
 
@@ -62,7 +67,7 @@ def prepare_task(task):
         ROOT / "third_party/Grounded-SAM-2",
         checkpoint,
         config,
-        models_dir / "grounding-dino-base",
+        models_dir / GROUNDING_WEIGHTS_DIR,
     )
     for obj in objects:
         directory = task / obj["name"]
@@ -78,7 +83,7 @@ def prepare_task(task):
     gc.collect()
     torch.cuda.empty_cache()
 
-    model = load_shape_model(ROOT / "third_party/Hunyuan3D-2.1", models_dir / "Hunyuan3D-2.1")
+    model = load_shape_model(ROOT / "third_party/Hunyuan3D-2.1", models_dir / SHAPE_WEIGHTS_DIR)
     for obj in objects:
         directory = task / obj["name"]
         output = directory / "reconstruction"

@@ -4,6 +4,10 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_MODELS_DIR = Path("third_party/weights")
+GROUNDING_WEIGHTS_DIR = "grounding-dino-base"
+SHAPE_WEIGHTS_DIR = "Hunyuan3D-2.1"
+SHAPE_CONFIG_PATH = "hunyuan3d-dit-v2-1/config.yaml"
+SHAPE_CHECKPOINT_PATH = "hunyuan3d-dit-v2-1/model.fp16.ckpt"
 
 SAM_MODELS: dict[str, dict[str, str]] = {
     "small": {
@@ -22,16 +26,16 @@ SAM_MODELS: dict[str, dict[str, str]] = {
 GROUNDING_MODEL: dict[str, Any] = {
     "repo_id": "IDEA-Research/grounding-dino-base",
     "revision": "12bdfa3120f3e7ec7b434d90674b3396eccf88eb",
-    "directory": "grounding-dino-base",
+    "directory": GROUNDING_WEIGHTS_DIR,
     "patterns": ["*.json", "model.safetensors", "vocab.txt", "README.md", "LICENSE*"],
 }
 SHAPE_MODEL: dict[str, Any] = {
     "repo_id": "tencent/Hunyuan3D-2.1",
     "revision": "0b94677654c57bb9a6b6845cd7b704ccf551d327",
-    "directory": "Hunyuan3D-2.1",
+    "directory": SHAPE_WEIGHTS_DIR,
     "patterns": [
-        "hunyuan3d-dit-v2-1/config.yaml",
-        "hunyuan3d-dit-v2-1/model.fp16.ckpt",
+        SHAPE_CONFIG_PATH,
+        SHAPE_CHECKPOINT_PATH,
         "README.md",
         "LICENSE*",
     ],

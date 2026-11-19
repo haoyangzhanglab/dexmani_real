@@ -14,7 +14,7 @@ from dexmani_real.robot.model import (
 
 
 class CollisionModel:
-    def __init__(self, *, static_boxes=(), margin_m):
+    def __init__(self, *, static_boxes=(), table_plane=None, margin_m):
         import pinocchio as pin
         from hppfcl.hppfcl import Box
 
@@ -46,6 +46,17 @@ class CollisionModel:
         pin.removeCollisionPairs(self.model, self.geometry, str(XARM7_XHAND_SRDF_PATH))
         self.environment_names = {}
 
+        self.table_vertices = []
+        if table_plane is not None:
+            self.table_normal = np.asarray(table_plane[:3])
+            self.table_min_projection = margin_m - table_plane[3]
+            # 固定基座安装在桌面上，只检查运动网格到桌面的距离。
+            self.table_vertices = [
+                (i, np.asarray(obj.geometry.vertices()))
+                for i, obj in enumerate(self.geometry.geometryObjects)
+                if obj.parentJoint != 0
+            ]
+
         for index, box in enumerate(static_boxes):
             placement = pin.SE3(np.eye(3), np.asarray(box.center_xyz_m))
             self.add_obstacle(f"obstacle_{index}", Box(*box.size_xyz_m), placement, robot_count)
@@ -73,11 +84,19 @@ class CollisionModel:
     def rejection(self, arm_qpos, hand_qpos):
         qpos = np.empty(self.model.nq)
         qpos[self.sdk_q_indices] = np.concatenate((arm_qpos, hand_qpos))
-        # 命令限位由调用方检查；手部实测姿态按原值参与几何计算。
+        # 命令限位由调用方检查；手部姿态按传入值参与几何计算。
         collided = self.pin.computeCollisions(
             self.model, self.data, self.geometry, self.geometry_data, qpos, True
         )
         if not collided:
+            # 平面投影在三角面内是线性的，最小值出现在网格顶点。
+            for index, vertices in self.table_vertices:
+                pose = self.geometry_data.oMg[index]
+                normal_local = pose.rotation.T @ self.table_normal
+                lowest = np.einsum("ij,j->i", vertices, normal_local).min()
+                projection = lowest + self.table_normal @ pose.translation
+                if projection < self.table_min_projection:
+                    return f"environment_collision: {self.link_name(index)}/table"
             return None
         index = next(
             i

@@ -2,23 +2,40 @@
 
 物体分割、单图重建、尺度调整与 RGB-D 位姿跟踪后端。模型在同一 Python 进程直接调用；任务模板与 Raw 写入由主项目负责。
 
+## 目录与维护
+
+`third_party/cordvip_geometry/` 保存随主仓库维护的后端源码、安装脚本和推理补丁。上游源码保存在 `third_party/` 下的本地 Git 工作树中，由主仓库忽略。
+
+| 目录 | 用途 |
+| --- | --- |
+| `Grounded-SAM-2/` | SAM2 单图分割和视频掩码跟踪。 |
+| `FoundationPose/` | RGB-D 位姿注册和跟踪。 |
+| `nvdiffrast/` | FoundationPose 使用的 CUDA 光栅化。 |
+| `Hunyuan3D-2.1/` | 可选的单图网格重建。 |
+
+复用已有源码时，指定目录必须是 Git 工作树根目录，且 `HEAD` 必须匹配安装脚本中的固定版本。版本匹配时保留本地修改，跳过已应用的补丁。目录或版本不符、补丁冲突时，安装会报错退出。固定版本见 [安装脚本](scripts/install_perception.sh)。
+
+`third_party/FoundationPose/mycpp/build/` 中的 `mycpp` 扩展供位姿跟踪在运行时加载，清理构建产物时须保留。
+
 ## 安装与命令
 
-在兼容 Torch/CUDA 的 `real_robot` 环境中，从仓库根目录执行：
+在兼容 Torch/CUDA 的 `real_robot` 环境中，从仓库根目录安装跟踪依赖，再下载 Grounding DINO 和 SAM2 权重：
 
 ```bash
 bash third_party/cordvip_geometry/scripts/install_perception.sh
 python -m cordvip_geometry download
 ```
 
-安装脚本准备跟踪源码、应用补丁并编译 CUDA 扩展，同时通过 `[cloud]` 安装读取 CAD 用的 trimesh，以及简化网格和射线渲染用的 Open3D。仅生成模板时，在主项目环境中运行 `python -m pip install -e 'third_party/cordvip_geometry[cloud]'`。FoundationPose 权重需另行放入 `third_party/FoundationPose/weights/`：
+安装脚本准备跟踪源码、应用补丁并编译扩展，同时通过 `[cloud]` 安装读取 CAD 用的 trimesh，以及简化网格和射线渲染用的 Open3D。仅生成模板时，在主项目环境中运行 `python -m pip install -e 'third_party/cordvip_geometry[cloud]'`。
+
+`download` 命令默认将权重写入 `third_party/weights/`。FoundationPose 的两个模型权重另行放入 `third_party/FoundationPose/weights/` 的对应子目录。
 
 | 模型 | 权重目录 |
 | --- | --- |
 | refine | `2023-10-28-18-33-37` |
 | score | `2024-01-11-20-02-45` |
 
-使用 Hunyuan3D 重建时，再执行：
+需要单图重建时，在完成跟踪安装的同一环境中安装 Hunyuan3D 依赖，再下载对应权重：
 
 ```bash
 bash third_party/cordvip_geometry/scripts/install_perception.sh reconstruction

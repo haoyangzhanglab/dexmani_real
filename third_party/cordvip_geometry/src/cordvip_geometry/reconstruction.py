@@ -6,13 +6,14 @@ from pathlib import Path
 import numpy as np
 
 from .mesh import simplify_mesh
+from .weights import SHAPE_CHECKPOINT_PATH, SHAPE_CONFIG_PATH
 
 
 def load_shape_model(source_root, weights_dir):
     root = Path(source_root).expanduser().resolve()
-    weights = Path(weights_dir).expanduser().resolve() / "hunyuan3d-dit-v2-1"
-    config_path = weights / "config.yaml"
-    checkpoint_path = weights / "model.fp16.ckpt"
+    weights = Path(weights_dir).expanduser().resolve()
+    config_path = weights / SHAPE_CONFIG_PATH
+    checkpoint_path = weights / SHAPE_CHECKPOINT_PATH
 
     import yaml
 

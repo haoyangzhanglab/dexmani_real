@@ -492,10 +492,12 @@ class PolicySession:
             issues = check_device_feedback(row, self.runtime) + check_observation(
                 row, self.runtime, self.observations.needs,
             )
+            if time.monotonic() >= observation_deadline:
+                if issues:
+                    raise ValueError("warmup observation: " + "; ".join(issues))
+                raise TimeoutError("warmup observation timed out")
             if not issues:
                 break
-            if time.monotonic() >= observation_deadline:
-                raise ValueError("warmup observation: " + "; ".join(issues))
             time.sleep(0.005)
         # 首帧填充与正式预测一致。
         rows = (self.observations.project(row),) * self.info.n_obs_steps

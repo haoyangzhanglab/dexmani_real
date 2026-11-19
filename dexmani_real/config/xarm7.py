@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import isfinite, pi, radians
-from typing import cast
 
 import numpy as np
 
@@ -13,38 +12,8 @@ from dexmani_real.robot.model import ARM_DOF, XARM7_HARD_LOWER, XARM7_HARD_UPPER
 
 @dataclass(frozen=True)
 class HomingConfig:
-    via_qpos: tuple[float, ...] | None = None
-    max_jerk_deg_per_s3: float | None = None
-    collision_margin_m: float | None = None
-    tracking_error_rad: float | None = None
-    hand_hold_tolerance_rad: float | None = None
-    max_lateness_s: float | None = None
-    timeout_s: float = 60.0
     max_speed_deg_s: float = 45.0
-    max_acceleration_deg_per_s2: float = 900.0
-
-    @property
-    def max_speed_rad_per_s(self) -> float:
-        return radians(self.max_speed_deg_s)
-
-    @property
-    def max_acceleration_rad_per_s2(self) -> float:
-        return radians(self.max_acceleration_deg_per_s2)
-
-    def validate(self) -> None:
-        for name in ("max_jerk_deg_per_s3", "collision_margin_m", "tracking_error_rad",
-                     "hand_hold_tolerance_rad", "max_lateness_s"):
-            value = getattr(self, name)
-            if value is None or not isfinite(value) or value <= 0:
-                raise ValueError(f"homing.{name} requires a measured positive value")
-        acceleration = self.max_acceleration_rad_per_s2
-        if not isfinite(acceleration) or acceleration <= 0:
-            raise ValueError("homing acceleration must be finite and positive")
-        if not isfinite(self.timeout_s) or self.timeout_s <= 0:
-            raise ValueError("homing.timeout_s must be finite and positive")
-        speed = self.max_speed_rad_per_s
-        if not isfinite(speed) or not 0.0001 <= speed <= pi:
-            raise ValueError("homing.max_speed_deg_s must convert to [0.0001, π] rad/s")
+    collision_margin_m: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -85,6 +54,10 @@ class ArmConfig:
     @property
     def max_joint_jerk_rad_per_s3(self) -> float:
         return radians(self.max_joint_jerk_deg_per_s3)
+
+    @property
+    def home_speed_rad_per_s(self) -> float:
+        return min(radians(self.homing.max_speed_deg_s), self.max_joint_velocity_rad_per_s)
 
     def validate(self) -> None:
         joint_values = np.asarray(
@@ -140,13 +113,10 @@ class ArmConfig:
     def validate_home(self) -> None:
         from dexmani_real.robot.commands import validate_arm_target
 
-        self.homing.validate()
-        if cast(float, self.homing.max_lateness_s) >= 1 / self.servo_hz:
-            raise ValueError("HOME lateness must be below one servo period")
-        if (self.homing.max_speed_deg_s > self.max_joint_velocity_deg_per_s
-                or self.homing.max_acceleration_deg_per_s2 > self.max_joint_acceleration_deg_per_s2
-                or cast(float, self.homing.max_jerk_deg_per_s3) > self.max_joint_jerk_deg_per_s3):
-            raise ValueError("HOME motion limits exceed arm limits")
-        if self.homing.via_qpos is not None:
-            validate_arm_target(self.homing.via_qpos, self.joint_limit_lower, self.joint_limit_upper)
+        speed = radians(self.homing.max_speed_deg_s)
+        if not isfinite(speed) or speed < 0.0001:
+            raise ValueError("homing.max_speed_deg_s must convert to at least 0.0001 rad/s")
+        margin = self.homing.collision_margin_m
+        if not isfinite(margin) or margin <= 0:
+            raise ValueError("homing.collision_margin_m must be finite and positive")
         validate_arm_target(self.home_qpos, self.joint_limit_lower, self.joint_limit_upper)

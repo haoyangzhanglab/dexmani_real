@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""键盘点动机械臂与显式 HOME；--no-hand 不连接灵巧手。"""
+"""键盘点动与 R 键回零，机械臂目标由 arm.home_qpos 配置。"""
 
 from __future__ import annotations
 
@@ -11,11 +10,11 @@ from dexmani_real.config.real import load_config
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Keyboard teleoperation for xArm7")
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config", type=Path, default=None, help="Trusted Python experiment file exporting CONFIG: RealConfig"
     )
-    parser.add_argument("--no-hand", action="store_true", help="不连接灵巧手；保留机械臂 Jog，组合 HOME 不可用")
+    parser.add_argument("--no-hand", action="store_true", help="不连接灵巧手，按 R 只回机械臂 HOME")
     args = parser.parse_args(argv)
 
     runtime = load_config(args.config)

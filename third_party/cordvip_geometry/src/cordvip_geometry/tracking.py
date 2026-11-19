@@ -16,6 +16,7 @@ from .foundationpose import (
 )
 from .mesh import MeshRaycaster, load_mesh
 from .segmentation import SAM2Segmenter, normalize_prompt
+from .weights import DEFAULT_MODELS_DIR, GROUNDING_WEIGHTS_DIR, resolve_sam_model
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -260,8 +261,6 @@ class SceneTracker:
     ):
         import torch
 
-        from .weights import DEFAULT_MODELS_DIR, resolve_sam_model
-
         self.config = config
         workspace = Path(workspace)
         models_dir = workspace / DEFAULT_MODELS_DIR
@@ -270,7 +269,7 @@ class SceneTracker:
             workspace / "third_party/Grounded-SAM-2",
             checkpoint,
             sam_config,
-            models_dir / "grounding-dino-base",
+            models_dir / GROUNDING_WEIGHTS_DIR,
         )
         self.segmenter.load_grounding()
         self.trackers = {}

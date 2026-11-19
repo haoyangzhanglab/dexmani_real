@@ -62,13 +62,6 @@ class EnvironmentConfig:
     eef_workspace_tolerance_m: float = 0.005
     # HOME 使用的已标定静态障碍物。
     static_boxes: tuple[StaticCollisionBox, ...] = ()
-    home_model_confirmed: bool = False
 
-    # 点云去桌面所用的标定事实。
+    # HOME 碰撞检查和点云去桌面共用的标定。
     table_plane_path: str | None = TABLE_PLANE_RELATIVE_PATH
-
-    def validate_home(self) -> None:
-        if type(self.home_model_confirmed) is not bool:
-            raise ValueError("home_model_confirmed must be an explicit boolean")
-        for box in self.static_boxes:
-            box.validate()

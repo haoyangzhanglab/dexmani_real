@@ -7,6 +7,7 @@ from numpy.typing import NDArray
 
 from dexmani_real.config.perception import PointCloudConfig
 from dexmani_real.geometry.camera import CameraIntrinsics, deproject_depth, depth_rays
+from dexmani_real.geometry.sampling import farthest_point_indices
 from dexmani_real.utils.table_plane import normalize_table_plane
 
 DEPTH_RANGE_M = (0.30, 1.50)
@@ -112,20 +113,6 @@ def radius_inliers(points: np.ndarray) -> np.ndarray:
     return density_keep & (component_sizes[labels] >= OUTLIER_MIN_COMPONENT_POINTS)
 
 
-def sample_indices(points: np.ndarray, num_points: int) -> np.ndarray:
-    """对非空点集 FPS；稀疏时循环重复已有点以满足形状，不增加几何信息。"""
-    if len(points) > num_points:
-        from fpsample import bucket_fps_kdline_sampling
-
-        return bucket_fps_kdline_sampling(
-            points,
-            num_points,
-            h=min(5, len(points).bit_length() - 1),
-            start_idx=0,
-        )
-    return np.arange(num_points) % len(points)
-
-
 def aligned_depth_points_in_base(
     *,
     depth_raw: np.ndarray,
@@ -215,11 +202,18 @@ class PointCloudProcessor:
         points, colors = voxel_downsample(points, colors)
         keep = radius_inliers(points)
         points, colors = points[keep], colors[keep]
-        if len(points) == 0:
+        available = len(points)
+        if available == 0:
             return np.empty((0, 6), dtype=np.float32)
 
-        selected = sample_indices(points, self.config.num_points)
-        return np.column_stack((points[selected], colors[selected]))
+        num_points = self.config.num_points
+        if available != num_points:
+            selected = (
+                farthest_point_indices(points, num_points)
+                if available > num_points else np.arange(num_points) % available
+            )
+            points, colors = points[selected], colors[selected]
+        return np.column_stack((points, colors))
 
 
 def processing_metadata(config, table_plane_abcd):

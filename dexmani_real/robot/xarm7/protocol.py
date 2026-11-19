@@ -8,9 +8,10 @@ import numpy as np
 from dexmani_real.robot.commands import CommandExpired, OperationCancelled
 from dexmani_real.robot.model import ARM_JOINT_SHAPE
 
-# startup/prepare 的基础等待预算；HOME 使用独立的 homing.timeout_s。
+# startup 和 prepare 的基础等待预算。
 READY_TIMEOUT_S = 15.0
 STANDSTILL_DWELL_S = 0.30
+HOME_POSITION_TOLERANCE_RAD = 0.02
 
 ARM_STATE_DTYPE = np.dtype(
     [
@@ -36,11 +37,6 @@ class PrepareRequest:
 
 
 @dataclass(frozen=True)
-class StandstillRequest:
-    deadline_ns: int
-
-
-@dataclass(frozen=True)
 class PhysicalStopRequest:
     deadline_ns: int
 
@@ -49,7 +45,7 @@ class PhysicalStopRequest:
 class HomeRequest:
     deadline_ns: int
     samples: np.ndarray
-    hand_max_age_s: float
+    hand_max_age_s: float | None  # 使用实测手部姿态规划时才需要反馈时效。
 
 
 class ArmChannels:

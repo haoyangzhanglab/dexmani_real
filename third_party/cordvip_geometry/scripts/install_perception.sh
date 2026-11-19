@@ -26,7 +26,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 reconstruction：在已完成跟踪安装的同一环境中获取 Hunyuan3D，
 应用分层解码补丁并安装重建依赖。
 
-源码按指定 revision 获取；已有目录和本地修改直接复用，补丁冲突会报错。
+源码按固定 revision 获取。已有目录须为 Git 工作树根目录，HEAD 匹配固定
+revision 时复用本地修改。版本不符或补丁冲突时退出。
 工作目录默认为当前目录，--workspace 必须放在首位。
 安装不下载模型或访问设备，后续命令见完成提示。
 USAGE
@@ -84,14 +85,28 @@ checkout_source() {
     elif [[ ! -d "$cordvip_path" ]]; then
         printf 'Source path is not a directory: %s\n' "$cordvip_path" >&2
         return 1
+    else
+        local cordvip_worktree cordvip_head
+        cordvip_path="$(cd -- "$cordvip_path" && pwd -P)"
+        if ! cordvip_worktree="$(git -C "$cordvip_path" rev-parse --show-toplevel)" ||
+                [[ "$cordvip_worktree" != "$cordvip_path" ]]; then
+            printf 'Expected a Git checkout at %s\n' "$cordvip_path" >&2
+            return 1
+        fi
+        cordvip_head="$(git -C "$cordvip_path" rev-parse --verify 'HEAD^{commit}')"
+        if [[ "$cordvip_head" != "$cordvip_revision" ]]; then
+            printf 'Source revision mismatch at %s (expected %s, found %s).\n' \
+                "$cordvip_path" "$cordvip_revision" "$cordvip_head" >&2
+            return 1
+        fi
     fi
 }
 
 apply_source_patch() {
-    local cordvip_source="third_party/$1"
+    local cordvip_source="$cordvip_root/third_party/$1"
     local cordvip_patch="$cordvip_library/scripts/$2"
-    if ! git apply --directory="$cordvip_source" --reverse --check "$cordvip_patch" 2>/dev/null; then
-        git apply --directory="$cordvip_source" "$cordvip_patch"
+    if ! git -C "$cordvip_source" apply --reverse --check "$cordvip_patch" 2>/dev/null; then
+        git -C "$cordvip_source" apply "$cordvip_patch"
     fi
 }
 

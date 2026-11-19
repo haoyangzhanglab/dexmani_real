@@ -1,5 +1,8 @@
-# Local upstream checkouts; versions and installation are documented separately.
+# Local upstream checkouts. See cordvip_geometry/README.md for installation.
 /Grounded-SAM-2/
 /Hunyuan3D-2.1/
 /FoundationPose/
 /nvdiffrast/
+
+# Local pretrained model weights
+/weights/

@@ -27,6 +27,7 @@ from dexmani_real.utils.timing import next_tick_ns, sample_is_fresh
 logger = logging.getLogger(__name__)
 
 FEEDBACK_PERIOD_NS = round(1e9 / 30)
+HAND_HOME_OUTPUT_LIMIT = 150
 
 if TYPE_CHECKING:
     from dexmani_real.robot.xarm7.process import ArmProcess
@@ -338,7 +339,7 @@ class Robot:
         self.hand_stop_required = True
         from dexmani_real.robot.xhand.driver import OVERCURRENT_WARNING_CODE
 
-        tor_max = np.minimum(self.hand_config.tor_max, self.hand_config.home_tor_max)
+        tor_max = np.minimum(self.hand_config.tor_max, HAND_HOME_OUTPUT_LIMIT)
         code = self.hand.send_position(
             target, tor_max=tor_max,
             deadline_ns=min(deadline_ns, stamp + int(self.hand_config.feedback_max_age_s * 1e9)),

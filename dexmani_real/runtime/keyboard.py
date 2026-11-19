@@ -123,31 +123,64 @@ class Keyboard:
             raise RuntimeError("keyboard instances are single-use")
         from pynput import keyboard
 
+        listener_type = keyboard.Listener
+        is_xorg = listener_type.__module__ == "pynput.keyboard._xorg"
+        if is_xorg:
+            owner = self
+
+            class XorgListener(keyboard.Listener):
+                _record_ready = False
+
+                def _mark_ready(self):
+                    # 关闭请求可能早于监听线程设置运行标志。
+                    with self._condition:
+                        if not owner.active:
+                            raise self.StopException()
+                        super()._mark_ready()
+
+                def _handler(self, events):
+                    super()._handler(events)
+                    if not self._record_ready:
+                        # _ready 表示控制连接可用，首个 RECORD 应答才表示开始接收事件。
+                        with self._condition:
+                            if owner.active and self.running:
+                                self._record_ready = True
+                                self._condition.notify()
+
+                @property
+                def running(self):
+                    with self._condition:
+                        return super().running
+
+                def stop(self):
+                    # 先发完停止请求，再让监听线程看到 running=False 并关闭连接。
+                    with self._condition:
+                        super().stop()
+
+                def _stop_platform(self):
+                    if self._ready and self.is_alive():
+                        # RECORD 数据连接被 EnableContext 占用，复用独立的控制连接。
+                        self._display_stop.record_disable_context(self._context)
+                        self._display_stop.flush()
+
+            listener_type = XorgListener
+
         self.saved_termios = suppress_terminal_echo()
         self.active = True
         try:
             on_press, on_release = self.callbacks(keyboard)
-            self.listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+            self.listener = listener_type(on_press=on_press, on_release=on_release)
             self.listener.start()
-            ready = threading.Event()
-            errors = []
-
-            def wait_until_ready():
-                try:
-                    self.listener.wait()
-                except Exception as exc:
-                    errors.append(exc)
-                finally:
-                    ready.set()
-
-            threading.Thread(target=wait_until_ready, name="keyboard-ready", daemon=True).start()
-            if not ready.wait(LISTENER_START_TIMEOUT_S):
-                raise RuntimeError("keyboard listener startup timed out")
-            if errors:
-                raise errors[0]
+            with self.listener._condition:
+                ready = self.listener._condition.wait_for(
+                    lambda: self.listener._record_ready if is_xorg else self.listener._ready,
+                    LISTENER_START_TIMEOUT_S,
+                )
             if not self.listener.is_alive():
                 self.listener.join(timeout=0)
                 raise RuntimeError("keyboard listener exited during startup")
+            if not ready:
+                raise RuntimeError("keyboard listener startup timed out")
         except BaseException:
             try:
                 self.stop()

@@ -4,7 +4,13 @@ import argparse
 from pathlib import Path
 
 from .mesh import validate_scale
-from .weights import DEFAULT_MODELS_DIR, SAM_MODELS, resolve_sam_model
+from .weights import (
+    DEFAULT_MODELS_DIR,
+    GROUNDING_WEIGHTS_DIR,
+    SAM_MODELS,
+    SHAPE_WEIGHTS_DIR,
+    resolve_sam_model,
+)
 
 
 def probability(value):
@@ -175,7 +181,7 @@ def main(argv=None):
             args.workspace / "third_party/Grounded-SAM-2",
             args.sam_checkpoint,
             args.sam_config,
-            args.models_dir / "grounding-dino-base",
+            args.models_dir / GROUNDING_WEIGHTS_DIR,
         )
         candidates = segmenter.predict(rgb, args.prompt, args.box_threshold, args.text_threshold)
         if not candidates:
@@ -199,15 +205,19 @@ def main(argv=None):
         with Image.open(args.segmentation_dir / "rgb.png") as image:
             rgb = np.asarray(image.convert("RGB")).copy()
         with np.load(args.segmentation_dir / "candidates.npz", allow_pickle=False) as saved:
-            candidates = [
-                {
-                    "mask": mask,
-                    "box_xyxy": saved["boxes"][i],
-                    "score": float(saved["scores"][i]),
-                    "label": str(saved["labels"][i]),
-                }
-                for i, mask in enumerate(saved["masks"])
-            ]
+            masks = saved["masks"]
+            boxes = saved["boxes"]
+            scores = saved["scores"]
+            labels = saved["labels"]
+        candidates = [
+            {
+                "mask": mask,
+                "box_xyxy": boxes[i],
+                "score": float(scores[i]),
+                "label": str(labels[i]),
+            }
+            for i, mask in enumerate(masks)
+        ]
         index = choose(rgb, candidates, args.instance, headless=args.headless)
         save_selection(output, rgb, candidates, index)
         return 0
@@ -215,7 +225,7 @@ def main(argv=None):
 
     model = load_shape_model(
         args.workspace / "third_party/Hunyuan3D-2.1",
-        args.models_dir / "Hunyuan3D-2.1",
+        args.models_dir / SHAPE_WEIGHTS_DIR,
     )
     image_path = output / "foreground_rgba.png" if command == "reconstruct" else args.image
     with Image.open(image_path) as image:

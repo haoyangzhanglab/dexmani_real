@@ -74,11 +74,13 @@ HOI（`object_pointcloud`）与场景点云（`point_cloud`）是互斥输入。
 
 提交预测时，以原请求槽计算截止 `started_ns + (slot + first_action_offset + future_steps) * dt_ns`。sync 与无前缀 RTC 的 `first_action_offset` 为 1，从请求后的下一槽起可提交。async 与带前缀 RTC 的偏移为 0，前者按原请求的绝对槽选步，后者按已提交步数接续。`action_steps` 限制每批执行步数。截止点本身已在窗口外，回收、接续或裁切结果时均沿用原截止。
 
-每个有效控制 tick 至多选择一个目标。程序在映射前和实际提交前检查同一窗口，过期结果不能替换仍有效的计划。映射跨过截止时，本 tick 放弃提交，仍有效的接续计划留到后续 tick。没有可接续计划时以 `prediction_expired` 结束本段。预测窗口只限制新目标的提交，设备继续使用原有命令租约和保持期限。反馈时效按各来源规则检查。
+预测入队前复核原截止。首个请求到期时以 `prediction_expired` 结束本段，预取到期时继续按当前计划的窗口和步数选点。每个有效控制 tick 至多选择一个目标，映射前和实际提交前均检查计划截止。映射跨过截止时，本 tick 放弃提交，仍有效的接续计划留到后续 tick。没有可接续计划时以 `prediction_expired` 结束本段。设备保持使用各自的命令租约和反馈时效规则。
 
 ## 观测与录制
 
 HOI 的关节与 FK 观测使用按相机来源时间对齐的关节，设备反馈检查使用最新实测值。对齐暂不可用或 HOI 点云过期时进入下述恢复流程。对齐规则见[物体重建与 HOI](object_reconstruction.md#跟踪与时间对齐)。
+
+初始观测须在各自等待期限内通过校验。截止时优先报告已有的具体反馈或观测问题，只有观测有效但已到期时报告初始观测超时。
 
 用 `--output` 或 Python 的 `output_root` 可显式指定会话输出根目录。省略路径时，启用 Raw 的会话默认写入当前工作目录下的 `rollouts/`，关闭 Raw 的会话仅输出到终端。
 
@@ -134,9 +136,11 @@ Hold 和 Release 仍以 SDK 返回 `0` 确认提交。普通动作收到过流�
 
 关闭时先确认机械臂停稳，再处理 XHand 并回收设备连接。默认保留已确认的位置保持，必要时刷新保持目标。`Robot.close()` 和 `close_runtime()` 可显式传入 `release_hand=True`，在停稳后提交 Passive 并记录回执。停稳确认失败时仍尝试尚待确认的位置保持，回收设备后报告错误。控制器与独立硬件安全链路负责真正的急停。
 
-VR 遥操作、策略部署与键盘点动共用 [home_robot()](../dexmani_real/runtime/home.py)。它先确认反馈有效和机械臂停稳，再规划和执行机械臂 HOME，最后执行手部回位。HOME 结束时必须确认停止，确认失败会以设备错误退出。HOME 的碰撞路径检查使用已确认的环境模型和实验参数。正常遥操作、策略末端控制与点动使用关节、工作空间和运动限制。
+VR 遥操作、策略部署与键盘点动共用 [home_robot()](../dexmani_real/runtime/home.py)。机械臂停稳后，程序沿通往 `arm.home_qpos` 的单段关节轨迹采样检查碰撞。切入伺服模式后复核起点。执行时按反馈来源时间核对已提交的参考，任一关节偏差超过 0.02 rad 时停止。各关节距 HOME 目标均在 0.02 rad（约 1.15°）以内并连续停稳 0.30 秒时确认到位。启用 XHand 时，机械臂在原截止前确认到位后执行手部回位。
 
-`home_model_confirmed=False` 是默认的操作者启用条件，不表示系统已经验证现场。普通 EEF 不检查 HOME 盒子及专用参数。Jog 不要求起点已经位于工作空间内，但本步 IK 终点仍须满足 workspace、关节、速度与 lead 约束，提交前继续检查时效与 stop；一步无法产生合法终点时拒绝。
+键盘点动使用 `--no-hand` 时，按 R 只执行机械臂 HOME。碰撞模型以 `hand.home_qpos_deg` 作为固定手部姿态。XHand 仍安装在末端时，现场须确认实物在回零过程中保持该姿态。
+
+机械臂 HOME 的专用参数是 `arm.homing.max_speed_deg_s`（默认 45°/s）和 `arm.homing.collision_margin_m`。路径检查使用 `environment.static_boxes` 中的固定障碍物。配置 `environment.table_plane_path` 时，还检查运动部件与桌面标定平面的距离。正常遥操作、策略末端控制与点动使用关节、工作空间和运动限制。
 
 键盘点动中，HOME 配置不满足要求或路径被拒绝时会提示具体原因，并重新准备 Jog；出现 `Keyboard jog ready` 后即可继续点动。Q、Esc、取消或设备故障仍沿原有停止与异常路径处理。
 

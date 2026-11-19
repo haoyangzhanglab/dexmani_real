@@ -99,23 +99,22 @@ def validate_extrema(trajectory, start, lower, upper):
             )
 
 
-def calculate_home_segment(cfg, q, v, target):
+def calculate_home_trajectory(cfg, q, v):
     """计算一段零加速度起步、零速度／加速度到达的离线轨迹。"""
     # 配置与反馈由 HOME 入口校验，初速还需满足规划器的 HOME 限速。
     inp = InputParameter(7)
     inp.current_position = np.asarray(q).tolist()
     inp.current_velocity = np.where(np.abs(v) < 1e-12, 0., v).tolist()
     inp.current_acceleration = [0.] * 7
-    inp.target_position = np.asarray(target).tolist()
+    inp.target_position = list(cfg.home_qpos)
     inp.target_velocity = inp.target_acceleration = [0.] * 7
-    inp.max_velocity = [cfg.homing.max_speed_rad_per_s] * 7
-    inp.max_acceleration = [cfg.homing.max_acceleration_rad_per_s2] * 7
-    inp.max_jerk = [np.deg2rad(cfg.homing.max_jerk_deg_per_s3)] * 7
+    inp.max_velocity = [cfg.home_speed_rad_per_s] * 7
+    inp.max_acceleration = [cfg.max_joint_acceleration_rad_per_s2] * 7
+    inp.max_jerk = [min(cfg.max_joint_jerk_rad_per_s3, np.deg2rad(3000.0))] * 7
     inp.duration_discretization = DurationDiscretization.Discrete
     trajectory = Trajectory(7)
     result = Ruckig(7, 1 / cfg.servo_hz).calculate(inp, trajectory)
     # 当前 Ruckig 不检查位置限位，路径越限由 validate_extrema 判定。
-    # 求解器错误不能证明路径不可行，不能据此改走 Via。
     if result not in (Result.Working, Result.Finished):
         raise RuntimeError(f"HOME Ruckig failed: {result}")
     return trajectory

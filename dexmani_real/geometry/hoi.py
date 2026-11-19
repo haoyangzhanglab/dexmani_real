@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from dexmani_real.config.perception import HOI_NUM_POINTS
+from dexmani_real.geometry.sampling import farthest_point_indices
 
 TASK_MESH_PATH = Path("mesh/mesh_m.obj")
 
@@ -97,8 +98,6 @@ def transform_task_points(template, poses_camera, base_from_camera):
 
 def sample_surface_points(mesh, num_points, seed=0):
     """从已校验的网格按面积采样，再用 FPS 选出固定点序。"""
-    from fpsample import bucket_fps_kdline_sampling
-
     candidate_count = 8 * num_points
     areas = mesh.area_faces
     rng = np.random.default_rng(seed)
@@ -109,10 +108,4 @@ def sample_surface_points(mesh, num_points, seed=0):
     root_u = np.sqrt(uv[:, 0])
     weights = np.column_stack((1 - root_u, root_u * (1 - uv[:, 1]), root_u * uv[:, 1]))
     dense = np.sum(triangles * weights[:, :, None], axis=1).astype(np.float32)
-    ids = bucket_fps_kdline_sampling(
-        dense,
-        num_points,
-        h=min(5, len(dense).bit_length() - 1),
-        start_idx=0,
-    )
-    return dense[ids]
+    return dense[farthest_point_indices(dense, num_points)]

@@ -4,9 +4,6 @@
 /rollouts/
 *.log
 
-# Local pretrained model weights
-/third_party/weights/
-
 # Reconstructed object meshes stay local; point clouds remain tracked.
 /assets/pointcloud_template/object/**/mesh/
 /assets/pointcloud_template/object/**/*.obj

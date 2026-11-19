@@ -6,7 +6,7 @@ HOI（Hand–Object Interaction，手物交互）观测用手部与物体点云�
 
 物体点云来自固定网格表面模板，由 RGB-D 跟踪位姿逐帧变换。手点云来自固定的 link 局部模板，由机械臂和手部关节通过 FK 变换。两者均为 xArm base 坐标系下的米制 float32 XYZ，保留点序和分段。
 
-任务模板、FoundationPose 和 MeshRaycaster 使用由同一米制 CAD 经 `simplify_mesh()` 处理后的几何，保留物体坐标原点与朝向。任务模板共 1024 点，按处理后的网格表面积分配配额，每对象至少 64 点，最多 16 个对象。每个对象以 `seed=0` 按面积均匀采样 8 倍候选点，再用固定起点的 FPS 选点。手模板沿用各 link 的面积配额与 URDF visual 变换，使用同一采样函数。
+任务模板、FoundationPose 和 MeshRaycaster 使用由同一米制 CAD 经 `simplify_mesh()` 处理后的几何，保留物体坐标原点与朝向。任务模板共 1024 点，按处理后的网格表面积分配配额，每对象至少 64 点，最多 16 个对象。每个对象以 `seed=0` 按面积均匀采样 8 倍候选点，再确定性地执行 FPS。手模板沿用各 link 的面积配额与 URDF visual 变换，使用同一采样函数。
 
 手模板保存 float32 `points[N,3]`，按 `part_names` 和整数 `part_offsets` 对应 URDF link。`hand_geometry()` 接收 EEF 变换 `[T,4,4]` 与 SDK 顺序的手关节 `[T,12]`，通过批量 FK 返回所选的指尖 `[T,5,3]` 和表面点 `[T,N,3]`；导出、部署和可视化共用此接口，保留模板点序与分段。
 
@@ -14,7 +14,7 @@ HOI（Hand–Object Interaction，手物交互）观测用手部与物体点云�
 
 任务模板保存 `points_local`、`object_names` 和 `offsets`。部署与离线标注共用任务解析，核对模板和 `task.json` 的对象集合，按模板顺序匹配网格和 prompt。
 
-通用场景点云在过滤后无有效点时返回 float32 `[0,6]`；非空但不足目标点数时循环重复已有 XYZRGB，超过目标点数时执行 FPS。重复填充仅满足输出形状，不增加真实几何信息。
+通用场景点云在过滤后无有效点时返回 float32 `[0,6]`。非空但不足目标点数时循环重复已有行，等于目标点数时按原顺序输出，超过时按 XYZ 执行 FPS，颜色随源点同行。场景和模板共用 CPU QuickFPS。遇到重复源索引时保留首次出现的顺序，再用未选行补足。
 
 ## 实验流程
 
