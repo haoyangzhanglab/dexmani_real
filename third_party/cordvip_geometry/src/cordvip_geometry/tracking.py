@@ -36,7 +36,7 @@ class TrackingConfig:
     min_precision: float = 0.5
     min_recall: float = 0.5
 
-    segmentation_interval_frames: int = 5
+    segmentation_interval_frames: int = 10  # 活动物体的低频周期校正。
     occlusion_timeout_s: float = 0.5
     max_translation_speed_m_s: float | None = None
     max_rotation_speed_rad_s: float | None = None
@@ -397,7 +397,7 @@ class SceneTracker:
             )
         return matches[0]["box_xyxy"]
 
-    def _pose_geometry(self, name, pose, reference, dt):
+    def _pose_geometry(self, name, pose, K, reference, dt):
         """检查候选刚体位姿，生成与当前 Mask 无关的几何证据。"""
         if np.shape(pose) != (4, 4) or not np.isfinite(pose).all():
             raise TrackingFailure("FoundationPose returned nonfinite/invalid pose")
@@ -417,10 +417,8 @@ class SceneTracker:
             raise TrackingFailure(
                 "FoundationPose centered pose must be in front of the camera"
             )
-        rendered = (
-            self.renderers[name]
-            .render(self.directions.reshape(-1, 3), pose)
-            .reshape(self.directions.shape[:2])
+        rendered = self.renderers[name].render_roi(
+            self.directions, pose, K, PIXEL_STRIDE, 2 * PIXEL_STRIDE
         )
         if reference is None:
             motion = {
@@ -463,7 +461,6 @@ class SceneTracker:
         ]
         candidates: dict[str, np.ndarray] = {}
         verdicts = dict.fromkeys(self.trackers, "LOST")
-        registered = set()
         pose_checks = {}
         grid = np.s_[::PIXEL_STRIDE, ::PIXEL_STRIDE]
         sampled = depth_m[grid]
@@ -503,11 +500,11 @@ class SceneTracker:
                 if name in confirming:
                     reference = self.pending_pose[name][0]
                     dt = self.frame_dt_s
-                elif name in self.last_pose and name not in registered:
+                elif name in self.last_pose and name not in due:
                     reference = self.last_pose[name]
                     dt = (self.timestamp_ns - self.last_pose_ns[name]) / 1e9
                 # Mask 更新后仅重算可见证据，复用同一候选的位姿检查和渲染。
-                pose_checks[name] = self._pose_geometry(name, pose, reference, dt)
+                pose_checks[name] = self._pose_geometry(name, pose, K, reference, dt)
             rendered, motion, continuous = pose_checks[name]
             if mask is None:
                 metrics, verdict = pose_depth_quality(sampled, rendered, self.config)
@@ -553,7 +550,6 @@ class SceneTracker:
                 if np.count_nonzero(valid) < self.config.min_depth_pixels:
                     raise TrackingFailure("insufficient segmented depth")
                 pose = self.trackers[name].register(rgb, depth_m, K, mask)
-                registered.add(name)
                 if evaluate(name, pose, mask) != "VALID":
                     return False
             except TrackingFailure as error:
@@ -571,9 +567,12 @@ class SceneTracker:
                     tracker.estimator.pose_last = self.pending_pose[name][1]
             candidates = track_objects(active, rgb, depth_m, K, self.frame_cache)
             check_candidates()
-            if masks is None and any(verdicts[name] != "VALID" for name in candidates):
+            if masks is None and any(
+                continuous and verdicts[name] != "VALID"
+                for name, (_, _, continuous) in pose_checks.items()
+            ):
                 masks = self._refresh_masks(rgb)
-                # 更近的深度先触发当前 Mask，再决定它是否属于前景遮挡。
+                # 用当前轮廓区分前景遮挡与位姿不一致。
                 check_candidates()
 
         if due:
@@ -610,7 +609,7 @@ class SceneTracker:
         for name, tracker in self.trackers.items():
             state = self.states[name]
             verdict = verdicts[name]
-            if state == "LOST" and name in registered and verdict == "VALID":
+            if name in due and verdict == "VALID":
                 self.pending_pose[name] = (
                     candidates[name],
                     tracker.estimator.pose_last,

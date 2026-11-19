@@ -44,17 +44,17 @@ python scripts/export_zarr.py /data/episodes/pick --fields joint_state action ha
 
 在 dexmani_policy 中训练后，用 `python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick` 部署。
 
-标注输入也可直接指定单个 Episode，如 `/data/episodes/pick/episode_001`。目录输入只处理其直接包含的 `episode_*` 子目录。标注读取 Raw 内的 RGB-D、深度单位与相机外参。活动对象的 SAM2 周期刷新间隔在线和离线均默认为 5 个处理帧。离线可用 `--segmentation-interval-frames` 调整，设为 1 时逐帧分割。Python 入口 `annotate_episodes(..., tracking_config=..., overwrite=True)` 可调整同一套配置。见[后端安装、接口与分割规则](../third_party/cordvip_geometry/README.md)。
+标注输入也可直接指定单个 Episode，如 `/data/episodes/pick/episode_001`。目录输入只处理其直接包含的 `episode_*` 子目录。标注读取 Raw 内的 RGB-D、深度单位与相机外参。离线可用 `--segmentation-interval-frames` 或 Python 入口 `annotate_episodes(..., tracking_config=...)` 调整 SAM2 周期，设为 1 时活动对象每个处理帧都刷新。见[后端分割规则](../third_party/cordvip_geometry/README.md#事件触发分割)。
 
 ## 跟踪与时间对齐
 
-在线 worker 加载并预热模型后宣告就绪。每段首帧对 RGB-D 去畸变，经 Grounding DINO、SAM2 和 FoundationPose 注册得到初始位姿。每个 `prompt` 须匹配唯一候选，参考图的 `instance` 只用于资产准备。后续对活动对象合批 refinement，用 CAD 和实测深度验证候选。有当前帧的 SAM2 Mask 时，同时检查可见轮廓。见[后端质量规则](../third_party/cordvip_geometry/README.md#质量检查)。
+在线 worker 加载并预热模型后宣告就绪。每段首帧对 RGB-D 去畸变，经 Grounding DINO、SAM2 和 FoundationPose 注册得到初始位姿。每个 `prompt` 须匹配唯一候选，参考图的 `instance` 只用于资产准备。后续对活动对象合批 refinement，在 CAD 投影区域渲染深度并验证候选。有当前帧的 SAM2 Mask 时，同时检查可见轮廓。见[后端质量规则](../third_party/cordvip_geometry/README.md#质量检查)。
 
 当前按非对称物体跟踪；对称物体的旋转歧义见 [Object Symmetry](../third_party/cordvip_geometry/README.md#object-symmetry)。
 
-模型跨段复用，初始化重置视频、位姿和相机缓存，段内相机参数及图像尺寸固定。在线、离线共用 SceneTracker，帧输入必须包含真实相机时间和来源序列；重复序列复用结果，跳帧不补造 SAM2 图像。
+模型跨段复用，初始化重置视频、位姿和相机缓存，段内相机参数及图像尺寸固定。在线和离线共用 `SceneTracker`，SAM2 默认每 10 个处理帧进行一次周期校正。通过位姿和运动检查的候选若在无当前 Mask 时深度验证失败，会触发同帧分割复查。帧输入必须包含真实相机时间和来源序列。在线跳过已处理的序列，离线同序列的行复用对应相机帧的结果。跳过的来源帧不补造 SAM2 图像。
 
-对象独立维护 TRACKING、OCCLUDED、LOST。证据不足时保留可靠内部位姿继续 Track，但当前观测无效；明确矛盾或遮挡超时才进入 LOST。恢复经过检测、分割、注册及下一处理帧的再次验证，两帧可信后才发布有效位姿。初始化因观测证据不满足要求而失败时，在后续新观测重试。状态和配置见[后端说明](../third_party/cordvip_geometry/README.md#遮挡恢复)。
+对象独立维护 TRACKING、OCCLUDED、LOST。证据不足时保留可靠内部位姿继续跟踪，当前帧标为无效。明确几何矛盾、位姿检查失败或遮挡超时会进入 LOST。恢复经过检测、分割、注册及下一处理帧的再次验证，两帧可信后才发布有效位姿。初始化因观测证据不满足要求而失败时，在后续新观测重试。状态和配置见[后端说明](../third_party/cordvip_geometry/README.md#遮挡恢复)。
 
 检测、分割、注册和跟踪的后端异常直接传播，不转为无效观测，也不在合批失败后逐对象重跑。在线 Worker 因此退出，由会话现有故障路径停止设备并收尾；离线标注立即报错，已有完整 `hoi.h5` 保留。
 

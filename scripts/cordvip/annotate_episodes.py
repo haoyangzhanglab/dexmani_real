@@ -130,6 +130,7 @@ def main(argv=None):
         "--segmentation-interval-frames",
         type=int,
         default=TrackingConfig().segmentation_interval_frames,
+        help="活动跟踪的 SAM2 周期校正间隔，以处理帧计（默认 %(default)s）",
     )
     args = parser.parse_args(argv)
     annotate_episodes(

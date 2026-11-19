@@ -1,6 +1,7 @@
 """网格读取、米制尺度调整与射线深度。"""
 
 import logging
+from itertools import product
 
 import numpy as np
 
@@ -94,6 +95,7 @@ class MeshRaycaster:
         import open3d as o3d
 
         vertices = np.asarray(mesh.vertices, dtype=np.float32)
+        self._bounds_corners = np.array(list(product(*mesh.bounds.T)))
         self._tensor = o3d.core.Tensor
         self._scene = o3d.t.geometry.RaycastingScene(nthreads=1)
         self._scene.add_triangles(
@@ -102,10 +104,40 @@ class MeshRaycaster:
         )
 
     def render(self, directions, pose):
+        """返回射线网格对应的相机深度。"""
         rotation, translation = pose[:3, :3], pose[:3, 3]
-        rays = np.empty((len(directions), 6), dtype=np.float32)
-        rays[:, :3] = -translation @ rotation
-        rays[:, 3:] = directions @ rotation
+        rays = np.empty((*directions.shape[:-1], 6), dtype=np.float32)
+        rays[..., :3] = -translation @ rotation
+        rays[..., 3:] = directions @ rotation
         # 不归一化方向；刚体变换后的 t_hit 仍是相机 Z，而非欧氏距离。
         hits = self._scene.cast_rays(self._tensor(rays), nthreads=1)["t_hit"].numpy()
         return np.where(np.isfinite(hits) & (hits > 0), hits, 0)
+
+    def render_roi(self, directions, pose, intrinsics, pixel_stride, margin_pixels):
+        """仅渲染 CAD 投影覆盖的射线，返回完整采样网格。"""
+        rotation, translation = pose[:3, :3], pose[:3, 3]
+        # 求逆与 render 的射线变换对应，包括带有浮点误差的旋转矩阵。
+        corners = np.linalg.solve(rotation.T, self._bounds_corners.T).T + translation
+        x, y, z = corners.T
+        shape = directions.shape[:2]
+        behind = z < 0.001
+        if behind.any():
+            if behind.all():
+                return np.zeros(shape, dtype=np.float32)
+            return self.render(directions, pose)
+
+        u = intrinsics[0, 0] * x / z + intrinsics[0, 2]
+        v = intrinsics[1, 1] * y / z + intrinsics[1, 2]
+        col_start = max(0, int(np.ceil((u.min() - margin_pixels) / pixel_stride)))
+        col_stop = min(
+            shape[1], int(np.floor((u.max() + margin_pixels) / pixel_stride)) + 1
+        )
+        row_start = max(0, int(np.ceil((v.min() - margin_pixels) / pixel_stride)))
+        row_stop = min(
+            shape[0], int(np.floor((v.max() + margin_pixels) / pixel_stride)) + 1
+        )
+        rendered = np.zeros(shape, dtype=np.float32)
+        if row_start < row_stop and col_start < col_stop:
+            roi = np.s_[row_start:row_stop, col_start:col_stop]
+            rendered[roi] = self.render(directions[roi], pose)
+        return rendered

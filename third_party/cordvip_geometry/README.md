@@ -94,15 +94,17 @@ if result.valid["apple"]:
 | `min_depth_coverage` | 0.5 | 检查区域的最低有效深度覆盖率 |
 | `min_precision`、`min_recall` | 0.5 | 可见轮廓的最低一致性 |
 
-TRACKING 和 OCCLUDED 对象先合批执行 FoundationPose，再验证候选。注册需要 Mask 深度生成平移初值；正常 Track 不以 Mask 深度预检。
+TRACKING 和 OCCLUDED 对象先合批执行 FoundationPose，再验证候选。注册用 Mask 深度生成平移初值。正常跟踪可用实测深度直接验证候选。
 
-每个候选的 SE(3)、运动连续性和 CAD 渲染只计算一次。相机射线、实测深度、SAM2 Mask 和渲染深度在质量检查中共用 stride=4 的像素网格，640×480 图像对应 160×120 条射线。Mask 更新或校正后，复用 CAD 深度重算当前可见证据。有 Mask 时使用 `pose_quality()`：仅 Mask 外更近、超出容差的有效深度支持前景遮挡，缺失深度不算遮挡。无 Mask 时使用 `pose_depth_quality()`，双向深度残差均计为不匹配。
+每个候选的 SE(3)、运动连续性和 CAD 渲染只计算一次。相机射线、实测深度、SAM2 Mask 和渲染深度共用 stride=4 的像素网格，640×480 图像对应 160×120 个采样位置。`MeshRaycaster` 将 CAD 局部包围盒的 8 个角点投影到图像，扩展 8 像素余量后裁剪到网格，只渲染区域内的射线。深度回填到完整网格，区域外为零。包围盒跨越 1 mm 近平面时使用全图，完全位于近平面后方时返回全零。
+
+Mask 更新或校正后复用 CAD 深度。`pose_quality()` 用 Mask 外更近且超出容差的有效深度识别前景遮挡。无当前 Mask 时使用 `pose_depth_quality()`，按有效深度与 CAD 深度的绝对差是否超过容差判断匹配。
 
 两个质量函数均返回 `(metrics, verdict)`：
 
 | `verdict` | 判据 |
 | --- | --- |
-| VALID | 匹配点数、比例、覆盖率和可见轮廓均通过 |
+| VALID | 深度支持和匹配满足阈值，有当前 Mask 时可见轮廓也须通过 |
 | OCCLUDED | 证据不足，且没有充分支持的几何矛盾 |
 | LOST | 有充分支持的深度或轮廓矛盾 |
 
@@ -134,7 +136,9 @@ FoundationPose 输出须为有限 `[4,4]` 位姿，齐次末行容差为 `1e-6`�
 
 ## 事件触发分割
 
-SAM2 在初始化、周期到期、候选深度质量不通过、恢复注册或恢复确认时共享刷新，同帧图像只追加一次。默认 `segmentation_interval_frames=5`，活动对象每五个处理帧周期刷新一次，设为 1 时逐帧分割。全部对象 LOST 时，等待恢复到期再刷新。DINO 仅用于初始化和到期 LOST 对象的重新检测。
+首帧用 Grounding DINO 检测框初始化 SAM2 视频状态。后续帧在 LOST 重检到期、恢复确认或周期到期时刷新。若当前帧尚无 Mask，通过位姿和运动检查的候选在纯深度验证失败时也会触发刷新，并用当前 Mask 复查。各对象共享同帧结果，每个来源帧最多追加一次图像。
+
+默认 `segmentation_interval_frames=10`，活动对象距上次 SAM2 输入满 10 个处理帧时进行周期校正。事件刷新后重新计数，设为 1 时每个活动处理帧都刷新。全部对象 LOST 且无待确认恢复时，分割随到期重检触发。
 
 `RGBDFrame` 必须携带真实的 `source_sequence` 和 `timestamp_ns`。`from_camera(camera, row, source_sequence=...)` 从相机行读取时间；在线来源为 Camera Ring，离线来源为 Raw timing。三种计数分别是：
 
@@ -160,7 +164,7 @@ SAM2 在初始化、周期到期、候选深度质量不通过、恢复注册或
 | `recovery_retry_interval_frames` | `15` 个处理帧 |
 | `recovery_box_threshold`、`recovery_text_threshold` | `0.3`、`0.25` |
 
-到期对象共享 DINO 检测，按规范化 Prompt 唯一匹配，经 SAM2 分割、FoundationPose 注册和质量检查后，用原 ID 的 `correct_masks()` 校正。合并 Mask 后复查全部当前候选，健康对象独立保留。
+到期对象共享 DINO 检测，按规范化 Prompt 唯一匹配，经 SAM2 单图分割、FoundationPose 注册和质量检查后，用 `correct_masks()` 校正当前视频帧的原对象 ID。合并 Mask 后复查全部当前候选，各对象按复查结果独立提交或回滚。
 
 恢复需要两帧确认。首次通过后保存 Pending 位姿，保持 LOST；下一处理帧以 Pending 为临时初值，与健康对象合批 Track，再次通过后才提交 TRACKING。Pending 失败则清理并保留原重试间隔。所有不可信候选均回滚到最后可靠内部位姿，历史位姿和 Pending 不作为当前有效观测发布。
 
@@ -174,7 +178,7 @@ SAM2 在初始化、周期到期、候选深度质量不通过、恢复注册或
 
 SAM2 流式前处理使用 1024 输入和 LANCZOS 缩放，上传 uint8 图像后查表获得 float32 输入，保持 float64 归一化后转 float32 的数值结果。[SAM2 补丁](scripts/sam2_inference.patch) 保留多尺度图像特征，仅计算 memory attention 所需的最终层位置编码。
 
-FoundationPose 后续帧复用图像缓冲、相机投影矩阵及采样网格常量，共享深度预处理。位姿保留在 GPU，从上一帧位姿开始更新。各物体独立渲染，观测裁剪与归一化合批执行。两轮 refinement 后，在固定像素网格上渲染各物体的 CAD 深度，按当前 Mask 是否可用执行轮廓与深度检查或纯深度检查。
+FoundationPose 后续帧复用图像缓冲、相机投影矩阵及采样网格常量，共享深度预处理。内部位姿保留在 GPU，各物体独立渲染，观测裁剪与归一化合批执行两轮 refinement。
 
 RGB 与几何输入共用采样网格：refine 直接裁剪 XYZ，score 从裁剪深度重建 XYZ。跟踪使用 PyTorch 原生 CUDA 卷积；注册和跟踪的 cuDNN 设置仅在调用内生效。批量大小会影响浮点结果，近对称物体的旋转可能不稳定。
 
