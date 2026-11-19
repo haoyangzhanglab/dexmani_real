@@ -1,20 +1,11 @@
-import sys
-from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import pytest
+import trimesh
+from cordvip_geometry.camera import camera_rays
+from cordvip_geometry.mesh import MeshRaycaster
 from scipy.spatial.transform import Rotation
-
-trimesh = pytest.importorskip("trimesh")
-pytest.importorskip("open3d")
-
-GEOMETRY_SOURCE = (
-    Path(__file__).resolve().parents[1] / "third_party/cordvip_geometry/src"
-)
-with patch.object(sys, "path", [str(GEOMETRY_SOURCE), *sys.path]):
-    from cordvip_geometry.camera import camera_rays
-    from cordvip_geometry.mesh import MeshRaycaster
 
 PIXEL_STRIDE = 4
 IMAGE_SHAPE = (480, 640)

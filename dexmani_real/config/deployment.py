@@ -12,7 +12,7 @@ DEFAULT_MAX_DURATION_S = 60.0
 class ExecutionConfig:
     # 未指定时使用 checkpoint 保存的控制周期。
     control_dt_s: float | None = None
-    # async/RTC 可继续旧预测尾部；action_steps 是名义窗口，RTC 按提交进度接续。
+    # action_steps 限制每次执行的步数，预测全长决定可提交窗口。
     # None 使用 checkpoint n_action_steps；显式值仍须满足模型约束。
     action_steps: int | None = None
     mode: str = "sync"

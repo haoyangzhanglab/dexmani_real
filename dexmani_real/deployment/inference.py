@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, cast
 if TYPE_CHECKING:
     from dexmani_policy.deployment import PolicyRuntime
 
+POLICY_STARTUP_TIMEOUT_S = 120.0
 MODEL_SHUTDOWN_TIMEOUT_S = 5.0
 logger = logging.getLogger(__name__)
 

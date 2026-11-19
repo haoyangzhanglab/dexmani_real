@@ -50,11 +50,7 @@ class CommandExpired(OperationCancelled):
 
 
 class HandCommandUnconfirmed(OperationCancelled):
-    """XHand 收到 CRC 回复，普通动作的送达结果未知。"""
-
-    def __init__(self, consecutive_crc: int, *, persistent: bool):
-        self.persistent = persistent
-        super().__init__(f"XHand position delivery unconfirmed after {consecutive_crc} consecutive write CRC replies")
+    """普通 XHand 动作未在期限内得到确认。"""
 
 
 class HandTargetRejected(ValueError):

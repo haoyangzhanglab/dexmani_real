@@ -65,7 +65,6 @@ PASSIVE_MODE = 0
 POSITION_MODE = 3
 RELEASE_TIMEOUT_S = 0.25
 HOLD_FEEDBACK_MAX_AGE_S = 4 / 30
-MAX_CONSECUTIVE_WRITE_CRC = 5
 
 
 def _valid_tactile_modalities(code: int) -> tuple[bool, bool]:
@@ -488,31 +487,32 @@ class XHand:
 
     def send_action(self, target: np.ndarray, *, deadline_ns: int, check_abort) -> None:
         """仅对 CRC 重发同一绝对目标，且受命令和反馈期限约束。"""
-        previous_crc = self.crc_counts["write_errors"]
-        confirmed = False
+        previous_crc = self.consecutive_write_crc
+        sdk_confirmed = False
         try:
             code = self.send_position(
                 target, tor_max=self.cfg.tor_max,
-                deadline_ns=deadline_ns, check_abort=check_abort, stop_on_persistent_crc=True,
+                deadline_ns=deadline_ns, check_abort=check_abort,
             )
-            confirmed = code == 0
-            if confirmed:
+            sdk_confirmed = code == 0
+            if sdk_confirmed:
+                if time.monotonic_ns() >= deadline_ns:
+                    raise HandCommandUnconfirmed(
+                        "XHand SDK success reply arrived at or after the hand submission deadline"
+                    )
                 return
             if code == OVERCURRENT_WARNING_CODE:
                 raise XHandError("send", code, "overcurrent warning; position submission not confirmed")
-            if self.crc_counts["write_errors"] == previous_crc:
+            if self.consecutive_write_crc == previous_crc:
                 raise CommandExpired("XHand command expired before SDK submission")
             raise HandCommandUnconfirmed(
-                self.consecutive_write_crc,
-                persistent=self.consecutive_write_crc >= MAX_CONSECUTIVE_WRITE_CRC,
+                f"XHand position delivery unconfirmed after {self.consecutive_write_crc} consecutive write CRC replies"
             )
         finally:
-            if not confirmed and self.crc_counts["write_errors"] > previous_crc:
+            if not sdk_confirmed and self.consecutive_write_crc > previous_crc:
                 self.crc_counts["unconfirmed_actions"] += 1
 
-    def _send_with_crc_retry(
-        self, prepare, *, deadline_ns: int, check_abort=None, stop_on_persistent_crc: bool = False,
-    ) -> int | None:
+    def _send_with_crc_retry(self, prepare, *, deadline_ns: int, check_abort=None) -> int | None:
         interval_s = self.cfg.crc_retry_interval_s
         for attempt in range(self.cfg.crc_retries + 1):
             if attempt:
@@ -530,13 +530,10 @@ class XHand:
             code = self._send_command()
             if code != COMMUNICATION_CRC_ERROR_CODE:
                 return code
-            if stop_on_persistent_crc and self.consecutive_write_crc >= MAX_CONSECUTIVE_WRITE_CRC:
-                break
         return None
 
     def send_position(
         self, target: np.ndarray, *, deadline_ns: int, check_abort=None, tor_max=None,
-        stop_on_persistent_crc: bool = False,
     ) -> int | None:
         """受限重试同一位置命令，保留 SDK 成功码或过流告警码。"""
         if self.control is None or self.command is None or not self.connected_flag:
@@ -552,9 +549,7 @@ class XHand:
                 joint.mode = POSITION_MODE
                 joint.position = float(value)
 
-        return self._send_with_crc_retry(
-            prepare, deadline_ns=deadline_ns, check_abort=check_abort, stop_on_persistent_crc=stop_on_persistent_crc,
-        )
+        return self._send_with_crc_retry(prepare, deadline_ns=deadline_ns, check_abort=check_abort)
 
     @property
     def hold_feedback_max_age_s(self) -> float:

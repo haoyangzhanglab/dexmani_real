@@ -116,10 +116,11 @@ class XArm7:
         check_sdk_return_code(self.api.set_state(0), "set_state(0) after Mode 1")
         check_abort()
         if not self._motion_configured:
-            check_sdk_return_code(
-                self.api.set_collision_sensitivity(self.cfg.collision_sensitivity),
-                "set_collision_sensitivity",
-            )
+            sensitivity = self.cfg.collision_sensitivity
+            if sensitivity is not None:
+                check_sdk_return_code(
+                    self.api.set_collision_sensitivity(sensitivity), "set_collision_sensitivity",
+                )
             check_abort()
             check_sdk_return_code(
                 self.api.set_tcp_load(

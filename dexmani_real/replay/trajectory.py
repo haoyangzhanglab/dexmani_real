@@ -1,4 +1,4 @@
-"""校验当前 Raw 时间与动作契约，读取尝试提交的绝对关节目标。"""
+"""校验 Raw 时间与动作契约，读取已确认提交的绝对关节目标。"""
 
 from __future__ import annotations
 
@@ -52,6 +52,7 @@ def load_trajectory(episode_path: str | Path, runtime: RealConfig, *, segment: i
             )
             raise ValueError(f"select one continuous segment with --segment (zero-based): {choices}")
         start, end = int(starts[segment]), int(ends[segment])
+        reader.require_confirmed_actions(start, end)
         hz = reader.control_hz
         validate_xhand_target_rate(hz)
         # RawReader 检查绝对目标语义、关节顺序、单位及行形状。

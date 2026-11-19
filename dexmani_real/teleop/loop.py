@@ -464,7 +464,6 @@ class TeleopLoop:
         episode_cancel_epoch = self.episode_cancel_epoch
         command = None
         action_accepted = False
-        command_unconfirmed = False
         compute_start_ns = time.monotonic_ns()
         first_target = self.target_deadline_ns is None
         initializing_anchor = self.controller.anchor is None
@@ -519,16 +518,8 @@ class TeleopLoop:
             self.request_episode_end(str(exc))
         except IKReferenceError as exc:
             self.request_episode_end(str(exc))
-        except (FeedbackUnavailable, CommandExpired) as exc:
+        except (FeedbackUnavailable, CommandExpired, HandCommandUnconfirmed) as exc:
             self.request_episode_end(str(exc))
-        except HandCommandUnconfirmed as exc:
-            command_unconfirmed = True
-            if exc.persistent:
-                self.request_episode_end(str(exc))
-            else:
-                # 未确认写入可能已移动手指，禁止重发上一次确认的手部命令。
-                self.controller.hand_retargeter.clear_reference()
-                self.last_command = None
         except OperationCancelled as exc:
             # 先检查 SDK/worker 故障，再即时登记已入队的终止意图。
             interrupted = self.poll_blocking_commands()
@@ -542,8 +533,6 @@ class TeleopLoop:
                 try:
                     # 仅真实提交尝试生成动作行，包含抛错前可能已发生的部分提交。
                     issue = self.recorder.append(row, command, action_accepted=action_accepted)
-                    if command_unconfirmed:
-                        self.recorder.mark_gap()
                     if issue is not None:
                         self.request_episode_end(issue)
                 except BaseException as exc:

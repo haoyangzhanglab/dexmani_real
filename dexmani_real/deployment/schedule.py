@@ -1,4 +1,4 @@
-"""普通 async 的时间窗口，以及异步请求快照。"""
+"""预测请求、动作窗口与控制槽。"""
 
 from dataclasses import dataclass
 
@@ -8,7 +8,9 @@ import numpy as np
 @dataclass
 class Prediction:
     slot: int
-    handoff_slot: int | None
+    observation_ns: int
+    handoff_slot: int
+    deadline_ns: int
     result: np.ndarray | None = None
     request_cursor: int = 0
 
@@ -16,21 +18,8 @@ class Prediction:
 @dataclass
 class ActionChunk:
     actions: np.ndarray
-    anchor_slot: int
-
-
-def handoff_plan(query: Prediction | None, *, slot: int) -> ActionChunk | None:
-    if query is None or query.result is None:
-        return None
-    if query.handoff_slot is not None and slot < query.handoff_slot:
-        return None
-    offset = slot - query.slot
-    return ActionChunk(query.result[offset:], slot)
-
-
-def prefetch_handoff(plan, *, slot, action_steps, prefetch_steps):
-    end = plan.anchor_slot + min(action_steps, len(plan.actions))
-    return end if slot >= end - prefetch_steps else None
+    anchor_slot: int  # async 切片首步的槽号，截止仍取原预测。
+    prediction: Prediction
 
 
 def control_slot(*, now_ns, next_step_ns, last_slot, dt_ns):
@@ -39,7 +28,3 @@ def control_slot(*, now_ns, next_step_ns, last_slot, dt_ns):
     skipped = (now_ns - next_step_ns) // dt_ns
     slot = last_slot + 1 + skipped
     return slot, skipped
-
-
-def plan_exhausted(plan, slot):
-    return slot >= plan.anchor_slot + len(plan.actions)

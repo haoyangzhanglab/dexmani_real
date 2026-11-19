@@ -69,9 +69,6 @@ class VRController:
         hand = None
         retargeter = self.hand_retargeter
         if retargeter is not None:
-            if retargeter.reference is None:
-                # 控制循环已等到写入未确认后的首次有效关节查询。
-                retargeter.reset(row.hand["qpos"][0], timestamp_ns=int(row.hand["timestamp_ns"][0]))
             hand = retargeter.retarget(row.vr["landmarks"], timestamp_ns=control_ns)
             if hand is None:
                 # 无 arm 求解时仍检查参考，禁止失配目标进入普通重发。

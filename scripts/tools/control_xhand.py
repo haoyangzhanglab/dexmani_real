@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""连接 XHand1，顺序执行 HOME → fist → palm → V → OK → HOME，到位后各停留 1 秒。"""
+"""连接 XHand1 并读取设备状态。默认执行 HOME → fist → palm → V → OK → HOME，到位后各停留 1 秒。"""
 
 from __future__ import annotations
 
@@ -276,7 +276,13 @@ def main(argv: list[str] | None = None) -> int:
         "--finger-id", type=int, choices=range(HAND_DOF), default=5,
         help="显示指定 SDK 关节的触觉；带传感器的关节为 2、5、7、9、11",
     )
-    parser.add_argument("--read-only", action="store_true", help="只读取设备与状态，不发送姿态或停止命令")
+    parser.add_argument(
+        "--read-only", action="store_true",
+        help=(
+            "不发送诊断运动目标，但仍会连接和断开设备。"
+            "特定 EtherCAT 配置在断开时可能请求固件状态切换。"
+        ),
+    )
     parser.add_argument(
         "--print-config", action="store_true", help="打印手部配置，不连接硬件"
     )

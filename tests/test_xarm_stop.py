@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import numpy as np
 import pytest
@@ -12,6 +12,55 @@ from dexmani_real.robot.xarm7 import process, worker
 from dexmani_real.robot.xarm7.driver import XArm7
 from dexmani_real.robot.xarm7.protocol import STANDSTILL_DWELL_S
 from dexmani_real.runtime.state import SessionState
+
+
+@pytest.fixture
+def motion_sdk():
+    sdk = Mock()
+    sdk.get_err_warn_code.return_value = 0, (0, 0)
+    sdk.motion_enable.return_value = 0
+    sdk.set_mode.return_value = 0
+    sdk.set_state.return_value = 0
+    sdk.set_collision_sensitivity.return_value = 0
+    sdk.set_tcp_load.return_value = 0
+    sdk.set_joint_maxacc.return_value = 0
+    return sdk
+
+
+@pytest.mark.parametrize("sensitivity", [None, 0, 3])
+def test_arm_motion_preparation_applies_only_configured_collision_setting(motion_sdk, sensitivity):
+    cfg = ArmConfig() if sensitivity is None else ArmConfig(collision_sensitivity=sensitivity)
+    assert cfg.collision_sensitivity == sensitivity
+    cfg.validate()
+    driver = XArm7(cfg)
+    driver.api = motion_sdk
+
+    driver.prepare_motion(check_abort=Mock())
+
+    collision_call = [] if sensitivity is None else [call.set_collision_sensitivity(sensitivity)]
+    assert motion_sdk.mock_calls == [
+        call.get_err_warn_code(),
+        call.motion_enable(True),
+        call.set_mode(1),
+        call.set_state(0),
+        *collision_call,
+        call.set_tcp_load(weight=cfg.tcp_load_mass_kg, center_of_gravity=list(cfg.tcp_load_cog_mm)),
+        call.set_joint_maxacc(cfg.max_joint_acceleration_rad_per_s2, is_radian=True),
+    ]
+    assert driver._motion_configured
+
+
+def test_arm_motion_preparation_propagates_collision_setting_failure(motion_sdk):
+    driver = XArm7(ArmConfig(collision_sensitivity=3))
+    driver.api = motion_sdk
+    motion_sdk.set_collision_sensitivity.return_value = 13
+
+    with pytest.raises(RuntimeError, match="set_collision_sensitivity failed with SDK code 13"):
+        driver.prepare_motion(check_abort=Mock())
+
+    motion_sdk.set_tcp_load.assert_not_called()
+    motion_sdk.set_joint_maxacc.assert_not_called()
+    assert not driver._motion_configured
 
 
 @pytest.fixture

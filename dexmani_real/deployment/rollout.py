@@ -15,13 +15,11 @@ import numpy as np
 from dexmani_real.control.ik import IKReferenceError
 from dexmani_real.data.raw import episode_recording_metadata
 from dexmani_real.data.recorder import EpisodeRecorder, RecordingError
+from dexmani_real.deployment.inference import POLICY_STARTUP_TIMEOUT_S
 from dexmani_real.deployment.schedule import (
     ActionChunk,
     Prediction,
     control_slot,
-    handoff_plan,
-    plan_exhausted,
-    prefetch_handoff,
 )
 from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
 from dexmani_real.ipc.sensors import read_camera_frame
@@ -309,7 +307,7 @@ class Rollout:
                 (self.observations.project(row),) * self.policy_info.n_obs_steps,
                 **kwargs,
             )
-            warmup_deadline = time.monotonic() + 120
+            warmup_deadline = time.monotonic() + POLICY_STARTUP_TIMEOUT_S
             while self.model.future is not None:
                 if time.monotonic() >= warmup_deadline:
                     raise TimeoutError("HOI policy warmup timeout")
@@ -376,13 +374,9 @@ class Rollout:
         if self.reset_pending:
             # 传递旧预测的异常，只丢弃成功返回的旧动作。
             return
-        if self.execution.mode == "sync":
-            self.plan = ActionChunk(actions, 0)
-            self.cursor = 0
-        else:
-            cast(Prediction, self.query).result = actions
+        cast(Prediction, self.query).result = actions
 
-    def _submit_prediction(self, slot: int, *, handoff_slot=None, prefix=None) -> None:
+    def _submit_prediction(self, slot: int, observation_ns: int, *, handoff_slot=None, prefix=None) -> None:
         kwargs = {} if prefix is None else {
             "rtc_prefix": prefix,
             "delay_steps": min(self.execution.prefetch_steps, len(prefix)),
@@ -391,11 +385,22 @@ class Rollout:
         if self.policy_info.requires_prev_action:
             kwargs["prev_action"] = self.prev_action
         rows = tuple(self.history)
+        # sync 和无前缀 RTC 的首动作在下一槽。从原采样时刻和原槽起算，采用较早的截止。
+        first_action_offset = int(self.execution.mode != "async" and prefix is None)
+        request_slot_ns = self.started_ns + slot * self.dt_ns
+        deadline_ns = min(observation_ns, request_slot_ns) + (
+            first_action_offset + self.policy_info.future_steps
+        ) * self.dt_ns
         self.check_motion()
         self.model.predict(rows, reset_episode=self.reset_pending, **kwargs)
         self.reset_pending = False
-        if self.execution.mode != "sync":
-            self.query = Prediction(slot, handoff_slot, request_cursor=self.cursor)
+        self.query = Prediction(
+            slot=slot,
+            observation_ns=observation_ns,
+            handoff_slot=slot + first_action_offset if handoff_slot is None else handoff_slot,
+            deadline_ns=deadline_ns,
+            request_cursor=self.cursor,
+        )
 
     def map_command(self, action, row):
         mode = self.policy_info.action_mode
@@ -414,47 +419,64 @@ class Rollout:
             return None, f"action_rejected: {decoded.rejection_reason}"
         return RobotCommand(decoded.arm_qpos, decoded.hand_qpos), None
 
-    def select_action(self, slot: int) -> np.ndarray | None:
-        mode = self.execution.mode
-        if mode == "rtc":
-            query = self.query
-            window = min(self.execution.action_steps, len(self.plan.actions)) if self.plan is not None else 0
-            if query is not None and query.result is not None and self.cursor >= window:
-                actions = query.result[self.cursor - query.request_cursor:]
-                self.query = None
-                if not len(actions):
-                    self.stop("prediction exhausted")
-                    return None
-                self.plan = ActionChunk(actions, 0)
-                self.cursor = 0
-        elif mode == "async":
-            new_plan = handoff_plan(self.query, slot=slot)
-            if new_plan is not None:
-                self.plan, self.query = new_plan, None
+    def _adopt_prediction(self, slot: int, now_ns: int) -> None:
+        query = self.query
+        if (
+            query is None or query.result is None
+            or slot < query.handoff_slot or now_ns >= query.deadline_ns
+        ):
+            return
+        mode, plan = self.execution.mode, self.plan
+        if mode == "async":
+            offset = slot - query.slot
+        elif mode == "rtc":
+            if (plan is not None and now_ns < plan.prediction.deadline_ns
+                    and self.cursor < min(self.execution.action_steps, len(plan.actions))):
+                return
+            offset = self.cursor - query.request_cursor
+        else:
+            offset = 0
+        self.plan = ActionChunk(query.result[offset:], slot, query)
+        self.query = None
+        self.cursor = 0
+
+    def _expire_plan(self, now_ns: int) -> bool:
         plan = self.plan
+        if plan is None or now_ns < plan.prediction.deadline_ns:
+            return False
+        # 保留仍有效的接续，并让下一控制槽选动作。
+        self.poll_model()
+        self._adopt_prediction((now_ns - self.started_ns) // self.dt_ns, now_ns)
+        if self.plan is plan:
+            self.stop("prediction_expired")
+        return True
+
+    def select_action(self, slot: int, observation_ns: int) -> np.ndarray | None:
+        now = time.monotonic_ns()
+        self._adopt_prediction(slot, now)
+        if self._expire_plan(now):
+            return None
+        plan = self.plan
+        query = self.query
         if plan is None:
-            # Future 由 poll_model 回收后，才能提交下一次预测。
-            if self.model.future is None:
-                self._submit_prediction(slot)
+            if query is None:
+                self._submit_prediction(slot, observation_ns)
+            elif now >= query.deadline_ns:
+                self.stop("prediction_expired")
             return None
-        if mode == "sync":
-            return plan.actions[self.cursor]
-        rtc = mode == "rtc"
-        exhausted = self.cursor >= len(plan.actions) if rtc else plan_exhausted(plan, slot)
-        if exhausted:
-            self.stop("prediction exhausted")
+        mode = self.execution.mode
+        index = slot - plan.anchor_slot if mode == "async" else self.cursor
+        limit = min(self.execution.action_steps, len(plan.actions))
+        if index >= limit:
+            if query is None:
+                self.stop("prediction exhausted")
             return None
-        if self.query is None:
-            if rtc:
-                window = min(self.execution.action_steps, len(plan.actions))
-                if self.cursor >= max(0, window - self.execution.prefetch_steps):
-                    self._submit_prediction(slot, prefix=plan.actions[self.cursor:].copy())
+        if query is None and mode != "sync" and index >= limit - self.execution.prefetch_steps:
+            if mode == "rtc":
+                self._submit_prediction(slot, observation_ns, prefix=plan.actions[index:].copy())
             else:
-                handoff = prefetch_handoff(plan, slot=slot,
-                    action_steps=self.execution.action_steps, prefetch_steps=self.execution.prefetch_steps)
-                if handoff is not None:
-                    self._submit_prediction(slot, handoff_slot=handoff)
-        return plan.actions[self.cursor if rtc else slot - plan.anchor_slot]
+                self._submit_prediction(slot, observation_ns, handoff_slot=plan.anchor_slot + limit)
+        return plan.actions[index]
 
     def check_motion(self):
         if (self.runtime_state.cancel_epoch != self.episode_cancel_epoch
@@ -658,7 +680,6 @@ class Rollout:
         quality_issue = self.recording_issue(raw) if self.recorder is not None else None
         attempted = None
         action_accepted = False
-        command_unconfirmed = False
         try:
             if quality_issue is not None:
                 self.stop(quality_issue)
@@ -669,8 +690,8 @@ class Rollout:
             if self.duration_expired():
                 return
             self.poll_model()
-            # 本 tick 固定选中的目标。映射后仍校验来源时效和 async 预测窗口。
-            action = self.select_action(slot)
+            # 本 tick 固定选中的目标，映射后重查同一预测窗口。
+            action = self.select_action(slot, row.control_timestamp_ns)
             if action is None:
                 return
             plan = cast(ActionChunk, self.plan)
@@ -678,15 +699,7 @@ class Rollout:
             if command is None:
                 return
             now = time.monotonic_ns()
-            if (self.execution.mode == "async"
-                    and now >= self.started_ns + (plan.anchor_slot + len(plan.actions)) * self.dt_ns):
-                self.poll_model()
-                current_slot = (time.monotonic_ns() - self.started_ns) // self.dt_ns
-                replacement = handoff_plan(self.query, slot=current_slot)
-                if replacement is not None and not plan_exhausted(replacement, current_slot):
-                    self.plan, self.query = replacement, None
-                    return
-                self.stop("prediction window expired during mapping")
+            if self._expire_plan(now):
                 return
             attempted = command
             self.robot.send_action(command, expires_ns=now + COMMAND_LEASE_NS)
@@ -707,16 +720,10 @@ class Rollout:
             if self.state == "RESUMING":
                 self.state = "RUNNING"
         except HandCommandUnconfirmed as exc:
-            command_unconfirmed = True
-            if exc.persistent:
-                self.stop(str(exc))
-            else:
-                self._clear_policy_context()
+            self.stop(str(exc))
         finally:
             # 已尝试提交的恢复动作也需要记录。
             if self.state == "RUNNING" or attempted is not None:
                 if skipped and not ode_gap and was_running and self.recorder is not None:
                     self.recorder.mark_gap()
                 self.record_row(raw, attempted, quality_issue=quality_issue, action_accepted=action_accepted)
-                if command_unconfirmed and self.recorder is not None:
-                    self.recorder.mark_gap()

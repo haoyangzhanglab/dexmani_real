@@ -14,7 +14,6 @@ import numpy as np
 from dexmani_real.robot.commands import (
     CommandExpired,
     FeedbackUnavailable,
-    HandCommandUnconfirmed,
     HomeTimeout,
     OperationCancelled,
     RobotError,
@@ -62,7 +61,7 @@ class Robot:
         self.connected = False
         self.hand_stop_required = False
         self.hand_feedback = XHandFeedback()
-        self._hand_write_unconfirmed = False
+        self._hand_refresh_required = False
         self.feedback_next_ns = 0
         self.joint_history: dict[str, deque[tuple[int, np.ndarray]]] = {}
         self.joint_history_ns = 0
@@ -140,7 +139,7 @@ class Robot:
             self.hand_stop_required = True
             initial = self.hand.connect(cancel_requested=cancelled)
             self.hand_feedback.consume(initial)
-            self._hand_write_unconfirmed = False
+            self._hand_refresh_required = False
             self.feedback_next_ns = initial.timestamp_ns + FEEDBACK_PERIOD_NS
         self.connected = True
         self._read_initial_state(cancel_requested=cancelled)
@@ -175,14 +174,14 @@ class Robot:
         state = self.hand.get_state()
         frame = self.hand_feedback.consume(state)
         if state is not None:
-            self._hand_write_unconfirmed = False
+            self._hand_refresh_required = False
         return frame
 
     @property
     def hand_feedback_pending(self) -> bool:
-        """读 CRC 尚未恢复，或未确认写入之后尚无有效关节反馈。"""
+        """读 CRC 尚未恢复，或普通写入异常后尚无有效关节反馈。"""
         return self.hand is not None and (
-            self._hand_write_unconfirmed or self.hand.consecutive_read_crc > 0
+            self._hand_refresh_required or self.hand.consecutive_read_crc > 0
         )
 
     def read_state(self):
@@ -282,31 +281,31 @@ class Robot:
     def send_action(self, command, *, expires_ns):
         """顺序发布 arm 邮箱并确认 hand SDK 发送结果。"""
         self.validate_command(command)
-        if command.hand_qpos is not None and self.hand_feedback_pending:
-            raise FeedbackUnavailable("fresh XHand feedback pending after CRC")
+        hand_target = command.hand_qpos
+        if hand_target is not None and self.hand_feedback_pending:
+            raise FeedbackUnavailable("fresh XHand feedback pending after CRC or unconfirmed submission")
         try:
             self.check_run()
-            if command.arm_qpos is not None or command.arm_hold:
-                if command.hand_qpos is not None:
-                    self._check_hand_feedback()
-                cast("ArmProcess", self.arm).submit(command, expires_ns=expires_ns)
-            if command.hand_qpos is not None:
-                self.check_run()
-                # arm 发布可能等待邮箱锁；真正发送 hand 前仍须复核当前反馈。
+            if hand_target is not None:
                 stamp = self._check_hand_feedback()
                 hand_deadline_ns = min(expires_ns, stamp + int(self.hand_config.feedback_max_age_s * 1e9))
-                if time.monotonic_ns() >= hand_deadline_ns:
-                    raise CommandExpired("command expired before hand submission")
-                self.hand_stop_required = True
-                cast("XHand", self.hand).send_action(
-                    command.hand_qpos, deadline_ns=hand_deadline_ns, check_abort=self.check_run,
-                )
+            if command.arm_qpos is not None or command.arm_hold:
+                cast("ArmProcess", self.arm).submit(command, expires_ns=expires_ns)
+            if hand_target is not None:
+                # hand 独占于主线程，arm 发布后仍按该反馈的期限检查真正发送。
+                try:
+                    cast("XHand", self.hand).send_action(
+                        hand_target, deadline_ns=hand_deadline_ns, check_abort=self.check_run,
+                    )
+                    self.hand_stop_required = True
+                except CommandExpired:
+                    raise  # SDK 未收到本次写入。
+                except BaseException:
+                    # 其余异常无法排除写入已生效，用新反馈决定保持位置。
+                    self.hand_stop_required = self._hand_refresh_required = True
+                    self.feedback_next_ns = 0
+                    raise
             self.check_run()
-        except HandCommandUnconfirmed:
-            # 实测反馈可能早于已经生效的写入；立即安排新查询，成功前禁止新手部目标。
-            self._hand_write_unconfirmed = True
-            self.feedback_next_ns = 0
-            raise
         except BaseException:
             self.runtime_state.stop_signal.set()
             raise

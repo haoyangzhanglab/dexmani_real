@@ -99,9 +99,6 @@ class HandRetargeter:
     def calibrate(self, measurements):
         self.calibration = HandCalibration.from_measurements(measurements, self.config)
 
-    def clear_reference(self) -> None:
-        self.reference = None
-
     def reset(self, initial_qpos: np.ndarray, *, timestamp_ns: int) -> None:
         if timestamp_ns <= 0:
             raise ValueError("hand reset timestamp must be positive")

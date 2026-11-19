@@ -15,6 +15,7 @@ from dexmani_real.deployment import rollout as deployment
 from dexmani_real.geometry.pose import Pose
 from dexmani_real.robot import system
 from dexmani_real.robot.commands import (
+    CommandExpired,
     FeedbackUnavailable,
     HandCommandUnconfirmed,
     OperationCancelled,
@@ -91,30 +92,83 @@ def test_write_crc_retries_same_absolute_target_and_resets_count(robot_with_mock
     assert len(targets) == 3
 
 
-def test_write_crc_exhaustion_stays_unconfirmed_until_persistent(robot_with_mock_hand):
+def test_write_crc_exhaustion_stops_before_next_command_and_refreshes_hold(robot_with_mock_hand):
     robot, command, clock, _ = robot_with_mock_hand
     hand = robot.hand
     hand.control.send_command.return_value = sdk_error(CRC)
-    hand.control.read_state.return_value = sdk_error(0), sdk_state(command.hand_qpos)
 
-    for expected_count, persistent in ((2, False), (4, False), (5, True)):
-        with pytest.raises(HandCommandUnconfirmed, match="delivery unconfirmed") as error:
-            robot.send_action(command, expires_ns=clock.now_ns + 1_000_000_000)
-        assert error.value.persistent is persistent
-        assert hand.consecutive_write_crc == expected_count
-        assert hand.control.send_command.call_count == expected_count
-        assert not robot.runtime_state.stop_signal.is_set()
-        assert robot.feedback_next_ns == 0
-        assert robot.hand_feedback_pending
-        arm_submissions = robot.arm.submit.call_count
-        with pytest.raises(FeedbackUnavailable, match="pending after CRC"):
-            robot.send_action(command, expires_ns=clock.now_ns + 1_000_000_000)
-        assert robot.arm.submit.call_count == arm_submissions
-        assert robot.service_feedback()
-        assert not robot.hand_feedback_pending
+    with pytest.raises(HandCommandUnconfirmed, match="delivery unconfirmed"):
+        robot.send_action(command, expires_ns=clock.now_ns + 1_000_000_000)
 
-    assert hand.crc_counts["unconfirmed_actions"] == 3
+    robot.arm.submit.assert_called_once()
+    assert hand.consecutive_write_crc == hand.control.send_command.call_count == 2
+    assert robot.runtime_state.stop_signal.is_set()
+    assert robot.feedback_next_ns == 0 and robot.hand_feedback_pending
+    assert hand.crc_counts["unconfirmed_actions"] == 1
     assert hand.crc_counts["write_recoveries"] == 0
+
+    with pytest.raises(FeedbackUnavailable, match="feedback pending"):
+        robot.send_action(command, expires_ns=clock.now_ns + 1_000_000_000)
+
+    hand.control.read_state.return_value = sdk_error(0), sdk_state(command.hand_qpos + 0.01)
+    hand.control.send_command.return_value = sdk_error(0)
+    robot.stop()
+    assert not robot.hand_feedback_pending
+    assert [operation[0] for operation in hand.control.mock_calls] == [
+        "send_command", "send_command", "read_state", "send_command",
+    ]
+    held = [joint.position for joint in hand.command.finger_command]
+    np.testing.assert_array_equal(held, command.hand_qpos + 0.01)
+    with pytest.raises(OperationCancelled, match="device operation cancelled"):
+        robot.send_action(command, expires_ns=clock.now_ns + 1_000_000_000)
+    robot.arm.submit.assert_called_once()
+    assert hand.control.send_command.call_count == 3
+
+
+@pytest.mark.parametrize(("limited_by", "late_ns", "retry"), [
+    ("command", 0, False), ("feedback", 1, False), ("command", 1, True),
+])
+def test_late_sdk_success_stops_without_fabricating_crc(robot_with_mock_hand, limited_by, late_ns, retry):
+    robot, command, clock, _ = robot_with_mock_hand
+    hand = robot.hand
+    deadline_ns = clock.now_ns + 100_000_000
+    if limited_by == "feedback":
+        deadline_ns = clock.now_ns + int(hand.cfg.feedback_max_age_s * 1e9)
+    expires_ns = deadline_ns if limited_by == "command" else deadline_ns + 1_000_000_000
+
+    def send(*_):
+        if retry and hand.control.send_command.call_count == 1:
+            return sdk_error(CRC)
+        clock.now_ns = deadline_ns + late_ns
+        return sdk_error(0)
+
+    hand.control.send_command.side_effect = send
+    with pytest.raises(HandCommandUnconfirmed, match="SDK success reply arrived at or after"):
+        robot.send_action(command, expires_ns=expires_ns)
+    robot.arm.submit.assert_called_once()
+    assert robot.runtime_state.stop_signal.is_set()
+    assert robot.feedback_next_ns == 0 and robot.hand_feedback_pending
+    assert hand.control.send_command.call_count == 1 + retry
+    assert hand.consecutive_write_crc == hand.crc_counts["unconfirmed_actions"] == 0
+    assert hand.crc_counts["write_errors"] == hand.crc_counts["write_recoveries"] == int(retry)
+
+
+@pytest.mark.parametrize("limited_by", ["command", "feedback"])
+def test_hand_command_expires_after_arm_publish_before_sdk_submission(robot_with_mock_hand, limited_by):
+    robot, command, clock, _ = robot_with_mock_hand
+    robot.hand.consecutive_write_crc = 1
+    if limited_by == "feedback":
+        clock.now_ns += int(robot.hand_config.feedback_max_age_s * 1e9) - 10_000_000
+    deadline_ns = clock.now_ns + 10_000_000
+    expires_ns = deadline_ns if limited_by == "command" else deadline_ns + 1_000_000_000
+    robot.arm.submit.side_effect = lambda *a, **kw: setattr(clock, "now_ns", deadline_ns)
+    with pytest.raises(CommandExpired, match="expired before SDK submission"):
+        robot.send_action(command, expires_ns=expires_ns)
+    robot.arm.submit.assert_called_once()
+    robot.hand.control.send_command.assert_not_called()
+    assert robot.runtime_state.stop_signal.is_set()
+    assert not robot.hand_feedback_pending and not robot.hand_stop_required
+    assert robot.hand.crc_counts["unconfirmed_actions"] == 0
 
 
 @pytest.mark.parametrize("limited_by", ["command", "feedback"])
@@ -138,6 +192,7 @@ def test_write_crc_rechecks_stop_after_backoff(robot_with_mock_hand):
         robot.send_action(command, expires_ns=clock.now_ns + 1_000_000_000)
     robot.hand.control.send_command.assert_called_once()
     assert robot.hand.crc_counts["unconfirmed_actions"] == 1
+    assert robot.hand_feedback_pending
 
 
 @pytest.mark.parametrize("code", [123, driver.COMBINED_FORCE_UNAVAILABLE_CODE, driver.OVERCURRENT_WARNING_CODE])
@@ -153,6 +208,18 @@ def test_non_crc_sdk_error_propagates_without_retry(robot_with_mock_hand, code):
     assert hand.crc_counts["write_recoveries"] == 0
     sleep.assert_not_called()
     assert robot.runtime_state.stop_signal.is_set()
+    assert robot.hand_feedback_pending
+
+
+def test_sdk_error_interrupts_crc_retry_and_keeps_feedback_pending(robot_with_mock_hand):
+    robot, command, clock, _ = robot_with_mock_hand
+    hand = robot.hand
+    hand.control.send_command.side_effect = [sdk_error(CRC), sdk_error(123)]
+    with pytest.raises(driver.XHandError, match="code=123"):
+        robot.send_action(command, expires_ns=clock.now_ns + 1_000_000_000)
+    assert hand.control.send_command.call_count == 2
+    assert hand.crc_counts["unconfirmed_actions"] == 1
+    assert robot.runtime_state.stop_signal.is_set() and robot.hand_feedback_pending
 
 
 @pytest.mark.parametrize("stale", [False, True])
@@ -257,15 +324,6 @@ def test_teleop_skips_pending_feedback_and_commits_only_confirmed_action(monkeyp
     robot.send_action.assert_not_called()
 
     robot.hand_feedback_pending = False
-    robot.send_action.side_effect = [HandCommandUnconfirmed(2, persistent=False), None]
-    clock.now_ns += loop.control_dt_ns
-    loop.run_control_tick()
-    controller.commit.assert_not_called()
-    controller.hand_retargeter.clear_reference.assert_called_once()
-    assert loop.last_command is None and loop.pending_termination_reason is None
-    assert not state.stop_signal.is_set()
-    assert loop.recorder.append.call_args.kwargs["action_accepted"] is False
-
     clock.now_ns += loop.control_dt_ns
     loop.run_control_tick()
     controller.reset.assert_called_once()
@@ -274,9 +332,9 @@ def test_teleop_skips_pending_feedback_and_commits_only_confirmed_action(monkeyp
     assert loop.recorder.append.call_args.kwargs["action_accepted"] is True
 
 
-@pytest.mark.parametrize("has_confirmed_target", [False, True])
-def test_teleop_reanchors_measured_hand_after_moved_write_loses_ack(
-    monkeypatch, robot_with_mock_hand, has_confirmed_target,
+@pytest.mark.parametrize(("has_confirmed_target", "late_success"), [(False, False), (True, False), (True, True)])
+def test_teleop_ends_episode_after_moved_write_without_on_time_ack(
+    monkeypatch, robot_with_mock_hand, has_confirmed_target, late_success,
 ):
     from dexmani_real.teleop.retargeting.solver import HandRetargeter
 
@@ -303,6 +361,7 @@ def test_teleop_reanchors_measured_hand_after_moved_write_loses_ack(
     )
     loop.episode_cancel_epoch = state.cancel_epoch
     loop.last_command = loop.target_deadline_ns = loop.hold_reason = None
+    loop.recorder = Mock()
     mock_time = SimpleNamespace(monotonic_ns=lambda: clock.now_ns)
     monkeypatch.setattr(teleop, "time", mock_time)
     monkeypatch.setattr(observation, "time", mock_time)
@@ -327,8 +386,19 @@ def test_teleop_reanchors_measured_hand_after_moved_write_loses_ack(
     def send(_device, sdk_command):
         if lost_ack:
             measured_qpos[0] = (command.hand_qpos[0] + sdk_command.finger_command[0].position) / 2
+            if late_success:
+                clock.now_ns += int(robot.hand_config.feedback_max_age_s * 1e9)
+                return sdk_error(0)
             return sdk_error(CRC)
         return sdk_error(0)
+
+    def append(_row, attempted, *, action_accepted):
+        if lost_ack:
+            assert state.stop_signal.is_set() and robot.hand_feedback_pending
+            assert not action_accepted
+            assert attempted.hand_qpos[0] > measured_qpos[0]
+
+    loop.recorder.append.side_effect = append
 
     def retarget(_landmarks, *, timestamp_ns):
         reference = retargeter.reference
@@ -344,51 +414,45 @@ def test_teleop_reanchors_measured_hand_after_moved_write_loses_ack(
     if has_confirmed_target:
         tick()
     deadline_ns = loop.target_deadline_ns
+    last_command = loop.last_command
+    if has_confirmed_target:
+        previous_eef = controller.previous_eef_target
+        reference_before = retargeter.reference
+        wrist_pos = np.array([0.1, 0, 0])
 
     lost_ack = True
     tick()
-    anchor = controller.anchor
-    previous_eef = controller.previous_eef_target
     send_count = robot.hand.control.send_command.call_count
-    assert send_count == (3 if has_confirmed_target else 2)
+    assert send_count == 1 + has_confirmed_target + (not late_success)
     assert measured_qpos[0] > command.hand_qpos[0]
-    invalidated_reference = retargeter.reference
-    assert invalidated_reference is None
+    if has_confirmed_target:
+        assert retargeter.reference is reference_before
+        assert controller.previous_eef_target is previous_eef
     assert robot.hand_feedback_pending and robot.hand.consecutive_read_crc == 0
-    assert loop.target_deadline_ns == deadline_ns
-    assert loop.pending_termination_reason is None and not state.stop_signal.is_set()
+    assert loop.target_deadline_ns == deadline_ns and loop.last_command is last_command
+    assert loop.pending_termination_reason == "cancelled" and state.stop_signal.is_set()
+    issue = loop.termination_details[0]["reason"]
+    assert ("SDK success reply arrived at or after" if late_success else "delivery unconfirmed") in issue
+    assert loop.recorder.append.call_count == 1 + has_confirmed_target
 
     lost_ack = False
-    wrist_pos = np.array([0.1, 0, 0])
     retarget_call.reset_mock()
     with monkeypatch.context() as read_patch:
         read_patch.setattr(robot.hand, "get_state", lambda: None)
-        assert robot.service_feedback()
+        assert not robot.hold_hand()
     assert robot.hand_feedback_pending
-    tick()  # 缓存仍在 TTL 内，但来自未确认写入之前。
+    tick()
     retarget_call.assert_not_called()
     assert robot.hand.control.send_command.call_count == send_count
 
-    clock.now_ns = robot.feedback_next_ns
-    feedback_ns = clock.now_ns
     robot.hand.control.read_state.return_value = sdk_error(0), sdk_state(measured_qpos)
-    assert robot.service_feedback()
-    arm_solver.solve.return_value = SimpleNamespace(qpos=None, reason="IK rejected")
-    tick()
-    reference = retargeter.reference
-    assert reference is not None
-    reference_qpos, reference_ns = reference
-    np.testing.assert_array_equal(reference_qpos, measured_qpos)
-    assert reference_ns == feedback_ns
+    robot.stop()
+    assert not robot.hand_feedback_pending
     assert retargeter.calibration is calibration
-    assert controller.anchor is anchor and controller.previous_eef_target is previous_eef
-    assert robot.hand.control.send_command.call_count == send_count
-
-    arm_solver.solve.return_value = SimpleNamespace(qpos=command.arm_qpos)
     tick()
-    assert loop.pending_termination_reason is None and not state.stop_signal.is_set()
+    retarget_call.assert_not_called()
     assert robot.hand.control.send_command.call_count == send_count + 1
-    assert controller.anchor is anchor
+    assert robot.arm.submit.call_count == 1 + has_confirmed_target
     sent_qpos = [joint.position for joint in robot.hand.command.finger_command]
     np.testing.assert_array_equal(sent_qpos, measured_qpos)
 
@@ -468,7 +532,7 @@ def test_robot_stop_propagates_failed_hold_without_releasing(robot_with_mock_han
     robot, _, _, _ = robot_with_mock_hand
     hand = robot.hand
     robot.hand_stop_required = True
-    hand.consecutive_write_crc = driver.MAX_CONSECUTIVE_WRITE_CRC
+    hand.consecutive_write_crc = 5
 
     def send(_device, sdk_command):
         assert robot.runtime_state.stop_signal.is_set()

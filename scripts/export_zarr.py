@@ -50,8 +50,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fields", nargs="+", required=True, choices=tuple(FIELD_INPUTS),
-        help="Canonical fields to export; RGB/depth use the fixed-K pinhole grid. "
-             "The fixed nonempty field selection is required.",
+        help=(
+            "Canonical fields to export. RGB/depth use the fixed-K pinhole grid. "
+            "action and action_ee use attempted targets and require confirmed host submission "
+            "of the combined arm and hand command on every Raw row. "
+            "Without those fields, action_ode holds the last confirmed target within each segment. "
+            "joint_state stores measured feedback."
+        ),
     )
     parser.add_argument(
         "--exclude",

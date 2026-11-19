@@ -1,6 +1,4 @@
 """真机策略评估；--print-config 仅打印配置，不连接设备。"""
-# Usage: python scripts/run_policy.py CHECKPOINT
-# HOI 需求由 Checkpoint 自动识别。
 
 from __future__ import annotations
 
@@ -46,15 +44,17 @@ def build_parser() -> argparse.ArgumentParser:
         "policy",
         metavar="POLICY",
         nargs="?",
-        help="Checkpoint file or directory containing checkpoints/latest.pt; relative to cwd",
+        help=(
+            "Load only trusted checkpoint files or directories containing checkpoints/latest.pt. "
+            "Relative paths use the current working directory. "
+            "Loading a training checkpoint constructs the policy from its saved configuration "
+            "and can execute code."
+        ),
     )
     parser.add_argument(
         "--config",
         type=Path,
-        help=(
-            "Trusted Python experiment file exporting CONFIG: RealConfig. "
-            "Policy recipe is restored from its checkpoint"
-        ),
+        help="Trusted Python experiment file exporting CONFIG: RealConfig",
     )
     parser.add_argument(
         "--num-episodes",

@@ -33,7 +33,7 @@ flowchart TD
 | 查看记录 | `python scripts/visualize_episode.py EPISODE`（`--no-hoi` 绕过标注，`--max-frames N` 按需读取前 N 帧） |
 | 导出训练数据 | `python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr --fields joint_state action` |
 | 策略评估并录制 | `python scripts/run_policy.py CHECKPOINT --record-raw` |
-| 回放臂和手目标完整的 VR 示教 | `python scripts/replay_episode.py episodes/pick/episode_001 --segment 0`（替换实际采集目录，段号从 0 开始） |
+| 回放逐行确认提交的 VR 示教段 | `python scripts/replay_episode.py episodes/pick/episode_001 --segment 0`（替换实际采集目录，段号从 0 开始） |
 
 HOI 数据先完成[物体资产准备与离线标注](docs/object_reconstruction.md)。具体选项见各入口的 `--help`。
 
@@ -58,9 +58,9 @@ python scripts/run_policy.py "$RUN/train/checkpoints/latest.pt" \
 
 `run_config.yaml` 保存训练处理参数和部署实际使用的场景、手部点云处理参数。场景点云去桌面时记录归一化平面系数。场景点云过滤为空时，在线继续使用最近一次非空结果，直到其来源过期。
 
-物理回放要求先将机器人就位到所选示教段的起点。回放按 Raw 标称频率顺序重发臂和手的绝对目标，慢槽会延长播放时间。目标含 NaN 或越限时，启动检查给出动作字段和 Raw 内从 0 开始的绝对行号。结尾日志的会话耗时包含连接、播放、末端留驻和关闭。
+物理回放要求先将机器人就位到所选示教段的起点。连接设备前，回放要求所选段每行均有臂手组合命令的主机侧提交确认，并检查目标是否有限且在限位内。能定位到具体行时，错误会给出 Raw 内从 0 开始的绝对行号。通过检查后按 Raw 标称频率顺序重发臂和手的绝对目标，慢槽会延长播放时间。结尾日志的会话耗时包含连接、播放、末端留驻和关闭。
 
-Raw 动作列记录尝试提交的绝对关节目标，实际关节位置由反馈列给出。失败尝试和缺失目标的记录规则见[时间与动作](docs/data.md#时间与动作)。主机时间戳记录采样过程，视频 PTS 取自相对首帧的控制采样时间，两者都无法给出设备执行时延。
+Raw 动作列记录尝试提交的绝对关节目标。当前录制以 `action_send_accepted=1` 表示臂手组合命令已在主机侧完整且按时提交，实测关节位置由反馈列给出。训练导出选择 `action` 或 `action_ee` 时，要求整个来源 Raw 的每行都有提交确认，否则拒绝该来源。主机时间戳记录采样过程，视频 PTS 取自相对首帧的控制采样时间，两者都无法给出设备执行时延。详见[时间与动作](docs/data.md#时间与动作)。
 
 实验配置由 [RealConfig](dexmani_real/config/real.py) 组装。用一个可信本地 Python 文件导出 `CONFIG`，将实际设备、工作空间、运动参数集中保存；采集、部署、导出和回放均可传 `--config experiment.py`。例如下面只改变采集周期，其余配置仍须符合实际设备：
 
@@ -74,11 +74,15 @@ CONFIG = replace(base, teleop=replace(base.teleop, control_hz=20.0))
 
 先用 `python scripts/collect_teleop.py TASK --config experiment.py --print-config` 检查声明值；策略的有效配置还会结合 checkpoint 在启动时解析。
 
+`ArmConfig.collision_sensitivity` 默认是 `None`，准备运动时保留 xArm 控制器的当前设置。显式设置整数 0–5 时才下发，0 会关闭控制器碰撞检测。这个默认值只约定程序如何处理控制器设置，检测是否开启、场地验收和全路径碰撞情况仍需现场核实。
+
 VR 朝向标定复用 `CONFIG.vr`：`python scripts/calibrate_vr_heading.py --config experiment.py`，临时端口可用 `--port` 覆盖。相机离线求解须指定候选文件，例如 `python scripts/calibrate_camera.py solve samples/run1 --output candidate_cameras.json`；合法可解的结果即使残差超过经验阈值也会保存并警告。采集或部署用 `--camera-calibration candidate_cameras.json` 选择采用它。
 
 策略的运行预算、动作接续与 HOI 恢复见[策略部署](docs/policy_deployment.md)。
 
 VR 和键盘启动时各自检查控制周期严格短于 `target_max_age_s`。默认 16 Hz 和 30 Hz 均使用 0.25 秒命令租约。
+
+XHand 诊断的 `--read-only` 不发送诊断运动目标，但仍会连接和断开设备。特定 EtherCAT 配置在断开时可能请求固件状态切换。见 [control_xhand.py](scripts/tools/control_xhand.py)。
 
 ## 核心模块
 
@@ -109,6 +113,8 @@ VR 和键盘启动时各自检查控制周期严格短于 `target_max_age_s`。�
 直接从 Python 启动策略使用 `PolicySession(runtime, checkpoint, record_raw=True).run()`（从 `dexmani_real.deployment.session` 导入）。HOI 策略还须传 `task_dir="/data/tasks/pick"`。启用 Raw 时默认写入当前工作目录下的 `rollouts/`，可通过 `output_root` 指定其他输出位置。
 
 主进程持有会话与 XHand I/O；机械臂 SDK、相机、VR 与启用的感知任务运行在子进程；策略推理和录制各有自己的工作线程。设备 SDK 留在驱动层，动作映射只生成目标，实际发送归 `Robot`。新增实验优先修改配置和对应流程，独立算法放入现有几何或感知模块。
+
+在仓库根目录运行 `python -m pytest -q -p no:cacheprovider` 验证离线测试。pytest 默认收集 `tests/`，几何回归使用仓库内的 CordViP 源码。依赖安装见 [CPU workflow](.github/workflows/cpu.yml)。
 
 ## 主题文档
 

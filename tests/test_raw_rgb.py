@@ -79,6 +79,24 @@ def write_raw_rgb(path: Path, offsets_ns: tuple[int, ...]) -> None:
         video.close()
 
 
+@pytest.mark.parametrize("termination_reason", [None, "quit", "failed", "recording_incomplete"])
+def test_reader_rejects_incomplete_raw_in_published_directory(tmp_path, termination_reason):
+    path = tmp_path / "episode_normal_name"
+    stamps = write_raw_data(path, (0, 50_000_000))
+    if termination_reason is not None:
+        with h5py.File(path / "data.h5", "r+") as data:
+            data["meta"].attrs["termination_reason"] = termination_reason
+            if termination_reason == "failed":
+                data["meta"].attrs["recording_truncated_reason"] = "example_truncation"
+
+    if termination_reason == "recording_incomplete":
+        with pytest.raises(RawDataError, match="termination_reason is recording_incomplete"):
+            RawReader(path)
+    else:
+        with RawReader(path) as reader:
+            np.testing.assert_array_equal(reader.read_timing()["control_ns"], stamps)
+
+
 def test_rgb_timing_matches_raw_after_seek(tmp_path):
     path = tmp_path / "episode"
     write_raw_rgb(path, (0, 33_346_679, 105_550_386))

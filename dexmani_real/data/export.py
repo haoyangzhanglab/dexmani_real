@@ -162,6 +162,10 @@ def iter_canonical_blocks(
 ):
     frames = reader.num_frames
     fields = specs.keys()
+    # 同时导出常规动作时，已确认的原始目标就是 action_ode，无需逐段保持。
+    joint_target_fields = tuple(
+        name for name in ("action", "action_ode") if name in fields and name not in alignment
+    )
     row_bytes = sum(int(np.prod(shape)) * dtype.itemsize for shape, dtype in specs.values())
     if "point_cloud" in fields and "depth" not in fields:
         # 点云逐帧计算，但原始深度仍按块读取；额外计入读取预算。
@@ -197,7 +201,7 @@ def iter_canonical_blocks(
                         raise RawDataError(f"{name}: nonfinite values at row {row}")
         if raw:
             del values
-        block = {}
+        block: dict[str, np.ndarray] = {}
         if images is not None:
             height, width = camera["shape"]
             if "rgb" in fields:
@@ -224,9 +228,14 @@ def iter_canonical_blocks(
             block["object_pointcloud"] = raw["object_pointcloud"]
         if "joint_state" in fields:
             block["joint_state"] = np.concatenate((raw["arm_qpos"], raw["hand_qpos"]), axis=1, dtype=np.float32)
-        if "action" in fields:
-            block["action"] = np.concatenate((raw["action_arm_joint_target"], raw["action_hand_joint_target"]), axis=1, dtype=np.float32)
-        if "action_ode" in fields:
+        if joint_target_fields:
+            joint_targets = np.concatenate(
+                (raw["action_arm_joint_target"], raw["action_hand_joint_target"]), axis=1, dtype=np.float32,
+            )
+            for name in joint_target_fields:
+                block[name] = joint_targets
+            del joint_targets
+        if "action_ode" in alignment:
             block["action_ode"] = alignment["action_ode"][start:end]
         if "action_ee" in fields:
             poses = eef_poses(raw["action_arm_joint_target"], arm_fk=arm_fk)
@@ -327,10 +336,16 @@ def prepare_raw(reader, processing, fields, clocks, hoi_devices):
         if reader.num_frames <= 0:
             raise RawDataError("episode contains no rows")
         boundaries = np.r_[reader.segment_starts, reader.num_frames]
+        requires_confirmed_actions = bool({"action", "action_ee"}.intersection(fields))
+        if requires_confirmed_actions:
+            reader.require_confirmed_actions()
         if "object_pointcloud" in fields:
             valid = read_hoi_validity(reader)
             if not valid.all():
                 raise RawDataError(f"HOI contains invalid rows: first at {int(np.flatnonzero(~valid)[0])}")
+        derive_held_targets = "action_ode" in fields and not requires_confirmed_actions
+        if derive_held_targets:
+            clocks = clocks | {"arm_ns", "hand_ns"}
         timing = reader.read_timing(source_clocks=clocks)
         alignment = {}
         if hoi_devices:
@@ -338,7 +353,7 @@ def prepare_raw(reader, processing, fields, clocks, hoi_devices):
                 reader, timing, boundaries, processing.hoi_max_joint_gap_s,
                 devices=hoi_devices, require_complete=True,
             )
-        if "action_ode" in fields:
+        if derive_held_targets:
             alignment["action_ode"] = accepted_joint_targets(reader, boundaries, alignment)
         return alignment, export_camera(reader, fields), boundaries
 
@@ -358,8 +373,6 @@ def export_zarr(
         "object_pointcloud": "camera_ns",
     }
     clocks = {source_clocks[name] for name in inputs if name in source_clocks}
-    if "action_ode" in fields:
-        clocks.update(("arm_ns", "hand_ns"))
     hoi_devices = tuple(
         device for device in ("arm", "hand")
         if "object_pointcloud" in inputs and f"{device}_qpos" in inputs

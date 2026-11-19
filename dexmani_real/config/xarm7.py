@@ -50,7 +50,7 @@ class HomingConfig:
 @dataclass(frozen=True)
 class ArmConfig:
     ip: str = "192.168.1.111"
-    collision_sensitivity: int = 0  # 0 关闭控制器碰撞检测。
+    collision_sensitivity: int | None = None  # None 保留控制器设置，显式 0 关闭碰撞检测。
     tcp_load_mass_kg: float = 1.1
     tcp_load_cog_mm: tuple[float, float, float] = (16.3, 7.9, 109.5)
 
@@ -99,8 +99,9 @@ class ArmConfig:
             raise ValueError("operational arm limits must be inside device effective limits")
         if not isinstance(self.ip, str) or not self.ip.strip():
             raise ValueError("arm ip must be non-empty")
-        if type(self.collision_sensitivity) is not int or not 0 <= self.collision_sensitivity <= 5:
-            raise ValueError("arm collision_sensitivity must be an integer in [0, 5]")
+        sensitivity = self.collision_sensitivity
+        if sensitivity is not None and (type(sensitivity) is not int or not 0 <= sensitivity <= 5):
+            raise ValueError("arm collision_sensitivity must be None or an integer in [0, 5]")
         for name in (
             "servo_hz",
             "feedback_hz",

@@ -209,7 +209,7 @@ def test_rollout_only_requires_tactile_when_trained_fields_need_it(requires_tact
     state = SessionState()
     runtime = RealConfig(execution=ExecutionConfig(control_dt_s=0.05, action_steps=1))
     fields = ("joint_state", "finger_tactile_force") if requires_tactile else ("joint_state",)
-    info = SimpleNamespace(observation_fields=fields, n_obs_steps=1, requires_prev_action=True)
+    info = SimpleNamespace(observation_fields=fields, n_obs_steps=1, requires_prev_action=True, future_steps=1)
     observations = ObservationBuilder(info, runtime)
     row = observation(XHandFeedback().consume(XHandState(np.zeros(12), None, None, now)), now)
     model = Mock(future=None)

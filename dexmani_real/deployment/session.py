@@ -22,6 +22,7 @@ from dexmani_real.data.raw import camera_metadata, robot_recording_parameters
 from dexmani_real.data.recorder import format_recording_result
 from dexmani_real.deployment.inference import (
     MODEL_SHUTDOWN_TIMEOUT_S,
+    POLICY_STARTUP_TIMEOUT_S,
     ModelShutdownTimeout,
     PolicyWorker,
 )
@@ -218,7 +219,7 @@ class PolicySession:
             build_observation=lambda rows: self.observations.build(rows),
         )
         self.model.load()
-        self.info = self.wait_model()
+        self.info = self.wait_model(stage="policy model load")
         declared_execution = self.runtime.execution
         self.runtime = resolve_deployment_config(self.info, self.runtime)
         self.observations = ObservationBuilder(self.info, self.runtime)
@@ -462,21 +463,28 @@ class PolicySession:
         if not self.startup_allowed():
             raise OperationCancelled("startup cancelled")
 
-    def wait_model(self):
+    def wait_model(self, *, stage: str):
         model = cast(PolicyWorker, self.model)
+        deadline = time.monotonic() + POLICY_STARTUP_TIMEOUT_S
         while True:
             self.check_startup()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             future = model.poll()
             if future is not None:
                 result = future.result()
                 self.check_startup()
-                return result
-            time.sleep(0.005)
+                if time.monotonic() < deadline:
+                    return result
+                break
+            time.sleep(min(0.005, remaining))
+        raise TimeoutError(f"{stage} timed out after {POLICY_STARTUP_TIMEOUT_S:g}s")
 
     def warmup_policy(self):
-        if cast(PolicyWorker, self.model).warmed_up:
+        model = cast(PolicyWorker, self.model)
+        if model.warmed_up:
             return
-        self.check_startup()
         observation_deadline = time.monotonic() + INITIAL_STATE_TIMEOUT_S
         while True:
             self.check_startup()
@@ -498,9 +506,9 @@ class PolicySession:
                 "rtc_delay": self.runtime.execution.prefetch_steps,
             }
         self.check_startup()
-        cast(PolicyWorker, self.model).warmup(rows, **kwargs)
-        self.wait_model()
-        cast(PolicyWorker, self.model).warmed_up = True
+        model.warmup(rows, **kwargs)
+        self.wait_model(stage="policy warmup")
+        model.warmed_up = True
 
     def poll_operator(self, *, timeout=0) -> int | None:
         return self.handle_command_batch(

@@ -483,6 +483,10 @@ class RawReader:
         self._hoi_file = None
         self.data_file = h5py.File(self.path / "data.h5", "r")
         try:
+            meta = self.data_file.get("meta")
+            reason = meta.attrs.get("termination_reason") if meta is not None else None
+            if isinstance(reason, (str, bytes)) and reason in ("recording_incomplete", b"recording_incomplete"):
+                raise RawDataError(f"Raw {self.path}: termination_reason is recording_incomplete")
             rows = self.data_file["timing/rows"]
             if not isinstance(rows, h5py.Dataset) or rows.ndim != 1 or rows.dtype != TIMING_ROW_DTYPE:
                 raise RawDataError(
@@ -585,6 +589,23 @@ class RawReader:
                     )
             self.dataset_cache[name] = array
         return self.dataset_cache[name]
+
+    def require_confirmed_actions(self, start: int = 0, end: int | None = None) -> None:
+        """要求范围内每行的臂手组合命令均已在主机侧完整提交。"""
+        name = "action_send_accepted"
+        try:
+            dataset = self[name]
+        except KeyError as exc:
+            raise RawDataError(f"Raw {self.path}: missing {name}") from exc
+        status = dataset[start:end]
+        unconfirmed = status != 1
+        count = np.count_nonzero(unconfirmed)
+        if count:
+            first = int(unconfirmed.argmax())
+            raise RawDataError(
+                f"Raw {self.path}: {name}={status[first]} at row {start + first} "
+                f"({count} row(s) without confirmed submission)"
+            )
 
     @property
     def hoi_file(self):
