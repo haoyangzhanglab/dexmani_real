@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import ArrayLike
 
+EEF_POSE_DIM = 9  # XYZ 和旋转矩阵的前两列。
 WXYZ_TO_XYZW = np.array([1, 2, 3, 0], dtype=np.intp)
 XYZW_TO_WXYZ = np.array([3, 0, 1, 2], dtype=np.intp)
 ROT6D_MIN_BASIS_NORM = 1e-4
@@ -35,18 +36,13 @@ def validate_rigid_transform(value, *, label="transform"):
     return matrix
 
 
-def _quaternion(value, name):
+def normalize_quat_wxyz(value, *, name="quaternion"):
     quat = np.asarray(value, dtype=np.float64)
     if quat.shape != (4,) or not np.isfinite(quat).all():
         raise ValueError(f"{name} must be a finite (4,) WXYZ quaternion")
     norm = float(np.linalg.norm(quat))
     if not np.isfinite(norm) or norm <= QUAT_NORM_EPS:
         raise ValueError(f"{name} quaternion norm is invalid")
-    return quat, norm
-
-
-def normalize_quat_wxyz(value, *, name="quaternion"):
-    quat, norm = _quaternion(value, name)
     return quat / norm
 
 
@@ -62,9 +58,6 @@ class Pose:
         self.q = normalize_quat_wxyz(q)
         if not np.isfinite(self.p).all():
             raise ValueError("Pose position must be finite")
-
-    def copy(self) -> "Pose":
-        return Pose(p=self.p.copy(), q=self.q.copy())
 
 
 def wxyz_to_xyzw(q: ArrayLike) -> np.ndarray:

@@ -13,7 +13,7 @@ from ruckig import (
 )
 
 from dexmani_real.config.xarm7 import ArmConfig
-from dexmani_real.robot.commands import arm_reference_from_feedback
+from dexmani_real.robot.commands import PositionLimitError, arm_reference_from_feedback
 
 # 仅容纳轨迹计算的浮点舍入误差（rad），不是运动或到位容差。
 _POSITION_ROUNDOFF_RAD = 1e-12
@@ -38,13 +38,13 @@ class ArmTrajectory:
         self.input.current_velocity = np.where(np.abs(v) < 1e-12, 0.0, v).tolist()
         self.input.target_position = self.input.current_position
 
-    def step(self, goal: np.ndarray | None = None, *, hold: bool = False) -> np.ndarray:
+    def step(self, goal: np.ndarray | None) -> np.ndarray:
         """计算并推进参考；未发送或发送失败后必须丢弃本轨迹。"""
         # 保持请求只制动；各关节独立停稳，不继续追赶此前积累的位置目标。
-        if hold:
+        if goal is None:
             self.input.control_interface = ControlInterface.Velocity
             self.input.synchronization = Synchronization.No
-        elif goal is not None:
+        else:
             self.input.control_interface = ControlInterface.Position
             self.input.synchronization = Synchronization.Time
             self.input.target_position = goal.tolist()
@@ -64,10 +64,6 @@ class ArmTrajectory:
         self.output.pass_to_input(self.input)
         self.input.current_position = q.tolist()
         return q
-
-
-class PositionLimitError(ValueError):
-    """完整参考轨迹越过操作位置限位。"""
 
 
 def validate_extrema(trajectory, start, lower, upper):

@@ -69,7 +69,7 @@ class _FinishRequest:
 class EpisodeRecorder:
     """每段独占一个 writer；失败由控制流程终段，线程退出后才处置文件。"""
 
-    def __init__(self, data_dir, *, control_hz, read_xhand_crc: Callable[[], dict[str, int]] | None = None):
+    def __init__(self, data_dir, *, control_hz, read_xhand_crc: Callable[[], dict[str, int]]):
         self.data_dir = Path(data_dir)
         self.control_hz = float(control_hz)
         self.thread: threading.Thread | None = None
@@ -84,7 +84,7 @@ class EpisodeRecorder:
         self.published_path: Path | None = None
         self.writer: RawWriter | None = None
         self.read_xhand_crc = read_xhand_crc
-        self.initial_xhand_crc = read_xhand_crc() if read_xhand_crc is not None else {}
+        self.initial_xhand_crc = read_xhand_crc()
 
     @property
     def written_frames(self):
@@ -212,7 +212,7 @@ class EpisodeRecorder:
         self.is_recording = False
         # 首次请求固定处置意图和等待预算。
         if self.finish_request is None:
-            counts = self.read_xhand_crc() if self.read_xhand_crc is not None else {}
+            counts = self.read_xhand_crc()
             delta = {key: count - self.initial_xhand_crc[key] for key, count in counts.items()}
             self.finish_request = _FinishRequest(save, reason, time.monotonic() + RECORDER_STOP_TIMEOUT_S, delta)
         request = self.finish_request
@@ -251,48 +251,49 @@ class EpisodeRecorder:
         return request
 
     def write_episode(self, metadata):
-        staging = self.staging_path
+        writer = None
         finish = None
         try:
-            self.writer = writer = RawWriter(staging, control_hz=self.control_hz)
-            try:
-                writer.open(metadata)
-                self.ready.set()
-                while self.error is None:
-                    finish = self.finish_request
-                    if finish is not None and not finish.save:
-                        break
-                    try:
-                        item = (
-                            self.queue.get(timeout=0.05)
-                            if finish is None
-                            else self.queue.get_nowait()
-                        )
-                    except Empty:
-                        # 仅取帧前已登记的请求能保证生产者停止；超时后到达的
-                        # 请求留到下轮处理，避免漏掉超时后刚入队的最后一帧。
-                        if finish is not None:
-                            break
-                        continue
-                    writer.append_frame(*item)
-                if finish is None or self.error is not None:
-                    writer.flush()
-                elif finish.save:
-                    writer.finish(
-                        finish.reason,
-                        recording_truncated_reason=self.recording_truncated_reason,
-                        xhand_crc_counts=finish.xhand_crc_counts,
-                    )
-            except BaseException as exc:  # noqa: BLE001 — 写入失败及中断由控制线程处理。
-                self.store_error(exc)
-                self.ready.set()  # 启动失败无需等待可能仍在阻塞的 close。
-            finally:
-                writer.close()
-        except BaseException as exc:  # noqa: BLE001 — 关闭失败也须转交控制线程。
-            self.store_error(exc, stage="writer_close")
-        finally:
+            self.writer = writer = RawWriter(self.staging_path, control_hz=self.control_hz)
+            writer.open(metadata)
             self.ready.set()
-            self.drain_frames()
+            while self.error is None:
+                finish = self.finish_request
+                if finish is not None and not finish.save:
+                    break
+                try:
+                    item = (
+                        self.queue.get(timeout=0.05)
+                        if finish is None
+                        else self.queue.get_nowait()
+                    )
+                except Empty:
+                    # 仅取帧前已登记的请求能保证生产者停止；超时后到达的
+                    # 请求留到下轮处理，避免漏掉超时后刚入队的最后一帧。
+                    if finish is not None:
+                        break
+                    continue
+                writer.append_frame(*item)
+            if finish is None or self.error is not None:
+                writer.flush()
+            elif finish.save:
+                writer.finish(
+                    finish.reason,
+                    recording_truncated_reason=self.recording_truncated_reason,
+                    xhand_crc_counts=finish.xhand_crc_counts,
+                )
+        except BaseException as exc:  # noqa: BLE001 — 写入失败及中断由控制线程处理。
+            self.store_error(exc)
+            self.ready.set()  # 启动失败无需等待可能仍在阻塞的 close。
+        finally:
+            try:
+                if writer is not None:
+                    writer.close()
+            except BaseException as exc:  # noqa: BLE001 — 关闭失败也须转交控制线程。
+                self.store_error(exc, stage="writer_close")
+            finally:
+                self.ready.set()
+                self.drain_frames()
 
     def drain_frames(self):
         while True:

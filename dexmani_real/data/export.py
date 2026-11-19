@@ -40,11 +40,14 @@ from dexmani_real.geometry.camera import (
     validate_distortion_model,
 )
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
-from dexmani_real.geometry.pose import encode_eef_pose
+from dexmani_real.geometry.pose import EEF_POSE_DIM, encode_eef_pose
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor, processing_metadata
 from dexmani_real.robot.model import (
     ARM_DOF,
+    HAND_DOF,
+    HAND_TACTILE_FORCE_SHAPE,
+    HAND_TACTILE_SUM_SHAPE,
     XHAND_FINGERTIP_LINK_NAMES,
     XHAND_TACTILE_SCALE_DIVISOR,
 )
@@ -121,7 +124,7 @@ def export_camera(reader, fields):
             camera["depth_scale_m"] = snapshot.depth_scale_m
         if names & {"rgb", "depth"}:
             camera["image_maps"] = init_undistort_maps(snapshot.color)
-        elif "point_cloud" in names:
+        else:
             # 在 Raw 输入边界拒绝不支持的畸变，点云算子故障仍直接传播。
             validate_distortion_model(snapshot.color.distortion_model)
     if "camera_intrinsic" in names:
@@ -139,9 +142,11 @@ def export_camera(reader, fields):
 def canonical_array_specs(fields, processing, camera):
     shapes = {
         "object_pointcloud": (HOI_NUM_POINTS, 3),
-        "joint_state": (19,), "action": (19,), "action_ee": (21,),
-        "finger_tactile_force": (5, 3), "taxel_tactile_force": (5, 120, 3),
-        "fingertip_xyz": (5, 3), "eef_pose": (9,),
+        "joint_state": (ARM_DOF + HAND_DOF,), "action": (ARM_DOF + HAND_DOF,),
+        "action_ee": (EEF_POSE_DIM + HAND_DOF,), "eef_pose": (EEF_POSE_DIM,),
+        "finger_tactile_force": HAND_TACTILE_SUM_SHAPE,
+        "taxel_tactile_force": HAND_TACTILE_FORCE_SHAPE,
+        "fingertip_xyz": (len(XHAND_FINGERTIP_LINK_NAMES), 3),
         "camera_intrinsic": (9,), "camera_extrinsic": (12,),
         "point_cloud": (processing.pointcloud.num_points, 6),
         "hand_pointcloud": (processing.hand_pointcloud.num_points, 3),
@@ -194,15 +199,13 @@ def iter_canonical_blocks(
         count = end - start
         with raw_input():
             raw = {name: source[start:end] for name, source in sources.items()}
-            for name, values in raw.items():
-                # 动作已逐段校验；不进入几何计算的浮点字段在写入时校验。
-                if name in {"arm_qpos", "hand_qpos"}:
-                    valid = np.isfinite(values).reshape(count, -1).all(axis=1)
-                    if not valid.all():
-                        row = start + int(np.flatnonzero(~valid)[0])
-                        raise RawDataError(f"{name}: nonfinite values at row {row}")
-        if raw:
-            del values
+            # 动作已逐段校验；不进入几何计算的浮点字段在写入时校验。
+            joint_fields = (name for name in raw if name in {"arm_qpos", "hand_qpos"})
+            for name in joint_fields:
+                valid = np.isfinite(raw[name]).all(axis=1)
+                if not valid.all():
+                    row = start + int(np.flatnonzero(~valid)[0])
+                    raise RawDataError(f"{name}: nonfinite values at row {row}")
         block: dict[str, np.ndarray] = {}
         if images is not None:
             height, width = camera["shape"]
@@ -380,8 +383,6 @@ def export_zarr(
         processing.pointcloud.validate()
         if processing.pointcloud.remove_table:
             processing = replace(processing, table_plane_abcd=normalize_table_plane(processing.table_plane_abcd))
-    if "hand_pointcloud" in fields:
-        processing.hand_pointcloud.validate()
     arm_fk = ArmFK() if ARM_FK_FIELDS.intersection(fields) else None
     hand_fk = hand_cloud = None
     if HAND_FK_FIELDS.intersection(fields):
@@ -396,7 +397,6 @@ def export_zarr(
     sources: list[str] = []
     ranges: list[list[int]] = []
     rejected: list[dict[str, str]] = []
-    source_count = 0
     try:
         for index, episode in enumerate(selected):
             if progress_callback:
@@ -437,16 +437,17 @@ def export_zarr(
                 ends.extend((offset + boundaries[1:]).tolist())
                 sources.extend([episode.name] * (len(boundaries) - 1))
                 ranges.extend([[int(a), int(b)] for a, b in pairwise(boundaries)])
-                source_count += 1
             except RawDataError as exc:
                 if arrays:
-                    for array in arrays.values():
-                        array.resize((offset, *array.shape[1:]))
                     if not ends:
                         shutil.rmtree(staging)
                         staging.mkdir()
                         root = None
                         arrays = {}
+                    else:
+                        for array in arrays.values():
+                            if array.shape[0] != offset:
+                                array.resize((offset, *array.shape[1:]))
                 rejected.append({"episode": episode.name, "reason": str(exc)})
                 logger.warning("Rejected Raw %s: %s", episode, exc)
         if root is None:
@@ -465,7 +466,7 @@ def export_zarr(
         if progress_callback:
             progress_callback(len(selected), len(selected))
         return {
-            "path": str(target), "source_count": source_count, "episode_count": len(ends),
+            "path": str(target), "source_count": len(set(sources)), "episode_count": len(ends),
             "total_frames": ends[-1], **selection,
         }
     finally:

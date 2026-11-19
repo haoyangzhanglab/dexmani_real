@@ -21,7 +21,7 @@ class PolicyWorker:
     def __init__(self, factory, *, build_observation):
         self.factory = factory
         self.build_observation = build_observation
-        self.warmed_up = False
+        self.hoi_warmed_up = False
         self.model = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-model")
         self.future: Future | None = None
@@ -52,7 +52,7 @@ class PolicyWorker:
             cast("PolicyRuntime", self.model).reset_episode()
         return cast("PolicyRuntime", self.model).predict(observation, **kwargs)
 
-    def predict(self, rows, *, reset_episode=False, **kwargs):
+    def predict(self, rows, *, reset_episode: bool, **kwargs) -> None:
         self._submit(self._predict, rows, reset_episode=reset_episode, **kwargs)
 
     def poll(self) -> Future | None:

@@ -216,13 +216,12 @@ class Robot:
             self.hand_feedback.snapshot() if self.hand is not None else None,
         )
 
-    def service_feedback(self) -> bool:
-        """服务反馈与故障；返回本次是否到采样机会，不代表收到新帧。"""
+    def service_feedback(self) -> None:
+        """刷新到期反馈并检查设备故障。"""
         try:
             self.check()
             now = time.monotonic_ns()
-            sampled = now >= self.feedback_next_ns
-            if sampled:
+            if now >= self.feedback_next_ns:
                 self.read_hand(retry_crc=not self.defer_hand_crc)
                 if self.joint_history:
                     state = self.read_state()
@@ -255,7 +254,6 @@ class Robot:
                     )
             if not self.runtime_state.stop_signal.is_set():
                 self._check_hand_feedback()
-            return sampled
         except BaseException:
             self.runtime_state.stop_signal.set()
             raise
@@ -269,7 +267,7 @@ class Robot:
             raise FeedbackUnavailable("current hand feedback unavailable/stale")
         return stamp
 
-    def _read_initial_state(self, *, cancel_requested):
+    def _read_initial_state(self, *, cancel_requested) -> None:
         """回调负责完整故障检查及当前操作的取消语义，异常原样传播。"""
         deadline_ns = time.monotonic_ns() + int(INITIAL_STATE_TIMEOUT_S * 1e9)
 
@@ -292,7 +290,7 @@ class Robot:
                     int(state.hand["timestamp_ns"][0]), self.hand_config.feedback_max_age_s, now_ns,
                 )
             if arm_ready and hand_ready:
-                return state
+                return
             wait_ns = min(self.feedback_next_ns, deadline_ns) - time.monotonic_ns()
             if wait_ns > 0:
                 time.sleep(min(0.01, wait_ns / 1e9))

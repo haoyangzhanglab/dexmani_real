@@ -105,8 +105,7 @@ class ArmController:
         """在绝对期限内确认连续停稳；不合格样本重新累计。"""
         tolerance = self.cfg.standstill_position_tolerance_rad
         interval_ns = round(1e9 / self.cfg.feedback_hz)
-        stable = None
-        anchor = None
+        stable: tuple[np.ndarray, int] | None = None
         previous_sample_ns = None
         # Owner 退出前的最后一次观测不会因 closing 已置位而忙等。
         if check_abort is None:
@@ -135,14 +134,13 @@ class ArmController:
             if target is not None:
                 valid = valid and np.max(np.abs(q - target)) <= HOME_POSITION_TOLERANCE_RAD
             if valid:
-                if anchor is None or np.max(np.abs(q - anchor)) > tolerance:
-                    stable, anchor = None, q.copy()
                 # SDK 未提供采样时刻；首尾查询的等待时间不能算作已观测到的停稳。
-                stable = completed_ns if stable is None else stable
-                if sample_ns - stable >= int(STANDSTILL_DWELL_S * 1e9):
+                if stable is None or np.max(np.abs(q - stable[0])) > tolerance:
+                    stable = q.copy(), completed_ns
+                if sample_ns - stable[1] >= int(STANDSTILL_DWELL_S * 1e9):
                     return
             else:
-                stable = anchor = None
+                stable = None
             # 按查询开始时刻限频，查询耗时既不拉长采样间隔，也不充作停稳时长。
             remaining_ns = min(sample_ns + interval_ns, deadline_ns) - time.monotonic_ns()
             wait(max(0, remaining_ns) / 1e9)
@@ -340,10 +338,7 @@ class ArmController:
                 raise RuntimeError("arm moved after standstill preparation")
             self.reference = ArmTrajectory(self.cfg, q, v)
         self.active = goal
-        q = self.reference.step(
-            goal["q_goal"] if not goal["hold"] else None,
-            hold=bool(goal["hold"]),
-        )
+        q = self.reference.step(None if goal["hold"] else goal["q_goal"])
         # 计算结束后、进入 SDK 前统一检查期限、反馈和最新控制器上报。
         if self.stop_if_goal_invalid(goal, time.monotonic_ns()):
             return None

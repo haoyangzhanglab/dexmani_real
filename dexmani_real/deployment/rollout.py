@@ -21,7 +21,7 @@ from dexmani_real.deployment.schedule import (
     Prediction,
     control_slot,
 )
-from dexmani_real.geometry.pose import Pose, rot6d_to_quat_wxyz
+from dexmani_real.geometry.pose import EEF_POSE_DIM, Pose, rot6d_to_quat_wxyz
 from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.robot.commands import (
     COMMAND_LEASE_NS,
@@ -32,6 +32,7 @@ from dexmani_real.robot.commands import (
     RobotCommand,
     arm_reference_from_feedback,
 )
+from dexmani_real.robot.model import ARM_DOF
 from dexmani_real.robot.xhand.feedback import expire_tactile
 from dexmani_real.runtime.ik_reference import IKReference, prepare_reference
 from dexmani_real.runtime.observation import (
@@ -187,15 +188,12 @@ class Rollout:
                 self.stop("recording_failed", run_end_reason=RunEndReason.FAILED)
                 self.robot.check()
                 poll_operator()
-            except FeedbackUnavailable as exc:
-                self.robot.check()
-                poll_operator()
-                self.stop(str(exc))
             except OperationCancelled as exc:
                 # 取消不能掩盖同时发生的设备或 worker 故障。
                 self.robot.check()
                 poll_operator()
-                if (not self.started_ns and self.runtime_state.cancel_epoch == self.episode_cancel_epoch
+                if (not isinstance(exc, FeedbackUnavailable) and not self.started_ns
+                        and self.runtime_state.cancel_epoch == self.episode_cancel_epoch
                         and self.runtime_state.requests_allow_motion()):
                     raise
                 self.stop(str(exc))
@@ -312,7 +310,7 @@ class Rollout:
                                        after_sequence=channels.camera_ring.latest_sequence)
         # 先检查各来源就绪；只有 HOI 预热会消费这次模型载荷。
         initial_hoi = self.observations.needs.hoi
-        warmup_needed = initial_hoi and not self.model.warmed_up
+        warmup_needed = initial_hoi and not self.model.hoi_warmed_up
         row = self.start_observation(poll_operator, initial_hoi=initial_hoi, warmup_payloads=warmup_needed)
         if row is None:
             self.stop(self.preparation_issue)
@@ -342,7 +340,7 @@ class Rollout:
                 raise OperationCancelled("HOI warmup cancelled")
             if time.monotonic() >= warmup_deadline:
                 raise TimeoutError("HOI policy warmup timeout")
-            self.model.warmed_up = True
+            self.model.hoi_warmed_up = True
         poll_operator()
         if not self.preparation_valid():
             raise OperationCancelled("cancelled before recorder start")
@@ -523,20 +521,20 @@ class Rollout:
         anchor = None
         try:
             if self.policy_info.action_mode == "joint":
-                decoded = self.action_mapper.map_joint(action[:7], action[7:])
+                decoded = self.action_mapper.map_joint(action[:ARM_DOF], action[ARM_DOF:])
             else:
-                pose = Pose(action[:3], rot6d_to_quat_wxyz(action[3:9]))
+                pose = Pose(action[:3], rot6d_to_quat_wxyz(action[3:EEF_POSE_DIM]))
                 reference = prepare_reference(
                     self.action_mapper.solver, self.ik_reference, row.arm["qpos"][0],
                     control_ns=time.monotonic_ns(),
                     period_s=self.execution.control_dt_s,
                 )
                 _, _, anchor, _ = reference
-                decoded = self.action_mapper.map_eef(pose, action[9:], reference)
+                decoded = self.action_mapper.map_eef(pose, action[EEF_POSE_DIM:], reference)
         except (IKReferenceError, HandTargetRejected) as exc:
             self.stop(str(exc))
             return None
-        if decoded.rejection_reason is not None or decoded.arm_qpos is None:
+        if decoded.arm_qpos is None:
             self.stop(f"action_rejected: {decoded.rejection_reason}")
             return None
         command = RobotCommand(decoded.arm_qpos, decoded.hand_qpos)

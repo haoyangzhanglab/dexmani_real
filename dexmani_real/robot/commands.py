@@ -57,6 +57,10 @@ class HandTargetRejected(ValueError):
     """XHand 目标在发送前被拒绝。"""
 
 
+class PositionLimitError(ValueError):
+    """机械臂目标或参考轨迹越过操作位置限位。"""
+
+
 class RobotError(RuntimeError):
     """设备或执行器失败，调用方须终止本次运行。"""
 
@@ -68,7 +72,7 @@ def validate_arm_target(qpos, lower, upper) -> np.ndarray:
     if not np.all(np.isfinite(target)):
         raise ValueError("arm target must be finite")
     if np.any(target < lower) or np.any(target > upper):
-        raise ValueError("arm target violates joint limits")
+        raise PositionLimitError("arm target violates joint limits")
     return target
 
 

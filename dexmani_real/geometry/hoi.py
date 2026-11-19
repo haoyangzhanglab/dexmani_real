@@ -1,12 +1,16 @@
 """HOI 任务资产、固定表面采样与坐标变换。"""
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
 
 from dexmani_real.config.perception import HOI_NUM_POINTS
-from dexmani_real.geometry.sampling import farthest_point_indices
+from dexmani_real.geometry.sampling import (
+    farthest_point_indices,
+    validate_point_segments,
+)
 
 TASK_MESH_PATH = Path("mesh/mesh_m.obj")
 
@@ -51,31 +55,12 @@ def load_hoi_task(
     return template, mesh_paths, prompts
 
 
-def validate_task_template(template):
+def validate_task_template(template: Mapping[str, np.ndarray]) -> None:
     """资产文件和 Raw 标注共用同一模板结构。"""
-    points, offsets, names = (template[key] for key in ("points_local", "offsets", "object_names"))
-    if (
-        names.ndim != 1
-        or names.dtype.kind != "U"
-        or not len(names)
-        or len(set(names)) != len(names)
-    ):
-        raise ValueError("非法 HOI 模板对象名")
-    if (
-        points.shape != (HOI_NUM_POINTS, 3)
-        or points.dtype != np.float32
-        or not np.isfinite(points).all()
-    ):
-        raise ValueError("非法 HOI 模板点")
-    # 直接比较相邻值，避免整数差分溢出。
-    if (
-        offsets.dtype.kind not in "iu"
-        or offsets.shape != (len(names) + 1,)
-        or offsets[0] != 0
-        or offsets[-1] != HOI_NUM_POINTS
-        or np.any(offsets[1:] <= offsets[:-1])
-    ):
-        raise ValueError("非法 HOI 点分段")
+    validate_point_segments(
+        template["points_local"], template["object_names"], template["offsets"],
+        num_points=HOI_NUM_POINTS, label="HOI template",
+    )
 
 
 def transform_task_points(template, poses_camera, base_from_camera):

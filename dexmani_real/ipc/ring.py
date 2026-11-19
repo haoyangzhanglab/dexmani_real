@@ -10,7 +10,7 @@ class SharedRing:
     def __init__(self, ctx, dtype: DTypeLike, capacity: int):
         if type(capacity) is not int or capacity <= 0:
             raise ValueError("ring capacity must be a positive integer")
-        self.dtype = np.dtype(dtype)
+        self.dtype: np.dtype = np.dtype(dtype)
         self.capacity = capacity
         self._last_snapshot: tuple[dict, int] | None = None
         names = self.dtype.names

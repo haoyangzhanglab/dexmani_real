@@ -17,7 +17,7 @@ IDLE_POLL_S = 0.001
 
 
 def run_pointcloud_worker(
-    shared: "SensorChannels",
+    shared: SensorChannels,
     pointcloud: PointCloudConfig,
     camera: CameraSnapshot,
     table_plane_abcd: tuple[float, float, float, float] | None,
@@ -40,14 +40,11 @@ def run_pointcloud_worker(
             time.sleep(IDLE_POLL_S)
             continue
         result = camera_ring.read()
-        if result is None:
-            time.sleep(IDLE_POLL_S)
-            continue
-        data, camera_sequence = result
-        if camera_sequence <= last_camera_sequence:
+        if result is None or result[1] <= last_camera_sequence:
             # 复制竞争可能返回上一份完整快照，不重复处理同一来源帧。
             time.sleep(IDLE_POLL_S)
             continue
+        data, camera_sequence = result
         last_camera_sequence = camera_sequence
 
         cloud = processor.process(data["depth"], data["rgb"])

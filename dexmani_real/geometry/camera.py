@@ -100,19 +100,6 @@ class CameraSnapshot:
             object.__setattr__(self, "T_xarm_base_from_color", transform)
 
 
-def camera_parameters_cv(
-    color: CameraIntrinsics,
-    T_xarm_base_from_color: np.ndarray | None = None,
-) -> dict[str, np.ndarray]:
-    """将已校验几何转为 float32 K(9) 和 base→color [R|t](12)，采用 optical RDF 轴。"""
-    parameters = {"camera_intrinsic": color.matrix(dtype=np.float32).ravel()}
-    if T_xarm_base_from_color is not None:
-        parameters["camera_extrinsic"] = camera_extrinsic_cv(T_xarm_base_from_color)
-    for values in parameters.values():
-        values.setflags(write=False)
-    return parameters
-
-
 def init_undistort_maps(intrinsics: CameraIntrinsics) -> tuple[np.ndarray, np.ndarray] | None:
     """固定 K、分辨率和 optical 轴的针孔网格；None 表示恒等映射。"""
     if not intrinsics.has_distortion:

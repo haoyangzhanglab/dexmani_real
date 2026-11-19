@@ -106,12 +106,12 @@ def check_device_feedback(row, runtime, *, now_ns=None):
     """设备事实；长计算后使用新的当前时间重新检查。"""
     now = time.monotonic_ns() if now_ns is None else now_ns
     issues = []
-    if not sample_is_fresh(int(row.arm["timestamp_ns"][0]), runtime.arm.feedback_max_age_s, now):
+    if not sample_is_fresh(row.arm["timestamp_ns"][0], runtime.arm.feedback_max_age_s, now):
         issues.append("arm_feedback_stale")
     if runtime.hand.enabled:
         if row.hand is None:
             issues.append("hand_feedback_unavailable")
-        elif not sample_is_fresh(int(row.hand["timestamp_ns"][0]), runtime.hand.feedback_max_age_s, now):
+        elif not sample_is_fresh(row.hand["timestamp_ns"][0], runtime.hand.feedback_max_age_s, now):
             issues.append("hand_timestamp_ns_unavailable_or_stale")
     return issues
 
@@ -137,10 +137,8 @@ def check_observation(row, runtime, needs, *, now_ns=None):
     elif needs.camera_fields:
         if row.camera is None:
             issues.append("camera_source_unavailable_or_unmatched")
-        else:
-            stamp = int(row.camera["timestamp_ns"])
-            if not sample_is_fresh(stamp, runtime.camera.max_frame_age_s, now):
-                issues.append("camera_source_stale")
+        elif not sample_is_fresh(row.camera["timestamp_ns"], runtime.camera.max_frame_age_s, now):
+            issues.append("camera_source_stale")
     if needs.vr:
         if row.vr is None:
             issues.append("vr_unavailable")
@@ -175,16 +173,15 @@ def _hoi_issues(hoi, runtime, now_ns):
     issues = []
     if not hoi["valid"]:
         issues.append("hoi_pose_invalid")
-    if not sample_is_fresh(int(hoi["timestamp_ns"]), runtime.execution.hoi_max_age_s, now_ns):
+    if not sample_is_fresh(hoi["timestamp_ns"], runtime.execution.hoi_max_age_s, now_ns):
         issues.append("hoi_stale")
     return issues
 
 
-def check_hoi_status(channels, runtime, *, now_ns=None) -> list[str]:
+def check_hoi_status(channels, runtime) -> list[str]:
     """仅读取当前请求及 HOI 元数据，不读取机器人、点云或图像。"""
     hoi = _read_hoi(channels)
-    now = time.monotonic_ns() if now_ns is None else now_ns
-    return _hoi_issues(hoi, runtime, now)
+    return _hoi_issues(hoi, runtime, time.monotonic_ns())
 
 
 def is_recoverable_hoi_failure(issues: Sequence[str]) -> bool:

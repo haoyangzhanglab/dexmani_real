@@ -3,7 +3,9 @@
 import numpy as np
 
 from dexmani_real import ASSET_DIR
+from dexmani_real.config.perception import HandCloudConfig
 from dexmani_real.geometry.kinematics import ArmFK, HandFK
+from dexmani_real.geometry.sampling import validate_point_segments
 
 HAND_TEMPLATE_DIR = ASSET_DIR / "pointcloud_template" / "hand"
 
@@ -12,26 +14,15 @@ class HandPointCloud:
     """读取 link 局部 XYZ 模板，保留分段及点序。"""
 
     def __init__(self, hand_fk: HandFK, num_points: int):
+        HandCloudConfig(num_points=num_points).validate()
         path = HAND_TEMPLATE_DIR / f"hand_{num_points}.npz"
         with np.load(path, allow_pickle=False) as template:
             points = template["points"]
             names = template["part_names"]
             offsets = template["part_offsets"]
-        if (
-            points.shape != (num_points, 3)
-            or points.dtype != np.float32
-            or not np.isfinite(points).all()
-            or names.ndim != 1
-            or names.dtype.kind != "U"
-            or not len(names)
-            or len(set(names)) != len(names)
-            or offsets.shape != (len(names) + 1,)
-            or offsets.dtype.kind not in "iu"
-            or offsets[0] != 0
-            or offsets[-1] != num_points
-            or np.any(offsets[1:] <= offsets[:-1])
-        ):
-            raise ValueError(f"Invalid hand point-cloud template: {path}")
+        validate_point_segments(
+            points, names, offsets, num_points=num_points, label=f"Hand point-cloud template {path}",
+        )
         self.frame_ids = tuple(hand_fk.model.getFrameId(name) for name in names.tolist())
         if any(frame_id >= hand_fk.model.nframes for frame_id in self.frame_ids):
             raise ValueError(

@@ -3,7 +3,11 @@
 import cv2
 import numpy as np
 
-from dexmani_real.geometry.camera import camera_parameters_cv, init_undistort_maps, remap_image
+from dexmani_real.geometry.camera import (
+    camera_extrinsic_cv,
+    init_undistort_maps,
+    remap_image,
+)
 from dexmani_real.geometry.kinematics import (
     ArmFK,
     HandFK,
@@ -94,19 +98,20 @@ class ObservationBuilder:
             value.flags.writeable = False
         return values
 
-    def configure_camera(self, camera):
-        self.camera_parameters = {}
+    def configure_camera(self, camera) -> None:
+        self.camera_parameters.clear()
         self.rgb_maps = init_undistort_maps(camera.color) if "rgb" in self.fields else None
         self.last_rgb_sequence = None
         self.last_rgb = None
-        requested = [name for name in self.fields if "camera_static" in FIELD_DEPENDENCIES[name]]
-        if not requested:
-            return
-        parameters = camera_parameters_cv(
-            camera.color,
-            camera.T_xarm_base_from_color if "camera_extrinsic" in requested else None,
-        )
-        self.camera_parameters = {name: parameters[name] for name in requested}
+        for name in self.fields:
+            if name == "camera_intrinsic":
+                values = camera.color.matrix(dtype=np.float32).ravel()
+            elif name == "camera_extrinsic":
+                values = camera_extrinsic_cv(camera.T_xarm_base_from_color)
+            else:
+                continue
+            values.setflags(write=False)
+            self.camera_parameters[name] = values
 
     def build(self, rows):
         fields, dependencies = self.fields, self.dependencies

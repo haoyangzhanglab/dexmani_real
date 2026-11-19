@@ -158,14 +158,10 @@ def run_replay(
             if "h" in events and keyboard.accept_operation(state) == epoch:
                 break
 
-        def home_cancel_requested() -> bool:
-            robot.check()
-            return False  # home_robot 合并急停、退出和本次操作的取消计数。
-
         logger.info("正在回初始位…")
         home_robot(
             state, robot, environment=runtime.environment, cancel_epoch=epoch,
-            cancel_requested=home_cancel_requested,
+            cancel_requested=robot.check,
         )
         logger.info("已回初始位。")
     except OperationCancelled:

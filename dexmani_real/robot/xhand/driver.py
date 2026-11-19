@@ -205,7 +205,7 @@ class XHand:
                 if remaining_ns <= 0:
                     break
                 if sample is not None:
-                    self.command = self.make_command(sample.qpos)
+                    self.command = self._make_command(sample.qpos)
                     logger.info("XHand connected via %s on %s; device_id=%d, discovered=%s",
                                 self.cfg.comm_type, device_name, self.cfg.device_id, hand_ids)
                     return sample
@@ -626,12 +626,13 @@ class XHand:
         self.warn_limited("overcurrent", "XHand 过流告警：%s code=%d msg=%s",
                           operation, OVERCURRENT_WARNING_CODE, message)
 
-    def make_command(self, qpos: np.ndarray) -> Any:
+    def _make_command(self, qpos: np.ndarray) -> Any:
+        """用首帧已校验的关节位置初始化命令。"""
         command = self.sdk.HandCommand_t()
         joints = command.finger_command
         if len(joints) != HAND_DOF:
             raise ValueError(f"XHand SDK command must provide {HAND_DOF} joint slots, got {len(joints)}")
-        for index, (joint, position) in enumerate(zip(joints, validate_hand_qpos(qpos), strict=True)):
+        for index, (joint, position) in enumerate(zip(joints, qpos, strict=True)):
             joint.id = index
             joint.position = float(position)
             joint.kp = int(self.cfg.kp[index])

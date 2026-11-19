@@ -86,7 +86,12 @@ class ArmConfig:
                 raise ValueError(f"arm {name} must be finite and positive")
         if 1 / self.feedback_hz >= self.feedback_max_age_s:
             raise ValueError("feedback period must fit freshness budget")
-        self._validate_standstill()
+        for value in (
+            self.standstill_position_tolerance_rad,
+            self.standstill_velocity_tolerance_rad_s,
+        ):
+            if not isfinite(value) or value <= 0:
+                raise ValueError("arm standstill thresholds must be finite and positive")
         speed = self.max_joint_velocity_rad_per_s
         if not isfinite(speed) or not 0.0001 <= speed <= pi:
             raise ValueError("max_joint_velocity_deg_per_s must convert to [0.0001, π] rad/s")
@@ -101,14 +106,6 @@ class ArmConfig:
         cog = np.asarray(self.tcp_load_cog_mm, dtype=np.float64)
         if cog.shape != (3,) or not np.isfinite(cog).all():
             raise ValueError("tcp_load_cog_mm must be a finite (3,) vector")
-
-    def _validate_standstill(self) -> None:
-        for value in (
-            self.standstill_position_tolerance_rad,
-            self.standstill_velocity_tolerance_rad_s,
-        ):
-            if not isfinite(value) or value <= 0:
-                raise ValueError("arm standstill thresholds must be finite and positive")
 
     def validate_home(self) -> None:
         from dexmani_real.robot.commands import validate_arm_target

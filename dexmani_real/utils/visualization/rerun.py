@@ -70,7 +70,7 @@ def log_camera_geometry(
 
 def log_rgbd(
     rgb: np.ndarray, depth_raw: np.ndarray, *, depth_scale_m: float,
-    depth_range_m: tuple[float, float] | None = None,
+    depth_range_m: tuple[float, float],
 ) -> None:
     import rerun as rr
 
@@ -79,9 +79,7 @@ def log_rgbd(
         "depth/image",
         rr.DepthImage(
             depth_raw, meter=1.0 / depth_scale_m,
-            depth_range=(
-                np.asarray(depth_range_m) / depth_scale_m if depth_range_m is not None else None
-            ),
+            depth_range=np.asarray(depth_range_m) / depth_scale_m,
         ),
     )
 

@@ -38,7 +38,6 @@ from dexmani_real.robot.commands import (
     FeedbackUnavailable,
     HomeTimeout,
     OperationCancelled,
-    RobotError,
 )
 from dexmani_real.robot.system import Robot
 from dexmani_real.robot.xhand.feedback import TACTILE_CHANNELS
@@ -317,8 +316,7 @@ class PolicySession:
         if not self.keyboard.check_health():
             self.runtime_state.request_emergency_stop()
             return False
-        if not self.sensors.check():
-            raise RobotError("required sensor process exited")
+        self.sensors.check()
         return True
 
     def start_devices(self):
@@ -359,11 +357,13 @@ class PolicySession:
                 args=(channels, self.camera_snapshot, *self.hoi_inputs),
             ), ring=channels.hoi_ring, may_start=self.startup_allowed)
             deadline = time.monotonic() + 120
-            while not channels.hoi_ready.value:
+            while True:
                 self.check_startup()
-                self.check_services()
-                if time.monotonic() > deadline:
+                ready = channels.hoi_ready.value
+                if time.monotonic() >= deadline:
                     raise TimeoutError("HOI model startup timeout")
+                if ready:
+                    break
                 time.sleep(0.01)
 
         if needs.point_cloud:
@@ -485,8 +485,6 @@ class PolicySession:
 
     def warmup_policy(self):
         model = cast(PolicyWorker, self.model)
-        if model.warmed_up:
-            return
         observation_deadline = time.monotonic() + INITIAL_STATE_TIMEOUT_S
         while True:
             self.check_startup()
@@ -512,7 +510,6 @@ class PolicySession:
         self.check_startup()
         model.warmup(rows, **kwargs)
         self.wait_model(stage="policy warmup")
-        model.warmed_up = True
 
     def poll_operator(self, *, timeout=0) -> int | None:
         return self.handle_command_batch(
@@ -521,17 +518,16 @@ class PolicySession:
 
     def handle_command_batch(self, signals: Sequence[str]) -> int | None:
         robot = cast(Robot, self.robot)
-        keys = set(signals)
-        if "d" in keys and self.episode is not None and not self.episode.finished:
-            self.episode.result.discard_requested = True
-        if self.episode is not None and keys.intersection({"s", "c", "d", "q", "esc"}):
-            reason = (RunEndReason.ESTOP if "esc" in keys else
-                      RunEndReason.QUIT if "q" in keys else RunEndReason.OPERATOR)
-            self.episode.stop("operator input", run_end_reason=reason)
-        if "esc" in keys:
-            self.runtime_state.request_emergency_stop()
-            return None
-        if keys.intersection({"s", "c", "d", "q"}):
+        stop_keys = {"s", "c", "d", "q", "esc"}.intersection(signals)
+        if stop_keys:
+            if self.episode is not None:
+                if "d" in stop_keys and not self.episode.finished:
+                    self.episode.result.discard_requested = True
+                reason = (RunEndReason.ESTOP if "esc" in stop_keys else
+                          RunEndReason.QUIT if "q" in stop_keys else RunEndReason.OPERATOR)
+                self.episode.stop("operator input", run_end_reason=reason)
+            if "esc" in stop_keys:
+                self.runtime_state.request_emergency_stop()
             return None
         for signal in signals:
             if signal not in {"b", "h", "t"}:

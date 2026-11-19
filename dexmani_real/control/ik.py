@@ -8,7 +8,11 @@ from scipy.optimize import least_squares
 
 from dexmani_real.geometry.kinematics import ArmFK
 from dexmani_real.geometry.pose import Pose
-from dexmani_real.robot.commands import arm_reference_from_feedback, validate_arm_target
+from dexmani_real.robot.commands import (
+    PositionLimitError,
+    arm_reference_from_feedback,
+    validate_arm_target,
+)
 
 JOINT_SCALE = np.sqrt([4.0, 1.8, 1.2, 0.6, 0.6, 0.9, 0.35])
 TASK_SCALE = np.array([1 / 0.3] * 3 + [1.0] * 3)
@@ -62,9 +66,7 @@ class IKSolver:
         """有限但越限的实测终止本段；格式与数值错误继续传播。"""
         try:
             return arm_reference_from_feedback(qpos, *self.limits.T)
-        except ValueError as exc:
-            if np.shape(qpos) != (7,) or not np.isfinite(qpos).all():
-                raise
+        except PositionLimitError as exc:
             raise IKReferenceError("measured arm outside operational limits") from exc
 
     def compute_eef_pose_base(self, qpos: np.ndarray) -> Pose:

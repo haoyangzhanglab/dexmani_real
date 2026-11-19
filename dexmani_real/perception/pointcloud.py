@@ -158,7 +158,7 @@ class PointCloudProcessor:
         table_plane_abcd: tuple[float, float, float, float] | None,
         config: PointCloudConfig,
     ):
-        config.validate()
+        bounds = config.validate()
         if T_xarm_base_from_color is None:
             raise ValueError("pointcloud requires camera extrinsics")
         if depth_scale_m is None:
@@ -168,7 +168,7 @@ class PointCloudProcessor:
 
         self.config = config
         self.depth_scale = np.float32(depth_scale_m)
-        self.lower, self.upper = np.asarray(config.workspace, dtype=np.float32).reshape(2, 3)
+        self.lower, self.upper = bounds.astype(np.float32)
         rays = depth_rays(intrinsics)
         transform = T_xarm_base_from_color
         self.rays_base = (rays @ transform[:3, :3].T).astype(np.float32)

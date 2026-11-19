@@ -4,7 +4,7 @@ import logging
 import signal
 import time
 
-from dexmani_real.robot.commands import OperationCancelled
+from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.runtime.state import SessionState
 
 logger = logging.getLogger(__name__)
@@ -21,12 +21,12 @@ class SensorWorkers:
     def __init__(self, channels=None):
         self.channels = channels
         self.processes = []
+        self._reported_exits = set()
 
     def start(self, process, *, ring, timeout_s=None, may_start) -> None:
         """传入超时时等待就绪，否则仅启动；失败后仍由本对象回收进程。"""
         allowed = may_start()
-        if not self.check():
-            raise RuntimeError("required sensor worker exited before startup")
+        self.check()
         if not allowed:
             raise OperationCancelled("sensor startup cancelled")
         self.processes.append(process)
@@ -36,19 +36,26 @@ class SensorWorkers:
             while time.monotonic() < deadline:
                 allowed = may_start()
                 sequence = ring.latest_sequence
-                if not self.check():
-                    raise RuntimeError(f"{process.name} exited during startup")
+                self.check()
                 if not allowed:
                     raise OperationCancelled(f"{process.name} startup cancelled")
                 if sequence > 0:
-                    if not may_start():
+                    allowed = may_start()
+                    self.check()
+                    if not allowed:
                         raise OperationCancelled(f"{process.name} startup cancelled")
+                    if time.monotonic() >= deadline:
+                        break
                     return
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
             raise RuntimeError(f"{process.name} failed to become ready")
 
-    def check(self) -> bool:
-        return all(process.is_alive() for process in self.processes)
+    def check(self) -> None:
+        for process in self.processes:
+            exitcode = process.exitcode
+            if exitcode is not None:
+                self._reported_exits.add(process)
+                raise RobotError(f"sensor worker {process.name} exited: exitcode={exitcode}")
 
     def shutdown(self, runtime_state: SessionState) -> None:
         """短时退出，必要时终止 sensor；仅保留实际未回收的句柄。"""
@@ -57,24 +64,33 @@ class SensorWorkers:
         deadline = time.monotonic() + SENSOR_SHUTDOWN_TIMEOUT_S
         errors: list[tuple[str, BaseException]] = []
         unresolved = []
+
+        def join_worker(process, timeout):
+            try:
+                process.join(timeout=timeout)
+            except KeyboardInterrupt as exc:
+                # 等待被打断仍要查看进程状态，并在必要时升级停止信号。
+                runtime_state.request_emergency_stop()
+                errors.append((process.name, exc))
+
         for process in self.processes:
             try:
                 if process.pid is None:
                     continue
-                process.join(timeout=max(0.0, deadline - time.monotonic()))
+                join_worker(process, max(0.0, deadline - time.monotonic()))
                 terminated = killed = False
                 if process.is_alive():
                     process.terminate()
                     terminated = True
-                    process.join(timeout=WORKER_STOP_TIMEOUT_S)
+                    join_worker(process, WORKER_STOP_TIMEOUT_S)
                 if process.is_alive():
                     process.kill()
                     killed = True
-                    process.join(timeout=WORKER_STOP_TIMEOUT_S)
+                    join_worker(process, WORKER_STOP_TIMEOUT_S)
                 exitcode = process.exitcode
                 if exitcode is None:
                     raise RuntimeError(f"process {process.name} could not be confirmed stopped")
-                if exitcode == 0:
+                if exitcode == 0 or process in self._reported_exits:
                     continue
                 # 升级 kill 后，退出仍可能由先前尝试的 SIGTERM 引起。
                 if not (
@@ -90,6 +106,7 @@ class SensorWorkers:
                 if process.pid is not None and process.exitcode is None:
                     unresolved.append(process)
         self.processes = unresolved
+        self._reported_exits.clear()
         if errors:
             for stage, error in errors[1:]:
                 logger.error("worker %s shutdown failed", stage, exc_info=(type(error), error, error.__traceback__))

@@ -181,7 +181,7 @@ class KeyboardTeleop:
             self.run_home(epoch)
         return True
 
-    def run_home(self, expected_cancel_epoch):
+    def run_home(self, expected_cancel_epoch) -> None:
         with self.runtime_state.motion_lock:
             if (self.runtime_state.cancel_epoch != expected_cancel_epoch
                     or not self.runtime_state.requests_allow_motion()):
@@ -215,6 +215,6 @@ class KeyboardTeleop:
             logger.info("HOME completed")
         if (self.runtime_state.cancel_epoch != cancel_epoch
                 or not self.runtime_state.requests_allow_motion()):
-            return False
+            return
         self.prepare_jog(cancel_epoch)
         self.tick_due_ns = time.monotonic_ns() + self.period_ns

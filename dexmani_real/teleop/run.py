@@ -119,6 +119,26 @@ def run_teleop(
     loop = None
     keyboard = audio = None
     primary_failure: BaseException | None = None
+
+    def record_failure(stage, error):
+        nonlocal primary_failure
+        if primary_failure is None:
+            primary_failure = error
+        if loop is None:
+            if isinstance(error, KeyboardInterrupt):
+                runtime_state.request_emergency_stop()
+            else:
+                runtime_state.stop_signal.set()
+            return
+        try:
+            loop.record_error(stage, error)
+        except BaseException as report_error:
+            if isinstance(error, KeyboardInterrupt) or isinstance(report_error, KeyboardInterrupt):
+                runtime_state.request_emergency_stop()
+            else:
+                runtime_state.stop_signal.set()
+            logger.exception("teleop error reporting failed at %s", stage)
+
     try:
         try:
             sensors = SensorWorkers(channels)
@@ -156,8 +176,9 @@ def run_teleop(
             keyboard.start()
 
             def check_services():
-                if not keyboard.check_health() or not sensors.check():
+                if not keyboard.check_health():
                     raise RobotError("teleop control service unavailable")
+                sensors.check()
                 return True
 
             robot.check_services = check_services
@@ -203,33 +224,24 @@ def run_teleop(
             loop.run()
             robot.check()
     except (Exception, KeyboardInterrupt) as exc:
-        primary_failure = exc
-        if loop is not None:
-            loop.record_error("session", exc)
-        elif isinstance(exc, KeyboardInterrupt):
-            runtime_state.request_emergency_stop()
-        else:
-            runtime_state.stop_signal.set()
+        record_failure("session", exc)
         logger.exception("teleop session failed")
     finally:
         if audio is not None and runtime_state.estop_request:
-            audio.play("emergency")
+            try:
+                audio.play("emergency")
+            except BaseException:
+                logger.exception("teleop emergency audio failed")
         try:
             close_runtime(runtime_state, robot, sensors=sensors, keyboard=keyboard)
         except BaseException as exc:
-            primary_failure = primary_failure or exc
-            if loop is not None:
-                loop.record_error("runtime_cleanup", exc)
-            elif isinstance(exc, KeyboardInterrupt):
-                runtime_state.request_emergency_stop()
+            record_failure("runtime_cleanup", exc)
             logger.exception("teleop runtime cleanup failed")
         try:
             if loop is not None:
                 loop.finish_recording(wait=True)
         except BaseException as exc:
-            primary_failure = primary_failure or exc
-            if loop is not None:
-                loop.record_error("recording_cleanup", exc)
+            record_failure("recording_cleanup", exc)
             logger.exception("teleop capture cleanup failed")
         if audio is not None:
             try:

@@ -318,8 +318,7 @@ class SceneTracker:
         self.occluded_since: dict[str, int] = {}
         # Pending 保存 (物体原点位姿, 居中网格内部位姿)，不提交到 pose_last。
         self.pending_pose: dict[str, tuple[np.ndarray, Tensor]] = {}
-        self.last_pose: dict[str, np.ndarray] = {}
-        self.last_pose_ns: dict[str, int] = {}
+        self.last_pose: dict[str, tuple[np.ndarray, int]] = {}
         self.frame_index = 0
         self.last_sam_frame = 0
         self._set_frame_time(frame, first=True)
@@ -493,15 +492,15 @@ class SceneTracker:
         ):
             masks = self._refresh_masks(rgb)
 
-        def evaluate(name, pose, mask):
+        def evaluate(name, pose, mask) -> None:
             if name not in pose_checks:
                 reference, dt = None, 0.0
                 if name in confirming:
                     reference = self.pending_pose[name][0]
                     dt = self.frame_dt_s
                 elif name in self.last_pose and name not in due:
-                    reference = self.last_pose[name]
-                    dt = (self.timestamp_ns - self.last_pose_ns[name]) / 1e9
+                    reference, reference_ns = self.last_pose[name]
+                    dt = (self.timestamp_ns - reference_ns) / 1e9
                 # Mask 更新后仅重算可见证据，复用同一候选的位姿检查和渲染。
                 pose_checks[name] = self._pose_geometry(name, pose, K, reference, dt)
             rendered, motion, continuous = pose_checks[name]
@@ -531,7 +530,6 @@ class SceneTracker:
             else:
                 result.failures.pop(name, None)
             verdicts[name] = verdict
-            return verdict
 
         def check_candidates():
             for name, pose in list(candidates.items()):
@@ -549,7 +547,8 @@ class SceneTracker:
                 if np.count_nonzero(valid) < self.config.min_depth_pixels:
                     raise TrackingFailure("insufficient segmented depth")
                 pose = self.trackers[name].register(rgb, depth_m, K, mask)
-                if evaluate(name, pose, mask) != "VALID":
+                evaluate(name, pose, mask)
+                if verdicts[name] != "VALID":
                     return False
             except TrackingFailure as error:
                 reject(name, error)
@@ -618,8 +617,7 @@ class SceneTracker:
                 continue
             if verdict == "VALID":
                 self.states[name] = "TRACKING"
-                self.last_pose[name] = candidates[name]
-                self.last_pose_ns[name] = self.timestamp_ns
+                self.last_pose[name] = candidates[name], self.timestamp_ns
                 result.poses[name] = candidates[name]
                 result.valid[name] = True
             else:

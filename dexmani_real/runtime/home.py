@@ -12,6 +12,7 @@ from dexmani_real.robot.commands import (
     FeedbackUnavailable,
     HomeTimeout,
     OperationCancelled,
+    PositionLimitError,
     RobotError,
     arm_reference_from_feedback,
     validate_hand_target,
@@ -22,7 +23,6 @@ from dexmani_real.robot.xarm7.protocol import (
     STANDSTILL_DWELL_S,
 )
 from dexmani_real.robot.xarm7.trajectory import (
-    PositionLimitError,
     calculate_home_trajectory,
     validate_extrema,
 )
@@ -313,10 +313,10 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
         failure = sys.exc_info()[1]
         try:
             robot.stop()
-        except Exception as exc:  # noqa: BLE001 — 同时报告停止结果与原始 HOME 失败。
+        except Exception as exc:
             # 可恢复的 HOME 失败仅在确认停止后才交回控制循环。
             if failure is None or isinstance(
                 failure, (OperationCancelled, HomeConfigurationError, HomePathRejected),
             ):
-                raise RobotError(f"HOME stop could not be confirmed: {exc}") from (failure or exc)
-            logger.error("HOME stop also failed: %s", exc)
+                raise RobotError(f"HOME stop could not be confirmed: {exc}") from exc
+            logger.exception("HOME stop also failed")

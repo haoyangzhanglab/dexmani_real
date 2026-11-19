@@ -35,7 +35,7 @@ def run_hoi_worker(shared, camera, template, mesh_paths, prompts):
         if request is None or int(request[0]["episode_id"]) == 0:
             time.sleep(0.005)
             continue
-        command = request[0]
+        command, request_sequence = request
         requested_epoch = int(command["episode_id"])
         if epoch != requested_epoch:
             epoch = requested_epoch
@@ -68,8 +68,8 @@ def run_hoi_worker(shared, camera, template, mesh_paths, prompts):
                 points = transform_task_points(
                     template, poses, camera.T_xarm_base_from_color
                 )
-        # 丢弃已经切换 Episode 的在途结果。
-        if int(shared.hoi_request.read()[0]["episode_id"]) != epoch:
+        # 检查请求的发布序列，避免读竞争时复用旧请求快照。
+        if shared.hoi_request.latest_sequence != request_sequence:
             continue
         if failure is not None:
             points = np.zeros((HOI_NUM_POINTS, 3), np.float32)

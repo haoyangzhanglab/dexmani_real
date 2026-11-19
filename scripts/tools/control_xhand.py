@@ -47,24 +47,18 @@ PRESET_QPOS_DEG = {
 
 
 def action_sequence(config: HandConfig) -> list[tuple[str, np.ndarray]]:
-    actions = (
-        ("HOME", config.home_qpos_deg),
-        ("fist", PRESET_QPOS_DEG["fist"]),
-        ("palm", config.home_qpos_deg),
-        ("V", PRESET_QPOS_DEG["v"]),
-        ("OK", PRESET_QPOS_DEG["ok"]),
-        ("HOME", config.home_qpos_deg),
-    )
-    result = []
-    for name, values in actions:
+    targets = {}
+    for name in ("HOME", "fist", "V", "OK"):
         try:
-            target = validate_hand_target(
-                np.deg2rad(values), config.qpos_min_rad, config.qpos_max_rad,
-            )
+            qpos = config.home_qpos_rad if name == "HOME" else np.deg2rad(PRESET_QPOS_DEG[name.lower()])
+            targets[name] = validate_hand_target(qpos, config.qpos_min_rad, config.qpos_max_rad)
         except ValueError as exc:
             raise ValueError(f"{name}: {exc}") from exc
-        result.append((name, target))
-    return result
+    home = targets["HOME"]
+    return [
+        ("HOME", home), ("fist", targets["fist"]), ("palm", home.copy()),
+        ("V", targets["V"]), ("OK", targets["OK"]), ("HOME", home.copy()),
+    ]
 
 
 class XHandDiagnostic(XHand):

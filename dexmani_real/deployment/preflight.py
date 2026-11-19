@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.deployment import ExecutionConfig
 from dexmani_real.deployment.observation import JOINT_OBSERVATION_FIELDS
+from dexmani_real.geometry.pose import EEF_POSE_DIM
 from dexmani_real.robot.commands import COMMAND_LEASE_NS
+from dexmani_real.robot.model import ARM_DOF, HAND_DOF
 from dexmani_real.runtime.preflight import (
     validate_robot_config,
     validate_xhand_target_rate,
@@ -77,7 +79,7 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
 
 
 def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
-    control_dim = {"joint": 19, "eef": 21}.get(info.action_mode)
+    control_dim = {"joint": ARM_DOF + HAND_DOF, "eef": EEF_POSE_DIM + HAND_DOF}.get(info.action_mode)
     if control_dim is None:
         raise ValueError(f"Real deployment does not support action_mode={info.action_mode!r}; use joint or eef")
     if info.control_action_dim != control_dim:

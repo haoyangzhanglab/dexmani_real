@@ -255,23 +255,13 @@ def _replay_endpoint(event, feedback, *, max_age_s):
     return result
 
 
-def summarize_timing(trace: dict) -> dict:
-    """以邮箱发布时间连接主机提交和 xArm 伺服调用。"""
-    metadata = trace["metadata"]
-    control = trace["control"]
-    servo, feedback = trace["servo"]["samples"], trace["feedback"]["samples"]
-    by_goal: dict[int, list[dict]] = defaultdict(list)
-    for sample in servo:
-        by_goal[sample["goal_published_ns"]].append(sample)
-
-    published = set()
+def _summarize_replay(trace: dict, by_goal: dict[int, list[dict]]) -> dict:
     last_published_ns = None
     replay_rows = []
     endpoint = None
-    for event in control["samples"]:
+    for event in trace["control"]["samples"]:
         if event["event"] == "arm_publish":
             last_published_ns = event["timestamp_ns"]
-            published.add(last_published_ns)
         elif event["event"] == "replay_row":
             stamp = event["arm_published_ns"]
             # 臂先发布、手后写入。组合失败时用同一次 send_action 内的发布事件。
@@ -288,8 +278,21 @@ def summarize_timing(trace: dict) -> dict:
                 "successful_sdk_calls_observed": sum(call["succeeded"] for call in calls),
             })
         elif event["event"] == "replay_endpoint":
-            endpoint = _replay_endpoint(event, feedback, max_age_s=metadata["feedback_max_age_s"])
+            endpoint = _replay_endpoint(
+                event, trace["feedback"]["samples"], max_age_s=trace["metadata"]["feedback_max_age_s"],
+            )
+    return {"rows": replay_rows, "endpoint": endpoint}
 
+
+def summarize_timing(trace: dict) -> dict:
+    """以邮箱发布时间连接主机提交和 xArm 伺服调用。"""
+    control = trace["control"]
+    servo, feedback = trace["servo"]["samples"], trace["feedback"]["samples"]
+    by_goal: dict[int, list[dict]] = defaultdict(list)
+    for sample in servo:
+        by_goal[sample["goal_published_ns"]].append(sample)
+
+    published = {event["timestamp_ns"] for event in control["samples"] if event["event"] == "arm_publish"}
     matched = published & by_goal.keys()
     servo_dropped = trace["servo"]["dropped"]
     # 保留窗口外的调用可能包括某个目标的首次发送。
@@ -312,8 +315,8 @@ def summarize_timing(trace: dict) -> dict:
         "servo": servo_dropped,
         "feedback": trace["feedback"]["dropped"],
     }
-    if metadata.get("mode") == "replay":
-        summary["replay"] = {"rows": replay_rows, "endpoint": endpoint}
+    if trace["metadata"].get("mode") == "replay":
+        summary["replay"] = _summarize_replay(trace, by_goal)
     return summary
 
 

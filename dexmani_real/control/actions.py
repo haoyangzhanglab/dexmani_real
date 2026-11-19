@@ -7,6 +7,7 @@ import numpy as np
 from dexmani_real.control.ik import IKSolver
 from dexmani_real.geometry.pose import Pose
 from dexmani_real.robot.commands import validate_hand_target
+from dexmani_real.robot.model import ARM_JOINT_SHAPE
 
 
 class StartPoseRejected(ValueError):
@@ -69,8 +70,8 @@ class ActionMapper:
     def map_joint(self, arm, hand):
         """限制机械臂目标并校验 XHand 的绝对关节目标。"""
         target = np.asarray(arm, dtype=np.float64)
-        if target.shape != (7,) or not np.isfinite(target).all():
-            raise ValueError("arm preparation requires a finite (7,) target")
+        if target.shape != ARM_JOINT_SHAPE or not np.isfinite(target).all():
+            raise ValueError(f"arm preparation requires a finite {ARM_JOINT_SHAPE} target")
         hand = self.prepare_hand(hand)
         target = np.clip(target, self.joint_limits[:, 0], self.joint_limits[:, 1])
         return ActionResult(target, hand)

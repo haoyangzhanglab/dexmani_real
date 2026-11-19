@@ -40,8 +40,11 @@ from dexmani_real.utils.visualization.rerun import (
 logger = logging.getLogger("dexmani_real.cli.visualize_episode")
 
 
-RAW_SERIES_FIELDS = (
-    "arm_qpos", "hand_qpos", "action_arm_joint_target", "action_hand_joint_target",
+RAW_JOINT_SERIES = (
+    ("State", "arm_qpos"),
+    ("State", "hand_qpos"),
+    ("Action", "action_arm_joint_target"),
+    ("Action", "action_hand_joint_target"),
 )
 
 FINGERTIP_COLORS: tuple[tuple[int, int, int], ...] = (
@@ -89,9 +92,6 @@ class EpisodeVisualizer:
     ):
         if max_frames is not None and max_frames <= 0:
             raise ValueError("max_frames must be positive")
-        import rerun as rr
-
-        self.rr = rr
 
         episode_name = Path(episode_path).stem
         try:
@@ -149,21 +149,21 @@ class EpisodeVisualizer:
             self.hand_cloud = HandPointCloud(self.hand_fk, hand_pointcloud_config.num_points)
             self.state = self.preload_state()
 
+            import rerun as rr
+
             app_id = f"DexMani - {episode_name}"
             rec_id = f"{episode_name}-{time.time_ns()}"
-            rr.init(
-                app_id,
-                recording_id=rec_id,
-                spawn=True,
-            )
+            rr.init(app_id, recording_id=rec_id)
+            self.rr = rr
+            rr.spawn()
             series = []
             series_groups: dict[str, list[str]] = {}
             force_labels = tuple(f"{axis} (SDK / 255)" for axis in ("Fx", "Fy", "Fz"))
+            joint_series = (
+                (group, f"{group.lower()}/{field}", field, None) for group, field in RAW_JOINT_SERIES
+            )
             for group, path, key, labels in (
-                ("State", "state/arm_qpos", "arm_qpos", None),
-                ("State", "state/hand_qpos", "hand_qpos", None),
-                ("Action", "action/action_arm_joint_target", "action_arm_joint_target", None),
-                ("Action", "action/action_hand_joint_target", "action_hand_joint_target", None),
+                *joint_series,
                 ("Contact Force", "state/hand_contact_mag", "hand_contact_mag",
                  tuple(f"{finger} (SDK / 255)" for finger in TACTILE_FINGER_ORDER.split(","))),
                 ("Contact Force", "state/hand_force_thumb", "hand_force_thumb", force_labels),
@@ -188,7 +188,7 @@ class EpisodeVisualizer:
 
     def preload_state(self) -> dict[str, np.ndarray]:
         state = {
-            key: self.reader[key][: self.frame_count] for key in RAW_SERIES_FIELDS
+            field: self.reader[field][: self.frame_count] for _, field in RAW_JOINT_SERIES
         }
 
         contact = self.reader["hand_contact"][: self.frame_count]
@@ -373,9 +373,9 @@ def main(argv: list[str] | None = None) -> int:
         stop = viz.frame_count if viz.frame_count < viz.reader.num_frames else None
         for step, rgb in enumerate(islice(viz.reader.iter_rgb_frames(), stop)):
             viz.log_step(step, rgb)
-        logger.info("数据已发送，脚本结束；可在 Rerun 中继续浏览。")
     finally:
         viz.close(sys.exc_info()[1])
+    logger.info("数据已发送，脚本结束；可在 Rerun 中继续浏览。")
     return 0
 
 

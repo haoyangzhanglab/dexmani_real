@@ -29,7 +29,7 @@ VR_DTYPE = np.dtype(
 )
 
 
-def camera_dtype(height: int, width: int, *, depth_enabled: bool = True) -> np.dtype:
+def camera_dtype(height: int, width: int, *, depth_enabled: bool) -> np.dtype:
     fields: list[tuple] = [
         # 实际采集通道中最早的首次接收时刻，重复帧不刷新时间。
         ("timestamp_ns", "<u8"),
@@ -40,7 +40,7 @@ def camera_dtype(height: int, width: int, *, depth_enabled: bool = True) -> np.d
     return np.dtype(fields, align=True)
 
 
-def pointcloud_dtype(num_points: int, rgb_dtype: np.dtype | None = None) -> np.dtype:
+def pointcloud_dtype(num_points: int, rgb_dtype: np.dtype | None) -> np.dtype:
     fields: list[tuple] = [
         ("source_camera_sequence", "<u8"),
         ("timestamp_ns", "<u8"),
@@ -71,10 +71,7 @@ class SensorChannels:
         self.vr_ring = SharedRing(ctx, VR_DTYPE, 8) if vr else None
         # VR worker 是唯一写者，断开即推进，下一份数据可能尚未发布。
         self.vr_connection_epoch = ctx.RawValue("Q", 0) if vr else None
-        rgb_dtype = None
-        if include_derived_rgb:
-            image_dtype: np.dtype = cast(SharedRing, self.camera_ring).dtype
-            rgb_dtype = image_dtype["rgb"]
+        rgb_dtype = cast(SharedRing, self.camera_ring).dtype["rgb"] if include_derived_rgb else None
         self.pointcloud_ring = (
             SharedRing(
                 ctx, pointcloud_dtype(pointcloud_num_points, rgb_dtype), 8,
@@ -119,10 +116,9 @@ def snapshot_camera_parameters(
     return CameraSnapshot(serial, color, scale, transform)
 
 
-def read_camera_frame(channels, *, fields=None):
-    result = channels.camera_ring.read(
-        fields=None if fields is None else ("timestamp_ns", *fields),
-    )
+def read_camera_frame(channels: SensorChannels, *, fields: tuple[str, ...]) -> dict | None:
+    """读取已分配的相机通道，空字段只取来源时间和序列号。"""
+    result = cast(SharedRing, channels.camera_ring).read(fields=("timestamp_ns", *fields))
     if result is None:
         return None
     data, sequence = result

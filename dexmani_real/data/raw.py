@@ -21,6 +21,8 @@ from dexmani_real.geometry.pose import ROTATION_ATOL, validate_rigid_transform
 from dexmani_real.robot.model import (
     ARM_JOINT_SHAPE,
     HAND_JOINT_SHAPE,
+    HAND_TACTILE_FORCE_SHAPE,
+    HAND_TACTILE_SUM_SHAPE,
     XARM7_JOINT_NAMES,
     XHAND_SDK_JOINT_NAMES,
     XHAND_TACTILE_SCALE_DIVISOR,
@@ -49,8 +51,8 @@ ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
     "arm_qpos": (ARM_JOINT_SHAPE, np.dtype(np.float64)),
     "hand_qpos": (HAND_JOINT_SHAPE, np.dtype(np.float64)),
     # 触觉保留校正后 SDK / 255，无法使用的指尖以 NaN 表示。
-    "hand_contact": ((5, 3), np.dtype(np.float32)),
-    "hand_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
+    "hand_contact": (HAND_TACTILE_SUM_SHAPE, np.dtype(np.float32)),
+    "hand_tactile_force": (HAND_TACTILE_FORCE_SHAPE, np.dtype(np.float32)),
     # 无新提交的观测行以两组全 NaN 目标表示。
     "action_arm_joint_target": (ARM_JOINT_SHAPE, np.dtype(np.float64)),
     "action_hand_joint_target": (HAND_JOINT_SHAPE, np.dtype(np.float64)),
@@ -208,7 +210,7 @@ def decode_camera_metadata(meta, *, include_depth=True, include_extrinsics=True)
         raise RawDataError("Raw camera_color_distortion_model must be a string")
     coeffs = np.asarray(meta["camera_color_distortion_coeffs"])
     if coeffs.shape != (5,) or coeffs.dtype.kind not in "fiu":
-        raise ValueError("camera_color_distortion_coeffs must contain five numeric values")
+        raise RawDataError("camera_color_distortion_coeffs must contain five numeric values")
     matrix = parse_camera_matrix(meta["camera_color_intrinsics"])
     color = CameraIntrinsics(
         width=np.asarray(meta["camera_color_width"]).item(),
@@ -233,6 +235,25 @@ def decode_camera_metadata(meta, *, include_depth=True, include_extrinsics=True)
 
 
 _RGB_TIME_BASE = Fraction(1, 1_000_000_000)
+
+
+def _close_handles(owner, *names: str, failure: BaseException | None = None) -> None:
+    """依次关闭已打开的句柄，保留首错和未确认关闭的句柄。"""
+    for name in names:
+        handle = getattr(owner, name)
+        if handle is None:
+            continue
+        try:
+            handle.close()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+            else:
+                logger.exception("Raw %s close also failed: %s", name, owner.path)
+        else:
+            setattr(owner, name, None)
+    if failure is not None:
+        raise failure
 
 
 class _VideoWriter:
@@ -275,17 +296,17 @@ class _VideoWriter:
             container.mux(packet)
 
     def close(self):
-        if self.container is None:
-            return
         # 取走编码流；flush 即使失败，也不能再次送入编码器。
         stream, self.stream = self.stream, None
+        failure = None
         try:
             if stream is not None:
+                container = cast("av.container.OutputContainer", self.container)
                 for packet in stream.encode(None):
-                    self.container.mux(packet)
-        finally:
-            self.container.close()
-            self.container = None
+                    container.mux(packet)
+        except BaseException as exc:  # noqa: BLE001 — flush 失败后仍须关闭容器，随后传播首错。
+            failure = exc
+        _close_handles(self, "container", failure=failure)
 
 
 class RawWriter:
@@ -332,12 +353,12 @@ class RawWriter:
         self.segment_starts = timing.create_dataset(
             "segment_starts", shape=(0,), maxshape=(None,), dtype=np.int64,
         )
-        rgb_shape = (metadata["camera_color_height"], metadata["camera_color_width"], 3)
+        height, width = metadata["camera_color_height"], metadata["camera_color_width"]
         self.datasets["depth"] = data.create_dataset(
             "depth",
-            shape=(0, *rgb_shape[:2]),
-            maxshape=(None, *rgb_shape[:2]),
-            chunks=(1, *rgb_shape[:2]),
+            shape=(0, height, width),
+            maxshape=(None, height, width),
+            chunks=(1, height, width),
             dtype=np.uint16,
             compression="gzip",
             compression_opts=1,
@@ -353,7 +374,6 @@ class RawWriter:
             for name, dataset in self.datasets.items()
         }
         self.timing_rows: np.ndarray | None = np.empty(batch_size, dtype=TIMING_ROW_DTYPE)
-        height, width, _ = rgb_shape
         self.video = _VideoWriter(
             self.path / "rgb.mp4", fps=self.control_hz, width=width, height=height
         )
@@ -405,14 +425,7 @@ class RawWriter:
 
     def close(self):
         try:
-            try:
-                if self.video is not None:
-                    self.video.close()
-                    self.video = None
-            finally:
-                if self.data_file is not None:
-                    self.data_file.close()
-                    self.data_file = None
+            _close_handles(self, "video", "data_file")
         finally:
             self.arrays = {}
             self.timing_rows = None
@@ -439,7 +452,10 @@ def open_hoi_file(path: Path, raw_meta, raw_timing):
         if not np.array_equal(timing[:], raw_timing.fields(CAMERA_TIMING_FIELDS)[:]):
             raise RawDataError(f"{path}: HOI camera_timing differs from Raw; re-annotate with --overwrite")
     except BaseException:
-        annotations.close()
+        try:
+            annotations.close()
+        except BaseException:
+            logger.exception("HOI file close also failed: %s", path)
         raise
     return annotations
 
@@ -447,7 +463,7 @@ def open_hoi_file(path: Path, raw_meta, raw_timing):
 def published_raw_path(requested: Path) -> Path:
     resolved = requested.resolve()
     if requested.name.startswith(".tmp_") or resolved.name.startswith(".tmp_"):
-        raise ValueError(f"unpublished Raw: {requested}")
+        raise RawDataError(f"unpublished Raw: {requested}")
     return resolved
 
 
@@ -520,7 +536,7 @@ class RawReader:
         ):
             indices = np.flatnonzero(bad)
             if len(indices):
-                raise ValueError(f"Raw {self.path}: {detail} at row {int(indices[0]) + offset}")
+                raise RawDataError(f"Raw {self.path}: {detail} at row {int(indices[0]) + offset}")
         self._validate_observation_clock(observation)
         for key in source_clocks:
             stamps = rows[key]
@@ -534,7 +550,7 @@ class RawReader:
     def _validate_observation_clock(self, stamps: np.ndarray) -> None:
         indices = np.flatnonzero(stamps[1:] <= stamps[:-1])
         if len(indices):
-            raise ValueError(
+            raise RawDataError(
                 f"Raw {self.path}: observation_clock_not_increasing at row {int(indices[0]) + 1}"
             )
 
@@ -551,7 +567,7 @@ class RawReader:
                 or (self.num_frames > 0 and (starts.size == 0 or starts[0] != 0))
                 or np.any(starts[1:] <= starts[:-1])
                 or np.any(starts >= self.num_frames)):
-            raise ValueError(f"Raw {self.path}: invalid timing/segment_starts")
+            raise RawDataError(f"Raw {self.path}: invalid timing/segment_starts")
         return starts.astype(np.intp, copy=False)
 
     def __getitem__(self, name):
@@ -566,7 +582,7 @@ class RawReader:
                 name in ACTION_TARGET_FIELDS
                 and self.meta["arm_action_semantics"] != ARM_ACTION_SEMANTICS
             ):
-                raise ValueError(f"Raw arm_action_semantics: expected {ARM_ACTION_SEMANTICS}")
+                raise RawDataError(f"Raw arm_action_semantics: expected {ARM_ACTION_SEMANTICS}")
             array = (self.hoi_file if name == "object_pointcloud" else self.data_file)[name]
             import h5py
             if not isinstance(array, h5py.Dataset):
@@ -602,7 +618,7 @@ class RawReader:
 
     def validate_joint_metadata(self, device, joint_names) -> None:
         if self.meta["joint_units"] != "rad":
-            raise ValueError("Raw joint_units: expected rad")
+            raise RawDataError("Raw joint_units: expected rad")
         name = f"{device}_joint_names"
         encoded = self.meta[name]
         if not isinstance(encoded, (str, bytes, bytearray)):
@@ -612,14 +628,14 @@ class RawReader:
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise RawDataError(f"Raw {name}: invalid joint names format: {exc}") from exc
         if names != list(joint_names):
-            raise ValueError(f"Raw {name}: incompatible joint order")
+            raise RawDataError(f"Raw {name}: incompatible joint order")
 
     def validate_tactile_metadata(self) -> None:
         if self.meta.get("hand_tactile_finger_order") != TACTILE_FINGER_ORDER:
-            raise ValueError("Raw hand_tactile_finger_order: incompatible tactile semantics")
+            raise RawDataError("Raw hand_tactile_finger_order: incompatible tactile semantics")
         divisor = positive_metadata_scalar(self.meta, "hand_tactile_scale_divisor")
         if divisor != XHAND_TACTILE_SCALE_DIVISOR:
-            raise ValueError(
+            raise RawDataError(
                 f"Raw hand_tactile_scale_divisor: expected {XHAND_TACTILE_SCALE_DIVISOR}, "
                 f"got {divisor!r}"
             )
@@ -636,11 +652,14 @@ class RawReader:
 
         if self.video_container is None:
             self.video_container = av.open(str(self.rgb_path), "r")
-            if not self.video_container.streams.video:
-                raise RawDataError(f"Raw {self.rgb_path}: missing video stream")
-            stream = self.video_container.streams.video[0]
-            stream.thread_type = "AUTO"
-            stream.thread_count = 4
+            try:
+                if not self.video_container.streams.video:
+                    raise RawDataError(f"Raw {self.rgb_path}: missing video stream")
+                stream = self.video_container.streams.video[0]
+                stream.thread_type = "AUTO"
+                stream.thread_count = 4
+            except BaseException as exc:  # noqa: BLE001 — 初始化失败时关闭容器并保留首错。
+                _close_handles(self, "video_container", failure=exc)
         self.video_container.seek(0)
         expected = (self.meta["camera_color_height"], self.meta["camera_color_width"], 3)
         elapsed_ns = self["timing/rows"].fields("control_ns")[:]
@@ -657,7 +676,7 @@ class RawReader:
                 )
             image = frame.to_ndarray(format="rgb24")
             if image.shape != expected:
-                raise ValueError(
+                raise RawDataError(
                     f"Raw {self.path}: RGB grid invalid at row {index}, expected {expected}"
                 )
             yield image
@@ -667,19 +686,7 @@ class RawReader:
 
     def close(self):
         self.dataset_cache.clear()
-        try:
-            if self.video_container is not None:
-                self.video_container.close()
-                self.video_container = None
-        finally:
-            try:
-                if self._hoi_file is not None:
-                    self._hoi_file.close()
-                    self._hoi_file = None
-            finally:
-                if self.data_file is not None:
-                    self.data_file.close()
-                    self.data_file = None
+        _close_handles(self, "video_container", "_hoi_file", "data_file")
 
     def __enter__(self):
         return self
