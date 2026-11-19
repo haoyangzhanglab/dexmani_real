@@ -138,6 +138,8 @@ FoundationPose 输出须为有限 `[4,4]` 位姿，齐次末行容差为 `1e-6`�
 
 首帧用 Grounding DINO 检测框初始化 SAM2 视频状态。后续帧在 LOST 重检到期、恢复确认或周期到期时刷新。若当前帧尚无 Mask，通过位姿和运动检查的候选在纯深度验证失败时也会触发刷新，并用当前 Mask 复查。各对象共享同帧结果，每个来源帧最多追加一次图像。
 
+深度异常按帧处理。持续遮挡时，下一帧若仍需用当前轮廓区分遮挡和位姿偏差，可以再次刷新。
+
 默认 `segmentation_interval_frames=10`，活动对象距上次 SAM2 输入满 10 个处理帧时进行周期校正。事件刷新后重新计数，设为 1 时每个活动处理帧都刷新。全部对象 LOST 且无待确认恢复时，分割随到期重检触发。
 
 `RGBDFrame` 必须携带真实的 `source_sequence` 和 `timestamp_ns`。`from_camera(camera, row, source_sequence=...)` 从相机行读取时间；在线来源为 Camera Ring，离线来源为 Raw timing。三种计数分别是：
