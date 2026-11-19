@@ -92,7 +92,7 @@ class KeyboardTeleop:
         self.keys.start()
         if not self.keys.check_health():
             raise RuntimeError("keyboard stop listener unavailable")
-        self.robot.check_services = self.keys.check_health
+        self.robot.check_services = self.check_services
         self.robot.connect()
         self.robot.check()
         if not (self.runtime_state.cancel_epoch == startup_epoch and self.runtime_state.requests_allow_motion()):
@@ -104,9 +104,12 @@ class KeyboardTeleop:
         )
         print(
             "点动就绪。松开所有点动键或点动目标被拒绝时，机械臂减速停稳并保持位置。"
-            "关节反馈或控制参考失效时，程序停止机械臂并退出遥操作。"
+            "关节反馈或控制参考失效时，程序停止机械臂。"
         )
         self.tick_due_ns = time.monotonic_ns() + self.period_ns
+
+    def check_services(self):
+        return self.keys.check_health()
 
     def prepare_jog(self, cancel_epoch):
         self.jog.clear_reference()
@@ -136,10 +139,7 @@ class KeyboardTeleop:
             if self.runtime_state.quit_requested:
                 return True
 
-            if "r" in events:
-                epoch = self.keys.accept_operation(self.runtime_state)
-                if epoch is not None:
-                    self.run_home(epoch)
+            if self.handle_operation(events):
                 continue
             if self.runtime_state.stop_signal.is_set():
                 continue
@@ -147,6 +147,14 @@ class KeyboardTeleop:
                 self.robot, self.keys, self.runtime_state, self.runtime,
             )
         return bool(self.runtime_state.quit_requested)
+
+    def handle_operation(self, events) -> bool:
+        if "r" not in events:
+            return False
+        epoch = self.keys.accept_operation(self.runtime_state)
+        if epoch is not None:
+            self.run_home(epoch)
+        return True
 
     def run_home(self, expected_cancel_epoch):
         with self.runtime_state.motion_lock:

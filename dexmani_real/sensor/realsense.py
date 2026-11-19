@@ -186,11 +186,11 @@ class RealSenseCamera:
                 self.pending_frame = None
                 self.condition.notify()
 
-    def read(self) -> CameraFrame | None:
+    def read(self, *, timeout_s: float = 0.3) -> CameraFrame | None:
         with self.condition:
             self.condition.wait_for(
                 lambda: self.pending_frame is not None or self.callback_error is not None,
-                timeout=0.3,
+                timeout=timeout_s,
             )
             if self.callback_error is not None:
                 raise self.callback_error

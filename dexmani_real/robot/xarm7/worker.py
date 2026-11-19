@@ -183,10 +183,6 @@ class ArmController:
                 stamp = int(self.status["timestamp_ns"])
                 if not sample_is_fresh(stamp, self.cfg.feedback_max_age_s, time.monotonic_ns()):
                     raise FeedbackUnavailable("HOME arm feedback stale")
-                # 查询发生在本周期发目标前，只能与已提交的参考比较。
-                reference_index = min(max(0, index - 1), (stamp - start) // period)
-                if np.max(np.abs(self.status["qpos"] - samples[reference_index])) > HOME_POSITION_TOLERANCE_RAD:
-                    raise OperationCancelled("HOME tracking error exceeded")
                 feedback_due = stamp + feedback_interval_ns
             guarded()
             if time.monotonic_ns()-due > lateness:

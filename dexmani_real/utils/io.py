@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -29,11 +30,13 @@ def publish(src: str | Path, dst: str | Path) -> Path:
     return target
 
 
-def _write_text(text, target):
+def _write_text(text: str, target: Path, *, check_abort: Callable[[], None] | None = None) -> Path:
     fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.tmp-", dir=target.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(text)
+        if check_abort is not None:
+            check_abort()
         os.replace(temporary, target)
     except BaseException:
         try:
@@ -51,9 +54,9 @@ def write_yaml(obj: object, path: str | Path) -> Path:
     return _write_text(text, Path(path))
 
 
-def write_json(obj: object, path: str | Path) -> Path:
-    """完整序列化后原子替换目标文件。"""
+def write_json(obj: object, path: str | Path, *, check_abort: Callable[[], None] | None = None) -> Path:
+    """完整序列化，检查外部取消后原子替换目标文件。"""
     text = json.dumps(obj, indent=2, ensure_ascii=False, allow_nan=False)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    return _write_text(text, target)
+    return _write_text(text, target, check_abort=check_abort)

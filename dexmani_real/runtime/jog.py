@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import cast
 
 import numpy as np
@@ -18,12 +18,12 @@ from dexmani_real.robot.commands import (
     arm_reference_from_feedback,
 )
 from dexmani_real.runtime.ik_reference import IKReference, prepare_reference
-from dexmani_real.runtime.keyboard import JOG_KEY_PAIRS
+from dexmani_real.runtime.keyboard import JOG_KEY_PAIRS, JOG_MOTION_KEYS
 from dexmani_real.runtime.observation import check_device_feedback
 
 logger = logging.getLogger(__name__)
 
-JOG_CONTROL_KEYS = frozenset(key for pair in JOG_KEY_PAIRS for key in pair) | {
+JOG_CONTROL_KEYS = JOG_MOTION_KEYS | {
     "q",
     "r",
     "esc",
@@ -39,6 +39,7 @@ class CartesianJog:
         self.position_lower, self.position_upper = bounds
         self.ik_reference = None
         self.rejection_reason = None
+        self.target_rejection: Callable[[np.ndarray], str | None] | None = None
 
     def clear_reference(self):
         self.ik_reference = None
@@ -62,7 +63,6 @@ class CartesianJog:
                     pressed_keys,
                     row.arm["qpos"][0],
                     control_ns=time.monotonic_ns(),
-
                 )
             except IKReferenceError as exc:
                 raise OperationCancelled(str(exc)) from exc
@@ -120,9 +120,14 @@ class CartesianJog:
             self.position_lower,
             self.position_upper,
         )
-        return self.solver.solve(
+        result = self.solver.solve(
             pose, measured, command, anchor, h=h
         )
+        if result.qpos is not None and self.target_rejection is not None:
+            reason = self.target_rejection(result.qpos)
+            if reason is not None:
+                return IKResult(qpos=None, reason=reason)
+        return result
 
 
 def jog_motion_requested(active_keys: Iterable[str]) -> bool:

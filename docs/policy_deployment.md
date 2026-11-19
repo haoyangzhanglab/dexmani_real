@@ -136,11 +136,11 @@ Hold 和 Release 仍以 SDK 返回 `0` 确认提交。普通动作收到过流�
 
 关闭时先确认机械臂停稳，再处理 XHand 并回收设备连接。默认保留已确认的位置保持，必要时刷新保持目标。`Robot.close()` 和 `close_runtime()` 可显式传入 `release_hand=True`，在停稳后提交 Passive 并记录回执。停稳确认失败时仍尝试尚待确认的位置保持，回收设备后报告错误。控制器与独立硬件安全链路负责真正的急停。
 
-VR 遥操作、策略部署与键盘点动共用 [home_robot()](../dexmani_real/runtime/home.py)。机械臂停稳后，程序沿通往 `arm.home_qpos` 的单段关节轨迹采样检查碰撞。切入伺服模式后复核起点。执行时按反馈来源时间核对已提交的参考，任一关节偏差超过 0.02 rad 时停止。各关节距 HOME 目标均在 0.02 rad（约 1.15°）以内并连续停稳 0.30 秒时确认到位。启用 XHand 时，机械臂在原截止前确认到位后执行手部回位。
+VR 遥操作、策略部署、键盘点动与相机标定共用 HOME 实现。机械臂停稳后，程序沿通往 `arm.home_qpos` 的单段关节轨迹采样检查碰撞。切入伺服模式后复核起点。执行中检查实测反馈时效和伺服调度期限。各关节距 HOME 目标均在 0.02 rad（约 1.15°）以内并连续停稳 0.30 秒时确认到位。启用 XHand 时，机械臂在原截止前确认到位后执行手部回位。 [home_robot()](../dexmani_real/runtime/home.py)
 
 键盘点动使用 `--no-hand` 时，按 R 只执行机械臂 HOME。碰撞模型以 `hand.home_qpos_deg` 作为固定手部姿态。XHand 仍安装在末端时，现场须确认实物在回零过程中保持该姿态。
 
-机械臂 HOME 的专用参数是 `arm.homing.max_speed_deg_s`（默认 45°/s）和 `arm.homing.collision_margin_m`。路径检查使用 `environment.static_boxes` 中的固定障碍物。配置 `environment.table_plane_path` 时，还检查运动部件与桌面标定平面的距离。正常遥操作、策略末端控制与点动使用关节、工作空间和运动限制。
+机械臂 HOME 的专用参数是 `arm.homing.max_speed_deg_s`（默认 45°/s）和 `arm.homing.collision_margin_m`。路径检查使用 `environment.static_boxes` 中的固定障碍物。配置 `environment.table_plane_path` 时，还检查运动部件与桌面标定平面的距离。正常遥操作、策略末端控制与点动使用关节、工作空间和运动限制。相机标定的点动目标还会检查自身碰撞和静态障碍物碰撞，碰撞模型使用固定的 `hand.home_qpos_deg`。
 
 键盘点动中，HOME 配置不满足要求或路径被拒绝时会提示具体原因，并重新准备 Jog；出现 `Keyboard jog ready` 后即可继续点动。Q、Esc、取消或设备故障仍沿原有停止与异常路径处理。
 

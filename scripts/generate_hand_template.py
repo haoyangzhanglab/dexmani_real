@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """离线生成手部 link 局部 XYZ 模板，运行时仅按 FK 变换组装。"""
 
 import argparse

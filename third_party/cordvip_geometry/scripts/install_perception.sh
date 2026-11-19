@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # 在现有 real_robot 环境中安装依赖并编译扩展。
 set -euo pipefail
 

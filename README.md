@@ -76,7 +76,11 @@ CONFIG = replace(base, teleop=replace(base.teleop, control_hz=20.0))
 
 `ArmConfig.collision_sensitivity` 默认是 `None`，准备运动时保留 xArm 控制器的当前设置。显式设置整数 0–5 时才下发，0 会关闭控制器碰撞检测。这个默认值只约定程序如何处理控制器设置，检测是否开启、场地验收和全路径碰撞情况仍需现场核实。
 
-VR 朝向标定复用 `CONFIG.vr`：`python scripts/calibrate_vr_heading.py --config experiment.py`，临时端口可用 `--port` 覆盖。相机离线求解须指定候选文件，例如 `python scripts/calibrate_camera.py solve samples/run1 --output candidate_cameras.json`；合法可解的结果即使残差超过经验阈值也会保存并警告。采集或部署用 `--camera-calibration candidate_cameras.json` 选择采用它。
+运行 `python scripts/calibrate_camera.py` 打开相机标定窗口。将 ArUco 标记刚性固定在机械臂末端，并拆除 XHand 或将其固定在配置的 HOME 姿态。用 WASD、方向键和 IJKL 点动机械臂，按 R 回 HOME。按 Space 停止点动并在机械臂停稳后采样，至少采集 10 组有效样本，摆位时绕不同方向转动末端。
+
+按 Enter 择优求解并显示位置和旋转 RMS。位置 RMS ≤ 5 mm 且旋转 RMS ≤ 3° 时，按相机序列号更新默认的 `cameras.json`。Backspace 撤销末次采样，X 移除最近一次求解中残差最差的样本，之后按 Enter 重算。Q 或关闭窗口退出，Esc 触发软件急停。可用 `--config experiment.py` 指定实验配置，或用 `--output camera_calibration.json` 指定外参文件。采集或部署时，通过 `--camera-calibration` 可选用自定义外参文件。 [默认外参文件](dexmani_real/config/calibration_data/cameras.json)
+
+VR 朝向标定复用 `CONFIG.vr`，用 `python scripts/calibrate_vr_heading.py --config experiment.py` 启动，临时端口可用 `--port` 覆盖。
 
 策略的运行预算、动作接续与 HOI 恢复见[策略部署](docs/policy_deployment.md)。
 

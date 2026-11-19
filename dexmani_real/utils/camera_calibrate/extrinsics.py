@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -41,9 +42,10 @@ def load_optional_camera_extrinsics(
         return load_camera_extrinsics(serial, path)
     if not isinstance(serial, str) or not serial.strip():
         raise ValueError("camera serial must be non-empty")
-    if not CAMERAS_PATH.exists():
+    try:
+        cameras = _read_cameras(CAMERAS_PATH)
+    except FileNotFoundError:
         return None
-    cameras = _read_cameras(CAMERAS_PATH)
     if serial not in cameras:
         return None
     return _parse_camera_extrinsics(cameras, serial)
@@ -53,12 +55,17 @@ def save_camera_calibration(
     T_base_from_camera: np.ndarray,
     serial: str,
     json_path: Path,
+    *,
+    calibration_capture: dict[str, object],
+    check_abort: Callable[[], None],
 ) -> None:
-    if not isinstance(serial, str) or not serial.strip():
-        raise ValueError("camera serial must be non-empty")
-    transform = validate_rigid_transform(
-        T_base_from_camera, label=f"camera {serial} T_base_from_camera",
-    )
-    cameras = _read_cameras(json_path) if json_path.exists() else {}
-    cameras[serial] = {"T_base_from_camera": transform.tolist()}
-    write_json(cameras, json_path)
+    """保存来自已连接相机、经求解器验证的外参及标定信息。"""
+    try:
+        cameras = _read_cameras(json_path)
+    except FileNotFoundError:
+        cameras = {}
+    cameras[serial] = {
+        "T_base_from_camera": T_base_from_camera.tolist(),
+        "calibration_capture": calibration_capture,
+    }
+    write_json(cameras, json_path, check_abort=check_abort)

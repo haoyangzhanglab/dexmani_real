@@ -17,6 +17,8 @@ JOG_KEY_PAIRS = (
     ("w", "s"), ("d", "a"), ("up", "down"),
     ("left", "right"), ("i", "k"), ("j", "l"),
 )
+JOG_MOTION_KEYS = frozenset(key for pair in JOG_KEY_PAIRS for key in pair)
+OPERATION_KEYS = frozenset({"b", "h", "r", "t", "space", "enter", "backspace", "x"})
 
 
 def suppress_terminal_echo():
@@ -71,7 +73,7 @@ class Keyboard:
                 self.held_keys.remove(name)
                 return
             self.held_keys.add(name)
-            if name in {"b", "h", "r", "t"} and not self.accepting_starts:
+            if name in OPERATION_KEYS and not self.accepting_starts:
                 return
             callback = self.bindings.get(name)
             if callback is not None:
@@ -92,7 +94,7 @@ class Keyboard:
             ):
                 return None
             self.accepting_starts = False
-            self.events = deque(event for event in self.events if event not in {"b", "h", "t", "r"})
+            self.events = deque(event for event in self.events if event not in OPERATION_KEYS)
             with state.motion_lock:
                 if not state.requests_allow_motion():
                     return None
