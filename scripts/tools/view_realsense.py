@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """预览 RealSense RGB-D，按 P 开关点云、S 切换 raw/processed。"""
 
 from __future__ import annotations

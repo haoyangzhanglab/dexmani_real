@@ -44,8 +44,8 @@ HOI（`object_pointcloud`）与场景点云（`point_cloud`）是互斥输入。
 | [preflight.py](../dexmani_real/deployment/preflight.py) | 合并模型描述与本地配置，检查部署条件并记录实际处理参数。 |
 | [observation.py](../dexmani_real/deployment/observation.py) | 将观测投影为历史快照，并从历史窗口构建模型输入。 |
 | [inference.py](../dexmani_real/deployment/inference.py) | 加载、预热模型，并执行预测。 |
-| [schedule.py](../dexmani_real/deployment/schedule.py) | 计算控制时刻与动作序列接续位置。 |
-| [rollout.py](../dexmani_real/deployment/rollout.py) | 推进单段的观测采样、推理请求、动作提交与录制。 |
+| [schedule.py](../dexmani_real/deployment/schedule.py) | 定义预测请求和动作片段，计算控制槽和跳槽数。 |
+| [rollout.py](../dexmani_real/deployment/rollout.py) | 推进单段采样、预测和录制，管理动作窗口、接续和提交。 |
 
 设备交互、运动约束、观测读取和数据存储分别复用 [robot](../dexmani_real/robot/)、[control](../dexmani_real/control/)、[runtime](../dexmani_real/runtime/) 和 [data](../dexmani_real/data/)。
 
@@ -72,7 +72,7 @@ HOI（`object_pointcloud`）与场景点云（`point_cloud`）是互斥输入。
 
 需要承接上一段动作的 ODE 策略使用 `sync`。只有完整组合命令提交成功才更新上一关节目标，下一次预测沿用该值。这里的成功指主机侧提交成功，设备随后按各自时序执行。
 
-预测请求记录原控制槽和实际送入模型的最新观测采样时间。截止从原槽起点和原采样时间中较早者算起，按控制周期计入模型的完整预测长度。sync 和无前缀的 RTC 额外计入首个动作前等待的一槽，从请求后的下一槽起可提交。async 按原请求的绝对槽选步，带前缀的 RTC 按已提交步数接续。`action_steps` 限制每批执行步数。截止点本身已在窗口外，收回或裁切结果以及收到更新的观测都不会延长原窗口。
+提交预测时，以原请求槽计算截止 `started_ns + (slot + first_action_offset + future_steps) * dt_ns`。sync 与无前缀 RTC 的 `first_action_offset` 为 1，从请求后的下一槽起可提交。async 与带前缀 RTC 的偏移为 0，前者按原请求的绝对槽选步，后者按已提交步数接续。`action_steps` 限制每批执行步数。截止点本身已在窗口外，回收、接续或裁切结果时均沿用原截止。
 
 每个有效控制 tick 至多选择一个目标。程序在映射前和实际提交前检查同一窗口，过期结果不能替换仍有效的计划。映射跨过截止时，本 tick 放弃提交，仍有效的接续计划留到后续 tick。没有可接续计划时以 `prediction_expired` 结束本段。预测窗口只限制新目标的提交，设备继续使用原有命令租约和保持期限。反馈时效按各来源规则检查。
 
@@ -86,9 +86,9 @@ HOI 的关节与 FK 观测使用按相机来源时间对齐的关节，设备反
 
 `termination_reason` 与 `termination_details` 保留首次控制结束原因，录像处置记入 `raw`，收尾故障记入 `errors` 并使会话失败退出。Raw Episode 各自保存标定及实验参数，结构见[实验数据](data.md#raw-episode)。
 
-模型加载和非 HOI 模型预热各有 120 秒的单调时钟等待期限。先加载模型再连接设备，需要实测观测的预热在允许机器人运动前进行。等待到期即拒绝启动，并沿会话失败路径收尾。该期限只约束等待，Python 线程、SDK 或 CUDA 调用无法由它强制中断，进程退出时间另取决于收尾。
+策略模型加载与预热各在提交任务后开始计时，等待期限为 120 秒，使用单调时钟。先加载模型再连接设备，预热在允许机器人运动前进行。等待到期沿会话失败路径收尾。原生调用可能在收尾期间继续阻塞，进程退出时间取决于收尾。
 
-模型在成功且未取消的预热完成后登记一次。HOI 首次有效观测后预热，之后各轮仍执行跟踪初始化和 episode reset。预热失败、取消或超时不登记成功。
+每个策略模型登记一次预热成功。首次 HOI 预热在取得本轮有效观测后提交，使用独立于初始观测等待的预热期限。成功读取预热结果后立即退出等待循环，最后一次操作者轮询和取消检查完成后，在原截止前登记成功。后续各轮仍执行跟踪初始化和 episode reset。
 
 ## HOI 暂停与恢复
 

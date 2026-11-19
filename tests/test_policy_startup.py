@@ -1,12 +1,15 @@
 from concurrent.futures import Future
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
+from dexmani_real.deployment import rollout as rollout_module
 from dexmani_real.deployment import session as deployment
 from dexmani_real.deployment.inference import PolicyWorker
 from dexmani_real.robot.commands import OperationCancelled
+from dexmani_real.runtime.state import SessionState
 
 
 @pytest.fixture
@@ -100,3 +103,69 @@ def test_wait_model_propagates_original_error(startup):
         policy.wait_model(stage="policy model load")
 
     assert exc.value is error
+
+
+@pytest.fixture
+def hoi_startup(monkeypatch):
+    clock = SimpleNamespace(now=0.0, deadline=0.012)
+
+    def sleep(seconds):
+        clock.now += seconds
+
+    fake_time = SimpleNamespace(
+        monotonic=lambda: clock.now, monotonic_ns=lambda: int(clock.now * 1e9), sleep=Mock(side_effect=sleep),
+    )
+    monkeypatch.setattr(rollout_module, "time", fake_time)
+    monkeypatch.setattr(rollout_module, "POLICY_STARTUP_TIMEOUT_S", clock.deadline)
+
+    model = Mock(future=None, warmed_up=False)
+
+    def warmup(_rows):
+        model.future = Future()
+        model.future.set_result(None)
+
+    model.warmup.side_effect = warmup
+    model.poll.side_effect = lambda: PolicyWorker.poll(model)
+    state = SessionState(stop_signal=Event(), emergency_signal=Event())
+    rollout = rollout_module.Rollout(
+        state, SimpleNamespace(execution=SimpleNamespace(control_dt_s=0.05, mode="sync")),
+        SimpleNamespace(n_obs_steps=1), episode_cancel_epoch=state.cancel_epoch, robot=Mock(),
+        observations=Mock(needs=SimpleNamespace(hoi=True, hoi_joint_devices=())), sensors=Mock(),
+        action_mapper=None, model=model, max_duration_s=None, index=1, output_dir=None, record_raw=False,
+        effective_parameters={},
+    )
+    rollout.start_observation = Mock(return_value=object())
+    return rollout, clock
+
+
+@pytest.mark.parametrize("stage, overrun", [("feedback", 0.001), ("operator", 0.0)])
+def test_hoi_warmup_rejects_success_at_or_after_deadline(hoi_startup, stage, overrun):
+    rollout, clock = hoi_startup
+
+    def advance_clock():
+        clock.now = clock.deadline + overrun
+
+    def poll_operator():
+        if stage == "operator" and rollout.model.poll.called and rollout.model.future is None:
+            advance_clock()
+
+    if stage == "feedback":
+        rollout.robot.service_feedback.side_effect = advance_clock
+
+    with pytest.raises(TimeoutError, match="HOI policy warmup timeout"):
+        rollout.prepare(poll_operator)
+
+    assert rollout.model.future is None
+    assert not rollout.model.warmed_up
+    rollout.robot.prepare_streaming.assert_not_called()
+
+
+def test_hoi_warmup_registers_success_without_sleeping_after_completion(hoi_startup):
+    rollout, clock = hoi_startup
+    rollout.robot.service_feedback.side_effect = lambda: setattr(clock, "now", clock.deadline - 0.001)
+
+    rollout.prepare(Mock())
+
+    assert rollout.model.warmed_up
+    rollout_module.time.sleep.assert_not_called()
+    rollout.robot.prepare_streaming.assert_called_once()

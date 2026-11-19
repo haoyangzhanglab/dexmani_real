@@ -308,7 +308,7 @@ class Rollout:
                 **kwargs,
             )
             warmup_deadline = time.monotonic() + POLICY_STARTUP_TIMEOUT_S
-            while self.model.future is not None:
+            while True:
                 if time.monotonic() >= warmup_deadline:
                     raise TimeoutError("HOI policy warmup timeout")
                 poll_operator()
@@ -318,10 +318,13 @@ class Rollout:
                 future = self.model.poll()
                 if future is not None:
                     future.result()
+                    break
                 time.sleep(0.005)
             poll_operator()
             if not self.preparation_valid():
                 raise OperationCancelled("HOI warmup cancelled")
+            if time.monotonic() >= warmup_deadline:
+                raise TimeoutError("HOI policy warmup timeout")
             self.model.warmed_up = True
         poll_operator()
         if not self.preparation_valid():
@@ -371,12 +374,11 @@ class Rollout:
         if future is None:
             return
         actions = future.result()
-        if self.reset_pending:
-            # 传递旧预测的异常，只丢弃成功返回的旧动作。
-            return
-        cast(Prediction, self.query).result = actions
+        # 已清除的请求仍需传播推理异常。
+        if self.query is not None:
+            self.query.result = actions
 
-    def _submit_prediction(self, slot: int, observation_ns: int, *, handoff_slot=None, prefix=None) -> None:
+    def _submit_prediction(self, slot: int, *, handoff_slot=None, prefix=None) -> None:
         kwargs = {} if prefix is None else {
             "rtc_prefix": prefix,
             "delay_steps": min(self.execution.prefetch_steps, len(prefix)),
@@ -385,18 +387,16 @@ class Rollout:
         if self.policy_info.requires_prev_action:
             kwargs["prev_action"] = self.prev_action
         rows = tuple(self.history)
-        # sync 和无前缀 RTC 的首动作在下一槽。从原采样时刻和原槽起算，采用较早的截止。
+        # sync 和无前缀 RTC 的首动作在下一槽。
         first_action_offset = int(self.execution.mode != "async" and prefix is None)
-        request_slot_ns = self.started_ns + slot * self.dt_ns
-        deadline_ns = min(observation_ns, request_slot_ns) + (
-            first_action_offset + self.policy_info.future_steps
+        deadline_ns = self.started_ns + (
+            slot + first_action_offset + self.policy_info.future_steps
         ) * self.dt_ns
         self.check_motion()
         self.model.predict(rows, reset_episode=self.reset_pending, **kwargs)
         self.reset_pending = False
         self.query = Prediction(
             slot=slot,
-            observation_ns=observation_ns,
             handoff_slot=slot + first_action_offset if handoff_slot is None else handoff_slot,
             deadline_ns=deadline_ns,
             request_cursor=self.cursor,
@@ -430,19 +430,19 @@ class Rollout:
         if mode == "async":
             offset = slot - query.slot
         elif mode == "rtc":
-            if (plan is not None and now_ns < plan.prediction.deadline_ns
+            if (plan is not None and now_ns < plan.deadline_ns
                     and self.cursor < min(self.execution.action_steps, len(plan.actions))):
                 return
             offset = self.cursor - query.request_cursor
         else:
             offset = 0
-        self.plan = ActionChunk(query.result[offset:], slot, query)
+        self.plan = ActionChunk(query.result[offset:], slot, query.deadline_ns)
         self.query = None
         self.cursor = 0
 
     def _expire_plan(self, now_ns: int) -> bool:
         plan = self.plan
-        if plan is None or now_ns < plan.prediction.deadline_ns:
+        if plan is None or now_ns < plan.deadline_ns:
             return False
         # 保留仍有效的接续，并让下一控制槽选动作。
         self.poll_model()
@@ -451,7 +451,7 @@ class Rollout:
             self.stop("prediction_expired")
         return True
 
-    def select_action(self, slot: int, observation_ns: int) -> np.ndarray | None:
+    def select_action(self, slot: int) -> np.ndarray | None:
         now = time.monotonic_ns()
         self._adopt_prediction(slot, now)
         if self._expire_plan(now):
@@ -460,7 +460,7 @@ class Rollout:
         query = self.query
         if plan is None:
             if query is None:
-                self._submit_prediction(slot, observation_ns)
+                self._submit_prediction(slot)
             elif now >= query.deadline_ns:
                 self.stop("prediction_expired")
             return None
@@ -473,9 +473,9 @@ class Rollout:
             return None
         if query is None and mode != "sync" and index >= limit - self.execution.prefetch_steps:
             if mode == "rtc":
-                self._submit_prediction(slot, observation_ns, prefix=plan.actions[index:].copy())
+                self._submit_prediction(slot, prefix=plan.actions[index:].copy())
             else:
-                self._submit_prediction(slot, observation_ns, handoff_slot=plan.anchor_slot + limit)
+                self._submit_prediction(slot, handoff_slot=plan.anchor_slot + limit)
         return plan.actions[index]
 
     def check_motion(self):
@@ -691,7 +691,7 @@ class Rollout:
                 return
             self.poll_model()
             # 本 tick 固定选中的目标，映射后重查同一预测窗口。
-            action = self.select_action(slot, row.control_timestamp_ns)
+            action = self.select_action(slot)
             if action is None:
                 return
             plan = cast(ActionChunk, self.plan)

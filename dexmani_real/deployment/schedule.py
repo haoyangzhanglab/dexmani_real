@@ -8,7 +8,6 @@ import numpy as np
 @dataclass
 class Prediction:
     slot: int
-    observation_ns: int
     handoff_slot: int
     deadline_ns: int
     result: np.ndarray | None = None
@@ -18,8 +17,8 @@ class Prediction:
 @dataclass
 class ActionChunk:
     actions: np.ndarray
-    anchor_slot: int  # async 切片首步的槽号，截止仍取原预测。
-    prediction: Prediction
+    anchor_slot: int  # async 切片首步的槽号。
+    deadline_ns: int  # 沿用原预测的截止。
 
 
 def control_slot(*, now_ns, next_step_ns, last_slot, dt_ns):

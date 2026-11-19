@@ -79,17 +79,21 @@ def episode(monkeypatch):
         record_raw=True, effective_parameters={},
     )
     rollout.started_ns = clock.now
-    rollout.read_observations = lambda **kwargs: (clock.row, clock.row)
+
+    def read_observations(**kwargs):
+        clock.now += clock.observation_delay_ns
+        return clock.row, clock.row
+
+    rollout.read_observations = read_observations
     rollout.recording_issue = lambda row: None
     rollout.recorder = recorder
     control_step = rollout.step
 
-    def step(slot, joint_state, *, phase_ns=0, map_delay_ns=0):
-        clock.now = rollout.started_ns + slot * rollout.dt_ns + phase_ns
+    def step(slot, joint_state, *, observation_delay_ns=0, map_delay_ns=0):
+        clock.now = rollout.started_ns + slot * rollout.dt_ns
+        clock.observation_delay_ns = observation_delay_ns
         clock.map_delay_ns = map_delay_ns
-        clock.row = SimpleNamespace(
-            qpos=np.full(19, joint_state, dtype=np.float32), control_timestamp_ns=clock.now,
-        )
+        clock.row = SimpleNamespace(qpos=np.full(19, joint_state, dtype=np.float32))
         control_step()
 
     return rollout, worker, recorder, robot, step
@@ -228,21 +232,28 @@ def test_prefetch_rollout_stops_and_preserves_inflight_prediction_error(episode,
 
 
 @pytest.mark.parametrize(("mode", "end_slot"), [("sync", 3), ("async", 2), ("rtc", 3)])
-def test_late_prediction_ends_episode_even_with_fresh_rows(episode, mode, end_slot):
+def test_prediction_returned_at_original_window_end_is_rejected(episode, mode, end_slot):
     rollout, worker, recorder, robot, step = episode
     rollout.execution.mode = mode
     rollout.policy_info.requires_prev_action = False
     rollout.policy_info.future_steps = 2
-    step(0, 1, phase_ns=7)
+    step(0, 1, observation_delay_ns=7)
     assert rollout.query.slot == 0
-    assert rollout.query.observation_ns == rollout.started_ns + 7
     assert rollout.query.deadline_ns == rollout.started_ns + end_slot * rollout.dt_ns
-    for slot in range(1, end_slot):
+    for slot in range(1, end_slot - 1):
         step(slot, slot + 1)
-    worker.finish(99, steps=2)
-    step(end_slot, end_slot + 1)
+    read_observations = rollout.read_observations
+
+    def read_with_completed_prediction(**kwargs):
+        sampled = read_observations(**kwargs)
+        worker.finish(99, steps=2)
+        return sampled
+
+    rollout.read_observations = read_with_completed_prediction
+    step(end_slot - 1, end_slot, observation_delay_ns=rollout.dt_ns)
 
     assert rollout.result.termination_details == "prediction_expired"
+    assert worker.future is None
     assert len(worker.calls) == 1
     robot.send_action.assert_not_called()
     assert np.isnan(recorder.rows[-1][1]).all() and not recorder.rows[-1][2]
@@ -290,7 +301,8 @@ def test_mapping_at_cutoff_keeps_ready_continuation_for_next_tick(episode, monke
         context.setattr(rollout, "map_command", complete_during_mapping)
         step(2, 3, map_delay_ns=2 * rollout.dt_ns)
 
-    assert not rollout.finished and rollout.plan.prediction.slot == 2
+    assert not rollout.finished
+    assert rollout.plan.deadline_ns == rollout.started_ns + 6 * rollout.dt_ns
     robot.send_action.assert_called_once()
     assert np.isnan(recorder.rows[-1][1]).all() and not recorder.rows[-1][2]
     step(4, 4)
@@ -303,7 +315,7 @@ def test_sync_submits_configured_steps_with_original_device_lease(episode, futur
     rollout, worker, recorder, robot, step = episode
     rollout.policy_info.future_steps = future_steps
     rollout.execution.action_steps = action_steps
-    step(0, 1)
+    step(0, 1, observation_delay_ns=7)
     worker.finish(10, steps=future_steps)
     for slot in range(1, action_steps + 1):
         step(slot, slot + 1)
@@ -334,15 +346,14 @@ def test_prefetch_keeps_original_window_and_mode_specific_progress(
     worker.future.set_result(np.repeat(np.arange(10, 14)[:, None], 19, axis=1))
     step(1, 2)
     step(2, 3)
-    query = rollout.query
-    assert query.slot == 2
+    deadline_ns = rollout.query.deadline_ns
+    assert deadline_ns == rollout.started_ns + 6 * rollout.dt_ns
     step(3, 4)
     assert robot.send_action.call_count == 2 and not rollout.finished
     worker.future.set_result(np.repeat(np.arange(20, 24)[:, None], 19, axis=1))
     step(4, 5)
 
-    assert rollout.plan.prediction is query
-    assert query.deadline_ns == rollout.started_ns + 6 * rollout.dt_ns
+    assert rollout.plan.deadline_ns == deadline_ns
     assert [attempt[0] for _, attempt, accepted in recorder.rows if accepted] == [
         *first_actions, handoff_action,
     ]
