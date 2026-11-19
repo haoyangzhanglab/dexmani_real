@@ -18,6 +18,7 @@ from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import close_runtime
 from dexmani_real.runtime.preflight import validate_robot_config
 from dexmani_real.runtime.state import SessionState
+from dexmani_real.runtime.teleop_timing import TeleopTiming
 from dexmani_real.utils.log import configure_logging
 from dexmani_real.utils.timing import next_tick_ns, sampling_clock_ns
 
@@ -25,8 +26,9 @@ logger = logging.getLogger(__name__)
 
 
 class KeyboardTeleop:
-    def __init__(self, runtime):
+    def __init__(self, runtime, *, timing_output=None):
         self.runtime = runtime
+        self.timing_output = timing_output
 
     def run(self):
         configure_logging()
@@ -43,23 +45,34 @@ class KeyboardTeleop:
         solver = IKSolver(
             self.runtime.arm, self.runtime.environment,
             target_speed=np.deg2rad(self.runtime.motion.ik_target_speed_deg_s),
-            device_speed=self.runtime.arm.max_joint_velocity_rad_per_s,
-            max_lead=np.deg2rad(self.runtime.motion.ik_max_lead_deg),
         )
         workspace = solver.workspace
         margin = config.workspace_command_margin_m
         lower, upper = workspace[:, 0] + margin, workspace[:, 1] - margin
         if np.any(lower >= upper):
             raise ValueError("keyboard workspace command margin leaves no interior workspace")
-        self.jog = CartesianJog(solver, config, (lower, upper))
+        timing = (
+            TeleopTiming(
+                self.timing_output, mode="keyboard", control_hz=config.control_hz,
+                arm=self.runtime.arm, motion=self.runtime.motion,
+            ) if self.timing_output is not None else None
+        )
+        if timing is not None:
+            timing.add(
+                "config", delta_pos_m=config.delta_pos_m, delta_rpy_rad=config.delta_rpy_rad,
+                target_max_age_s=config.target_max_age_s, hand_enabled=self.runtime.hand.enabled,
+            )
+        self.jog = CartesianJog(solver, config, (lower, upper), timing=timing)
         self.runtime_state = SessionState()
         self.robot = Robot(
             self.runtime.arm, self.runtime.hand, runtime_state=self.runtime_state,
+            timing=timing,
         )
 
         self.keys = Keyboard(
             estop_callback=self.runtime_state.request_emergency_stop,
             bindings={'q': self.runtime_state.request_quit},
+            timing=timing,
         )
         clean = False
         shutdown_clean = False
@@ -82,6 +95,12 @@ class KeyboardTeleop:
                 logger.exception("keyboard runtime cleanup failed")
             else:
                 shutdown_clean = True
+            if timing is not None:
+                try:
+                    timing.write()
+                except Exception:
+                    logger.exception("keyboard timing output failed")
+                    shutdown_clean = False
         return int(
             not clean or not shutdown_clean
             or self.runtime_state.estop_request
@@ -100,7 +119,7 @@ class KeyboardTeleop:
         self.prepare_jog(startup_epoch)
         print(
             "WASD、方向键和 IJKL 用于点动。按 Q 退出，按 Esc 急停。"
-            + ("按 R 让机械臂和灵巧手依次回零。" if self.runtime.hand.enabled else "按 R 让机械臂回零。")
+            + ("按 R 先让灵巧手回零，再让机械臂回零。" if self.runtime.hand.enabled else "按 R 让机械臂回零。")
         )
         print(
             "点动就绪。松开所有点动键或点动目标被拒绝时，机械臂减速停稳并保持位置。"
@@ -129,8 +148,8 @@ class KeyboardTeleop:
                 remaining_ns = self.tick_due_ns - time.monotonic_ns()
                 if remaining_ns > 0:
                     time.sleep(min(0.005, remaining_ns / 1e9))
-            now_ns = time.monotonic_ns()
-            self.tick_due_ns = next_tick_ns(self.tick_due_ns, self.period_ns, now_ns)
+            scheduled_ns = self.tick_due_ns
+            self.tick_due_ns = next_tick_ns(scheduled_ns, self.period_ns, time.monotonic_ns())
             self.robot.service_feedback()
             self.keys.allow_start()
             events = self.keys.poll(self.runtime_state, timeout=0)[0]
@@ -143,8 +162,14 @@ class KeyboardTeleop:
                 continue
             if self.runtime_state.stop_signal.is_set():
                 continue
+            timing = self.jog.timing
+            if timing is not None:
+                missed_slots = (self.tick_due_ns - scheduled_ns) // self.period_ns - 1
+                if missed_slots > 0:
+                    timing.add("control_miss", scheduled_ns=scheduled_ns, slots=missed_slots)
             self.jog.step(
                 self.robot, self.keys, self.runtime_state, self.runtime,
+                scheduled_ns=scheduled_ns,
             )
         return bool(self.runtime_state.quit_requested)
 
@@ -183,7 +208,7 @@ class KeyboardTeleop:
         except HomePathRejected as exc:
             self.robot.check()
             logger.warning(
-                "自动 HOME 路径不可行：%s。未执行 HOME 轨迹；可使用 Jog 手动调整姿态后再次按 R。",
+                "机械臂 HOME 路径不可行（%s）。可使用 Jog 手动调整姿态后再次按 R。",
                 exc,
             )
         else:

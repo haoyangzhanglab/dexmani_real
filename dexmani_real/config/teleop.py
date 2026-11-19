@@ -11,8 +11,8 @@ import numpy as np
 class TeleopConfig:
     control_hz: float = 16.0
     # 每控制步中新目标的权重：0 保留参考，1 直接跟随新目标。
-    ema_alpha_pos: float = 0.95
-    ema_alpha_rot: float = 0.85
+    ema_alpha_pos: float = 0.8
+    ema_alpha_rot: float = 0.5
     vr_pos_scale: float = 0.7
     # 暂定的 VR 来源掉线容忍度；生产频率未知，不能由 control_hz 推导。
     vr_stale_threshold_s: float = 0.5

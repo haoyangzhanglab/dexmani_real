@@ -4,13 +4,13 @@
 
 遥操作默认写入当前目录的 `episodes/<task_name>/`。每个已发布的 Episode 可独立读取和导出，包含 `data.h5`、有损 H.264 图像 `rgb.mp4` 和可选的 [HOI 标注](object_reconstruction.md#标注与查看) `hoi.h5`。用 `python scripts/visualize_episode.py EPISODE --info` 查看结构和录制截断原因。
 
-读取时会拒绝 `meta.termination_reason` 明确标为 `recording_incomplete` 的 Raw，即使目录已改为正常名称。未记录该属性的旧文件继续按原有规则读取，已完成并发布的有效截断前缀仍可读。
+Raw 读取要求有效的 `meta.termination_reason`，已发布的有效截断前缀可读。读取动作要求 `meta.arm_action_semantics="q_goal_confirmed_submission"`。
 
 `data.h5` 的 `meta` 顶层属性保存该段的相机内参、畸变、深度单位和已有外参。`effective_parameters` 是 JSON，保存实际使用的硬件和控制参数，包括 `camera_config`、适用的 VR 标定、五指 SDK `tactile_reset` 回执和 `tactile_calibration`。校准元数据包含本次状态、最后一次有效 Bias、该 Bias 的 Unix 时间（纳秒）和应用状态。
 
-`meta.xhand_crc_counts_json` 记录录制窗口内收到的读写 CRC 回复数、读写恢复次数，以及因写入 CRC 送达未确认的普通位置动作次数。SDK 成功回执晚到时只按真实回执更新 CRC 统计。
+`meta.xhand_crc_counts_json` 记录录制窗口内的读写 CRC 回复数、读写恢复次数和因 CRC 未确认送达的写入次数（`unconfirmed_writes`）。
 
-Raw 按字段使用固定类型。关节、绝对关节目标、VR 腕部位姿和手部关键点使用 `float64`，触觉与 HOI 点云使用 `float32`，深度使用 `uint16`，VR 接收时间和序列号使用 `uint64`。提交状态使用 `int8`，`timing/segment_starts` 使用 `int64`，`timing/rows` 使用 `TIMING_ROW_DTYPE`。
+Raw 按字段使用固定类型。关节、绝对关节目标、VR 腕部位姿和手部关键点使用 `float64`，触觉与 HOI 点云使用 `float32`，深度使用 `uint16`，VR 接收时间和序列号使用 `uint64`。`timing/segment_starts` 使用 `int64`，`timing/rows` 使用 `TIMING_ROW_DTYPE`。
 
 `hand_contact` 和 `hand_tactile_force` 保留现有形状与 `/ 255` 缩放。应用校准时先用 SDK 原始值减去 `tactile_calibration.bias_sdk`，否则直接缩放原始值。两种触觉独立按拇指到小指记录，缺失或过期的指尖存为 NaN。五指均有限时该模态有效，`timing/rows` 对应触觉时间记录最老的有效指尖来源时间。任一指尖缺失时，对应模态时间为 `0`。
 
@@ -18,11 +18,13 @@ Raw 按字段使用固定类型。关节、绝对关节目标、VR 腕部位姿�
 
 `timing/rows` 保留控制采样时刻、观测完成时刻及各来源的主机单调时钟时间，单位为纳秒。相机派生观测沿用相机来源时间，重复读取保留原时间。多来源观测按这些时间做软件对齐，时间戳记录的是主机侧查询或接收时刻。
 
-Raw 动作列保存尝试提交的绝对关节目标。`action_send_accepted=1` 表示臂手组合命令已在主机侧完整且按时提交。手部写入重试后仍未确认，或 SDK 成功回执到达时已达手部截止，原尝试目标均保留，状态记为 `0`，本轮结束。预测过期等原因使组合命令未进入发送时，已记录的观测行使用 NaN 目标和状态 `0`。设备实际执行和到位需要实测反馈。
+Raw 的 `action_arm_joint_target` 和 `action_hand_joint_target` 保存已在主机侧完整且按时提交的臂手绝对关节目标。VR 只写成功提交的行。策略正常等待且这一拍没有新指令时，保留观测行，两列目标均填 NaN。停止前未完成提交的终止拍省略。设备实际执行和到位以实测反馈为准。
 
-Raw 的手部关节列通过 `meta.hand_joint_names` 和 `meta.joint_units` 校验，使用 SDK ID 顺序和弧度。Canonical Zarr 的 `joint_state`、`action`、`action_ode` 在 7 个臂关节之后接 12 个手关节，`action_ee` 在 9 个末端位姿分量之后接同样的 12 列。
+Raw 的手部关节列通过 `meta.hand_joint_names` 和 `meta.joint_units` 校验，使用 SDK ID 顺序和弧度。Canonical Zarr 的 `joint_state` 和 `action` 在 7 个臂关节之后接 12 个手关节，`action_ee` 在 9 个末端位姿分量之后接同样的 12 列。
 
-`timing/segment_starts` 记录连续段首行。跳槽或 HOLD 产生录制间断时，下一个接纳的行开始新段。队列满或录制来源失效则停止接纳并记录 `recording_truncated_reason`。回放在连接设备前检查选定连续段 `[start, end)` 的每行，只有 `action_send_accepted=1` 才接受。提交状态缺失、无效或未确认时拒绝该段，能定位时报告首个问题在 Raw 内从 0 开始的绝对行号。其他段的提交状态不影响所选段。回放仍按当前实验操作限位校验 XHand，越限时报告行号和关节名称。运行前需将机器人就位到该段起点。回放发送时遇到反馈不可用或提交未确认会结束回放。
+`timing/segment_starts` 记录连续段首行。跳槽或 HOLD 产生录制间断时，下一个接纳的行开始新段。队列满或录制来源失效则停止接纳并记录 `recording_truncated_reason`。
+
+真机回放直接使用原始 Raw 所选连续段 `[start, end)` 的绝对关节目标。连接设备前，检查该段每行臂手目标的完整性、有限性和当前实验操作限位。发现缺失或无效的目标时，能定位则报告 Raw 内从 0 开始的绝对行号。运行前需将机器人就位到该段起点。播放结束并停稳后保持连接，按 H 回到初始位并退出。S/Q 停止并退出，Esc 急停。回放发送时遇到反馈不可用或提交未确认会结束回放。
 
 ## 图像与模型输入
 
@@ -34,12 +36,14 @@ Raw 保留采集像素网格上的 RGB-D，解码后的有损 RGB 与现场像�
 
 ## 按需导出
 
-- 每次 `export_zarr.py --fields ...` 发布一份固定字段的 Zarr。纯关节导出跳过相机，纯 RGB 跳过深度单位，选择 `object_pointcloud` 时才读取 HOI。用 `--output` 指定输出路径，否则默认写入当前目录的 `datasets/<输入目录名>.zarr`，单个 Episode 使用其父目录名。新产物完整后原子发布，路径须尚不存在。
-- 同一产物的 `task_name` 取自各 Raw 一致的 `meta.task_label`。`action_space="joint"` 标记采集动作空间。`action` 和经 FK 派生的 `action_ee` 均使用尝试目标，要求整个来源 Raw 每行均为 `action_send_accepted=1`。提交状态缺失、无效或有未确认行时，拒绝整个来源并继续处理其他采集。纯观测导出无需提交状态。
+- 每次 `export_zarr.py INPUT_ROOT` 发布一份固定字段的 Zarr。默认导出由 Raw 生成的全部字段，所选录制均有 `hoi.h5` 时一并导出 `object_pointcloud`。用 `--fields ...` 可指定字段。纯关节导出跳过相机，纯 RGB 跳过深度单位，选择 `object_pointcloud` 时才读取 HOI。
+- 用 `--output` 指定输出路径，否则默认写入当前目录的 `datasets/<输入目录名>.zarr`，单个 Episode 使用其父目录名。新产物完整后原子发布，路径须尚不存在。
+- 同一产物的 `task_name` 取自各 Raw 一致的 `meta.task_label`。`action_space="joint"` 标记采集动作空间。含动作的产物使用根属性 `action_semantics="held_accepted_joint_target"`。
+- 选择 `action` 或 `action_ee` 时，导出器构造同一份关节目标序列。两列目标均有限的行使用原目标。两列目标均为 NaN 的等待行沿用本段上一条成功目标，段首等待行统一填入段首实测关节状态。使用 HOI 对齐关节反馈时，段首填充值也来自这组对齐反馈。每段独立填充并保留原时间轴。`action_ee` 将同一序列的臂关节目标经 FK 转为末端位姿，并保留手关节目标。
 - 每个原生连续段成为一个 Zarr episode，`source_episodes` 和 `source_row_ranges=[start, stop)` 与 `episode_ends` 逐段对应。位置对齐和采样窗口限于段内。同一采集的各段属于同一个训练或验证分组，`val_episodes` 和 `max_train_episodes` 按采集组计数。
 - 所选数据缺失、损坏或所需的 HOI 关节对齐无法覆盖整段时，整条 Raw 回滚并继续处理其他采集。完整有效的截断前缀仍可导出。没有可用采集时导出失败。
-- 根属性 `rejected_episodes` 保存被拒的入口名和原因。能定位的提交状态错误会在原因中给出首个问题行的 Raw 绝对行号及可取得的问题行数。`excluded_episodes` 保存显式排除的入口名。排除后仍有两个入口指向同一目录时会报错。
+- 根属性 `rejected_episodes` 保存被拒的入口名和原因。臂手目标的有限值与 NaN 混杂或含无穷值时，原因给出首个问题的 Raw 绝对行号。`excluded_episodes` 保存显式排除的入口名。排除后仍有两个入口指向同一目录时会报错。
 
-配套 Policy 的 Real 原生 ODE 读取 `action_ode`，使用 `export_zarr.py --fields joint_state point_cloud action_ode` 导出。未选择 `action` 或 `action_ee` 时，未尝试提交的观测行和已尝试但未确认的行都沿用本段上一条已确认目标，保留原时间轴。段首在首条确认前使用该段起始关节状态。同时选择常规动作字段时，`action_ode` 使用同批逐行确认的关节目标。该组合的反馈时钟要求由一同导出的观测决定。
+配套 Policy 的 Real 原生 ODE 使用同一关节 `action` 序列，可用 `export_zarr.py INPUT_ROOT --fields joint_state point_cloud action` 导出。
 
 Zarr 的 `data_processing` 保存实际使用的处理参数。开启去桌面时，归一化系数写入 `data_processing.point_cloud.table_plane_abcd`。部署对应值见 `run_config.yaml` 的 `actual_processing.point_cloud.table_plane_abcd`。接触预训练按同一帧的手部和物体点云计算 1024 个有序标签。见[标注与查看](object_reconstruction.md#标注与查看)。

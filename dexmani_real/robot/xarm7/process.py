@@ -7,12 +7,14 @@ from typing import TYPE_CHECKING
 
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.xarm7.protocol import (
+    EXECUTOR_TIMEOUT_S,
     READY_TIMEOUT_S,
     ArmChannels,
     HomeRequest,
     PhysicalStopRequest,
     PrepareRequest,
 )
+from dexmani_real.utils.timing import sample_is_fresh
 
 if TYPE_CHECKING:
     from multiprocessing.process import BaseProcess
@@ -21,7 +23,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-EXECUTOR_TIMEOUT_S = 3.0
 STOP_REPLY_GRACE_S = 0.05
 
 
@@ -31,9 +32,11 @@ class ArmProcess:
         cfg,
         *,
         runtime_state: "SessionState",
+        timing=None,
     ):
         self.runtime_state = runtime_state
         self.cfg = cfg
+        self.timing = timing
         self.ctx = mp.get_context("spawn")
         self.io = ArmChannels(
             self.ctx,
@@ -42,8 +45,8 @@ class ArmProcess:
         )
         self.pipe, self.child_pipe = self.ctx.Pipe()
         self.process: BaseProcess | None = None
-        # 空闲轮询只确认一次；显式等待始终验证新反馈。
-        self.physical_stop_confirmed = False
+        self._reported_owner_error: str | None = None
+        self._reported_stop_error: str | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -61,12 +64,19 @@ class ArmProcess:
         )
 
     @property
-    def needs_close_stop_confirmation(self) -> bool:
-        # 未启动的 Owner 无需确认，清理重试可复用关闭反馈通道前的停稳确认。
+    def physical_stop_confirmed(self) -> bool:
         return (
-            self.process is not None and self.process.pid is not None
-            and not (self.io.closing.is_set() and self.physical_stop_confirmed)
+            self.io.stop.is_set() and self.io.stop_observed.is_set()
+            and not self.io.stop_failed.is_set()
         )
+
+    @property
+    def needs_close_stop_confirmation(self) -> bool:
+        # 同一停止周期内，关闭可以复用刚刚完成的停稳确认。
+        confirmed = self.physical_stop_confirmed and sample_is_fresh(
+            self.io.stop_observed_ns.value, self.cfg.feedback_max_age_s, time.monotonic_ns(),
+        )
+        return self.io.device_claimed.is_set() and not confirmed
 
     @property
     def stop_reason(self):
@@ -99,7 +109,7 @@ class ArmProcess:
         check_startup()
         self.process = self.ctx.Process(
             target=run_arm,
-            args=(self.cfg, self.io, self.child_pipe, startup_deadline_ns),
+            args=(self.cfg, self.io, self.child_pipe, startup_deadline_ns, self.timing),
             name="xarm-owner",
             daemon=False,
         )
@@ -128,14 +138,27 @@ class ArmProcess:
             return None
         if exitcode != 0 or not self.io.closing.is_set():
             return RobotError(f"arm owner exited: {exitcode}")
-        if not self.io.sdk_stop_handled.is_set():
+        if self.io.device_claimed.is_set() and not self.io.sdk_stop_handled.is_set():
             return RobotError("arm owner exited without handling SDK stop")
         return None
+
+    def _read_stop_error(self) -> RobotError | None:
+        if self.io.stop_failed.is_set():
+            return RobotError(self.io.stop_error.value.decode(errors="replace"))
+        return None
+
+    def _check_stop_result(self) -> None:
+        error = self._read_stop_error()
+        if error is not None:
+            self._reported_stop_error = str(error)
+            raise error
 
     def check_error(self) -> None:
         error = self._read_owner_fault() or self._read_owner_exit_error()
         if error is not None:
+            self._reported_owner_error = str(error)
             raise error
+        self._check_stop_result()
 
     def snapshot(self):
         self.check_error()
@@ -146,11 +169,11 @@ class ArmProcess:
         frame.flags.writeable = False
         return frame
 
-    def submit(self, command, *, expires_ns):
+    def submit(self, command, *, expires_ns) -> int:
         self.check_error()
         if not self.is_connected:
             raise RuntimeError("arm unavailable for target submission")
-        self.io.publish_goal(command, expires_ns=expires_ns)
+        return self.io.publish_goal(command, expires_ns=expires_ns)
 
     def resume(self, cancel_epoch, *, deadline_ns):
         """旧发布调用已返回；确认停止、清空邮箱后才恢复设备接纳。"""
@@ -158,8 +181,8 @@ class ArmProcess:
         if not self.is_connected:
             raise RuntimeError("arm unavailable for lifecycle operation")
         self.io.stop.set()
-        self._wait_for_sdk_stop(deadline=min(
-            time.monotonic() + EXECUTOR_TIMEOUT_S, deadline_ns / 1e9,
+        self._wait_for_sdk_stop(deadline_ns=min(
+            time.monotonic_ns() + int(EXECUTOR_TIMEOUT_S * 1e9), deadline_ns,
         ))
         self.io.clear_goal(deadline_ns=min(deadline_ns, time.monotonic_ns() + int(EXECUTOR_TIMEOUT_S * 1e9)))
         with self.runtime_state.motion_lock:
@@ -169,9 +192,7 @@ class ArmProcess:
                 raise OperationCancelled("operation cancelled before preparation")
             if time.monotonic_ns() >= deadline_ns:
                 raise TimeoutError("arm operation deadline expired before preparation")
-            # SDK 停止完成事件仅由 Owner 写入，接纳请求时清除。
-            # 父进程此时清确认会使 owner 把尚未清除的 stop 当作新停止。
-            self.physical_stop_confirmed = False
+            # Owner 接纳请求时清除上一停止周期的确认。
             self.io.stop.clear()
 
     def request_operation(self, request: PrepareRequest | HomeRequest, *, service, abort, cancel_epoch):
@@ -190,6 +211,7 @@ class ArmProcess:
                 if isinstance(error, Exception):
                     fault = self._read_owner_fault()
                     if fault is not None:
+                        self._reported_owner_error = str(fault)
                         raise fault from error
                 raise error
 
@@ -248,8 +270,7 @@ class ArmProcess:
                     raise
                 raise
             self.io.closing.set()
-            # 异常请求不再恢复；最终 close 读取 owner 的晚到故障。
-            self.check_error()
+            # 保留当前失败，最终 close 读取 owner 的晚到故障。
             raise
 
     def prepare(self, cancel_epoch, *, service):
@@ -279,50 +300,59 @@ class ArmProcess:
             cancel_epoch=cancel_epoch,
         )
 
-    def _wait_for_sdk_stop(self, *, deadline: float) -> None:
-        while not self.io.sdk_stop_handled.is_set():
-            self.check_error()
-            if self.process is None or self.process.pid is None:
-                raise RobotError("arm owner unavailable before handling stop request")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("arm stop unresolved; SDK acceptance not confirmed")
-            self.io.sdk_stop_handled.wait(min(0.05, remaining))
-        self.check_error()  # Owner 先记录 SDK 停止故障，再置完成事件。
+    def _wait_for_stop_event(self, event, *, deadline_ns, stage, service=None) -> None:
+        while not event.is_set():
+            if self.process is None or not self.process.is_alive():
+                if event.is_set():
+                    break  # Owner 可能在检查期间发布结果并退出。
+                raise RobotError(f"{stage} unresolved: arm owner exited before reporting")
+            if service is not None:
+                service()
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            if remaining_ns <= 0:
+                raise TimeoutError(f"{stage} unresolved: owner reply timed out")
+            event.wait(min(0.005 if service is not None else 0.05, remaining_ns / 1e9))
 
-    def wait_physical_stop(self) -> None:
-        """确认 SDK 停止已处理，再由 Owner 查询新反馈并验证停稳。"""
-        self.physical_stop_confirmed = False
+    def _wait_for_sdk_stop(self, *, deadline_ns) -> None:
+        self._wait_for_stop_event(
+            self.io.sdk_stop_handled, deadline_ns=deadline_ns, stage="arm SDK stop",
+        )
+        self._check_stop_result()
+
+    def wait_physical_stop(self, *, service=None) -> None:
+        """等待 SDK 停止和实测停稳，独立于此前的运动故障。"""
         if not self.io.stop.is_set():
             raise OperationCancelled("arm stop was not requested")
-        self._wait_for_sdk_stop(deadline=time.monotonic() + EXECUTOR_TIMEOUT_S)
-        if not self.is_connected:
-            raise RobotError("arm owner unavailable for physical stop verification")
+        self._wait_for_sdk_stop(
+            deadline_ns=time.monotonic_ns() + int(EXECUTOR_TIMEOUT_S * 1e9),
+        )
 
         deadline_ns = time.monotonic_ns() + int(EXECUTOR_TIMEOUT_S * 1e9)
         # Owner 到达采样期限后仍需发送失败回复。
         reply_deadline_ns = deadline_ns + round(STOP_REPLY_GRACE_S * 1e9)
-        try:
-            self.pipe.send(PhysicalStopRequest(deadline_ns))
-            while not self.pipe.poll(0.005):
-                self.check_error()
-                if not self.is_connected:
-                    raise RobotError("arm owner unavailable during physical stop verification")
-                if time.monotonic_ns() >= reply_deadline_ns:
-                    raise TimeoutError("arm physical stop unresolved: owner reply timed out")
-            error = self.pipe.recv()
-        except BaseException as exc:
-            # 未消费的晚到回复不能进入下一次操作。
-            self.io.closing.set()
-            if isinstance(exc, Exception):
-                self.check_error()
-            if isinstance(exc, (BrokenPipeError, EOFError)):
-                raise RobotError("arm owner feedback channel closed during physical stop verification") from exc
-            raise
-        self.check_error()
-        if error is not None:
-            raise error
-        self.physical_stop_confirmed = True
+        if self.is_connected and not self.io.fault.value:
+            try:
+                self.pipe.send(PhysicalStopRequest(deadline_ns))
+                while not self.pipe.poll(0.005):
+                    if not self.is_connected or self.io.fault.value:
+                        break
+                    if service is not None:
+                        service()
+                    if time.monotonic_ns() >= reply_deadline_ns:
+                        raise TimeoutError("arm physical stop unresolved: owner reply timed out")
+                else:
+                    self.pipe.recv()
+            except (BrokenPipeError, EOFError):
+                self.io.closing.set()
+            except BaseException:
+                # 未消费的晚到回复不能进入下一次操作。
+                self.io.closing.set()
+                raise
+        self._wait_for_stop_event(
+            self.io.stop_observed, deadline_ns=reply_deadline_ns,
+            stage="arm physical stop", service=service,
+        )
+        self._check_stop_result()
 
     def close(self) -> None:
         """回收 Owner 和管道，物理停稳确认须在关闭反馈通道前完成。"""
@@ -336,16 +366,22 @@ class ArmProcess:
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
                 errors.append(exc)
-        # join 后重新读取故障，包含关闭期间晚到的错误。
+        # join 后报告晚到的故障和断开错误，已经传播的故障由其调用者保留。
         fault = self._read_owner_fault()
-        if fault is not None:
+        if fault is not None and str(fault) != self._reported_owner_error:
             errors.insert(0, fault)
+        stop_error = self._read_stop_error()
+        if stop_error is not None and str(stop_error) != self._reported_stop_error:
+            errors.append(stop_error)
+        disconnect_error = self.io.disconnect_error.value.decode(errors="replace")
+        if disconnect_error:
+            errors.append(RobotError(f"xArm disconnect failed: {disconnect_error}"))
         alive = self.process is not None and self.process.is_alive()
         if alive:
             errors.append(TimeoutError("arm owner process still active; stop/disconnect unresolved"))
         else:
             exit_error = self._read_owner_exit_error()
-            if exit_error is not None:
+            if exit_error is not None and str(exit_error) != self._reported_owner_error:
                 if fault is None:
                     errors.insert(0, exit_error)
                 else:

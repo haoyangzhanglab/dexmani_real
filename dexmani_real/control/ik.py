@@ -8,11 +8,7 @@ from scipy.optimize import least_squares
 
 from dexmani_real.geometry.kinematics import ArmFK
 from dexmani_real.geometry.pose import Pose
-from dexmani_real.robot.commands import (
-    FEEDBACK_POSITION_ROUNDOFF_RAD,
-    arm_reference_from_feedback,
-    validate_arm_target,
-)
+from dexmani_real.robot.commands import arm_reference_from_feedback, validate_arm_target
 
 JOINT_SCALE = np.sqrt([4.0, 1.8, 1.2, 0.6, 0.6, 0.9, 0.35])
 TASK_SCALE = np.array([1 / 0.3] * 3 + [1.0] * 3)
@@ -34,12 +30,11 @@ class IKResult:
 
 
 class IKSolver:
-    def __init__(self, arm, environment, *, target_speed, max_lead, device_speed):
-        if not all(
-            np.isfinite(v) and v > 0 for v in (target_speed, max_lead, device_speed)
-        ):
-            raise ValueError("IK speed and lead must be finite and positive")
-        self.speed, self.lead = min(target_speed, device_speed), max_lead
+    def __init__(self, arm, environment, *, target_speed):
+        device_speed = arm.max_joint_velocity_rad_per_s
+        if not all(np.isfinite(v) and v > 0 for v in (target_speed, device_speed)):
+            raise ValueError("IK speeds must be finite and positive")
+        self.speed = min(target_speed, device_speed)
         self.limits = np.column_stack((arm.joint_limit_lower, arm.joint_limit_upper))
         self.workspace = environment.workspace.as_array()
         tolerance = environment.eef_workspace_tolerance_m
@@ -79,20 +74,10 @@ class IKSolver:
             self.fk.pin.Quaternion(transform[:3, :3]).coeffs()[[3, 0, 1, 2]],
         )
 
-    def bounds(
-        self, measured: np.ndarray, command: np.ndarray, *, h: float
-    ):
-        # 实测入口与已提交解建立格式和限位不变量；这里判断变化中的跟踪范围。
-        if np.any(
-            np.abs(command - measured) > self.lead + FEEDBACK_POSITION_ROUNDOFF_RAD
-        ):
-            raise IKReferenceError("IK command exceeds measured lead range")
-        lower = np.maximum.reduce(
-            (self.limits[:, 0], command - self.speed * h, measured - self.lead)
-        )
-        upper = np.minimum.reduce(
-            (self.limits[:, 1], command + self.speed * h, measured + self.lead)
-        )
+    def bounds(self, command: np.ndarray, *, h: float) -> tuple[np.ndarray, np.ndarray]:
+        step = self.speed * h
+        lower = np.maximum(self.limits[:, 0], command - step)
+        upper = np.minimum(self.limits[:, 1], command + step)
         if np.any(lower > upper) or (h > 0 and np.any(lower == upper)):
             raise IKReferenceError("IK feasible range unavailable")
         return lower, upper
@@ -121,11 +106,8 @@ class IKSolver:
             raise ValueError("non-finite IK residual/Jacobian")
         return residual, jacobian
 
-    def solve(
-        self, target: Pose, measured, command, anchor, *, h: float
-    ) -> IKResult:
-        lower, upper = self.bounds(measured, command, h=h)
-        seed = np.clip(command, lower, upper)  # 仅初值；最终输出不裁剪。
+    def solve(self, target: Pose, command, anchor, *, h: float) -> IKResult:
+        lower, upper = self.bounds(command, h=h)
         weight = np.hypot(CONTINUITY_WEIGHT, ANCHOR_WEIGHT)
         reference = (
             CONTINUITY_WEIGHT**2 * command + ANCHOR_WEIGHT**2 * anchor
@@ -141,13 +123,13 @@ class IKSolver:
                 cached_value = self.residual_and_jacobian(q, goal, reference, weight)
             return cached_value
 
-        initial = evaluate(seed)[0]
+        initial = evaluate(command)[0]
         initial_cost = initial @ initial
-        q = seed
+        q = command
         if h > 0:
             result = least_squares(
                 lambda x: evaluate(x)[0],
-                seed,
+                command,
                 jac=lambda x: evaluate(x)[1],
                 bounds=(lower, upper),
                 method="trf",

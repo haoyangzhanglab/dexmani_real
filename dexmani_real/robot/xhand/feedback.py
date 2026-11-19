@@ -24,7 +24,9 @@ HAND_STATE_DTYPE = np.dtype(
         # 每种触觉分别保留各指最后有效样本的查询起点，0 表示无有效样本。
         ("tactile_aggregate_timestamp_ns", "<u8", (HAND_FINGER_COUNT,)),
         ("tactile_dense_timestamp_ns", "<u8", (HAND_FINGER_COUNT,)),
-        # 关节来源时间独立于触觉缓存。
+        # 过流状态与关节位置共用来源时间，独立于逐指触觉缓存。
+        ("overcurrent", "?"),
+        ("overcurrent_joint_mask", "?", HAND_JOINT_SHAPE),
         ("timestamp_ns", "<u8"),
     ]
 )
@@ -38,6 +40,8 @@ class XHandState:
     tactile_aggregate: np.ndarray | None
     tactile_dense: np.ndarray | None
     timestamp_ns: int
+    overcurrent: bool
+    overcurrent_joint_mask: np.ndarray
 
 
 class XHandFeedback:
@@ -68,6 +72,8 @@ class XHandFeedback:
         else:
             frame = self.latest.copy()
         frame["qpos"] = state.qpos
+        frame["overcurrent"] = state.overcurrent
+        frame["overcurrent_joint_mask"] = state.overcurrent_joint_mask
         for name in TACTILE_CHANNELS:
             values = getattr(state, f"tactile_{name}")
             if values is not None:

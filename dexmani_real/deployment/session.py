@@ -41,6 +41,7 @@ from dexmani_real.robot.commands import (
     RobotError,
 )
 from dexmani_real.robot.system import Robot
+from dexmani_real.robot.xhand.feedback import TACTILE_CHANNELS
 from dexmani_real.runtime.home import (
     HomeConfigurationError,
     HomePathRejected,
@@ -309,6 +310,7 @@ class PolicySession:
         self.robot = Robot(
             self.runtime.arm, self.runtime.hand, runtime_state=self.runtime_state,
             check_services=self.check_services,
+            hand_tactile_channels=TACTILE_CHANNELS if self.record_raw else needs.required_tactile,
         )
 
     def check_services(self):

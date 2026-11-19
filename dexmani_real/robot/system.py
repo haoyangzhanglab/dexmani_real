@@ -49,6 +49,9 @@ class Robot:
         *,
         runtime_state: "SessionState",
         check_services=None,
+        timing=None,
+        hand_tactile_channels: tuple[str, ...] = (),
+        defer_hand_crc: bool = True,
     ):
         self.arm_config, self.hand_config = arm_config, hand_config
         self.arm_lower = np.asarray(arm_config.joint_limit_lower, dtype=np.float64)
@@ -57,10 +60,13 @@ class Robot:
         self.hand_upper = np.array(hand_config.qpos_max_rad, dtype=np.float64, copy=True)
         self.runtime_state = runtime_state
         self.check_services = check_services
+        self.timing = timing
+        self.hand_tactile_channels = hand_tactile_channels
+        self.defer_hand_crc = defer_hand_crc
         self.arm: ArmProcess | None = None
         self.hand: XHand | None = None
         self.connected = False
-        self.hand_stop_required = False
+        self._hand_hold_tor_max: tuple[int, ...] | None = None  # 待确认的保持输出上限。
         self.hand_feedback = XHandFeedback()
         self._hand_refresh_required = False
         self.feedback_next_ns = 0
@@ -129,6 +135,7 @@ class Robot:
         self.arm = ArmProcess(
             self.arm_config,
             runtime_state=self.runtime_state,
+            timing=self.timing.arm if self.timing is not None else None,
         )
         self.arm.connect(check_services=self.check_services)
         if cancelled():
@@ -136,8 +143,8 @@ class Robot:
         if self.hand_config.enabled:
             from dexmani_real.robot.xhand.driver import XHand
 
-            self.hand = XHand(self.hand_config)
-            self.hand_stop_required = True
+            self.hand = XHand(self.hand_config, tactile_channels=self.hand_tactile_channels)
+            self._hand_hold_tor_max = self.hand_config.tor_max
             initial = self.hand.connect(cancel_requested=cancelled)
             self.hand_feedback.consume(initial)
             self._hand_refresh_required = False
@@ -169,18 +176,33 @@ class Robot:
             self.hand_feedback.clear_tactile()
             self.feedback_next_ns = 0
 
-    def read_hand(self) -> np.ndarray | None:
+    def read_hand(self, *, retry_crc: bool = True) -> np.ndarray | None:
         if self.hand is None:
             return None
-        state = self.hand.get_state()
+        timing = self.timing
+        started_ns = time.monotonic_ns() if timing is not None else 0
+        state = None
+        try:
+            state = self.hand.get_state(retry_crc=retry_crc)
+        finally:
+            if timing is not None:
+                timing.add(
+                    "hand_feedback", timestamp_ns=started_ns, finished_ns=time.monotonic_ns(),
+                    feedback_timestamp_ns=state.timestamp_ns if state is not None else None,
+                    succeeded=state is not None,
+                )
         frame = self.hand_feedback.consume(state)
         if state is not None:
             self._hand_refresh_required = False
         return frame
 
     @property
+    def hand_stop_required(self) -> bool:
+        return self._hand_hold_tor_max is not None
+
+    @property
     def hand_feedback_pending(self) -> bool:
-        """读 CRC 尚未恢复，或普通写入异常后尚无有效关节反馈。"""
+        """读 CRC 尚未恢复，或写入结果未明确后尚无有效关节反馈。"""
         return self.hand is not None and (
             self._hand_refresh_required or self.hand.consecutive_read_crc > 0
         )
@@ -201,7 +223,7 @@ class Robot:
             now = time.monotonic_ns()
             sampled = now >= self.feedback_next_ns
             if sampled:
-                self.read_hand()
+                self.read_hand(retry_crc=not self.defer_hand_crc)
                 if self.joint_history:
                     state = self.read_state()
                     for name, history in self.joint_history.items():
@@ -221,9 +243,16 @@ class Robot:
                         # 留下窗口左侧的一个样本，供边界时刻插值。
                         while len(history) > 2 and history[1][0] < stamp - self.joint_history_ns:
                             history.popleft()
-                self.feedback_next_ns = next_tick_ns(
-                    self.feedback_next_ns or now, FEEDBACK_PERIOD_NS, time.monotonic_ns(),
-                )
+                finished_ns = time.monotonic_ns()
+                if self.defer_hand_crc and self.hand is not None and (
+                    0 < self.hand.consecutive_read_crc <= self.hand_config.crc_retries
+                ):
+                    # 在线退避沿用反馈调度，保留旧样本时间与 pending 状态。
+                    self.feedback_next_ns = finished_ns + round(self.hand_config.crc_retry_interval_s * 1e9)
+                else:
+                    self.feedback_next_ns = next_tick_ns(
+                        self.feedback_next_ns or now, FEEDBACK_PERIOD_NS, finished_ns,
+                    )
             if not self.runtime_state.stop_signal.is_set():
                 self._check_hand_feedback()
             return sampled
@@ -279,37 +308,58 @@ class Robot:
         cast("ArmProcess", self.arm).prepare(cancel_epoch, service=service)
         self.check_run()
 
-    def send_action(self, command, *, expires_ns):
-        """顺序发布 arm 邮箱并确认 hand SDK 发送结果。"""
+    def send_action(self, command, *, expires_ns) -> int | None:
+        """组合提交成功后返回臂邮箱发布时间，纯手部命令返回 None。"""
         self.validate_command(command)
         hand_target = command.hand_qpos
         if hand_target is not None and self.hand_feedback_pending:
             raise FeedbackUnavailable("fresh XHand feedback pending after CRC or unconfirmed submission")
+        timing = self.timing
+        arm_published_ns = None
+        accepted = False
         try:
             self.check_run()
             if hand_target is not None:
                 stamp = self._check_hand_feedback()
                 hand_deadline_ns = min(expires_ns, stamp + int(self.hand_config.feedback_max_age_s * 1e9))
             if command.arm_qpos is not None or command.arm_hold:
-                cast("ArmProcess", self.arm).submit(command, expires_ns=expires_ns)
+                arm_published_ns = cast("ArmProcess", self.arm).submit(command, expires_ns=expires_ns)
             if hand_target is not None:
                 # hand 独占于主线程，arm 发布后仍按该反馈的期限检查真正发送。
+                hand_started_ns = time.monotonic_ns() if timing is not None else 0
+                hand_sent = False
                 try:
                     cast("XHand", self.hand).send_action(
                         hand_target, deadline_ns=hand_deadline_ns, check_abort=self.check_run,
                     )
-                    self.hand_stop_required = True
+                    hand_sent = True
+                    self._hand_hold_tor_max = self.hand_config.tor_max
                 except CommandExpired:
                     raise  # SDK 未收到本次写入。
                 except BaseException:
                     # 其余异常无法排除写入已生效，用新反馈决定保持位置。
-                    self.hand_stop_required = self._hand_refresh_required = True
+                    self._hand_hold_tor_max = self.hand_config.tor_max
+                    self._hand_refresh_required = True
                     self.feedback_next_ns = 0
                     raise
+                finally:
+                    if timing is not None:
+                        timing.add(
+                            "hand_send", timestamp_ns=hand_started_ns, finished_ns=time.monotonic_ns(),
+                            arm_published_ns=arm_published_ns, succeeded=hand_sent,
+                        )
             self.check_run()
+            accepted = True
         except BaseException:
             self.runtime_state.stop_signal.set()
             raise
+        finally:
+            if timing is not None and arm_published_ns is not None:
+                timing.add(
+                    "arm_publish", timestamp_ns=arm_published_ns, expires_ns=expires_ns,
+                    qpos=command.arm_qpos, hold=command.arm_hold, accepted=accepted,
+                )
+        return arm_published_ns
 
     def validate_command(self, command):
         """组合命令格式与绝对限位必须先于任一设备副作用。"""
@@ -324,7 +374,7 @@ class Robot:
             validate_hand_target(command.hand_qpos, self.hand_lower, self.hand_upper)
 
     def send_hand_home(self, qpos, *, deadline_ns, check_abort) -> bool:
-        """提交 HOME 小步目标并返回过流告警。"""
+        """提交最终 HOME 目标，返回是否收到过流告警。"""
         if not self.connected or self.hand is None or not self.hand.is_connected:
             raise RobotError("hand device unavailable")
         # 操作范围已由连接前配置校验限制在额定范围内。
@@ -336,24 +386,32 @@ class Robot:
         stamp = self._check_hand_feedback()
         if time.monotonic_ns() >= deadline_ns:
             raise HomeTimeout("hand HOME budget exhausted before submission")
-        self.hand_stop_required = True
         from dexmani_real.robot.xhand.driver import OVERCURRENT_WARNING_CODE
 
-        tor_max = np.minimum(self.hand_config.tor_max, HAND_HOME_OUTPUT_LIMIT)
-        code = self.hand.send_position(
-            target, tor_max=tor_max,
-            deadline_ns=min(deadline_ns, stamp + int(self.hand_config.feedback_max_age_s * 1e9)),
-            check_abort=check_abort,
-        )
-        if code is None:
-            raise FeedbackUnavailable("HOME XHand position submission unconfirmed within its deadline")
+        tor_max = tuple(min(value, HAND_HOME_OUTPUT_LIMIT) for value in self.hand_config.tor_max)
+        previous_tor_max = self._hand_hold_tor_max
+        self._hand_hold_tor_max = tor_max
+        try:
+            code = self.hand.send_position(
+                target, tor_max=tor_max,
+                deadline_ns=min(deadline_ns, stamp + int(self.hand_config.feedback_max_age_s * 1e9)),
+                check_abort=check_abort,
+            )
+        except CommandExpired:
+            self._hand_hold_tor_max = previous_tor_max
+            raise
+        except BaseException:
+            self._hand_refresh_required = True
+            self.feedback_next_ns = 0
+            raise
         return code == OVERCURRENT_WARNING_CODE
 
     def hold_hand(self, *, check_abort=None) -> bool:
         """使用最近可信的反馈保持位置，必要时刷新一次。"""
         if self.hand is None:
             return False
-        self.hand_stop_required = True
+        tor_max = self._hand_hold_tor_max or self.hand_config.tor_max
+        self._hand_hold_tor_max = tor_max
         frame = self.hand_feedback.snapshot()
         stamp = int(frame["timestamp_ns"][0]) if frame is not None else 0
         if self.hand_feedback_pending or not sample_is_fresh(
@@ -362,10 +420,19 @@ class Robot:
             frame = self.read_hand()
         if frame is None or self.hand_feedback_pending:
             return False
-        confirmed = self.hand.hold(
-            frame["qpos"][0], timestamp_ns=int(frame["timestamp_ns"][0]), check_abort=check_abort,
-        )
-        self.hand_stop_required = not confirmed
+        try:
+            confirmed = self.hand.hold(
+                frame["qpos"][0], timestamp_ns=int(frame["timestamp_ns"][0]),
+                tor_max=tor_max, check_abort=check_abort,
+            )
+        except CommandExpired:
+            raise
+        except BaseException:
+            self._hand_refresh_required = True
+            self.feedback_next_ns = 0
+            raise
+        if confirmed:
+            self._hand_hold_tor_max = None
         return confirmed
 
     @contextmanager
@@ -377,7 +444,7 @@ class Robot:
                 self.runtime_state.request_emergency_stop()
             errors.append((stage, exc))
 
-    def stop(self) -> None:
+    def stop(self, *, service=None) -> None:
         """请求机械臂停止，同时保持 XHand 位置，并确认机械臂停稳。"""
         self.runtime_state.stop_signal.set()
         errors: list[tuple[str, BaseException]] = []
@@ -386,8 +453,13 @@ class Robot:
                 if not self.hold_hand():
                     raise FeedbackUnavailable("XHand position hold not confirmed")
         if self.arm is not None:
+            def service_stop():
+                if not errors:
+                    with self._stop_stage(errors, "stop_service"):
+                        service()
+
             with self._stop_stage(errors, "arm_stop_confirm"):
-                self.arm.wait_physical_stop()
+                self.arm.wait_physical_stop(service=service_stop if service is not None else None)
         if errors:
             for stage, error in errors[1:]:
                 logger.error("%s failed", stage, exc_info=(type(error), error, error.__traceback__))
@@ -428,16 +500,20 @@ class Robot:
                 if self.arm.is_closed:
                     self.arm = None
 
-        if self.hand is not None:
+        hand = self.hand
+        if hand is not None:
             try:
                 with self._stop_stage(errors, "hand_disconnect"):
-                    self.hand.disconnect()
+                    hand.disconnect()
             finally:
-                if self.hand.control is None:
+                if hand.control is None:
                     self.hand = None
+                if self.timing is not None:
+                    self.timing.add("xhand_crc", counts=hand.crc_counts.copy())
 
         self.connected = False
-        self.hand_stop_required = self.hand is not None
+        if self.hand is None:
+            self._hand_hold_tor_max = None
         if errors:
             for stage, error in errors[1:]:
                 logger.error("%s failed", stage, exc_info=(type(error), error, error.__traceback__))

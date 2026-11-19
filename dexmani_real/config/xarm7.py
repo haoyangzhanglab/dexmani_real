@@ -28,8 +28,8 @@ class ArmConfig:
     joint_limit_lower: tuple[float, ...] = XARM7_HARD_LOWER
     joint_limit_upper: tuple[float, ...] = XARM7_HARD_UPPER
 
-    max_joint_velocity_deg_per_s: float = 150.0
-    max_joint_acceleration_deg_per_s2: float = 900.0
+    max_joint_velocity_deg_per_s: float = 180.0
+    max_joint_acceleration_deg_per_s2: float = 1100.0
     max_joint_jerk_deg_per_s3: float = 12000.0
 
     servo_hz: float = 100.0

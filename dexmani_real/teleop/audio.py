@@ -1,4 +1,4 @@
-"""后台尽力播放 WAV；待播提示只保留最新一条。"""
+"""播放 WAV 提示，后台播放只保留最新的待播提示。"""
 
 import logging
 import shutil
@@ -22,13 +22,30 @@ EVENT_FILES = {
 }
 
 
+def _find_player() -> tuple[str, ...] | None:
+    players = (("aplay", "-q"), ("paplay",))
+    return next((player for player in players if shutil.which(player[0])), None)
+
+
+def play_wav(path: Path, *, timeout_s: float) -> None:
+    """等待单条提示播完，播放故障只记警告。"""
+    player = _find_player()
+    if player is None:
+        logger.warning("No audio player; audio disabled")
+        return
+    try:
+        subprocess.run([*player, str(path)], stdout=subprocess.DEVNULL, timeout=timeout_s, check=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Audio playback failed: %s", exc)
+
+
 class AudioFeedback:
     def __init__(self):
         self.condition = threading.Condition()
         self.pending = None
         self.closed = False
         self.paths: dict[str, Path | None] = {}
-        self.player = next((name for name in ("aplay", "paplay") if shutil.which(name)), None)
+        self.player = _find_player()
         self.worker = None
         if self.player is None:
             logger.warning("No audio player; audio disabled")
@@ -77,9 +94,8 @@ class AudioFeedback:
                 return
 
     def play_one(self, path):
-        player = cast(str, self.player)  # 仅在播放器已发现的工作线程调用。
-        command = [player, "-q", str(path)] if player == "aplay" else [player, str(path)]
-        proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        player = cast(tuple[str, ...], self.player)  # 仅在播放器已发现的工作线程调用。
+        proc = subprocess.Popen([*player, str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             while True:
                 with self.condition:
@@ -92,7 +108,7 @@ class AudioFeedback:
                     continue
             if proc.returncode:
                 detail = " ".join(stderr.decode("utf-8", errors="replace").split())[:512]
-                raise RuntimeError(f"{self.player} exited {proc.returncode}: {detail}")
+                raise RuntimeError(f"{player[0]} exited {proc.returncode}: {detail}")
         finally:
             if proc.poll() is None:
                 try:

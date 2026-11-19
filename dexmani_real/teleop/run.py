@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
+from dexmani_real import ASSET_DIR
 from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
 from dexmani_real.config.teleop import DEFAULT_TASK_NAME
 from dexmani_real.control.actions import ActionMapper
@@ -14,6 +15,7 @@ from dexmani_real.data.raw import validate_task_label
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
+from dexmani_real.robot.xhand.feedback import TACTILE_CHANNELS
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
@@ -26,9 +28,10 @@ from dexmani_real.runtime.preflight import (
     validate_xhand_target_rate,
 )
 from dexmani_real.runtime.state import SessionState
+from dexmani_real.runtime.teleop_timing import TeleopTiming
 from dexmani_real.sensor.realsense import run_camera
 from dexmani_real.sensor.vr import run_vr
-from dexmani_real.teleop.audio import AudioFeedback
+from dexmani_real.teleop.audio import AudioFeedback, play_wav
 from dexmani_real.teleop.loop import TeleopLoop
 from dexmani_real.teleop.vr import VRController
 from dexmani_real.utils.log import configure_logging
@@ -47,6 +50,7 @@ def run_teleop(
     task_name=DEFAULT_TASK_NAME,
     vr_transform_path=VR_TRANSFORM_PATH,
     camera_calibration_path=None,
+    timing_output: str | Path | None = None,
 ) -> int:
     """装配遥操作资源并收尾。"""
     configure_logging()
@@ -77,6 +81,19 @@ def run_teleop(
     if not runtime.hand.enabled and record:
         raise ValueError("hand-disabled operation cannot record episodes")
     vr_to_robot_rotation = load_vr_transform(vr_transform_path)
+    timing = (
+        TeleopTiming(
+            timing_output, mode="vr", control_hz=runtime.teleop.control_hz,
+            arm=runtime.arm, motion=runtime.motion,
+        )
+        if timing_output is not None else None
+    )
+    if timing is not None:
+        timing.add(
+            "config", record=record, vr_pos_scale=runtime.teleop.vr_pos_scale,
+            ema_alpha_pos=runtime.teleop.ema_alpha_pos, ema_alpha_rot=runtime.teleop.ema_alpha_rot,
+            target_max_age_s=runtime.teleop.target_max_age_s, hand_enabled=runtime.hand.enabled,
+        )
     controller = VRController(
         ActionMapper.for_mode(
             "eef",
@@ -88,6 +105,7 @@ def run_teleop(
         build_hand_retargeter(runtime),
         runtime.teleop,
         vr_to_robot_rotation,
+        timing=timing,
     )
     ctx = mp.get_context("spawn")
     runtime_state = SessionState()
@@ -108,13 +126,15 @@ def run_teleop(
                 runtime.arm,
                 runtime.hand,
                 runtime_state=runtime_state,
+                timing=timing,
+                hand_tactile_channels=TACTILE_CHANNELS if record else (),
             )
             keyboard = Keyboard(
                 estop_callback=runtime_state.request_emergency_stop,
                 bindings={
                     "s": runtime_state.request_stop,
                     "c": runtime_state.request_stop,
-                    "q": runtime_state.request_quit,
+                    "d": runtime_state.request_stop,
                 },
             )
             audio = AudioFeedback()
@@ -130,8 +150,9 @@ def run_teleop(
                 audio=audio,
                 recording_dir=recording_dir,
                 max_duration_s=max_duration_s,
+                timing=timing,
             )
-            keyboard.bindings["d"] = runtime_state.request_stop
+            keyboard.bindings["q"] = loop.handle_quit_key
             keyboard.start()
 
             def check_services():
@@ -165,7 +186,10 @@ def run_teleop(
                 raise OperationCancelled("startup cancelled")
             initialize_teleop(
                 loop,
-                ctx.Process(name="vr", target=run_vr, args=(channels, runtime.vr)),
+                ctx.Process(
+                    name="vr", target=run_vr, args=(channels, runtime.vr),
+                    kwargs={"hand_enabled": runtime.hand.enabled},
+                ),
                 cancel_epoch=startup_cancel_epoch,
             )
         except OperationCancelled:
@@ -210,6 +234,11 @@ def run_teleop(
         if audio is not None:
             try:
                 audio.close()
+                if (
+                    loop is not None and loop.quit_presses == 2 and not loop.session_failed
+                    and primary_failure is None and not runtime_state.estop_request
+                ):
+                    play_wav(ASSET_DIR / "audio" / "操作结束.wav", timeout_s=5.0)
             except Exception:
                 logger.warning("teleop audio cleanup failed", exc_info=True)
             except BaseException as exc:
@@ -217,6 +246,12 @@ def run_teleop(
                     runtime_state.request_emergency_stop()
                 primary_failure = primary_failure or exc
                 logger.exception("teleop audio cleanup failed")
+        if timing is not None:
+            try:
+                timing.write()
+            except (Exception, KeyboardInterrupt) as exc:
+                primary_failure = primary_failure or exc
+                logger.exception("teleop timing output failed")
     return int(
         not runtime_state.quit_requested or primary_failure is not None or runtime_state.estop_request
         or loop is not None and loop.session_failed
@@ -241,14 +276,14 @@ def initialize_teleop(loop, vr_process, *, cancel_epoch) -> None:
         raise OperationCancelled("teleop startup cancelled")
     print(
         "就绪：B 空闲时开始新段 | S/C 保存结束本段 | D 丢弃本段 | "
-        "Q 保存并退出 | Esc 急停 | H 空闲时先臂后手回位 | "
+        "Q 第一次提示，第二次保存并退出 | Esc 急停 | H 空闲时先手后臂回位 | "
         "T 空闲且确认五指无接触时校准触觉。",
         flush=True,
     )
 
 
 def calibrate_hand(loop, cancel_epoch) -> None:
-    """按 Ring 发布序号消费新鲜 VR 帧；重复读取缓存不计作标定样本。"""
+    """只统计新鲜的独立关键点包。"""
     retargeter = loop.controller.hand_retargeter
     if retargeter is None:
         return
@@ -259,12 +294,14 @@ def calibrate_hand(loop, cancel_epoch) -> None:
     )
 
     config = loop.runtime.hand_retargeting
-    print("正在标定手部骨长：请保持右手清晰可见；无需保持伸直。S/Q/Esc 可取消。", flush=True)
+    print("正在标定手部骨长：请保持右手清晰可见；无需保持伸直。S 或 Esc 可取消，按两次 Q 退出。", flush=True)
     deadline = time.monotonic() + config.calibration_timeout_s
     measurements: list[np.ndarray] = []
+    channels = loop.sensors.channels
+    connection_epoch = channels.vr_connection_epoch.value
     last_sequence = 0
     last_error = "no fresh hand frames"
-    while len(measurements) < config.calibration_samples:
+    while True:
         if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
             raise OperationCancelled("hand calibration cancelled")
         loop.robot.service_idle()
@@ -272,13 +309,22 @@ def calibrate_hand(loop, cancel_epoch) -> None:
             raise RuntimeError(
                 f"hand calibration timed out ({len(measurements)}/{config.calibration_samples}): {last_error}"
             )
-        result = loop.sensors.channels.vr_ring.read()
+        current_epoch = channels.vr_connection_epoch.value
+        if current_epoch != connection_epoch:
+            connection_epoch = current_epoch
+            measurements.clear()
+            last_error = "VR transport disconnected"
+        if len(measurements) >= config.calibration_samples:
+            break
+        result = channels.vr_ring.read()
         if result is not None:
-            frame, sequence = result
-            stamp = int(frame["recv_ts_ns"])
+            frame, _ = result
+            sequence = int(frame["landmarks_sequence_id"])
+            stamp = int(frame["landmarks_recv_ts_ns"])
             now_ns = time.monotonic_ns()
             if (
-                sequence > last_sequence
+                int(frame["connection_epoch"]) == connection_epoch
+                and sequence > last_sequence
                 and sample_is_fresh(stamp, loop.runtime.teleop.vr_stale_threshold_s, now_ns)
             ):
                 last_sequence = sequence
@@ -292,7 +338,7 @@ def calibrate_hand(loop, cancel_epoch) -> None:
     if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
         raise OperationCancelled("hand calibration cancelled")
     retargeter.calibrate(measurements)
-    logger.info("Hand morphology calibrated from %s distinct frames", len(measurements))
+    logger.info("Hand morphology calibrated from %s distinct landmark packets", len(measurements))
 
 
 def build_hand_retargeter(runtime):

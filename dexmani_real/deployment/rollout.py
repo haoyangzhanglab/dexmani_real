@@ -222,7 +222,9 @@ class Rollout:
             self.robot.check()
         return valid
 
-    def read_observations(self, *, include_visual_payloads=True) -> tuple[Observation, Observation]:
+    def read_observations(
+        self, *, include_visual_payloads=True, include_raw_payloads=True,
+    ) -> tuple[Observation, Observation]:
         """共享关节采样；模型使用派生观测时，Raw 独立读取相机。"""
         row = read_observation(
             self.sensors.channels,
@@ -233,25 +235,30 @@ class Rollout:
         )
         raw = row
         if self.read_raw_camera:
-            camera = read_camera_frame(
-                self.sensors.channels,
-                fields=RAW_RECORDING_NEEDS.camera_fields if include_visual_payloads else (),
+            camera_fields = (
+                RAW_RECORDING_NEEDS.camera_fields if include_visual_payloads and include_raw_payloads else ()
             )
+            camera = read_camera_frame(self.sensors.channels, fields=camera_fields)
             observed_ns = time.monotonic_ns()
             hand = expire_tactile(row.hand, max_age_s=self.runtime.hand.tactile_max_age_s, now_ns=observed_ns)
-            raw = replace(row, hand=hand, camera=camera, point_cloud=None, hoi=None, aligned_joints=None,
-                          observation_timestamp_ns=observed_ns)
+            raw = replace(
+                row, hand=hand, camera=camera, point_cloud=None, pointcloud_timestamp_ns=None,
+                hoi=None, aligned_joints=None, observation_timestamp_ns=observed_ns,
+            )
         return row, raw
 
-    def start_observation(self, poll_operator, *, after_ns=None, initial_hoi=False):
+    def start_observation(self, poll_operator, *, after_ns=None, initial_hoi=False, warmup_payloads=False):
         timeout_s = 120.0 if initial_hoi else INITIAL_STATE_TIMEOUT_S
         until = time.monotonic_ns() + int(timeout_s * 1e9)
+        include_visual_payloads = False
         while True:
             poll_operator()
             if not self.preparation_valid():
                 raise OperationCancelled("initial observation cancelled")
             self.robot.service_feedback()
-            row, raw = self.read_observations()
+            row, raw = self.read_observations(
+                include_visual_payloads=include_visual_payloads, include_raw_payloads=False,
+            )
             devices = check_device_feedback(row, self.runtime)
             model_issues = check_observation(row, self.runtime, self.observations.needs)
             issue = ("device feedback: " + "; ".join(devices)) if devices else (
@@ -272,8 +279,13 @@ class Rollout:
                 logger.warning("本轮未开始：%s；等待停止与收尾。", self.preparation_issue)
                 return None
             if ready:
+                if warmup_payloads and not include_visual_payloads:
+                    # 预热要用模型载荷，重读后仍按本轮截止时间与来源检查准入。
+                    include_visual_payloads = True
+                    continue
                 self.preparation_issue = None
                 break
+            include_visual_payloads = False
             time.sleep(0.005)
         if self.policy_info.action_mode == "eef":
             try:
@@ -298,12 +310,14 @@ class Rollout:
             channels = self.sensors.channels
             channels.hoi_request.write(episode_id=self.result.index, after_ns=time.monotonic_ns(),
                                        after_sequence=channels.camera_ring.latest_sequence)
-        # 全模态初值先于 writer；等待与资源初始化期间设备保持停止。
-        row = self.start_observation(poll_operator, initial_hoi=self.observations.needs.hoi)
+        # 先检查各来源就绪；只有 HOI 预热会消费这次模型载荷。
+        initial_hoi = self.observations.needs.hoi
+        warmup_needed = initial_hoi and not self.model.warmed_up
+        row = self.start_observation(poll_operator, initial_hoi=initial_hoi, warmup_payloads=warmup_needed)
         if row is None:
             self.stop(self.preparation_issue)
             return
-        if self.observations.needs.hoi and not self.model.warmed_up:
+        if warmup_needed:
             kwargs = ({"rtc_delay": self.execution.prefetch_steps, "rtc_guidance_cap": self.execution.rtc_guidance_cap}
                       if self.execution.mode == "rtc" else {})
             self.model.warmup(
@@ -408,23 +422,6 @@ class Rollout:
         )
         return True
 
-    def map_command(self, action, row):
-        mode = self.policy_info.action_mode
-        if mode == "joint":
-            decoded = self.action_mapper.map_joint(action[:7], action[7:])
-        else:
-            current = row.arm["qpos"][0]
-            pose = Pose(action[:3], rot6d_to_quat_wxyz(action[3:9]))
-            reference = prepare_reference(
-                self.action_mapper.solver, self.ik_reference, current,
-                control_ns=time.monotonic_ns(),
-                period_s=self.execution.control_dt_s,
-            )
-            decoded = self.action_mapper.map_eef(pose, action[9:], reference)
-        if decoded.rejection_reason is not None or decoded.arm_qpos is None:
-            return None, f"action_rejected: {decoded.rejection_reason}"
-        return RobotCommand(decoded.arm_qpos, decoded.hand_qpos), None
-
     def _adopt_prediction(self, slot: int, now_ns: int) -> None:
         query = self.query
         if (
@@ -522,15 +519,27 @@ class Rollout:
             return True
         return False
 
-    def prepare_command(self, action, row):
+    def prepare_command(self, action, row) -> tuple[RobotCommand, np.ndarray | None] | None:
+        anchor = None
         try:
-            command, issue = self.map_command(action, row)
+            if self.policy_info.action_mode == "joint":
+                decoded = self.action_mapper.map_joint(action[:7], action[7:])
+            else:
+                pose = Pose(action[:3], rot6d_to_quat_wxyz(action[3:9]))
+                reference = prepare_reference(
+                    self.action_mapper.solver, self.ik_reference, row.arm["qpos"][0],
+                    control_ns=time.monotonic_ns(),
+                    period_s=self.execution.control_dt_s,
+                )
+                _, _, anchor, _ = reference
+                decoded = self.action_mapper.map_eef(pose, action[9:], reference)
         except (IKReferenceError, HandTargetRejected) as exc:
             self.stop(str(exc))
             return None
-        if issue is not None:
-            self.stop(issue)
+        if decoded.rejection_reason is not None or decoded.arm_qpos is None:
+            self.stop(f"action_rejected: {decoded.rejection_reason}")
             return None
+        command = RobotCommand(decoded.arm_qpos, decoded.hand_qpos)
         self.check_motion()
         if self.duration_expired():
             return None
@@ -546,28 +555,7 @@ class Rollout:
             if issues:
                 self._enter_hoi_hold()
                 return None
-        return command
-
-    def record_row(self, row, attempted_command, *, quality_issue, action_accepted):
-        primary_error = sys.exc_info()[1]
-        if primary_error is not None:
-            self.runtime_state.stop_signal.set()
-        if self.recorder is not None:
-            try:
-                issue = self.recorder.append(
-                    row, attempted_command, quality_issue=quality_issue, action_accepted=action_accepted,
-                )
-                if issue is not None:
-                    self.stop(issue)
-            except BaseException as exc:
-                if primary_error is None:
-                    raise
-                if exc is primary_error:
-                    return
-                self.result.errors.append(error_detail("recording_append", exc))
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                logger.exception("recording also failed during control failure")
+        return command, anchor
 
     def _observation_failure(self, issues, context):
         if is_recoverable_hoi_failure(issues):
@@ -684,8 +672,7 @@ class Rollout:
                 return
         row, raw = self.sample_observation()
         quality_issue = self.recording_issue(raw) if self.recorder is not None else None
-        attempted = None
-        action_accepted = False
+        submitted_command = None
         try:
             if quality_issue is not None:
                 self.stop(quality_issue)
@@ -701,24 +688,25 @@ class Rollout:
             if action is None:
                 return
             plan = cast(ActionChunk, self.plan)
-            command = self.prepare_command(action, row)
-            if command is None:
+            prepared = self.prepare_command(action, row)
+            if prepared is None:
                 return
+            command, anchor = prepared
             now = time.monotonic_ns()
             if self._expire_plan(now):
                 return
-            attempted = command
-            self.robot.send_action(command, expires_ns=now + COMMAND_LEASE_NS)
-            action_accepted = True
+            arm_published_ns = self.robot.send_action(command, expires_ns=now + COMMAND_LEASE_NS)
+            submitted_command = command
             if self.duration_expired():
                 return
             if self.policy_info.requires_prev_action:
-                self.prev_action = np.concatenate((command.arm_qpos, command.hand_qpos))
-            if self.policy_info.action_mode == "eef":
-                anchor = (arm_reference_from_feedback(
-                    row.arm["qpos"][0], *self.action_mapper.solver.limits.T,
-                ) if self.ik_reference is None else self.ik_reference.anchor)
-                self.ik_reference = IKReference(command.arm_qpos, anchor, time.monotonic_ns())
+                self.prev_action = np.concatenate(
+                    (cast(np.ndarray, command.arm_qpos), cast(np.ndarray, command.hand_qpos)),
+                )
+            if anchor is not None:
+                self.ik_reference = IKReference(
+                    cast(np.ndarray, command.arm_qpos), anchor, cast(int, arm_published_ns),
+                )
             if self.execution.mode in {"sync", "rtc"}:
                 self.cursor += 1
                 if self.execution.mode == "sync" and self.cursor == min(len(plan.actions), self.execution.action_steps):
@@ -728,8 +716,26 @@ class Rollout:
         except HandCommandUnconfirmed as exc:
             self.stop(str(exc))
         finally:
-            # 已尝试提交的恢复动作也需要记录。
-            if self.state == "RUNNING" or attempted is not None:
-                if skipped and not ode_gap and was_running and self.recorder is not None:
-                    self.recorder.mark_gap()
-                self.record_row(raw, attempted, quality_issue=quality_issue, action_accepted=action_accepted)
+            primary_error = sys.exc_info()[1]
+            if primary_error is not None:
+                self.runtime_state.stop_signal.set()
+            still_running = (
+                self.state == "RUNNING" and not self.finished and not self.runtime_state.stop_signal.is_set()
+            )
+            if self.recorder is not None and (
+                submitted_command is not None or quality_issue is not None or still_running
+            ):
+                try:
+                    if skipped and not ode_gap and was_running:
+                        self.recorder.mark_gap()
+                    issue = self.recorder.append(raw, submitted_command, quality_issue=quality_issue)
+                    if issue is not None:
+                        self.stop(issue)
+                except BaseException as exc:
+                    if primary_error is None:
+                        raise
+                    if exc is not primary_error:
+                        self.result.errors.append(error_detail("recording_append", exc))
+                        if isinstance(exc, KeyboardInterrupt):
+                            self.runtime_state.request_emergency_stop()
+                        logger.exception("recording also failed during control failure")

@@ -1,6 +1,7 @@
-"""Arm-first HOME；模型上的离散工程验证不覆盖异常制动或未知障碍。"""
+"""先回位 XHand，再对 xArm HOME 轨迹采样检查碰撞并执行。"""
 
 import logging
+import sys
 import time
 from math import ceil
 
@@ -36,7 +37,6 @@ from dexmani_real.utils.timing import sample_is_fresh
 logger = logging.getLogger(__name__)
 ARM_HOME_TIMEOUT_S = 60.0
 HAND_HOME_TIMEOUT_S = 10.0
-HAND_HOME_STEP_RAD = np.deg2rad(1.0)
 HAND_HOLD_TOLERANCE_RAD = 0.02
 HOME_CONSECUTIVE_SAMPLES = 3
 HOME_OVERCURRENT_CONSECUTIVE_CYCLES = 3
@@ -47,7 +47,7 @@ class HomeConfigurationError(ValueError):
 
 
 class HomePathRejected(ValueError):
-    """轨迹检查未通过，未提交 HOME 运动。"""
+    """机械臂 HOME 轨迹检查失败。"""
 
 
 def _plan_home(cfg, q, v, hand_q, collision, check):
@@ -105,14 +105,15 @@ def _hand_sample(robot):
     return frame[0]
 
 
-def _home_hand(robot, check):
+def _home_hand(robot, check) -> np.ndarray:
+    """确认 XHand 到位并返回碰撞规划使用的稳定手型。"""
     cfg = robot.hand_config
-    check()
-    _hand_sample(robot)
     deadline = time.monotonic_ns() + int(HAND_HOME_TIMEOUT_S * 1e9)
     target = cfg.home_qpos_rad
-    step = HAND_HOME_STEP_RAD
     tolerance = np.deg2rad(cfg.home_tolerance_deg)
+    dwell_ns = round(STANDSTILL_DWELL_S * 1e9)
+    anchor = None
+    stable_since_ns = 0
     last = 0
     consecutive = 0
     overcurrent_consecutive = 0
@@ -120,17 +121,18 @@ def _home_hand(robot, check):
     while True:
         check()
         if time.monotonic_ns() >= deadline:
-            raise HomeTimeout("hand HOME convergence timed out")
+            raise HomeTimeout("hand HOME position and standstill not confirmed")
         robot.service_feedback()
         check()
         if time.monotonic_ns() >= deadline:
             raise HomeTimeout("hand HOME feedback exceeded deadline")
         sample = _hand_sample(robot)
         stamp = int(sample["timestamp_ns"])
-        if stamp > last and not robot.hand_feedback_pending:
-            warning_stamp, read_warning, joints = robot.hand.feedback_overcurrent
-            if warning_stamp != stamp:
-                raise FeedbackUnavailable("HOME hand overcurrent status does not match feedback")
+        if robot.hand_feedback_pending:
+            anchor = None
+            consecutive = 0
+        elif stamp > last:
+            read_warning = bool(sample["overcurrent"])
             write_warning = False
             # 第三次读取告警不再发送；其余周期合并读写结果后只计一次。
             abort_before_send = (
@@ -138,37 +140,43 @@ def _home_hand(robot, check):
                 and overcurrent_consecutive + 1 >= HOME_OVERCURRENT_CONSECUTIVE_CYCLES
             )
             q = sample["qpos"]
-            consecutive = (
-                consecutive + 1
-                if submitted and not read_warning and np.max(np.abs(q - target)) <= tolerance
-                else 0
-            )
-            if consecutive >= HOME_CONSECUTIVE_SAMPLES:
-                return
-            if not abort_before_send:
-                delta = target - q
-                command = np.where(np.abs(delta) <= step, target, q + np.copysign(step, delta))
-                write_warning = robot.send_hand_home(command, deadline_ns=deadline, check_abort=check)
+            if submitted and not read_warning and np.max(np.abs(q - target)) <= tolerance:
+                if (
+                    anchor is None
+                    or not sample_is_fresh(last, cfg.feedback_max_age_s, stamp)
+                    or np.max(np.abs(q - anchor)) > HAND_HOLD_TOLERANCE_RAD
+                ):
+                    anchor = q.copy()
+                    stable_since_ns = time.monotonic_ns()
+                    consecutive = 0
+                consecutive += 1
+                if consecutive >= HOME_CONSECUTIVE_SAMPLES and stamp - stable_since_ns >= dwell_ns:
+                    return anchor
+            else:
+                anchor = None
+                consecutive = 0
+            if consecutive < HOME_CONSECUTIVE_SAMPLES and not abort_before_send:
+                write_warning = robot.send_hand_home(target, deadline_ns=deadline, check_abort=check)
+                submitted = not write_warning
             warned = read_warning or write_warning
             overcurrent_consecutive = overcurrent_consecutive + 1 if warned else 0
             if warned:
+                anchor = None
                 consecutive = 0
             if overcurrent_consecutive >= HOME_OVERCURRENT_CONSECUTIVE_CYCLES:
                 source = "read" if read_warning else "send"
-                error = XHandError(
+                joints = np.flatnonzero(sample["overcurrent_joint_mask"]).tolist()
+                raise XHandError(
                     "HOME", OVERCURRENT_WARNING_CODE,
-                    f"persistent overcurrent: source={source}, joints={list(joints)}, "
+                    f"persistent overcurrent: source={source}, joints={joints}, "
                     f"board_code={OVERCURRENT_BOARD_CODE if joints else 'unknown'}, consecutive={overcurrent_consecutive}",
                 )
-                logger.error("%s", error)
-                raise error
-            submitted = not write_warning
-            last = time.monotonic_ns()
+            last = stamp
         time.sleep(0.005)
 
 
 def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
-    """cancel_requested 须服务故障并读取取消；所有失败均确认停止后传播。"""
+    """cancel_requested 须服务故障并读取取消；返回前确认停止。"""
 
     def cancelled():
         return (
@@ -182,11 +190,16 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
         if cancelled():
             raise OperationCancelled("HOME cancelled")
 
+    cfg, hand_cfg = robot.arm_config, robot.hand_config
+    hand_enabled = hand_cfg.enabled
+
+    # 等待机械臂停稳时继续刷新 XHand 反馈，供手部回位使用。
     try:
-        robot.stop()
+        robot.stop(service=robot.service_feedback if hand_enabled else None)
+    except Exception as exc:
+        raise RobotError(f"HOME initial stop could not be confirmed: {exc}") from exc
+    try:
         check()
-        cfg, hand_cfg = robot.arm_config, robot.hand_config
-        hand_enabled = hand_cfg.enabled
         try:
             cfg.validate_home()
             if hand_enabled:
@@ -200,7 +213,6 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
                 box.validate()
         except (ValueError, TypeError) as exc:
             raise HomeConfigurationError(str(exc)) from exc
-        deadline = time.monotonic_ns() + int(ARM_HOME_TIMEOUT_S * 1e9)
         if robot.home_collision_model is None:
             path = environment.table_plane_path
             try:
@@ -214,6 +226,10 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
             )
         model = robot.home_collision_model
 
+        if hand_enabled:
+            hand_anchor = _home_hand(robot, check)
+        deadline = time.monotonic_ns() + int(ARM_HOME_TIMEOUT_S * 1e9)
+
         def check_arm():
             check()
             if time.monotonic_ns() >= deadline:
@@ -224,22 +240,6 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
                 raise HomeTimeout("arm HOME feedback exceeded deadline")
 
         check_arm()
-        if hand_enabled:
-            # 入口的 robot.stop() 已确认 XHand 位置保持。
-            hand_anchor = _hand_sample(robot)["qpos"].copy()
-            stable = time.monotonic_ns()
-            while True:
-                check_arm()
-                sample = _hand_sample(robot)
-                if (
-                    np.max(np.abs(sample["qpos"] - hand_anchor))
-                    > HAND_HOLD_TOLERANCE_RAD
-                ):
-                    hand_anchor = sample["qpos"].copy()
-                    stable = time.monotonic_ns()
-                elif int(sample["timestamp_ns"]) - stable >= int(STANDSTILL_DWELL_S * 1e9):
-                    break
-                time.sleep(0.005)
         row = robot.arm.snapshot()[0]
         q = arm_reference_from_feedback(
             row["qpos"], cfg.joint_limit_lower, cfg.joint_limit_upper
@@ -251,18 +251,20 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
         if np.max(np.abs(row["qvel"])) > cfg.standstill_velocity_tolerance_rad_s:
             raise OperationCancelled("arm moved after standstill")
 
+        published_hand_stamp = 0
+
         def check_path():
+            nonlocal published_hand_stamp
             check_arm()
             if not hand_enabled:
                 return
             sample = _hand_sample(robot)
-            if (
-                np.max(np.abs(sample["qpos"] - hand_anchor))
-                > HAND_HOLD_TOLERANCE_RAD
-            ):
+            if np.max(np.abs(sample["qpos"] - hand_anchor)) > HAND_HOLD_TOLERANCE_RAD:
                 raise OperationCancelled("XHand moved from HOME planning posture")
-            if not state.stop_signal.is_set():
-                robot.arm.publish_home_hand_stamp(int(sample["timestamp_ns"]))
+            stamp = int(sample["timestamp_ns"])
+            if stamp > published_hand_stamp and not state.stop_signal.is_set():
+                robot.arm.publish_home_hand_stamp(stamp)
+                published_hand_stamp = stamp
 
         check_path()
         home = np.asarray(cfg.home_qpos)
@@ -274,7 +276,7 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
             samples = _plan_home(cfg, q, row["qvel"], hand_anchor, model, check_path)
 
             def execution_service():
-                # 取消收尾时不再检查保持偏差，仍服务设备故障。
+                # 取消收尾时只服务反馈和设备故障。
                 if state.stop_signal.is_set():
                     robot.service_feedback()
                 else:
@@ -288,7 +290,7 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
                 abort=cancelled,
                 deadline_ns=deadline,
             )
-        check_arm()
+        check_path()
         current = robot.arm.snapshot()[0]
         check()
         now_ns = time.monotonic_ns()
@@ -304,13 +306,17 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
             or np.max(np.abs(current["qvel"])) > cfg.standstill_velocity_tolerance_rad_s
         ):
             raise FeedbackUnavailable("arm HOME position/standstill not confirmed")
-        if hand_enabled:
-            _home_hand(robot, check)
     except KeyboardInterrupt:
         state.request_emergency_stop()
         raise
     finally:
+        failure = sys.exc_info()[1]
         try:
             robot.stop()
-        except OperationCancelled as exc:
-            raise RobotError("HOME stop could not be confirmed") from exc
+        except Exception as exc:  # noqa: BLE001 — 同时报告停止结果与原始 HOME 失败。
+            # 可恢复的 HOME 失败仅在确认停止后才交回控制循环。
+            if failure is None or isinstance(
+                failure, (OperationCancelled, HomeConfigurationError, HomePathRejected),
+            ):
+                raise RobotError(f"HOME stop could not be confirmed: {exc}") from (failure or exc)
+            logger.error("HOME stop also failed: %s", exc)

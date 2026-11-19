@@ -14,7 +14,6 @@ class MotionConfig:
     """共享 EEF 目标变化约束；默认值待真机验证。"""
 
     ik_target_speed_deg_s: float = 75.0
-    ik_max_lead_deg: float = 10.0
 
 
 @dataclass(frozen=True)

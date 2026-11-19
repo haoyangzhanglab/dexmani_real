@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from pprint import pprint
 
 from dexmani_real.config.real import load_config
@@ -48,6 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--camera-calibration", default=None, help="Explicit camera extrinsics JSON"
     )
+    parser.add_argument("--timing-output", type=Path, metavar="PATH", help="退出后保存遥操作时序诊断 JSON")
     args = parser.parse_args(argv)
 
     runtime = load_config(args.config)
@@ -73,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
         task_name=args.task_name,
         vr_transform_path=VR_TRANSFORM_PATH if args.vr_transform is None else args.vr_transform,
         camera_calibration_path=args.camera_calibration,
+        timing_output=args.timing_output,
     )
 
 

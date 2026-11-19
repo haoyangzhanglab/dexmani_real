@@ -10,6 +10,7 @@ from dexmani_real.robot.model import ARM_JOINT_SHAPE
 
 # startup 和 prepare 的基础等待预算。
 READY_TIMEOUT_S = 15.0
+EXECUTOR_TIMEOUT_S = 3.0
 STANDSTILL_DWELL_S = 0.30
 HOME_POSITION_TOLERANCE_RAD = 0.02
 
@@ -26,6 +27,7 @@ GOAL_DTYPE = np.dtype(
         ("pending", "?"),
         ("hold", "?"),
         ("expires_ns", "<i8"),
+        ("published_ns", "<i8"),
         ("q_goal", "<f8", ARM_JOINT_SHAPE),
     ]
 )
@@ -54,7 +56,13 @@ class ArmChannels:
     ):
         self.stop, self.emergency = stop_signal, emergency_signal
         self.closing, self.sdk_stop_handled, self.ready = (ctx.Event() for _ in range(3))
+        self.device_claimed = ctx.Event()  # Owner 已取得排他锁并进入 SDK 启动。
         self.fault = ctx.Array("c", 1024, lock=False)
+        self.stop_failed = ctx.Event()
+        self.stop_error = ctx.Array("c", 1024, lock=False)
+        self.stop_observed = ctx.Event()
+        self.stop_observed_ns = ctx.RawValue("q", 0)
+        self.disconnect_error = ctx.Array("c", 1024, lock=False)
         # 仅 Owner 写；先写原因再置 stop，接纳新操作时清除。
         self.stop_reason = ctx.Array("c", 64, lock=False)
         self.home_hand_stamp = ctx.Value("q", 0)
@@ -62,7 +70,7 @@ class ArmChannels:
         self.goal = ctx.RawArray("b", GOAL_DTYPE.itemsize)
         self.status = ctx.RawArray("b", ARM_STATE_DTYPE.itemsize)
 
-    def publish_goal(self, command, *, expires_ns):
+    def publish_goal(self, command, *, expires_ns) -> int:
         if not self.goal_lock.acquire(timeout=max(0, expires_ns - time.monotonic_ns()) / 1e9):
             raise CommandExpired("arm target publication expired waiting for mailbox")
         try:
@@ -72,14 +80,17 @@ class ArmChannels:
                 or self.emergency.is_set()
             ):
                 raise OperationCancelled("arm target run cancelled")
-            if time.monotonic_ns() >= expires_ns:
+            published_ns = time.monotonic_ns()
+            if published_ns >= expires_ns:
                 raise CommandExpired("arm target deadline expired")
             np.frombuffer(self.goal, dtype=GOAL_DTYPE, count=1)[0] = (
                 True,
                 command.arm_hold,
                 expires_ns,
+                published_ns,
                 command.arm_qpos if command.arm_qpos is not None else 0.0,
             )
+            return published_ns
         finally:
             self.goal_lock.release()
 

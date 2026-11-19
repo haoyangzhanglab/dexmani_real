@@ -68,6 +68,7 @@ class HandConfig:
     feedback_max_age_s: float = 0.20
     tactile_max_age_s: float = 0.10
     tactile_calibration_samples: int = 5
+    # 复位前预检和复位后拟合/验证各使用一次采样预算。
     tactile_calibration_timeout_s: float = 1.0
     # Aggregate、Dense 的三轴范数上限，使用 SDK 原始单位，需现场核定。
     tactile_contact_limits: tuple[float, float] = (40.0, 40.0)

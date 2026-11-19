@@ -1,7 +1,12 @@
 """机械臂 SDK 与伺服循环；阻塞的原生调用无法在此中断。"""
 
+import fcntl
 import logging
+import os
+import stat
 import time
+from pathlib import Path
+from urllib.parse import quote
 
 import numpy as np
 
@@ -12,6 +17,7 @@ from dexmani_real.robot.commands import (
 )
 from dexmani_real.robot.xarm7.protocol import (
     ARM_STATE_DTYPE,
+    EXECUTOR_TIMEOUT_S,
     HOME_POSITION_TOLERANCE_RAD,
     READY_TIMEOUT_S,
     STANDSTILL_DWELL_S,
@@ -27,8 +33,9 @@ logger = logging.getLogger(__name__)
 
 
 class ArmController:
-    def __init__(self, cfg, io, pipe, driver):
+    def __init__(self, cfg, io, pipe, driver, *, timing=None):
         self.cfg, self.io, self.pipe, self.driver = cfg, io, pipe, driver
+        self.timing = timing
         self.status = np.zeros((), dtype=ARM_STATE_DTYPE)
         self.active = None
         self.reference: ArmTrajectory | None = None
@@ -59,23 +66,32 @@ class ArmController:
             self.io.emergency.set()
         self.io.stop.set()
         if not self.io.fault.value:
+            self.io.stop_observed.clear()
             self.io.fault.value = f"{type(reason).__name__}: {reason}".encode()[:1023]
         # traceback 不能经共享字符串/普通 pickle 传递，在 SDK 所有者处保留。
         logger.error("arm controller failed", exc_info=(type(reason), reason, reason.__traceback__))
 
     def read_feedback(self):
         started = time.monotonic_ns()
+        succeeded = False
         try:
             q, v = self.driver.read()
             self.status["qpos"] = q
             self.status["qvel"] = v
             # 来源时间采用查询开始时刻，不能替换为缓存读取时间。
             self.status["timestamp_ns"] = started
+            succeeded = True
         except Exception:
             self.status["timestamp_ns"] = 0
             raise
         finally:
+            finished = time.monotonic_ns() if self.timing is not None else 0
             self.io.publish_status(self.status)
+            if self.timing is not None:
+                self.timing.record_feedback(
+                    started_ns=started, finished_ns=finished,
+                    qpos=self.status["qpos"], qvel=self.status["qvel"], succeeded=succeeded,
+                )
 
     def wait_settled(
         self,
@@ -92,12 +108,17 @@ class ArmController:
         stable = None
         anchor = None
         previous_sample_ns = None
-        # 停止确认期间 stop 已置位，改用 closing 等待下一次采样。
-        wake = self.io.closing if while_stopped else self.io.stop
+        # Owner 退出前的最后一次观测不会因 closing 已置位而忙等。
+        if check_abort is None:
+            wait = time.sleep
+        else:
+            wait = (self.io.closing if while_stopped else self.io.stop).wait
         while time.monotonic_ns() < deadline_ns:
-            check_abort()
+            if check_abort is not None:
+                check_abort()
             self.read_feedback()
-            check_abort()
+            if check_abort is not None:
+                check_abort()
             completed_ns = time.monotonic_ns()
             if completed_ns >= deadline_ns:
                 break
@@ -124,8 +145,9 @@ class ArmController:
                 stable = anchor = None
             # 按查询开始时刻限频，查询耗时既不拉长采样间隔，也不充作停稳时长。
             remaining_ns = min(sample_ns + interval_ns, deadline_ns) - time.monotonic_ns()
-            wake.wait(max(0, remaining_ns) / 1e9)
-        check_abort()
+            wait(max(0, remaining_ns) / 1e9)
+        if check_abort is not None:
+            check_abort()
         raise TimeoutError(f"{stage}: measured position/velocity dwell not confirmed")
 
     def home(self, message, *, check_abort):
@@ -154,10 +176,10 @@ class ArmController:
                 finally:
                     value.get_lock().release()
             if not sample_is_fresh(last_hand_stamp, hand_max_age_s, time.monotonic_ns()):
-                raise FeedbackUnavailable("HOME hand posture verification expired")
+                raise FeedbackUnavailable("HOME hand feedback expired")
         guarded()
-        self.driver.prepare_motion(check_abort=guarded)
-        # 规划前已确认停稳，切换伺服模式后只需复核当前起点。
+        self.driver.prepare_motion(check_abort=guarded, deadline_ns=message.deadline_ns)
+        # 规划前已确认停稳，伺服就绪后重新复核当前起点。
         self.read_feedback()
         guarded()
         stamp = int(self.status["timestamp_ns"])
@@ -187,7 +209,10 @@ class ArmController:
             guarded()
             if time.monotonic_ns()-due > lateness:
                 raise HomeTimeout("HOME servo schedule late; no catch-up")
-            self.driver.servo(point)
+            try:
+                self.driver.servo(point)
+            except RuntimeError as exc:
+                raise RuntimeError(f"HOME point {index + 1}/{len(samples)} failed ({exc})") from exc
             guarded()
             if time.monotonic_ns()-due > lateness:
                 raise HomeTimeout("HOME servo call exceeded schedule budget")
@@ -199,15 +224,38 @@ class ArmController:
         self.active = self.reference = None
         try:
             self.driver.stop()
-        except BaseException as exc:  # noqa: BLE001 — 停止失败必须锁存，不能伪装为确认停止。
-            self.fault(exc)
+        except BaseException as exc:  # noqa: BLE001 — 停止失败独立于运动故障锁存。
+            self.stop_failure("SDK stop failed", exc)
         finally:
             self.io.publish_status(self.status)
-            self.io.sdk_stop_handled.set()  # SDK 处理结束，失败保存在 fault。
+            self.io.sdk_stop_handled.set()
+
+    def stop_failure(self, stage, error):
+        if isinstance(error, KeyboardInterrupt):
+            self.io.emergency.set()
+        self.io.stop_error.value = f"xArm {stage}: {type(error).__name__}: {error}".encode()[:1023]
+        self.io.stop_failed.set()
+        self.io.closing.set()
+
+    def observe_stop(self, deadline_ns, *, closing=False):
+        stage = "arm physical stop"
+        check_abort = None if closing else lambda: self.check_lifecycle(
+            deadline_ns=deadline_ns, stage=stage, while_stopped=True,
+        )
+        self.io.stop_observed.clear()
+        self.io.stop_observed_ns.value = 0
+        try:
+            self.wait_settled(check_abort, stage=stage, deadline_ns=deadline_ns, while_stopped=True)
+            self.io.stop_observed_ns.value = int(self.status["timestamp_ns"])
+        except BaseException as exc:  # noqa: BLE001 — 观测失败只描述停稳结果。
+            self.stop_failure("physical stop unconfirmed", exc)
+        finally:
+            self.io.stop_observed.set()
 
     def motion_operation(self, message: PrepareRequest | HomeRequest) -> BaseException | None:
         self.io.stop_reason.value = b""
         self.io.sdk_stop_handled.clear()
+        self.io.stop_observed.clear()
         is_home = isinstance(message, HomeRequest)
         kind = "home" if is_home else "prepare"
         error = None
@@ -224,7 +272,7 @@ class ArmController:
                 self.home(message, check_abort=check_abort)
                 self.stop()
             else:
-                self.driver.prepare_motion(check_abort=check_abort)
+                self.driver.prepare_motion(check_abort=check_abort, deadline_ns=message.deadline_ns)
                 settled_deadline_ns = min(
                     message.deadline_ns,
                     time.monotonic_ns() + int(READY_TIMEOUT_S * 1e9),
@@ -250,16 +298,7 @@ class ArmController:
     def operation(self, message: PrepareRequest | HomeRequest | PhysicalStopRequest) -> None:
         error: BaseException | None = None
         if isinstance(message, PhysicalStopRequest):
-            stage = "arm physical stop"
-            try:
-                self.wait_settled(
-                    lambda: self.check_lifecycle(
-                        deadline_ns=message.deadline_ns, stage=stage, while_stopped=True,
-                    ),
-                    stage=stage, deadline_ns=message.deadline_ns, while_stopped=True,
-                )
-            except (OperationCancelled, TimeoutError) as exc:
-                error = exc
+            self.observe_stop(message.deadline_ns)
         else:
             error = self.motion_operation(message)
         self.io.publish_status(self.status)
@@ -268,31 +307,29 @@ class ArmController:
         except (BrokenPipeError, EOFError):
             self.io.closing.set()
 
-    def command_issue(self, goal, now):
+    def stop_if_goal_invalid(self, goal, now):
         if self.cancelled():
-            return "cancelled"
-        if now >= goal["expires_ns"]:
-            return "command_expired"
-        stamp = int(self.status["timestamp_ns"])
-        if not sample_is_fresh(stamp, self.cfg.feedback_max_age_s, now):
-            return "arm_feedback_expired"
-        return None
+            reason = "cancelled"
+        elif now >= goal["expires_ns"]:
+            reason = "command_expired"
+        elif not sample_is_fresh(int(self.status["timestamp_ns"]), self.cfg.feedback_max_age_s, now):
+            reason = "arm_feedback_expired"
+        else:
+            return False
+        logger.warning("arm stopped: %s", reason)
+        self.active = self.reference = None
+        if reason != "cancelled":
+            self.io.stop_reason.value = reason.encode()
+        self.io.stop.set()
+        return True
 
-    def tick(self) -> int | None:
+    def tick(self, scheduled_ns: int) -> int | None:
         if self.cancelled():
             return None
         # 先消费最新目标再判时效；旧 active 到期不能覆盖邮箱中的新目标。
         pending = self.io.take_goal()
         goal = pending if pending is not None else self.active
-        if goal is None:
-            return None
-        issue = self.command_issue(goal, time.monotonic_ns())
-        if issue:
-            logger.warning("arm stopped: %s", issue)
-            self.active = self.reference = None
-            if issue in {"command_expired", "arm_feedback_expired"}:
-                self.io.stop_reason.value = issue.encode()
-            self.io.stop.set()
+        if goal is None or self.stop_if_goal_invalid(goal, time.monotonic_ns()):
             return None
         if self.reference is None:
             raise RuntimeError("arm streaming has not been prepared")
@@ -308,16 +345,19 @@ class ArmController:
             hold=bool(goal["hold"]),
         )
         # 计算结束后、进入 SDK 前统一检查期限、反馈和最新控制器上报。
-        issue = self.command_issue(goal, time.monotonic_ns())
-        if issue:
-            logger.warning("arm stopped: %s", issue)
-            self.active = self.reference = None
-            if issue in {"command_expired", "arm_feedback_expired"}:
-                self.io.stop_reason.value = issue.encode()
-            self.io.stop.set()
+        if self.stop_if_goal_invalid(goal, time.monotonic_ns()):
             return None
         started = time.monotonic_ns()
-        self.driver.servo(q)
+        if self.timing is None:
+            self.driver.servo(q)
+        else:
+            def record(started_ns, finished_ns, succeeded):
+                self.timing.record_servo(
+                    scheduled_ns=scheduled_ns, sdk_started_ns=started_ns, sdk_finished_ns=finished_ns,
+                    goal_published_ns=int(goal["published_ns"]), qpos=q, succeeded=succeeded,
+                )
+
+            self.driver.servo(q, record=record)
         return started
 
     def run(self, startup_deadline_ns):
@@ -326,6 +366,7 @@ class ArmController:
                 self.check_lifecycle(deadline_ns=startup_deadline_ns, stage="startup")
 
             startup_abort()
+            self.io.device_claimed.set()
             self.driver.connect(check_abort=startup_abort)
             self.read_feedback()
             startup_abort()
@@ -356,7 +397,7 @@ class ArmController:
                         feedback_due, feedback_period, time.monotonic_ns(),
                     )
                 if time.monotonic_ns() >= tick:
-                    sent_ns = self.tick()
+                    sent_ns = self.tick(tick)
                     tick = (sent_ns if sent_ns is not None else time.monotonic_ns()) + period
                 # 停止可中断等待，目标仅在计划的伺服时刻生效。
                 delay = max(0, min(tick, feedback_due) - time.monotonic_ns()) / 1e9
@@ -372,18 +413,42 @@ class ArmController:
                 self.io.closing.set()
                 self.io.stop.set()
         finally:
-            if not self.io.sdk_stop_handled.is_set():
-                self.stop()
-            try:
-                self.driver.close()
-            except BaseException as exc:  # noqa: BLE001 — 关闭失败仍须经故障通道报告。
-                self.fault(exc)
+            self.io.closing.set()
+            if self.io.device_claimed.is_set():
+                if not self.io.sdk_stop_handled.is_set():
+                    self.stop()
+                if not self.io.stop_failed.is_set() and not self.io.stop_observed.is_set():
+                    self.observe_stop(time.monotonic_ns() + int(EXECUTOR_TIMEOUT_S * 1e9), closing=True)
+                try:
+                    self.driver.close()
+                except BaseException as exc:  # noqa: BLE001 — 保留独立的 SDK 断开错误。
+                    if isinstance(exc, KeyboardInterrupt):
+                        self.io.emergency.set()
+                    self.io.disconnect_error.value = f"{type(exc).__name__}: {exc}".encode()[:1023]
             self.pipe.close()
 
 
-def run_arm(cfg, io, pipe, startup_deadline_ns):
+def run_arm(cfg, io, pipe, startup_deadline_ns, timing=None):
     configure_logging()
     from dexmani_real.robot.xarm7.driver import XArm7
 
-    driver = XArm7(cfg)
-    ArmController(cfg, io, pipe, driver).run(startup_deadline_ns)
+    controller = ArmController(cfg, io, pipe, XArm7(cfg), timing=timing)
+    try:
+        uid = os.getuid()
+        lock_dir = Path("/tmp") / f"dexmani_real-xarm7-{uid}"
+        lock_dir.mkdir(mode=0o700, exist_ok=True)
+        info = lock_dir.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or info.st_mode & 0o077:
+            raise RuntimeError(f"xArm lock directory must be a private directory owned by uid {uid}: {lock_dir}")
+        address = quote(cfg.ip.strip(), safe="")
+        # 保留锁文件 inode，避免并发启动打开彼此不同的 inode。
+        with (lock_dir / f"{address}.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError(f"xArm at {cfg.ip} is already owned by another local DexMani session") from None
+            controller.run(startup_deadline_ns)
+    except BaseException as exc:  # noqa: BLE001 — 锁或 Owner 启动失败通过原故障通道报告。
+        controller.fault(exc)
+        io.closing.set()
+        pipe.close()

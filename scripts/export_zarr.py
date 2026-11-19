@@ -1,4 +1,8 @@
-"""将 Raw episode 的所选字段导出为 Canonical Zarr。"""
+"""
+将 Raw episode 导出为 Canonical Zarr。
+python scripts/export_zarr.py episodes/pick_place_toy
+python scripts/export_zarr.py episodes/pick_place_toy --fields point_cloud action_ee joint_state
+"""
 
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ from dexmani_real.utils.table_plane import load_table_plane
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Export selected fields from published Raw episodes of one task to canonical Zarr. "
+            "Export published Raw episodes of one task to canonical Zarr. "
             "Export native segments; reject damaged whole Raw and continue."
         )
     )
@@ -49,12 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Trusted Python experiment file exporting CONFIG: RealConfig; execution.hoi_max_joint_gap_s bounds joint interpolation intervals (default 0.10 s)",
     )
     parser.add_argument(
-        "--fields", nargs="+", required=True, choices=tuple(FIELD_INPUTS),
+        "--fields", nargs="+", choices=tuple(FIELD_INPUTS),
         help=(
-            "Canonical fields to export. RGB/depth use the fixed-K pinhole grid. "
-            "action and action_ee use attempted targets and require confirmed host submission "
-            "of the combined arm and hand command on every Raw row. "
-            "Without those fields, action_ode holds the last confirmed target within each segment. "
+            "Defaults to all Raw-derived fields, plus object_pointcloud if every selected episode "
+            "has hoi.h5. RGB/depth use the fixed-K pinhole grid. "
+            "action and action_ee hold the last confirmed arm and hand target within each segment, "
+            "starting from its measured joint state. "
             "joint_state stores measured feedback."
         ),
     )
@@ -85,7 +89,7 @@ def load_processing_config(path: Path | None, fields) -> ExportConfig:
     runtime = load_config(path)
     plane = (
         load_table_plane(runtime.environment.table_plane_path)
-        if "point_cloud" in fields and runtime.pointcloud.remove_table else None
+        if (fields is None or "point_cloud" in fields) and runtime.pointcloud.remove_table else None
     )
     return ExportConfig(
         pointcloud=runtime.pointcloud,

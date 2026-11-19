@@ -29,7 +29,5 @@ def prepare_reference(
         h = period_s
     else:
         command, anchor = reference.command, reference.anchor
-        if control_ns < reference.submitted_ns:
-            raise ValueError("IK monotonic clock moved backwards")
         h = min((control_ns - reference.submitted_ns) * 1e-9, period_s)
     return measured, command, anchor, h

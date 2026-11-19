@@ -46,7 +46,7 @@ class Observation:
     vr: dict | None
     point_cloud: np.ndarray | None
     observation_timestamp_ns: int
-    pointcloud_timestamp_ns: int = 0
+    pointcloud_timestamp_ns: int | None = None
     control_timestamp_ns: int = -1
     hoi: dict | None = None
     aligned_joints: dict | None = None
@@ -55,7 +55,7 @@ class Observation:
 def read_observation(
     channels, robot, *, needs: ObservationNeeds, joint_gap_s=0.10, include_visual_payloads=True,
 ) -> Observation:
-    """按需读取快照；HOI 暂停时只读取视觉来源元数据。"""
+    """按需读取快照；就绪检查可只读取视觉来源元数据。"""
     control_ns = time.monotonic_ns()
     state = robot.read_state()
     camera_fields = needs.camera_fields if include_visual_payloads else ()
@@ -65,8 +65,9 @@ def read_observation(
             channels, fields=("object_pointcloud", *camera_fields) if include_visual_payloads else (),
         )
     elif needs.point_cloud:
+        cloud_fields = ("point_cloud", *camera_fields) if include_visual_payloads else ()
         cloud_result = channels.pointcloud_ring.read(
-            fields=("timestamp_ns", "source_camera_sequence", "point_cloud", *needs.camera_fields),
+            fields=("timestamp_ns", "source_camera_sequence", *cloud_fields),
         )
         cloud = cloud_result[0] if cloud_result is not None else None
     camera = None
@@ -94,10 +95,10 @@ def read_observation(
         aligned_joints=aligned_joints,
         camera=camera,
         vr=vr_result[0] if vr_result is not None else None,
-        point_cloud=cloud["point_cloud"] if cloud is not None else None,
+        point_cloud=cloud["point_cloud"] if cloud is not None and include_visual_payloads else None,
         observation_timestamp_ns=observed_ns,
         control_timestamp_ns=control_ns,
-        pointcloud_timestamp_ns=int(cloud["timestamp_ns"]) if cloud is not None else 0,
+        pointcloud_timestamp_ns=int(cloud["timestamp_ns"]) if cloud is not None else None,
     )
 
 
@@ -129,7 +130,7 @@ def check_observation(row, runtime, needs, *, now_ns=None):
         if needs.hoi_joint_devices and row.aligned_joints is None:
             issues.append("hoi_joint_alignment_unavailable")
     elif needs.point_cloud:
-        if row.point_cloud is None:
+        if row.pointcloud_timestamp_ns is None:
             issues.append("pointcloud_unavailable")
         elif not sample_is_fresh(row.pointcloud_timestamp_ns, runtime.camera.max_frame_age_s, now):
             issues.append("pointcloud_stale")

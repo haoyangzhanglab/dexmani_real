@@ -50,7 +50,7 @@ class CommandExpired(OperationCancelled):
 
 
 class HandCommandUnconfirmed(OperationCancelled):
-    """普通 XHand 动作未在期限内得到确认。"""
+    """XHand 已尝试提交命令，未在期限内得到确认。"""
 
 
 class HandTargetRejected(ValueError):

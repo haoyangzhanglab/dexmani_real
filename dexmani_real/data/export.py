@@ -24,6 +24,7 @@ from dexmani_real.config.perception import (
 )
 from dexmani_real.data.hoi import align_hoi_episode, read_hoi_validity
 from dexmani_real.data.raw import (
+    ACTION_TARGET_FIELDS,
     RawDataError,
     RawReader,
     decode_camera_extrinsic,
@@ -43,6 +44,7 @@ from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor, processing_metadata
 from dexmani_real.robot.model import (
+    ARM_DOF,
     XHAND_FINGERTIP_LINK_NAMES,
     XHAND_TACTILE_SCALE_DIVISOR,
 )
@@ -69,9 +71,8 @@ class ExportConfig:
 # 输出字段直接对应 Raw 输入；FK 和相机计算由下方普通条件启用。
 FIELD_INPUTS = {
     "joint_state": ("arm_qpos", "hand_qpos"),
-    "action": ("action_arm_joint_target", "action_hand_joint_target"),
-    "action_ode": (),
-    "action_ee": ("action_arm_joint_target", "action_hand_joint_target"),
+    "action": ACTION_TARGET_FIELDS,
+    "action_ee": ACTION_TARGET_FIELDS,
     "eef_pose": ("arm_qpos",),
     "fingertip_xyz": ("arm_qpos", "hand_qpos"),
     "hand_pointcloud": ("arm_qpos", "hand_qpos"),
@@ -89,7 +90,12 @@ ARM_FK_FIELDS = {"action_ee", "eef_pose", "fingertip_xyz", "hand_pointcloud"}
 HAND_FK_FIELDS = {"fingertip_xyz", "hand_pointcloud"}
 
 
-def resolve_fields(fields):
+def resolve_fields(fields, episodes):
+    if fields is None:
+        if all((episode / "hoi.h5").is_file() for episode in episodes):
+            return tuple(FIELD_INPUTS)
+        logger.info("Default export: object_pointcloud requires hoi.h5 for every selected episode")
+        return tuple(name for name in FIELD_INPUTS if name != "object_pointcloud")
     selected = set(fields)
     if not selected or selected - FIELD_INPUTS.keys():
         raise ValueError(f"fields must be nonempty and selected from {tuple(FIELD_INPUTS)}")
@@ -133,7 +139,7 @@ def export_camera(reader, fields):
 def canonical_array_specs(fields, processing, camera):
     shapes = {
         "object_pointcloud": (HOI_NUM_POINTS, 3),
-        "joint_state": (19,), "action": (19,), "action_ode": (19,), "action_ee": (21,),
+        "joint_state": (19,), "action": (19,), "action_ee": (21,),
         "finger_tactile_force": (5, 3), "taxel_tactile_force": (5, 120, 3),
         "fingertip_xyz": (5, 3), "eef_pose": (9,),
         "camera_intrinsic": (9,), "camera_extrinsic": (12,),
@@ -162,10 +168,6 @@ def iter_canonical_blocks(
 ):
     frames = reader.num_frames
     fields = specs.keys()
-    # 同时导出常规动作时，已确认的原始目标就是 action_ode，无需逐段保持。
-    joint_target_fields = tuple(
-        name for name in ("action", "action_ode") if name in fields and name not in alignment
-    )
     row_bytes = sum(int(np.prod(shape)) * dtype.itemsize for shape, dtype in specs.values())
     if "point_cloud" in fields and "depth" not in fields:
         # 点云逐帧计算，但原始深度仍按块读取；额外计入读取预算。
@@ -193,8 +195,8 @@ def iter_canonical_blocks(
         with raw_input():
             raw = {name: source[start:end] for name, source in sources.items()}
             for name, values in raw.items():
-                # 触觉及物体点云直接交给 append_rows 校验。
-                if values.dtype.kind == "f" and name not in {"hand_contact", "hand_tactile_force", "object_pointcloud"}:
+                # 动作已逐段校验；不进入几何计算的浮点字段在写入时校验。
+                if name in {"arm_qpos", "hand_qpos"}:
                     valid = np.isfinite(values).reshape(count, -1).all(axis=1)
                     if not valid.all():
                         row = start + int(np.flatnonzero(~valid)[0])
@@ -228,15 +230,10 @@ def iter_canonical_blocks(
             block["object_pointcloud"] = raw["object_pointcloud"]
         if "joint_state" in fields:
             block["joint_state"] = np.concatenate((raw["arm_qpos"], raw["hand_qpos"]), axis=1, dtype=np.float32)
-        if joint_target_fields:
-            joint_targets = np.concatenate(
+        if "action" in fields:
+            block["action"] = np.concatenate(
                 (raw["action_arm_joint_target"], raw["action_hand_joint_target"]), axis=1, dtype=np.float32,
             )
-            for name in joint_target_fields:
-                block[name] = joint_targets
-            del joint_targets
-        if "action_ode" in alignment:
-            block["action_ode"] = alignment["action_ode"][start:end]
         if "action_ee" in fields:
             poses = eef_poses(raw["action_arm_joint_target"], arm_fk=arm_fk)
             block["action_ee"] = np.concatenate((encode_eef_pose(poses), raw["action_hand_joint_target"]), axis=1, dtype=np.float32)
@@ -299,33 +296,30 @@ def raw_input():
         raise
 
 
-def accepted_joint_targets(reader, boundaries, alignment):
-    status = reader["action_send_accepted"][:]
-    accepted = status == 1
-    unknown = np.flatnonzero((status != 0) & ~accepted)
-    if len(unknown):
-        raise RawDataError(f"action_ode has unknown submission status at row {unknown[0]}")
-    attempts = np.concatenate((
-        reader["action_arm_joint_target"][:], reader["action_hand_joint_target"][:],
-    ), axis=1, dtype=np.float32)
-    invalid = np.flatnonzero(accepted & ~np.isfinite(attempts).all(axis=1))
+def held_joint_targets(reader, boundaries, alignment):
+    """使用最近一次完整提交的目标，保留 float64 以供动作 FK。"""
+    targets = np.concatenate([reader[field][:] for field in ACTION_TARGET_FIELDS], axis=1)
+    accepted = np.isfinite(targets).all(axis=1)
+    missing = np.isnan(targets).all(axis=1)
+    invalid = np.flatnonzero(~(accepted | missing))
     if len(invalid):
-        raise RawDataError(f"action_ode requires a complete finite target at accepted row {invalid[0]}")
+        raise RawDataError(f"Raw joint targets must be all finite or all NaN at row {invalid[0]}")
 
-    targets = np.empty_like(attempts)
     for start, end in pairwise(boundaries):
+        if not missing[start:end].any():
+            continue
         latest = np.maximum.accumulate(np.where(accepted[start:end], np.arange(start, end), -1))
-        has_target = latest >= 0
         segment = targets[start:end]
-        segment[has_target] = attempts[latest[has_target]]
-        if not has_target[0]:
-            # Use the same segment-start anchor as ODEDataset.
+        hold = missing[start:end] & (latest >= 0)
+        segment[hold] = targets[latest[hold]]
+        if latest[0] < 0:
+            # 段首实测与训练中的初始参考一致。
             arm = alignment["arm_qpos"] if "arm_qpos" in alignment else reader["arm_qpos"]
             hand = alignment["hand_qpos"] if "hand_qpos" in alignment else reader["hand_qpos"]
-            initial = np.concatenate((arm[start], hand[start]), dtype=np.float32)
+            initial = np.concatenate((arm[start], hand[start]))
             if not np.isfinite(initial).all():
-                raise RawDataError(f"action_ode requires finite initial joint state at row {start}")
-            segment[~has_target] = initial
+                raise RawDataError(f"Raw actions require finite initial joint state at row {start}")
+            segment[latest < 0] = initial
     return targets
 
 
@@ -336,15 +330,12 @@ def prepare_raw(reader, processing, fields, clocks, hoi_devices):
         if reader.num_frames <= 0:
             raise RawDataError("episode contains no rows")
         boundaries = np.r_[reader.segment_starts, reader.num_frames]
-        requires_confirmed_actions = bool({"action", "action_ee"}.intersection(fields))
-        if requires_confirmed_actions:
-            reader.require_confirmed_actions()
         if "object_pointcloud" in fields:
             valid = read_hoi_validity(reader)
             if not valid.all():
                 raise RawDataError(f"HOI contains invalid rows: first at {int(np.flatnonzero(~valid)[0])}")
-        derive_held_targets = "action_ode" in fields and not requires_confirmed_actions
-        if derive_held_targets:
+        include_actions = bool({"action", "action_ee"}.intersection(fields))
+        if include_actions:
             clocks = clocks | {"arm_ns", "hand_ns"}
         timing = reader.read_timing(source_clocks=clocks)
         alignment = {}
@@ -353,15 +344,21 @@ def prepare_raw(reader, processing, fields, clocks, hoi_devices):
                 reader, timing, boundaries, processing.hoi_max_joint_gap_s,
                 devices=hoi_devices, require_complete=True,
             )
-        if derive_held_targets:
-            alignment["action_ode"] = accepted_joint_targets(reader, boundaries, alignment)
+        if include_actions:
+            targets = held_joint_targets(reader, boundaries, alignment)
+            alignment["action_arm_joint_target"] = targets[:, :ARM_DOF]
+            alignment["action_hand_joint_target"] = targets[:, ARM_DOF:]
         return alignment, export_camera(reader, fields), boundaries
 
 
 def export_zarr(
-    input_root, output_path, *, processing, fields, exclude=(), progress_callback=None
+    input_root, output_path, *, processing, fields=None, exclude=(), progress_callback=None
 ):
-    fields = resolve_fields(fields)
+    target = Path(output_path).expanduser().absolute()
+    if os.path.lexists(target):
+        raise FileExistsError(target)
+    selected, excluded = select_episodes(input_root, exclude)
+    fields = resolve_fields(fields, selected)
     inputs = {name for field in fields for name in FIELD_INPUTS[field]}
     source_clocks = {
         "arm_qpos": "arm_ns",
@@ -385,10 +382,6 @@ def export_zarr(
             processing = replace(processing, table_plane_abcd=normalize_table_plane(processing.table_plane_abcd))
     if "hand_pointcloud" in fields:
         processing.hand_pointcloud.validate()
-    target = Path(output_path).expanduser().absolute()
-    if os.path.lexists(target):
-        raise FileExistsError(target)
-    selected, excluded = select_episodes(input_root, exclude)
     arm_fk = ArmFK() if ARM_FK_FIELDS.intersection(fields) else None
     hand_fk = hand_cloud = None
     if HAND_FK_FIELDS.intersection(fields):
@@ -459,8 +452,6 @@ def export_zarr(
         if root is None:
             raise ValueError(f"all Raw episodes rejected: {rejected}")
         metadata: dict[str, dict[str, Any]] = {}
-        if "action_ode" in fields:
-            metadata["action_ode"] = {"semantics": "held_accepted_joint_target"}
         if "point_cloud" in fields:
             metadata["point_cloud"] = processing_metadata(processing.pointcloud, processing.table_plane_abcd)
         if "hand_pointcloud" in fields:
@@ -500,7 +491,7 @@ def create_store(store, camera, *, specs, control_hz, task_name):
     if {"finger_tactile_force", "taxel_tactile_force"}.intersection(fields):
         root.attrs["tactile_scale_divisor"] = XHAND_TACTILE_SCALE_DIVISOR
     if {"action", "action_ee"}.intersection(fields):
-        root.attrs["action_semantics"] = "absolute_joint_goal_not_next_step_arrival"
+        root.attrs["action_semantics"] = "held_accepted_joint_target"
     if "fingertip_xyz" in fields:
         root.attrs["fingertip_link_names"] = list(XHAND_FINGERTIP_LINK_NAMES)
     if {"rgb", "depth"}.intersection(fields):

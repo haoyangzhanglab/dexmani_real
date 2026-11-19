@@ -38,7 +38,7 @@ def restore_terminal_echo(saved):
 
 
 class Keyboard:
-    def __init__(self, *, bindings=None, estop_callback=None):
+    def __init__(self, *, bindings=None, estop_callback=None, timing=None):
         self.events: deque[str] = deque()
         self.accepting_starts = False
         self.held_keys: set[str] = set()
@@ -49,6 +49,7 @@ class Keyboard:
         self.estop_callback = estop_callback
         self.bindings = dict(bindings or {})
         self.saved_termios = None
+        self.timing = timing
 
     def latch_emergency_stop(self):
         with self.condition:
@@ -69,6 +70,8 @@ class Keyboard:
         with self.condition:
             if not self.active or pressed == (name in self.held_keys):
                 return
+            if self.timing is not None and name in JOG_MOTION_KEYS:
+                self.timing.add("key", key=name, pressed=pressed)
             if not pressed:
                 self.held_keys.remove(name)
                 return
@@ -76,8 +79,9 @@ class Keyboard:
             if name in OPERATION_KEYS and not self.accepting_starts:
                 return
             callback = self.bindings.get(name)
-            if callback is not None:
-                callback()
+            # VR 第一次 Q 只播报退出提示。
+            if callback is not None and callback() is False:
+                return
             self.events.append(name)
             self.condition.notify()
 

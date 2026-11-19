@@ -10,7 +10,7 @@ import numpy as np
 
 from dexmani_real.config.calibration_data import VR_TRANSFORM_PATH
 from dexmani_real.geometry.pose import forward_from_quat_wxyz
-from dexmani_real.sensor.vr import _rotation_to_flu
+from dexmani_real.sensor.vr import VRSample, rotation_to_flu
 from dexmani_real.utils.io import write_json
 
 MIN_HEADING_SAMPLES = 30
@@ -73,44 +73,33 @@ def save_vr_transform(calibration: HeadingCalibration, path: str | Path = VR_TRA
 
 
 def read_heading(event, reference):
-    from hand_tracking_sdk import HandFrame, HandSide, HeadFrame
-
-    if reference == "head" and isinstance(event, HeadFrame):
-        sequence, pose = int(event.recv_ts_ns), event.head
-        if sequence <= 0:
-            return None
-    elif reference == "wrist" and isinstance(event, HandFrame) and event.side == HandSide.RIGHT:
-        sequence, pose = int(event.sequence_id), event.wrist
-    else:
+    if not isinstance(event, VRSample):
         return None
     try:
-        return sequence, _rotation_to_flu(pose)
+        return rotation_to_flu(event.pose)
     except ValueError as exc:
         logger.warning("Invalid VR %s heading rejected: %s", reference, exc)
         return None
 
 
 def collect_headings(events, reference, duration_s):
+    from hand_tracking_sdk import TransportDisconnectedError
+
     deadline = time.monotonic() + duration_s
     forwards = []
-    duplicates = 0
-    previous = None
     last_print = 0.0
     for event in events:
         if time.monotonic() >= deadline:
             break
-        sample = read_heading(event, reference)
-        if sample is not None:
-            sequence, quaternion = sample
-            if sequence == previous:
-                duplicates += 1
-            else:
-                previous = sequence
-                forwards.append(forward_from_quat_wxyz(quaternion))
+        if isinstance(event, TransportDisconnectedError):
+            raise event
+        quaternion = read_heading(event, reference)
+        if quaternion is not None:
+            forwards.append(forward_from_quat_wxyz(quaternion))
         now = time.monotonic()
         if now - last_print >= 1.0:
             print(f"    collected {len(forwards)} frames...")
             last_print = now
     else:
         raise RuntimeError("VR receiver stopped during collection")
-    return np.asarray(forwards, dtype=np.float64).reshape(-1, 3), duplicates
+    return np.asarray(forwards, dtype=np.float64).reshape(-1, 3)

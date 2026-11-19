@@ -73,7 +73,7 @@ class EpisodeRecorder:
         self.data_dir = Path(data_dir)
         self.control_hz = float(control_hz)
         self.thread: threading.Thread | None = None
-        self.queue: Queue[tuple[Observation, RobotCommand | None, bool, bool]] = Queue(maxsize=16)
+        self.queue: Queue[tuple[Observation, RobotCommand | None, bool]] = Queue(maxsize=16)
         self.ready = threading.Event()
         self.error = None
         self.is_recording = False
@@ -82,7 +82,7 @@ class EpisodeRecorder:
         self.finish_request: _FinishRequest | None = None
         self.staging_path: Path | None = None
         self.published_path: Path | None = None
-        self.writer = None
+        self.writer: RawWriter | None = None
         self.read_xhand_crc = read_xhand_crc
         self.initial_xhand_crc = read_xhand_crc() if read_xhand_crc is not None else {}
 
@@ -189,15 +189,15 @@ class EpisodeRecorder:
         self.check_error()
         self.is_recording = True
 
-    def append(self, row, command=None, *, action_accepted: bool, quality_issue=None) -> str | None:
-        """质量拒绝或队列满时返回终段原因。写入 I/O 失败以 RecordingError 抛出。"""
+    def append(self, row, submitted_command=None, *, quality_issue=None) -> str | None:
+        """接纳观测和已完整提交的目标。质量拒绝或队列满时返回终段原因。"""
         self.check_error()
         if not self.is_recording:
             return None
         if quality_issue is None:
             # 数组已脱离共享缓冲，入队后生产者不再修改。
             try:
-                self.queue.put_nowait((row, command, self.pending_segment_start, action_accepted))
+                self.queue.put_nowait((row, submitted_command, self.pending_segment_start))
             except Full:
                 quality_issue = "recording_queue_full"
             else:

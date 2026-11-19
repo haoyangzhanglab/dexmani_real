@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import stat
 import time
 from operator import index as integer_index
 from typing import Any
@@ -60,7 +62,7 @@ OVERCURRENT_BOARD_CODE = 110
 EC_STATE_INIT = 1
 POST_EC_DISCONNECT_S = 2.0
 TACTILE_SENSOR_IDS = (0x11, 0x12, 0x13, 0x14, 0x15)
-TACTILE_CALIBRATION_INTERVAL_S = 0.02
+TACTILE_CALIBRATION_INTERVAL_NS = 20_000_000
 PASSIVE_MODE = 0
 POSITION_MODE = 3
 RELEASE_TIMEOUT_S = 0.25
@@ -80,9 +82,10 @@ def _valid_tactile_modalities(code: int) -> tuple[bool, bool]:
 
 def _parse_joints(
     state: Any,
-) -> tuple[np.ndarray, dict[int, Any]]:
+) -> tuple[np.ndarray, dict[int, Any], np.ndarray]:
     qpos = np.full(HAND_JOINT_SHAPE, np.nan, dtype=np.float64)
     joints = {}
+    overcurrent_joint_mask = np.zeros(HAND_JOINT_SHAPE, dtype=bool)
     for joint in state.finger_state:
         index = integer_index(joint.id)
         if not 0 <= index < HAND_DOF:
@@ -99,10 +102,12 @@ def _parse_joints(
                 f"joint/communication board fault at {XHAND_SDK_JOINT_NAMES[index]} (SDK id {index}): "
                 f"commboard_err={comm_error}, jointboard_err={joint_error}"
             )
+        if joint_error == OVERCURRENT_BOARD_CODE:
+            overcurrent_joint_mask[index] = True
     if len(joints) != HAND_DOF:
         missing = [name for i, name in enumerate(XHAND_SDK_JOINT_NAMES) if i not in joints]
         raise ValueError(f"missing XHand SDK joints: {', '.join(missing)}")
-    return validate_hand_qpos(qpos), joints
+    return validate_hand_qpos(qpos), joints, overcurrent_joint_mask
 
 
 def _parse_tactile(sensors, allowed: np.ndarray, *, dense: bool) -> tuple[np.ndarray | None, np.ndarray]:
@@ -139,8 +144,9 @@ class XHandError(RobotError):
 
 
 class XHand:
-    def __init__(self, config: HandConfig):
+    def __init__(self, config: HandConfig, *, tactile_channels: tuple[str, ...] = TACTILE_CHANNELS):
         self.cfg = config
+        self.tactile_channels = tactile_channels
         self.connected_flag = False
         self.consecutive_read_crc = 0
         self.consecutive_write_crc = 0
@@ -149,7 +155,7 @@ class XHand:
             "write_errors": 0,
             "read_recoveries": 0,
             "write_recoveries": 0,
-            "unconfirmed_actions": 0,
+            "unconfirmed_writes": 0,
         }
         self.next_warning_ns: dict[str, int] = {}
         self.control: Any = None
@@ -159,12 +165,6 @@ class XHand:
         self._tactile_bias_time_ns: int | None = None
         self._tactile_bias_applied = False
         self._tactile_calibration_issue: str | None = "not calibrated"
-        self._feedback_overcurrent: tuple[int, bool, tuple[int, ...]] = (0, False, ())
-
-    @property
-    def feedback_overcurrent(self) -> tuple[int, bool, tuple[int, ...]]:
-        """最近有效关节反馈的来源时间、过流状态及已知关节编号。"""
-        return self._feedback_overcurrent
 
     @property
     def is_connected(self) -> bool:
@@ -189,7 +189,7 @@ class XHand:
             self._tactile_bias_applied = False
             self._tactile_calibration_issue = "not calibrated"
             self.control = self.sdk.XHandControl()
-            self.open_device()
+            device_name = self.open_device()
             self.connected_flag = True
             deadline_ns = time.monotonic_ns() + int(CONNECT_TIMEOUT_S * 1e9)
             hand_ids = []
@@ -206,11 +206,13 @@ class XHand:
                     break
                 if sample is not None:
                     self.command = self.make_command(sample.qpos)
+                    logger.info("XHand connected via %s on %s; device_id=%d, discovered=%s",
+                                self.cfg.comm_type, device_name, self.cfg.device_id, hand_ids)
                     return sample
                 time.sleep(min(CONNECT_POLL_INTERVAL_S, remaining_ns / 1e9))
             raise XHandError(
                 "connect", -1,
-                f"initial XHand feedback timed out; device_id={self.cfg.device_id}, "
+                f"initial XHand feedback timed out on {device_name}; device_id={self.cfg.device_id}, "
                 f"discovered={hand_ids}",
             )
         except BaseException as failure:
@@ -222,22 +224,29 @@ class XHand:
                 logger.exception("XHand connection cleanup failed")
             raise
 
-    def open_device(self) -> None:
+    def open_device(self) -> str:
         device_name = self.cfg.device_name
         if device_name is None:
             devices = self.control.enumerate_devices(SDK_PROTOCOL[self.cfg.comm_type])
             if not devices:
                 raise XHandError("connect", -2, f"no device found for {self.cfg.comm_type}")
+            if self.cfg.comm_type == "serial" and len(devices) > 1:
+                raise XHandError("connect", -2, f"multiple serial ports found: {devices}; set hand.device_name")
             device_name = devices[0]
 
         if self.cfg.comm_type == "serial":
+            if not stat.S_ISCHR(os.stat(device_name).st_mode):
+                raise ValueError(f"serial port {device_name} is not a character device")
+            if not os.access(device_name, os.R_OK | os.W_OK):
+                raise PermissionError(f"serial port {device_name} is not readable and writable by the current user")
             error = self.control.open_serial(device_name, self.cfg.baudrate)
         else:
             error = self.control.open_ethercat(device_name)
         if error.error_code == OVERCURRENT_WARNING_CODE:
             self.warn_overcurrent("connect", error.error_message)
         elif error.error_code != 0:
-            raise XHandError("connect", error.error_code, error.error_message)
+            raise XHandError("connect", error.error_code, f"{device_name}: {error.error_message}")
+        return device_name
 
     def disconnect(self) -> None:
         connected_ethercat = self.connected_flag and self.cfg.comm_type == "ethercat"
@@ -333,7 +342,7 @@ class XHand:
         while time.monotonic_ns() < deadline_ns:
             if cancel_requested():
                 raise OperationCancelled("XHand tactile calibration cancelled")
-            state = self._read_state(deadline_ns=deadline_ns)
+            state = self._read_state(deadline_ns=deadline_ns, tactile_channels=TACTILE_CHANNELS)
             if cancel_requested():
                 raise OperationCancelled("XHand tactile calibration cancelled")
             now_ns = time.monotonic_ns()
@@ -343,7 +352,7 @@ class XHand:
                 channels = (state.tactile_aggregate, state.tactile_dense)
                 if all(values is not None and np.isfinite(values).all() for values in channels):
                     return channels
-            time.sleep(min(TACTILE_CALIBRATION_INTERVAL_S, (deadline_ns - now_ns) / 1e9))
+            time.sleep(min(TACTILE_CALIBRATION_INTERVAL_NS, deadline_ns - now_ns) / 1e9)
         return None
 
     def calibrate_tactile(self, *, no_contact: bool, cancel_requested=lambda: False) -> bool:
@@ -357,6 +366,10 @@ class XHand:
         if no_contact is not True:
             return fail("operator must confirm no contact")
         timeout_ns = int(self.cfg.tactile_calibration_timeout_s * 1e9)
+        sample_count = self.cfg.tactile_calibration_samples + 1  # 含独立验证样本。
+        min_timeout_ns = sample_count * TACTILE_CALIBRATION_INTERVAL_NS
+        if timeout_ns <= min_timeout_ns:
+            return fail(f"post-reset sampling requires a timeout greater than {min_timeout_ns / 1e6:g} ms")
         baseline = self._calibration_sample(time.monotonic_ns() + timeout_ns, cancel_requested)
         if baseline is None:
             return fail("missing fresh pre-reset tactile feedback")
@@ -373,8 +386,8 @@ class XHand:
         deadline_ns = time.monotonic_ns() + timeout_ns
         samples = []
         # 拟合与残差验证分别用不同的主动查询。
-        for _ in range(self.cfg.tactile_calibration_samples + 1):
-            time.sleep(TACTILE_CALIBRATION_INTERVAL_S)
+        for _ in range(sample_count):
+            time.sleep(TACTILE_CALIBRATION_INTERVAL_NS / 1e9)
             sample = self._calibration_sample(deadline_ns, cancel_requested)
             if sample is None:
                 return fail("insufficient fresh calibration or verification samples")
@@ -396,9 +409,11 @@ class XHand:
         logger.info("XHand tactile calibration accepted (%d fit samples)", len(samples) - 1)
         return True
 
-    def get_state(self, *, deadline_ns: int | None = None) -> XHandState | None:
-        """读关节及 SDK 原单位触觉，有已核验的 Bias 时应用校正。"""
-        state = self._read_state(deadline_ns=deadline_ns)
+    def get_state(self, *, deadline_ns: int | None = None, retry_crc: bool = True) -> XHandState | None:
+        """读关节及所需触觉，有已核验的 Bias 时应用校正。"""
+        state = self._read_state(
+            deadline_ns=deadline_ns, tactile_channels=self.tactile_channels, retry_crc=retry_crc,
+        )
         bias = self._tactile_bias if self._tactile_bias_applied else None
         if state is not None and bias is not None:
             for name, offset in zip(TACTILE_CHANNELS, bias):
@@ -408,14 +423,17 @@ class XHand:
                     setattr(state, field, values - offset)
         return state
 
-    def _read_state(self, *, deadline_ns: int | None) -> XHandState | None:
+    def _read_state(
+        self, *, deadline_ns: int | None, tactile_channels: tuple[str, ...], retry_crc: bool = True,
+    ) -> XHandState | None:
         if self.control is None or not self.connected_flag:
             raise RobotError("XHand is not connected")
         retry_deadline_ns = time.monotonic_ns() + int(self.cfg.feedback_max_age_s * 1e9)
         if deadline_ns is not None:
             retry_deadline_ns = min(retry_deadline_ns, deadline_ns)
         interval_s = self.cfg.crc_retry_interval_s
-        for attempt in range(self.cfg.crc_retries + 1):
+        retries = self.cfg.crc_retries if retry_crc else 0
+        for attempt in range(retries + 1):
             if attempt:
                 if time.monotonic_ns() + round(interval_s * 1e9) >= retry_deadline_ns:
                     return None
@@ -440,7 +458,7 @@ class XHand:
             raise XHandError("read", code, "missing state payload")
 
         try:
-            qpos, joints = _parse_joints(raw_state)
+            qpos, joints, overcurrent_joint_mask = _parse_joints(raw_state)
         except (AttributeError, TypeError, ValueError, OverflowError) as exc:
             raise XHandError("read", code, f"invalid joint payload: {exc}") from exc
         if time.monotonic_ns() >= retry_deadline_ns:
@@ -449,14 +467,14 @@ class XHand:
             self.crc_counts["read_recoveries"] += 1
             self.consecutive_read_crc = 0
 
-        overcurrent_joints = [
-            index for index, joint in joints.items()
-            if int(joint.jonitboard_err) == OVERCURRENT_BOARD_CODE
-        ]
-        warned = code == OVERCURRENT_WARNING_CODE or bool(overcurrent_joints)
-        self._feedback_overcurrent = (query_started_ns, warned, tuple(overcurrent_joints))
+        warned = code == OVERCURRENT_WARNING_CODE or bool(overcurrent_joint_mask.any())
         if warned:
+            overcurrent_joints = np.flatnonzero(overcurrent_joint_mask).tolist()
             self.warn_overcurrent("read", f"{error.error_message}; joints={overcurrent_joints}")
+
+        state = XHandState(qpos, None, None, query_started_ns, warned, overcurrent_joint_mask)
+        if not tactile_channels:
+            return state
 
         tip_codes = []
         for finger_id in XHAND_TACTILE_SENSOR_FINGER_IDS:
@@ -470,71 +488,58 @@ class XHand:
         if summary_code not in tip_codes:
             allowed &= _valid_tactile_modalities(summary_code)
         sensors = getattr(raw_state, "sensor_data", ())
-        tactile = {}
         for index, name in enumerate(TACTILE_CHANNELS):
+            if name not in tactile_channels:
+                continue
             values, valid = _parse_tactile(sensors, allowed[:, index], dense=name == "dense")
             if not valid.all():
                 self.warn_limited(name, "XHand tactile %s unavailable for finger indices %s (SDK code=%s)",
                                   name, np.flatnonzero(~valid).tolist(), code)
-            tactile[name] = values
-
-        return XHandState(
-            qpos=qpos,
-            tactile_aggregate=tactile["aggregate"],
-            tactile_dense=tactile["dense"],
-            timestamp_ns=query_started_ns,
-        )
+            setattr(state, f"tactile_{name}", values)
+        return state
 
     def send_action(self, target: np.ndarray, *, deadline_ns: int, check_abort) -> None:
-        """仅对 CRC 重发同一绝对目标，且受命令和反馈期限约束。"""
-        previous_crc = self.consecutive_write_crc
-        sdk_confirmed = False
-        try:
-            code = self.send_position(
-                target, tor_max=self.cfg.tor_max,
-                deadline_ns=deadline_ns, check_abort=check_abort,
-            )
-            sdk_confirmed = code == 0
-            if sdk_confirmed:
-                if time.monotonic_ns() >= deadline_ns:
-                    raise HandCommandUnconfirmed(
-                        "XHand SDK success reply arrived at or after the hand submission deadline"
-                    )
-                return
-            if code == OVERCURRENT_WARNING_CODE:
-                raise XHandError("send", code, "overcurrent warning; position submission not confirmed")
-            if self.consecutive_write_crc == previous_crc:
-                raise CommandExpired("XHand command expired before SDK submission")
-            raise HandCommandUnconfirmed(
-                f"XHand position delivery unconfirmed after {self.consecutive_write_crc} consecutive write CRC replies"
-            )
-        finally:
-            if not sdk_confirmed and self.consecutive_write_crc > previous_crc:
-                self.crc_counts["unconfirmed_actions"] += 1
+        code = self.send_position(
+            target, tor_max=self.cfg.tor_max, deadline_ns=deadline_ns, check_abort=check_abort,
+        )
+        if code == OVERCURRENT_WARNING_CODE:
+            raise XHandError("send", code, "overcurrent warning; position submission not confirmed")
 
-    def _send_with_crc_retry(self, prepare, *, deadline_ns: int, check_abort=None) -> int | None:
+    def _send_with_crc_retry(self, prepare, *, deadline_ns: int, check_abort=None) -> int:
+        """仅重试 CRC 回执；成功和过流回执都须在期内收到。"""
         interval_s = self.cfg.crc_retry_interval_s
-        for attempt in range(self.cfg.crc_retries + 1):
-            if attempt:
-                if time.monotonic_ns() + round(interval_s * 1e9) >= deadline_ns:
-                    break
+        code = None
+        try:
+            for attempt in range(self.cfg.crc_retries + 1):
+                if attempt:
+                    if time.monotonic_ns() + round(interval_s * 1e9) >= deadline_ns:
+                        break
+                    if check_abort is not None:
+                        check_abort()
+                    time.sleep(interval_s)
                 if check_abort is not None:
                     check_abort()
-                time.sleep(interval_s)
-            if check_abort is not None:
-                check_abort()
-            if time.monotonic_ns() >= deadline_ns:
-                break
-            if attempt == 0:
-                prepare()
-            code = self._send_command()
-            if code != COMMUNICATION_CRC_ERROR_CODE:
-                return code
-        return None
+                if time.monotonic_ns() >= deadline_ns:
+                    break
+                if not attempt:
+                    prepare()
+                    if time.monotonic_ns() >= deadline_ns:
+                        break
+                code = self._send_command()
+                if time.monotonic_ns() >= deadline_ns:
+                    raise HandCommandUnconfirmed(f"XHand SDK reply arrived after the submission deadline (code={code})")
+                if code != COMMUNICATION_CRC_ERROR_CODE:
+                    return code
+            if code is None:
+                raise CommandExpired("XHand command expired before SDK submission")
+            raise HandCommandUnconfirmed("XHand command delivery unconfirmed after write CRC replies")
+        finally:
+            if code == COMMUNICATION_CRC_ERROR_CODE:
+                self.crc_counts["unconfirmed_writes"] += 1
 
     def send_position(
-        self, target: np.ndarray, *, deadline_ns: int, check_abort=None, tor_max=None,
-    ) -> int | None:
+        self, target: np.ndarray, *, tor_max: tuple[int, ...], deadline_ns: int, check_abort=None,
+    ) -> int:
         """受限重试同一位置命令，保留 SDK 成功码或过流告警码。"""
         if self.control is None or self.command is None or not self.connected_flag:
             raise RuntimeError("XHand command path is not initialized")
@@ -544,8 +549,7 @@ class XHand:
         def prepare():
             for index, value in enumerate(target):
                 joint = self.command.finger_command[index]
-                if tor_max is not None:
-                    joint.tor_max = int(tor_max[index])
+                joint.tor_max = int(tor_max[index])
                 joint.mode = POSITION_MODE
                 joint.position = float(value)
 
@@ -555,7 +559,9 @@ class XHand:
     def hold_feedback_max_age_s(self) -> float:
         return min(self.cfg.feedback_max_age_s, HOLD_FEEDBACK_MAX_AGE_S)
 
-    def hold(self, qpos: np.ndarray, *, timestamp_ns: int, check_abort=None) -> bool:
+    def hold(
+        self, qpos: np.ndarray, *, timestamp_ns: int, tor_max: tuple[int, ...], check_abort=None,
+    ) -> bool:
         """以新鲜的实测位置提交保持，返回 SDK 是否确认提交。"""
         max_age_s = self.hold_feedback_max_age_s
         if not sample_is_fresh(timestamp_ns, max_age_s, time.monotonic_ns()):
@@ -569,7 +575,7 @@ class XHand:
             logger.warning("XHand hold skipped: invalid position feedback (%s)", exc)
             return False
         return self.send_position(
-            reference,
+            reference, tor_max=tor_max,
             deadline_ns=timestamp_ns + int(max_age_s * 1e9), check_abort=check_abort,
         ) == 0
 

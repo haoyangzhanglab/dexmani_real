@@ -31,15 +31,15 @@ flowchart TD
 | VR 采集 / 仅遥操作 | `python scripts/collect_teleop.py TASK` / 加 `--no-record` |
 | 键盘调整姿态 | `python scripts/keyboard_teleop.py` |
 | 查看记录 | `python scripts/visualize_episode.py EPISODE`（`--no-hoi` 绕过标注，`--max-frames N` 按需读取前 N 帧） |
-| 导出训练数据 | `python scripts/export_zarr.py episodes/TASK --output datasets/TASK.zarr --fields joint_state action` |
+| 导出训练数据 | `python scripts/export_zarr.py episodes/TASK`（可加 `--fields joint_state action` 指定字段） |
 | 策略评估并录制 | `python scripts/run_policy.py CHECKPOINT --record-raw` |
-| 回放逐行确认提交的 VR 示教段 | `python scripts/replay_episode.py episodes/pick/episode_001 --segment 0`（替换实际采集目录，段号从 0 开始） |
+| 回放具有完整目标的 Raw 连续段 | `python scripts/replay_episode.py episodes/pick/episode_001 --segment 0`（替换实际采集目录，段号从 0 开始） |
 
 HOI 数据先完成[物体资产准备与离线标注](docs/object_reconstruction.md)。具体选项见各入口的 `--help`。
 
 ### 从示教训练并部署 CordViP
 
-以下命令使用 `dexmani_policy` 提交 `d87b937` 中的接口。从本仓库根目录运行。示例 Raw 的 `meta.task_label` 为 `pick`，训练命令的 `task_name` 须与它一致。将前三个路径改为实际的 VR 采集目录、已准备好米制网格和 `task.json` 的资产目录、新的实验输出目录。标注和现场部署需要配好 HOI 跟踪后端，完整训练使用带 GPU 的 Policy 环境。
+以下命令使用支持本文动作约定的配套 `dexmani_policy`。从本仓库根目录运行。示例 Raw 的 `meta.task_label` 为 `pick`，训练命令的 `task_name` 须与它一致。将前三个路径改为实际的 VR 采集目录、已准备好米制网格和 `task.json` 的资产目录、新的实验输出目录。标注和现场部署需要配好 HOI 跟踪后端，完整训练使用带 GPU 的 Policy 环境。
 
 ```bash
 RAW=/data/episodes/pick
@@ -58,9 +58,9 @@ python scripts/run_policy.py "$RUN/train/checkpoints/latest.pt" \
 
 `run_config.yaml` 保存训练处理参数和部署实际使用的场景、手部点云处理参数。场景点云去桌面时记录归一化平面系数。场景点云过滤为空时，在线继续使用最近一次非空结果，直到其来源过期。
 
-物理回放要求先将机器人就位到所选示教段的起点。连接设备前，回放要求所选段每行均有臂手组合命令的主机侧提交确认，并检查目标是否有限且在限位内。能定位到具体行时，错误会给出 Raw 内从 0 开始的绝对行号。通过检查后按 Raw 标称频率顺序重发臂和手的绝对目标，慢槽会延长播放时间。结尾日志的会话耗时包含连接、播放、末端留驻和关闭。
+物理回放要求先将机器人就位到所选连续段的起点。连接设备前，回放检查原始 Raw 所选段的每行是否都有完整、有限且在限位内的臂手绝对目标。能定位到具体行时，错误会给出 Raw 内从 0 开始的绝对行号。通过检查后按 Raw 标称频率顺序重发目标，慢槽会延长播放时间。播放结束并停稳后保持连接，按 H 回到初始位并退出，按 S/Q 停止并退出，Esc 急停。会话耗时包含等待按键和回位。
 
-Raw 动作列记录尝试提交的绝对关节目标。当前录制以 `action_send_accepted=1` 表示臂手组合命令已在主机侧完整且按时提交，实测关节位置由反馈列给出。训练导出选择 `action` 或 `action_ee` 时，要求整个来源 Raw 的每行都有提交确认，否则拒绝该来源。主机时间戳记录采样过程，视频 PTS 取自相对首帧的控制采样时间，两者都无法给出设备执行时延。详见[时间与动作](docs/data.md#时间与动作)。
+VR 只录制臂手组合命令成功提交的拍。策略正常等待时可录制观测，该行两列动作目标均填 NaN。停止或失败终止的控制拍省略。训练导出在各连续段内填充等待行，形成统一的关节 `action`，并由同一序列派生 `action_ee`。实测关节位置由反馈列给出。主机时间戳记录采样过程，视频 PTS 取自相对首帧的控制采样时间。详见[时间与动作](docs/data.md#时间与动作)。
 
 实验配置由 [RealConfig](dexmani_real/config/real.py) 组装。用一个可信本地 Python 文件导出 `CONFIG`，将实际设备、工作空间、运动参数集中保存；采集、部署、导出和回放均可传 `--config experiment.py`。例如下面只改变采集周期，其余配置仍须符合实际设备：
 
@@ -74,19 +74,86 @@ CONFIG = replace(base, teleop=replace(base.teleop, control_hz=20.0))
 
 先用 `python scripts/collect_teleop.py TASK --config experiment.py --print-config` 检查声明值；策略的有效配置还会结合 checkpoint 在启动时解析。
 
+`MotionConfig.ik_target_speed_deg_s` 限制单拍 IK 关节目标变化。
+
 `ArmConfig.collision_sensitivity` 默认是 `None`，准备运动时保留 xArm 控制器的当前设置。显式设置整数 0–5 时才下发，0 会关闭控制器碰撞检测。这个默认值只约定程序如何处理控制器设置，检测是否开启、场地验收和全路径碰撞情况仍需现场核实。
 
 运行 `python scripts/calibrate_camera.py` 打开相机标定窗口。将 ArUco 标记刚性固定在机械臂末端，并拆除 XHand 或将其固定在配置的 HOME 姿态。用 WASD、方向键和 IJKL 点动机械臂，按 R 回 HOME。按 Space 停止点动并在机械臂停稳后采样，至少采集 10 组有效样本，摆位时绕不同方向转动末端。
 
 按 Enter 择优求解并显示位置和旋转 RMS。位置 RMS ≤ 5 mm 且旋转 RMS ≤ 3° 时，按相机序列号更新默认的 `cameras.json`。Backspace 撤销末次采样，X 移除最近一次求解中残差最差的样本，之后按 Enter 重算。Q 或关闭窗口退出，Esc 触发软件急停。可用 `--config experiment.py` 指定实验配置，或用 `--output camera_calibration.json` 指定外参文件。采集或部署时，通过 `--camera-calibration` 可选用自定义外参文件。 [默认外参文件](dexmani_real/config/calibration_data/cameras.json)
 
-VR 朝向标定复用 `CONFIG.vr`，用 `python scripts/calibrate_vr_heading.py --config experiment.py` 启动，临时端口可用 `--port` 覆盖。
+VR 朝向标定复用 `CONFIG.vr`，用 `python scripts/calibrate_vr_heading.py --config experiment.py` 启动，临时端口可用 `--port` 覆盖。默认监听 TCP 8000。使用 USB 时先执行 `adb reverse tcp:8000 tcp:8000`，在 Quest 的 Hand Tracking Streamer 里选 **TCP Wired**。无线时选 **TCP Wireless**，填入 Quest 可达的电脑 IP 和端口。启动脚本后戴上头显，打开 **Head Pose**，再点 **Start**。标定结果保存成功后，电脑会播报「轴向已标定」。 [HTS 连接说明](https://github.com/wengmister/hand-tracking-streamer/blob/main/CONNECTIONS.md)
+
+VR 接收器报告 TCP 断开时，程序请求停止并结束当前段。重连后按 B 启动新段，以当时的实测臂姿态重新定锚。设置 `hand.enabled=False` 并使用 `--no-record` 时，只需右腕输入。触及工作空间边界时，成功提交新目标后会丢弃超界的手势位移，让反向输入从边界开始响应。
+
+VR 遥操作第一次按 Q 播报准备退出，当前操作继续。再次按 Q 停止并保存当前录制，收尾后播报「操作结束」再退出。Esc 立即请求急停。
 
 策略的运行预算、动作接续与 HOI 恢复见[策略部署](docs/policy_deployment.md)。
 
-VR 和键盘启动时各自检查控制周期严格短于 `target_max_age_s`。默认 16 Hz 和 30 Hz 均使用 0.25 秒命令租约。
+VR 和键盘启动时各自检查控制周期严格短于 `target_max_age_s`。两者默认控制频率分别为 16 Hz 和 30 Hz，命令租约均为 0.25 秒。
+
+xArm 切到 Mode 1 后会主动确认控制器的运动状态。每次发送前检查上报的状态和模式。HOME 在就绪后重新核对规划起点。若发送被拒，错误会记录控制器状态、上报模式及最近的就绪查询结果，HOME 还会标出参考点序号。同一用户在一台 Linux 工作站上运行本仓入口时，相同配置地址只能由一个会话持有。
 
 XHand 诊断的 `--read-only` 不发送诊断运动目标，但仍会连接和断开设备。特定 EtherCAT 配置在断开时可能请求固件状态切换。见 [control_xhand.py](scripts/tools/control_xhand.py)。
+
+串口连接会在打开前检查设备类型和权限。若 `hand.device_name=None` 且枚举得到多个串口，请在实验配置指定实际端口。XHand 的触觉解析由会话决定。录制 Raw 时读取合力和稠密触觉，无录制策略只解析模型需要的通道，键盘、回放和无录制 VR 使用关节反馈。显式触觉校准及独立诊断使用两路触觉。
+
+### 遥操作跟随时序
+
+VR 遥操作默认 16 Hz。实验配置可通过 `teleop.control_hz` 指定频率。若要保持滤波时间常数，将位置和姿态的 EMA 权重分别按 `1 - (1 - alpha_old) ** (hz_old / hz_new)` 换算。
+
+用相同起点和手势对照不同频率，分别保存 Raw 和时序。以下命令采集默认频率的基线。每次运行使用新的 `--timing-output` 路径，可加 `--no-record` 仅测控制链路。
+
+```bash
+python scripts/collect_teleop.py TASK --episodes-dir episodes/vr-16hz \
+    --timing-output episodes/vr-16hz/TASK-timing.json
+```
+
+VR 控制频率也决定 XHand 目标提交、Raw 行和 `rgb.mp4` 的标称频率。视频 PTS 采用实际控制采样时间。xArm 反馈查询默认为 25 Hz，采集频率更高时，相邻 Raw 行可能引用同一次关节反馈。
+
+每份 Canonical Zarr 使用单一 `dt`。将不同采集频率的 Raw 分开导出。
+
+```bash
+python scripts/export_zarr.py episodes/vr-16hz/TASK --output datasets/TASK-16hz.zarr
+```
+
+键盘提频对照可把下面的配置保存为 `tracking.py`。50 Hz 下每拍步长为 4.8 mm 和 0.018 rad，对应原来的名义操作速度。
+
+```python
+from dataclasses import replace
+from dexmani_real.config.real import RealConfig
+
+base = RealConfig()  # 用实际实验配置作为基线
+jog_hz = 50.0
+jog_rate_ratio = base.keyboard_teleop.control_hz / jog_hz
+CONFIG = replace(
+    base,
+    keyboard_teleop=replace(
+        base.keyboard_teleop, control_hz=jog_hz,
+        delta_pos_m=base.keyboard_teleop.delta_pos_m * jog_rate_ratio,
+        delta_rpy_rad=base.keyboard_teleop.delta_rpy_rad * jog_rate_ratio,
+    ),
+)
+```
+
+```bash
+python scripts/keyboard_teleop.py --config tracking.py --timing-output traces/keyboard-50.json
+python scripts/replay_episode.py EPISODE --segment 0 --timing-output traces/replay.json
+```
+
+会话结束后输出 JSON。`control` 收集输入、求解和提交事件，`servo` 收集常规跟随的 SDK 调用时刻与关节参考，`feedback` 收集 SDK 查询与实测关节。用 `control_ns` 对齐一拍内的事件，用 `goal_published_ns` 对齐伺服参考与 `arm_publish.timestamp_ns`。各缓冲保留最近的样本，`dropped` 为已覆盖或收尾时无法完整取得的条数。短段对照宜在约两分钟内结束会话。
+
+```bash
+python -m dexmani_real.runtime.teleop_timing episodes/vr-16hz/TASK-timing.json
+```
+
+离线汇总以每次成功反馈的主机查询起点配对最近完成的伺服调用，要求该调用成功且相距至多两个名义伺服周期。输出配对条数、关节最大绝对偏差和 URDF 末端位置及姿态误差的分位数。`reference_age_ms` 表示这两个主机时刻之差。比较配置时同时查看配对数量和误差，采样间隔和空闲时长会影响配对。
+
+汇总中的 `dispatch` 统计目标发布到首次伺服、SDK 调用、调度迟到和反馈查询耗时。回放汇总按 Raw 的绝对行号显示组合提交结果和观测到的伺服调用，并用末帧留驻内的新鲜反馈计算关节误差和实测最大关节速度。
+
+在相同起点和意图速度下重复平移、旋转和组合动作，比较跟随差距、伺服发送间隔及松键或停腕后的位移。`ik` 事件中用 `goal_qpos` 与 `reference_qpos` 的差值和 `h_s × metadata.ik_speed_rad_s` 对照单拍关节步长，用 `goal_qpos` 与 `measured_qpos` 的差值观察目标和实测之间的偏差。
+
+`summary` 汇总保留窗口内的手部读取和写入 p95、调度错过的控制槽及主动跳过的控制步，也记录会话累计的 XHand CRC 计数。在线反馈的读 CRC 退避由下一次轮询承担，写入耗时包含同步 CRC 重试等待。比较解包成本时，用相同 SDK 样本分别测关节、合力和稠密解析。
 
 ## 核心模块
 

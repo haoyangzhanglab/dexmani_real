@@ -19,6 +19,8 @@ from dexmani_real.geometry.camera import (
 )
 from dexmani_real.geometry.pose import ROTATION_ATOL, validate_rigid_transform
 from dexmani_real.robot.model import (
+    ARM_JOINT_SHAPE,
+    HAND_JOINT_SHAPE,
     XARM7_JOINT_NAMES,
     XHAND_SDK_JOINT_NAMES,
     XHAND_TACTILE_SCALE_DIVISOR,
@@ -38,20 +40,20 @@ class RawDataError(ValueError):
     """输入 Raw 不满足完整示教的数据契约。"""
 
 
-ARM_ACTION_SEMANTICS = "q_goal_submission_attempt"
+ARM_ACTION_SEMANTICS = "q_goal_confirmed_submission"
+ACTION_TARGET_FIELDS = ("action_arm_joint_target", "action_hand_joint_target")
 TACTILE_FINGER_ORDER = "thumb,index,middle,ring,pinky"
 
 
 ROBOT_DATASET_SPECS: dict[str, tuple[tuple[int, ...], np.dtype]] = {
-    "arm_qpos": ((7,), np.dtype(np.float64)),
-    "hand_qpos": ((12,), np.dtype(np.float64)),
+    "arm_qpos": (ARM_JOINT_SHAPE, np.dtype(np.float64)),
+    "hand_qpos": (HAND_JOINT_SHAPE, np.dtype(np.float64)),
     # 触觉保留校正后 SDK / 255，无法使用的指尖以 NaN 表示。
     "hand_contact": ((5, 3), np.dtype(np.float32)),
     "hand_tactile_force": ((5, 120, 3), np.dtype(np.float32)),
-    # 绝对目标保留失败尝试，是否完整提交由 action_send_accepted 标记。
-    "action_arm_joint_target": ((7,), np.dtype(np.float64)),
-    "action_hand_joint_target": ((12,), np.dtype(np.float64)),
-    "action_send_accepted": ((), np.dtype(np.int8)),
+    # 无新提交的观测行以两组全 NaN 目标表示。
+    "action_arm_joint_target": (ARM_JOINT_SHAPE, np.dtype(np.float64)),
+    "action_hand_joint_target": (HAND_JOINT_SHAPE, np.dtype(np.float64)),
 }
 
 
@@ -96,23 +98,22 @@ def validate_task_label(task_label) -> None:
         raise ValueError("task_label must be a non-empty string without NUL")
 
 
-def encode_raw_row(row, command):
+def encode_raw_row(row, submitted_command):
     arm, hand = row.arm[0], row.hand[0]
+    if submitted_command is None:
+        arm_target = np.full(ARM_JOINT_SHAPE, np.nan)
+        hand_target = np.full(HAND_JOINT_SHAPE, np.nan)
+    else:
+        arm_target, hand_target = submitted_command.arm_qpos, submitted_command.hand_qpos
+        if arm_target is None or hand_target is None:
+            raise ValueError("Raw action requires a complete arm and hand target")
     return {
         "arm_qpos": arm["qpos"],
         "hand_qpos": hand["qpos"],
         "hand_contact": hand["tactile_aggregate"],
         "hand_tactile_force": hand["tactile_dense"],
-        "action_arm_joint_target": (
-            command.arm_qpos
-            if command is not None and command.arm_qpos is not None
-            else np.full(7, np.nan)
-        ),
-        "action_hand_joint_target": (
-            command.hand_qpos
-            if command is not None and command.hand_qpos is not None
-            else np.full(12, np.nan)
-        ),
+        "action_arm_joint_target": arm_target,
+        "action_hand_joint_target": hand_target,
     }
 
 
@@ -358,9 +359,8 @@ class RawWriter:
         )
         self.video.open()
 
-    def append_frame(self, row, command, segment_start: bool, action_accepted: bool):
-        values = encode_raw_row(row, command)
-        values["action_send_accepted"] = int(action_accepted)
+    def append_frame(self, row, submitted_command, segment_start: bool):
+        values = encode_raw_row(row, submitted_command)
         if "vr_landmarks" in self.datasets:
             values.update({name: row.vr[name.removeprefix("vr_")] for name in VR_DATASET_SPECS})
         rgb, depth = row.camera["rgb"], row.camera["depth"]
@@ -483,10 +483,9 @@ class RawReader:
         self._hoi_file = None
         self.data_file = h5py.File(self.path / "data.h5", "r")
         try:
-            meta = self.data_file.get("meta")
-            reason = meta.attrs.get("termination_reason") if meta is not None else None
-            if isinstance(reason, (str, bytes)) and reason in ("recording_incomplete", b"recording_incomplete"):
-                raise RawDataError(f"Raw {self.path}: termination_reason is recording_incomplete")
+            reason = self.meta.get("termination_reason")
+            if not isinstance(reason, str) or not reason or reason == "recording_incomplete":
+                raise RawDataError(f"Raw {self.path}: invalid termination_reason {reason!r}")
             rows = self.data_file["timing/rows"]
             if not isinstance(rows, h5py.Dataset) or rows.ndim != 1 or rows.dtype != TIMING_ROW_DTYPE:
                 raise RawDataError(
@@ -564,7 +563,7 @@ class RawReader:
             elif name in {"hand_qpos", "action_hand_joint_target"}:
                 self.validate_joint_metadata("hand", XHAND_SDK_JOINT_NAMES)
             if (
-                name in {"action_arm_joint_target", "action_hand_joint_target"}
+                name in ACTION_TARGET_FIELDS
                 and self.meta["arm_action_semantics"] != ARM_ACTION_SEMANTICS
             ):
                 raise ValueError(f"Raw arm_action_semantics: expected {ARM_ACTION_SEMANTICS}")
@@ -589,23 +588,6 @@ class RawReader:
                     )
             self.dataset_cache[name] = array
         return self.dataset_cache[name]
-
-    def require_confirmed_actions(self, start: int = 0, end: int | None = None) -> None:
-        """要求范围内每行的臂手组合命令均已在主机侧完整提交。"""
-        name = "action_send_accepted"
-        try:
-            dataset = self[name]
-        except KeyError as exc:
-            raise RawDataError(f"Raw {self.path}: missing {name}") from exc
-        status = dataset[start:end]
-        unconfirmed = status != 1
-        count = np.count_nonzero(unconfirmed)
-        if count:
-            first = int(unconfirmed.argmax())
-            raise RawDataError(
-                f"Raw {self.path}: {name}={status[first]} at row {start + first} "
-                f"({count} row(s) without confirmed submission)"
-            )
 
     @property
     def hoi_file(self):

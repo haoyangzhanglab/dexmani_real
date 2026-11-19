@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import resource
 import signal
-import stat
 import sys
 import time
 from pathlib import Path
@@ -154,8 +152,6 @@ class XHandDiagnostic(XHand):
             target, tor_max=self.cfg.tor_max, deadline_ns=min(deadline_ns, feedback_deadline_ns),
             check_abort=self.check_active,
         )
-        if code is None:
-            raise FeedbackUnavailable("XHand diagnostic position submission not confirmed")
         if code != 0:
             raise FeedbackUnavailable(f"XHand diagnostic position submission not confirmed (SDK code={code})")
         last_sample_ns = time.monotonic_ns()
@@ -189,19 +185,10 @@ class XHandDiagnostic(XHand):
             return
         # 取消后仍查询反馈，用实测位置完成保持收尾。
         state = self.get_state()
-        if state is None or not self.hold(state.qpos, timestamp_ns=state.timestamp_ns):
+        if state is None or not self.hold(state.qpos, timestamp_ns=state.timestamp_ns, tor_max=self.cfg.tor_max):
             raise FeedbackUnavailable("XHand diagnostic position hold not confirmed")
         self.motion_pending = False
         print("  Position hold accepted by SDK")
-
-
-def validate_serial_port(serial_port: str) -> None:
-    """在调用原生 SDK 前检查串口；文件系统错误保留原始原因。"""
-    port = Path(serial_port)
-    if not stat.S_ISCHR(port.stat().st_mode):
-        raise ValueError(f"serial port {serial_port} is not a character device")
-    if not os.access(port, os.R_OK | os.W_OK):
-        raise PermissionError(f"serial port {serial_port} is not readable and writable by the current user")
 
 
 def run_hardware_session(config: HandConfig, *, finger_id: int, read_only: bool) -> int:
@@ -232,8 +219,6 @@ def run_hardware_session(config: HandConfig, *, finger_id: int, read_only: bool)
     }
     result = 0
     try:
-        if config.comm_type == "serial" and config.device_name is not None:
-            validate_serial_port(config.device_name)
         hand.check_active()
         hand.connect(cancel_requested=hand.cancel_requested)
         hand.check_active()

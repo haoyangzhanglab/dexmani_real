@@ -12,14 +12,18 @@ from dexmani_real.utils.camera_calibrate.extrinsics import (
     load_optional_camera_extrinsics,
 )
 
-# recv_ts_ns 取腕部与关键点中较早的接收时刻。
+# 组合观测的 recv_ts_ns 取腕部与关键点中较早的接收时刻。
 VR_DTYPE = np.dtype(
     [
         ("wrist_pos", "<f8", (3,)),
         ("wrist_quat_wxyz", "<f8", (4,)),
         ("landmarks", "<f8", (21, 3)),
         ("recv_ts_ns", "<u8"),
+        ("wrist_recv_ts_ns", "<u8"),
+        ("landmarks_recv_ts_ns", "<u8"),
         ("sequence_id", "<u8"),
+        ("landmarks_sequence_id", "<u8"),
+        ("connection_epoch", "<u8"),
     ],
     align=True,
 )
@@ -65,6 +69,8 @@ class SensorChannels:
             else None
         )
         self.vr_ring = SharedRing(ctx, VR_DTYPE, 8) if vr else None
+        # VR worker 是唯一写者，断开即推进，下一份数据可能尚未发布。
+        self.vr_connection_epoch = ctx.RawValue("Q", 0) if vr else None
         rgb_dtype = None
         if include_derived_rgb:
             image_dtype: np.dtype = cast(SharedRing, self.camera_ring).dtype
