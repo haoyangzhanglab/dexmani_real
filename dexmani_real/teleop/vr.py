@@ -67,13 +67,17 @@ class VRController:
         )
         target = self._wrist_target(row.vr["wrist_pos"], row.vr["wrist_quat_wxyz"])
         hand = None
-        if self.hand_retargeter is not None:
-            hand = self.hand_retargeter.retarget(row.vr["landmarks"], timestamp_ns=control_ns)
+        retargeter = self.hand_retargeter
+        if retargeter is not None:
+            if retargeter.reference is None:
+                # 控制循环已等到写入未确认后的首次有效关节查询。
+                retargeter.reset(row.hand["qpos"][0], timestamp_ns=int(row.hand["timestamp_ns"][0]))
+            hand = retargeter.retarget(row.vr["landmarks"], timestamp_ns=control_ns)
             if hand is None:
                 # 无 arm 求解时仍检查参考，禁止失配目标进入普通重发。
                 measured, command, _, h = reference
                 self.action_mapper.solver.bounds(measured, command, h=h)
-                return ActionResult(None, None, self.hand_retargeter.rejection_reason)
+                return ActionResult(None, None, retargeter.rejection_reason)
         return self.action_mapper.map_eef(target, hand, reference)
 
     def commit(self, command, *, eef_pose, submit_end_ns, measured_qpos):

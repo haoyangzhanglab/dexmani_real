@@ -38,7 +38,7 @@ class OperationCancelled(RuntimeError):
 
 
 class FeedbackUnavailable(OperationCancelled):
-    """可信反馈暂不可用；恢复前仍须确认停止并重新准备。"""
+    """可信反馈暂不可用，由调用方按当前流程决定等待或停止。"""
 
 
 class HomeTimeout(OperationCancelled):

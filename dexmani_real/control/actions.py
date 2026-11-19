@@ -10,7 +10,7 @@ from dexmani_real.robot.commands import validate_hand_target
 
 
 class StartPoseRejected(ValueError):
-    """实测姿态无法作为本段有界动作的起点；设备会话仍可继续使用。"""
+    """实测姿态无法建立有界控制参考，本段结束后设备会话可继续使用。"""
 
 
 @dataclass(frozen=True)

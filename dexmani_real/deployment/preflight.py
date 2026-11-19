@@ -77,7 +77,9 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
 
 
 def resolve_deployment_config(info, runtime: RealConfig) -> RealConfig:
-    control_dim = {"joint": 19, "eef": 21}[info.action_mode]
+    control_dim = {"joint": 19, "eef": 21}.get(info.action_mode)
+    if control_dim is None:
+        raise ValueError(f"Real deployment does not support action_mode={info.action_mode!r}; use joint or eef")
     if info.control_action_dim != control_dim:
         raise ValueError(f"Real {info.action_mode} deployment requires control_action_dim={control_dim}")
     action_steps = runtime.execution.action_steps

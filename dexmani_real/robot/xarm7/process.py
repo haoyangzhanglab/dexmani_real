@@ -62,8 +62,12 @@ class ArmProcess:
         )
 
     @property
-    def fault(self):
-        return self.io.fault.value.decode(errors="replace") or None
+    def needs_close_stop_confirmation(self) -> bool:
+        # 未启动的 Owner 无需确认，清理重试可复用关闭反馈通道前的停稳确认。
+        return (
+            self.process is not None and self.process.pid is not None
+            and not (self.io.closing.is_set() and self.physical_stop_confirmed)
+        )
 
     @property
     def stop_reason(self):
@@ -111,23 +115,26 @@ class ArmProcess:
         except BaseException as exc:
             if isinstance(exc, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()
-            self.request_stop()
+            self.io.stop.set()
             self.io.closing.set()
             raise
 
-    def _read_fault(self):
-        # owner 的首个故障不会被清除；每次检查直接报告当前事实。
-        issue = self.fault
-        if (not issue and self.process is not None and self.process.pid is not None
-                and not self.process.is_alive()):
-            if self.process.exitcode != 0 or not self.io.closing.is_set():
-                issue = f"arm owner exited: {self.process.exitcode}"
-            elif not self.io.stopped.is_set():
-                issue = "arm owner exited without confirming stop"
+    def _read_owner_fault(self) -> RobotError | None:
+        issue = self.io.fault.value.decode(errors="replace")
         return RobotError(f"xArm controller fault: {issue}") if issue else None
 
-    def check_error(self):
-        error = self._read_fault()
+    def _read_owner_exit_error(self) -> RobotError | None:
+        exitcode = self.process.exitcode if self.process is not None else None
+        if exitcode is None:
+            return None
+        if exitcode != 0 or not self.io.closing.is_set():
+            return RobotError(f"arm owner exited: {exitcode}")
+        if not self.io.sdk_stop_handled.is_set():
+            return RobotError("arm owner exited without handling SDK stop")
+        return None
+
+    def check_error(self) -> None:
+        error = self._read_owner_fault() or self._read_owner_exit_error()
         if error is not None:
             raise error
 
@@ -151,8 +158,8 @@ class ArmProcess:
         self.check_error()
         if not self.is_connected:
             raise RuntimeError("arm unavailable for lifecycle operation")
-        self.request_stop()
-        self.wait_stopped(deadline=min(
+        self.io.stop.set()
+        self._wait_for_sdk_stop(deadline=min(
             time.monotonic() + EXECUTOR_TIMEOUT_S, deadline_ns / 1e9,
         ))
         self.io.clear_goal(deadline_ns=min(deadline_ns, time.monotonic_ns() + int(EXECUTOR_TIMEOUT_S * 1e9)))
@@ -163,7 +170,7 @@ class ArmProcess:
                 raise OperationCancelled("operation cancelled before preparation")
             if time.monotonic_ns() >= deadline_ns:
                 raise TimeoutError("arm operation deadline expired before preparation")
-            # stopped 仅由 owner 写入；它在接纳请求时失效旧确认。
+            # SDK 停止完成事件仅由 Owner 写入，接纳请求时清除。
             # 父进程此时清确认会使 owner 把尚未清除的 stop 当作新停止。
             self.physical_stop_confirmed = False
             self.io.stop.clear()
@@ -181,8 +188,10 @@ class ArmProcess:
             # recv 成功即已消费；取消回复本身也会抛出异常。
             reply_received = True
             if error is not None:
-                if isinstance(error, Exception) and self.fault:
-                    raise self._read_fault() from error
+                if isinstance(error, Exception):
+                    fault = self._read_owner_fault()
+                    if fault is not None:
+                        raise fault from error
                 raise error
 
         try:
@@ -207,7 +216,7 @@ class ArmProcess:
         except BaseException as failure:
             if isinstance(failure, KeyboardInterrupt):
                 self.runtime_state.request_emergency_stop()
-            self.request_stop()
+            self.io.stop.set()
             if (isinstance(failure, OperationCancelled)
                     and not self.io.emergency.is_set() and not self.io.closing.is_set()):
                 cleanup_deadline = time.monotonic() + EXECUTOR_TIMEOUT_S
@@ -223,7 +232,7 @@ class ArmProcess:
                         remaining = cleanup_deadline - time.monotonic()
                         if remaining <= 0:
                             raise TimeoutError("arm cancellation unresolved: stop or lifecycle reply missing")
-                        if self.io.stopped.is_set() and (not submitted or reply_received):
+                        if self.io.sdk_stop_handled.is_set() and (not submitted or reply_received):
                             break
                         if submitted and not reply_received:
                             if self.pipe.poll(min(0.005, remaining)):
@@ -232,7 +241,7 @@ class ArmProcess:
                                 except OperationCancelled:
                                     pass  # 本次普通取消；真实错误仍向外传播。
                         else:
-                            self.io.stopped.wait(min(0.005, remaining))
+                            self.io.sdk_stop_handled.wait(min(0.005, remaining))
                 except BaseException as cleanup:
                     if isinstance(cleanup, KeyboardInterrupt):
                         self.runtime_state.request_emergency_stop()
@@ -274,28 +283,23 @@ class ArmProcess:
             cancel_epoch=cancel_epoch,
         )
 
-    def request_stop(self):
-        self.io.stop.set()
-
-    def wait_stopped(self, *, deadline=None):
-        """等待 Owner 处理 SDK 停止请求。"""
-        deadline = time.monotonic() + EXECUTOR_TIMEOUT_S if deadline is None else deadline
-        while not self.io.stopped.is_set():
+    def _wait_for_sdk_stop(self, *, deadline: float) -> None:
+        while not self.io.sdk_stop_handled.is_set():
             self.check_error()
             if self.process is None or self.process.pid is None:
                 raise RobotError("arm owner unavailable before handling stop request")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("arm stop unresolved; SDK acceptance not confirmed")
-            self.io.stopped.wait(min(0.05, remaining))
-        self.check_error()  # Owner 先记录 stop 的故障，再置 stopped。
+            self.io.sdk_stop_handled.wait(min(0.05, remaining))
+        self.check_error()  # Owner 先记录 SDK 停止故障，再置完成事件。
 
-    def wait_physical_stop(self):
+    def wait_physical_stop(self) -> None:
         """确认 SDK 停止已处理，再由 Owner 查询新反馈并验证停稳。"""
         self.physical_stop_confirmed = False
         if not self.io.stop.is_set():
             raise OperationCancelled("arm stop was not requested")
-        self.wait_stopped()
+        self._wait_for_sdk_stop(deadline=time.monotonic() + EXECUTOR_TIMEOUT_S)
         if not self.is_connected:
             raise RobotError("arm owner unavailable for physical stop verification")
 
@@ -316,6 +320,8 @@ class ArmProcess:
             self.io.closing.set()
             if isinstance(exc, Exception):
                 self.check_error()
+            if isinstance(exc, (BrokenPipeError, EOFError)):
+                raise RobotError("arm owner feedback channel closed during physical stop verification") from exc
             raise
         self.check_error()
         if error is not None:
@@ -323,35 +329,36 @@ class ArmProcess:
         self.physical_stop_confirmed = True
 
     def close(self) -> None:
-        self.request_stop()
+        """回收 Owner 和管道，物理停稳确认须在关闭反馈通道前完成。"""
+        self.io.stop.set()
         self.io.closing.set()
         errors: list[BaseException] = []
         if self.process is not None and self.process.pid is not None:
             try:
                 self.process.join(EXECUTOR_TIMEOUT_S)
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001 — 中断 join 后仍须检查 Owner 状态。
                 if isinstance(exc, KeyboardInterrupt):
                     self.runtime_state.request_emergency_stop()
                 errors.append(exc)
         # join 后重新读取故障，包含关闭期间晚到的错误。
-        fault = self._read_fault()
+        fault = self._read_owner_fault()
         if fault is not None:
             errors.insert(0, fault)
         alive = self.process is not None and self.process.is_alive()
         if alive:
             errors.append(TimeoutError("arm owner process still active; stop/disconnect unresolved"))
         else:
-            # 无 SDK fault 的异常退出已由 _read_fault 报告；有主错时保留独立退出失败。
-            if self.fault and self.process is not None and self.process.pid is not None:
-                if self.process.exitcode != 0:
-                    errors.append(RobotError(f"arm owner exited: {self.process.exitcode}"))
-                elif not self.io.stopped.is_set():
-                    errors.append(RobotError("arm owner exited without confirming stop"))
+            exit_error = self._read_owner_exit_error()
+            if exit_error is not None:
+                if fault is None:
+                    errors.insert(0, exit_error)
+                else:
+                    errors.append(exit_error)
             # 活着的 owner 保留管道；确认退出后尝试关闭全部端点。
             for pipe in (self.child_pipe, self.pipe):
                 try:
                     pipe.close()
-                except BaseException as exc:
+                except BaseException as exc:  # noqa: BLE001 — 其余管道仍须回收。
                     if isinstance(exc, KeyboardInterrupt):
                         self.runtime_state.request_emergency_stop()
                     errors.append(exc)

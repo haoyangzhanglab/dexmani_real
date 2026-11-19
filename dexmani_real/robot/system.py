@@ -4,6 +4,8 @@ import logging
 import time
 from bisect import bisect_left
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -60,6 +62,7 @@ class Robot:
         self.connected = False
         self.hand_stop_required = False
         self.hand_feedback = XHandFeedback()
+        self._hand_write_unconfirmed = False
         self.feedback_next_ns = 0
         self.joint_history: dict[str, deque[tuple[int, np.ndarray]]] = {}
         self.joint_history_ns = 0
@@ -137,6 +140,7 @@ class Robot:
             self.hand_stop_required = True
             initial = self.hand.connect(cancel_requested=cancelled)
             self.hand_feedback.consume(initial)
+            self._hand_write_unconfirmed = False
             self.feedback_next_ns = initial.timestamp_ns + FEEDBACK_PERIOD_NS
         self.connected = True
         self._read_initial_state(cancel_requested=cancelled)
@@ -165,14 +169,21 @@ class Robot:
             self.hand_feedback.clear_tactile()
             self.feedback_next_ns = 0
 
-    def read_hand(self):
+    def read_hand(self) -> np.ndarray | None:
         if self.hand is None:
             return None
-        return self.hand_feedback.consume(self.hand.get_state())
+        state = self.hand.get_state()
+        frame = self.hand_feedback.consume(state)
+        if state is not None:
+            self._hand_write_unconfirmed = False
+        return frame
 
     @property
     def hand_feedback_pending(self) -> bool:
-        return self.hand is not None and self.hand.consecutive_read_crc > 0
+        """读 CRC 尚未恢复，或未确认写入之后尚无有效关节反馈。"""
+        return self.hand is not None and (
+            self._hand_write_unconfirmed or self.hand.consecutive_read_crc > 0
+        )
 
     def read_state(self):
         """消费来源时间不变的反馈缓存，不执行硬件查询。"""
@@ -292,7 +303,8 @@ class Robot:
                 )
             self.check_run()
         except HandCommandUnconfirmed:
-            # 组合发送可能已发布 arm；下个控制周期先安排新的 hand 实测反馈。
+            # 实测反馈可能早于已经生效的写入；立即安排新查询，成功前禁止新手部目标。
+            self._hand_write_unconfirmed = True
             self.feedback_next_ns = 0
             raise
         except BaseException:
@@ -356,25 +368,26 @@ class Robot:
         self.hand_stop_required = not confirmed
         return confirmed
 
-    def stop(self):
+    @contextmanager
+    def _stop_stage(self, errors: list[tuple[str, BaseException]], stage: str) -> Iterator[None]:
+        try:
+            yield
+        except BaseException as exc:  # noqa: BLE001 — 锁存中断并继续清理，最后传播错误。
+            if isinstance(exc, KeyboardInterrupt):
+                self.runtime_state.request_emergency_stop()
+            errors.append((stage, exc))
+
+    def stop(self) -> None:
         """请求机械臂停止，同时保持 XHand 位置，并确认机械臂停稳。"""
         self.runtime_state.stop_signal.set()
-        errors = []
+        errors: list[tuple[str, BaseException]] = []
         if self.hand_stop_required:
-            try:
+            with self._stop_stage(errors, "hand_hold"):
                 if not self.hold_hand():
                     raise FeedbackUnavailable("XHand position hold not confirmed")
-            except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                errors.append(("hand_hold", exc))
         if self.arm is not None:
-            try:
+            with self._stop_stage(errors, "arm_stop_confirm"):
                 self.arm.wait_physical_stop()
-            except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                errors.append(("arm_stop_confirm", exc))
         if errors:
             for stage, error in errors[1:]:
                 logger.error("%s failed", stage, exc_info=(type(error), error, error.__traceback__))
@@ -388,52 +401,37 @@ class Robot:
         if self.connected:
             self.service_feedback()
 
-    def close(self, *, release_hand: bool = False):
-        """关闭设备前完成保持。调用方显式选择时提交 Passive。"""
+    def close(self, *, release_hand: bool = False) -> None:
+        """请求 Arm 停止并确认停稳，再处理 Hand 和设备关闭。"""
         if self.arm is None and self.hand is None:
             return
-        # 共用 stop 先通知 arm；owner 退出后的最终故障也由 close 带回。
+        # 先通知 Arm Owner，使停稳确认能在关闭反馈通道前完成。
         self.runtime_state.stop_signal.set()
-        # 首次停止失败由操作结果保留；这里只收集本次关闭失败。
-        errors = []
+        errors: list[tuple[str, BaseException]] = []
+        if self.arm is not None and self.arm.needs_close_stop_confirmation:
+            with self._stop_stage(errors, "arm_stop_confirm"):
+                self.arm.wait_physical_stop()
+        release_hand = release_hand and not errors
         # disconnect 失败仍持有句柄，但驱动已撤销读写；重试关闭只释放资源。
         if self.hand is not None and self.hand.is_connected:
-            if release_hand and self.arm is not None:
-                try:
-                    self.arm.wait_physical_stop()
-                except BaseException as exc:  # noqa: BLE001 — 中断也须跳过释放并回收设备。
-                    if isinstance(exc, KeyboardInterrupt):
-                        self.runtime_state.request_emergency_stop()
-                    errors.append(("arm_stop_confirm", exc))
-                    release_hand = False
-            try:
+            with self._stop_stage(errors, "hand_release" if release_hand else "hand_hold"):
                 if release_hand:
                     if not self.hand.release():
                         raise RobotError("XHand release not confirmed")
                 elif self.hand_stop_required and not self.hold_hand():
                     raise FeedbackUnavailable("XHand position hold not confirmed during close")
-            except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                errors.append(("hand_release" if release_hand else "hand_hold", exc))
         if self.arm is not None:
             try:
-                self.arm.close()
-            except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                errors.append(("arm_close", exc))
+                with self._stop_stage(errors, "arm_close"):
+                    self.arm.close()
             finally:
                 if self.arm.is_closed:
                     self.arm = None
 
         if self.hand is not None:
             try:
-                self.hand.disconnect()
-            except BaseException as exc:
-                if isinstance(exc, KeyboardInterrupt):
-                    self.runtime_state.request_emergency_stop()
-                errors.append(("hand_disconnect", exc))
+                with self._stop_stage(errors, "hand_disconnect"):
+                    self.hand.disconnect()
             finally:
                 if self.hand.control is None:
                     self.hand = None

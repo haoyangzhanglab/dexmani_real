@@ -7,9 +7,12 @@ import numpy as np
 import pytest
 
 from dexmani_real.config.deployment import ExecutionConfig
+from dexmani_real.config.teleop import HandRetargetingConfig, TeleopConfig
 from dexmani_real.config.xarm7 import ArmConfig
 from dexmani_real.config.xhand import HandConfig
+from dexmani_real.control.actions import ActionMapper
 from dexmani_real.deployment import rollout as deployment
+from dexmani_real.geometry.pose import Pose
 from dexmani_real.robot import system
 from dexmani_real.robot.commands import (
     FeedbackUnavailable,
@@ -21,9 +24,11 @@ from dexmani_real.robot.commands import (
 from dexmani_real.robot.xarm7.protocol import ARM_STATE_DTYPE
 from dexmani_real.robot.xhand import driver
 from dexmani_real.robot.xhand.feedback import XHandState
+from dexmani_real.runtime import observation
 from dexmani_real.runtime.lifecycle import close_runtime
 from dexmani_real.runtime.state import SessionState
 from dexmani_real.teleop import loop as teleop
+from dexmani_real.teleop.vr import VRController
 
 CRC = driver.COMMUNICATION_CRC_ERROR_CODE
 
@@ -90,6 +95,7 @@ def test_write_crc_exhaustion_stays_unconfirmed_until_persistent(robot_with_mock
     robot, command, clock, _ = robot_with_mock_hand
     hand = robot.hand
     hand.control.send_command.return_value = sdk_error(CRC)
+    hand.control.read_state.return_value = sdk_error(0), sdk_state(command.hand_qpos)
 
     for expected_count, persistent in ((2, False), (4, False), (5, True)):
         with pytest.raises(HandCommandUnconfirmed, match="delivery unconfirmed") as error:
@@ -99,6 +105,13 @@ def test_write_crc_exhaustion_stays_unconfirmed_until_persistent(robot_with_mock
         assert hand.control.send_command.call_count == expected_count
         assert not robot.runtime_state.stop_signal.is_set()
         assert robot.feedback_next_ns == 0
+        assert robot.hand_feedback_pending
+        arm_submissions = robot.arm.submit.call_count
+        with pytest.raises(FeedbackUnavailable, match="pending after CRC"):
+            robot.send_action(command, expires_ns=clock.now_ns + 1_000_000_000)
+        assert robot.arm.submit.call_count == arm_submissions
+        assert robot.service_feedback()
+        assert not robot.hand_feedback_pending
 
     assert hand.crc_counts["unconfirmed_actions"] == 3
     assert hand.crc_counts["write_recoveries"] == 0
@@ -216,6 +229,8 @@ def test_persistent_read_crc_preserves_cache_and_only_stops_after_expiry(robot_w
 
 def test_teleop_skips_pending_feedback_and_commits_only_confirmed_action(monkeypatch):
     state, robot, controller = SessionState(), Mock(), Mock()
+    controller.anchor = None
+    controller.reset.side_effect = lambda _: setattr(controller, "anchor", object())
     runtime = SimpleNamespace(teleop=SimpleNamespace(target_max_age_s=0.25))
     loop = teleop.TeleopLoop(
         state, runtime, robot, control_dt_ns=50_000_000, task_label="test", sensors=Mock(),
@@ -225,7 +240,7 @@ def test_teleop_skips_pending_feedback_and_commits_only_confirmed_action(monkeyp
     loop.last_command = loop.target_deadline_ns = loop.hold_reason = None
     loop.recorder = Mock()
     loop.recorder.append.return_value = None
-    loop.admit_observation = Mock(return_value=[])
+    monkeypatch.setattr(loop, "admit_observation", Mock(return_value=[]))
     controller.compute_target.return_value = SimpleNamespace(
         arm_qpos=np.zeros(7), hand_qpos=np.zeros(12), eef_pose=None, rejection_reason=None,
     )
@@ -246,15 +261,136 @@ def test_teleop_skips_pending_feedback_and_commits_only_confirmed_action(monkeyp
     clock.now_ns += loop.control_dt_ns
     loop.run_control_tick()
     controller.commit.assert_not_called()
+    controller.hand_retargeter.clear_reference.assert_called_once()
     assert loop.last_command is None and loop.pending_termination_reason is None
     assert not state.stop_signal.is_set()
     assert loop.recorder.append.call_args.kwargs["action_accepted"] is False
 
     clock.now_ns += loop.control_dt_ns
     loop.run_control_tick()
+    controller.reset.assert_called_once()
     controller.commit.assert_called_once()
     assert loop.last_command is not None
     assert loop.recorder.append.call_args.kwargs["action_accepted"] is True
+
+
+@pytest.mark.parametrize("has_confirmed_target", [False, True])
+def test_teleop_reanchors_measured_hand_after_moved_write_loses_ack(
+    monkeypatch, robot_with_mock_hand, has_confirmed_target,
+):
+    from dexmani_real.teleop.retargeting.solver import HandRetargeter
+
+    robot, command, clock, _ = robot_with_mock_hand
+    state = robot.runtime_state
+    cfg = TeleopConfig()
+    runtime = SimpleNamespace(arm=robot.arm_config, hand=robot.hand_config, teleop=cfg)
+    arm_limits = np.column_stack((robot.arm_lower, robot.arm_upper))
+    arm_solver = Mock(limits=arm_limits, workspace=np.tile([-1.0, 1.0], (3, 1)))
+    arm_solver.measured_reference.side_effect = lambda qpos: qpos
+    arm_solver.compute_eef_pose_base.return_value = Pose(np.zeros(3), [1, 0, 0, 0])
+    arm_solver.solve.return_value = SimpleNamespace(qpos=command.arm_qpos)
+    mapper = ActionMapper(
+        joint_limits=arm_limits, hand_enabled=True, hand_lower_rad=robot.hand_lower,
+        hand_upper_rad=robot.hand_upper, solver=arm_solver,
+    )
+    retargeter = HandRetargeter(HandRetargetingConfig(), robot.hand_config)
+    calibration = retargeter.calibration = object()
+    controller = VRController(mapper, retargeter, cfg, np.eye(3))
+    sensors = Mock()
+    loop = teleop.TeleopLoop(
+        state, runtime, robot, control_dt_ns=50_000_000, task_label="test", sensors=sensors,
+        controller=controller, recording_dir=None, max_duration_s=None, keyboard=Mock(), audio=Mock(),
+    )
+    loop.episode_cancel_epoch = state.cancel_epoch
+    loop.last_command = loop.target_deadline_ns = loop.hold_reason = None
+    mock_time = SimpleNamespace(monotonic_ns=lambda: clock.now_ns)
+    monkeypatch.setattr(teleop, "time", mock_time)
+    monkeypatch.setattr(observation, "time", mock_time)
+
+    wrist_pos = np.zeros(3)
+    arm = np.zeros(1, dtype=ARM_STATE_DTYPE)
+    robot.arm.snapshot.return_value = arm
+
+    def tick():
+        if loop.next_tick_ns is not None:
+            clock.now_ns = max(clock.now_ns, loop.next_tick_ns)
+        arm["timestamp_ns"] = clock.now_ns
+        sensors.channels.vr_ring.read.return_value = ({
+            "recv_ts_ns": clock.now_ns, "wrist_pos": wrist_pos,
+            "wrist_quat_wxyz": np.array([1, 0, 0, 0]), "landmarks": None,
+        }, 1)
+        loop.run_control_tick()
+
+    lost_ack = False
+    measured_qpos = command.hand_qpos.copy()
+
+    def send(_device, sdk_command):
+        if lost_ack:
+            measured_qpos[0] = (command.hand_qpos[0] + sdk_command.finger_command[0].position) / 2
+            return sdk_error(CRC)
+        return sdk_error(0)
+
+    def retarget(_landmarks, *, timestamp_ns):
+        reference = retargeter.reference
+        assert reference is not None
+        target = reference[0].copy()
+        if lost_ack:
+            target[0] += 0.1
+        return target
+
+    robot.hand.control.send_command.side_effect = send
+    retarget_call = Mock(side_effect=retarget)
+    monkeypatch.setattr(retargeter, "retarget", retarget_call)
+    if has_confirmed_target:
+        tick()
+    deadline_ns = loop.target_deadline_ns
+
+    lost_ack = True
+    tick()
+    anchor = controller.anchor
+    previous_eef = controller.previous_eef_target
+    send_count = robot.hand.control.send_command.call_count
+    assert send_count == (3 if has_confirmed_target else 2)
+    assert measured_qpos[0] > command.hand_qpos[0]
+    invalidated_reference = retargeter.reference
+    assert invalidated_reference is None
+    assert robot.hand_feedback_pending and robot.hand.consecutive_read_crc == 0
+    assert loop.target_deadline_ns == deadline_ns
+    assert loop.pending_termination_reason is None and not state.stop_signal.is_set()
+
+    lost_ack = False
+    wrist_pos = np.array([0.1, 0, 0])
+    retarget_call.reset_mock()
+    with monkeypatch.context() as read_patch:
+        read_patch.setattr(robot.hand, "get_state", lambda: None)
+        assert robot.service_feedback()
+    assert robot.hand_feedback_pending
+    tick()  # 缓存仍在 TTL 内，但来自未确认写入之前。
+    retarget_call.assert_not_called()
+    assert robot.hand.control.send_command.call_count == send_count
+
+    clock.now_ns = robot.feedback_next_ns
+    feedback_ns = clock.now_ns
+    robot.hand.control.read_state.return_value = sdk_error(0), sdk_state(measured_qpos)
+    assert robot.service_feedback()
+    arm_solver.solve.return_value = SimpleNamespace(qpos=None, reason="IK rejected")
+    tick()
+    reference = retargeter.reference
+    assert reference is not None
+    reference_qpos, reference_ns = reference
+    np.testing.assert_array_equal(reference_qpos, measured_qpos)
+    assert reference_ns == feedback_ns
+    assert retargeter.calibration is calibration
+    assert controller.anchor is anchor and controller.previous_eef_target is previous_eef
+    assert robot.hand.control.send_command.call_count == send_count
+
+    arm_solver.solve.return_value = SimpleNamespace(qpos=command.arm_qpos)
+    tick()
+    assert loop.pending_termination_reason is None and not state.stop_signal.is_set()
+    assert robot.hand.control.send_command.call_count == send_count + 1
+    assert controller.anchor is anchor
+    sent_qpos = [joint.position for joint in robot.hand.command.finger_command]
+    np.testing.assert_array_equal(sent_qpos, measured_qpos)
 
 
 def test_hold_retries_measured_position_and_preserves_torque_limit(robot_with_mock_hand):

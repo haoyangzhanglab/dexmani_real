@@ -109,7 +109,7 @@ class Rollout:
         self.dt_ns = round(self.execution.control_dt_s * 1e9)
         self.started_ns = 0
         self.ik_reference: IKReference | None = None
-        self.first_prediction = True
+        self.reset_pending = True
         self.prev_action: np.ndarray | None = None
         self.state: Literal["RUNNING", "HOI_HOLD", "RESUMING"] = "RUNNING"
         self.next_hoi_hold_ns = 0
@@ -368,21 +368,21 @@ class Rollout:
         self.result.started_utc = utc_now()
         logger.info("Policy control loop started; waiting for the first prediction")
 
-    def poll_model(self):
+    def poll_model(self) -> None:
         future = self.model.poll()
-        if future is not None:
-            actions = future.result()
-            if self.state == "HOI_HOLD" or self.first_prediction:
-                # result() 的异常仍须传播，旧预测不能进入恢复后的计划。
-                return
-            # sync 直接接收动作；async/RTC 将结果关联到原预测请求。
-            if self.execution.mode == "sync":
-                self.plan = ActionChunk(actions, 0)
-                self.cursor = 0
-            else:
-                cast(Prediction, self.query).result = actions
+        if future is None:
+            return
+        actions = future.result()
+        if self.reset_pending:
+            # 传递旧预测的异常，只丢弃成功返回的旧动作。
+            return
+        if self.execution.mode == "sync":
+            self.plan = ActionChunk(actions, 0)
+            self.cursor = 0
+        else:
+            cast(Prediction, self.query).result = actions
 
-    def submit(self, slot, *, handoff_slot=None, prefix=None):
+    def _submit_prediction(self, slot: int, *, handoff_slot=None, prefix=None) -> None:
         kwargs = {} if prefix is None else {
             "rtc_prefix": prefix,
             "delay_steps": min(self.execution.prefetch_steps, len(prefix)),
@@ -392,8 +392,8 @@ class Rollout:
             kwargs["prev_action"] = self.prev_action
         rows = tuple(self.history)
         self.check_motion()
-        self.model.predict(rows, reset_episode=self.first_prediction, **kwargs)
-        self.first_prediction = False
+        self.model.predict(rows, reset_episode=self.reset_pending, **kwargs)
+        self.reset_pending = False
         if self.execution.mode != "sync":
             self.query = Prediction(slot, handoff_slot, request_cursor=self.cursor)
 
@@ -414,50 +414,47 @@ class Rollout:
             return None, f"action_rejected: {decoded.rejection_reason}"
         return RobotCommand(decoded.arm_qpos, decoded.hand_qpos), None
 
-    def select_action(self, slot):
-        if self.execution.mode == "sync":
-            if self.plan is None:
-                if self.model.future is None:
-                    self.submit(None)
-                return None
-            return self.plan.actions[self.cursor]
-        rtc = self.execution.mode == "rtc"
-        if rtc:
+    def select_action(self, slot: int) -> np.ndarray | None:
+        mode = self.execution.mode
+        if mode == "rtc":
             query = self.query
             window = min(self.execution.action_steps, len(self.plan.actions)) if self.plan is not None else 0
             if query is not None and query.result is not None and self.cursor >= window:
-                consumed = self.cursor - query.request_cursor if self.plan is not None else 0
-                actions = query.result[consumed:]
+                actions = query.result[self.cursor - query.request_cursor:]
                 self.query = None
                 if not len(actions):
                     self.stop("prediction exhausted")
                     return None
                 self.plan = ActionChunk(actions, 0)
                 self.cursor = 0
-        else:
+        elif mode == "async":
             new_plan = handoff_plan(self.query, slot=slot)
             if new_plan is not None:
                 self.plan, self.query = new_plan, None
-        if self.plan is None:
-            # 启动或恢复后的首预测允许无旧计划等待；执行中耗尽仍结束。
-            if self.first_prediction:
-                self.submit(slot)
+        plan = self.plan
+        if plan is None:
+            # Future 由 poll_model 回收后，才能提交下一次预测。
+            if self.model.future is None:
+                self._submit_prediction(slot)
             return None
-        exhausted = self.cursor >= len(self.plan.actions) if rtc else plan_exhausted(self.plan, slot)
+        if mode == "sync":
+            return plan.actions[self.cursor]
+        rtc = mode == "rtc"
+        exhausted = self.cursor >= len(plan.actions) if rtc else plan_exhausted(plan, slot)
         if exhausted:
             self.stop("prediction exhausted")
             return None
         if self.query is None:
             if rtc:
-                window = min(self.execution.action_steps, len(self.plan.actions))
+                window = min(self.execution.action_steps, len(plan.actions))
                 if self.cursor >= max(0, window - self.execution.prefetch_steps):
-                    self.submit(slot, prefix=self.plan.actions[self.cursor:].copy())
+                    self._submit_prediction(slot, prefix=plan.actions[self.cursor:].copy())
             else:
-                handoff = prefetch_handoff(self.plan, slot=slot,
+                handoff = prefetch_handoff(plan, slot=slot,
                     action_steps=self.execution.action_steps, prefetch_steps=self.execution.prefetch_steps)
                 if handoff is not None:
-                    self.submit(slot, handoff_slot=handoff)
-        return self.plan.actions[self.cursor if rtc else slot - self.plan.anchor_slot]
+                    self._submit_prediction(slot, handoff_slot=handoff)
+        return plan.actions[self.cursor if rtc else slot - plan.anchor_slot]
 
     def check_motion(self):
         if (self.runtime_state.cancel_epoch != self.episode_cancel_epoch
@@ -551,13 +548,13 @@ class Rollout:
             self.stop(context + ": " + "; ".join(issues))
 
     def _clear_policy_context(self):
-        """清除控制侧上下文；在途推理仍由 poll_model 或 Session 回收。"""
+        """清除控制侧上下文，等在途推理回收后再重置模型。"""
         self.history.clear()
         self.plan = self.query = None
         self.cursor = 0
         self.prev_action = None
         self.ik_reference = None
-        self.first_prediction = True
+        self.reset_pending = True
 
     def _enter_hoi_hold(self):
         if self.state == "HOI_HOLD":
@@ -652,7 +649,7 @@ class Rollout:
             self._clear_policy_context()
             if was_running and self.recorder is not None:
                 self.recorder.mark_gap()
-        if self.first_prediction and self.model.future is not None:
+        if self.reset_pending and self.model.future is not None:
             self.poll_model()
             if self.model.future is not None:
                 # 新段从首个可提交查询的观测开始，与离线起点一致。

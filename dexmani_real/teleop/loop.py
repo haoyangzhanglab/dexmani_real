@@ -466,15 +466,11 @@ class TeleopLoop:
         action_accepted = False
         command_unconfirmed = False
         compute_start_ns = time.monotonic_ns()
-        first_target = self.last_command is None
+        first_target = self.target_deadline_ns is None
+        initializing_anchor = self.controller.anchor is None
         try:
-            if first_target:
-                try:
-                    self.controller.reset(row)
-                except StartPoseRejected as exc:
-                    logger.warning("%s", exc)
-                    self.request_episode_end(str(exc))
-                    return
+            if initializing_anchor:
+                self.controller.reset(row)
             result = self.controller.compute_target(row, control_ns=compute_start_ns)
             if self.recorder is not None:
                 self.recorder.check_error()
@@ -500,6 +496,8 @@ class TeleopLoop:
                 logger.info("Teleop %s", f"保持/等待：{reason}" if rejected else "恢复有效目标")
                 self.hold_reason = reason
             if rejected and self.last_command is None:
+                if initializing_anchor:
+                    self.controller.clear()
                 return
             expires_ns = (
                 self.target_deadline_ns if rejected else
@@ -516,6 +514,9 @@ class TeleopLoop:
             if first_target:
                 logger.info("Teleop first target submitted")
                 self.audio.play("begin")
+        except StartPoseRejected as exc:
+            logger.warning("%s", exc)
+            self.request_episode_end(str(exc))
         except IKReferenceError as exc:
             self.request_episode_end(str(exc))
         except (FeedbackUnavailable, CommandExpired) as exc:
@@ -524,6 +525,10 @@ class TeleopLoop:
             command_unconfirmed = True
             if exc.persistent:
                 self.request_episode_end(str(exc))
+            else:
+                # 未确认写入可能已移动手指，禁止重发上一次确认的手部命令。
+                self.controller.hand_retargeter.clear_reference()
+                self.last_command = None
         except OperationCancelled as exc:
             # 先检查 SDK/worker 故障，再即时登记已入队的终止意图。
             interrupted = self.poll_blocking_commands()

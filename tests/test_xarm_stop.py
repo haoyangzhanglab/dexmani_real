@@ -24,6 +24,13 @@ def robot_with_mock_arm(monkeypatch):
     arm.process = Mock(pid=1, exitcode=None)
     arm.process.is_alive.return_value = True
     arm.io.ready.set()
+
+    def join(_timeout):
+        assert arm.io.closing.is_set()
+        arm.process.exitcode = 0
+        arm.process.is_alive.return_value = False
+
+    arm.process.join.side_effect = join
     driver = XArm7(cfg)
     driver.api = sdk = Mock()
     sdk.set_state.return_value = 0
@@ -47,9 +54,9 @@ def robot_with_mock_arm(monkeypatch):
 
     def acknowledge_stop(_timeout):
         assert state.stop_signal.is_set()
-        if not arm.io.stopped.is_set():
+        if not arm.io.sdk_stop_handled.is_set():
             owner.stop()
-        return arm.io.stopped.is_set()
+        return arm.io.sdk_stop_handled.is_set()
 
     poll = arm.pipe.poll
 
@@ -58,7 +65,7 @@ def robot_with_mock_arm(monkeypatch):
             owner.operation(arm.child_pipe.recv())
         return poll(0)
 
-    monkeypatch.setattr(arm.io.stopped, "wait", acknowledge_stop)
+    monkeypatch.setattr(arm.io.sdk_stop_handled, "wait", acknowledge_stop)
     monkeypatch.setattr(arm.pipe, "poll", run_owner)
 
     with arm.pipe, arm.child_pipe:
@@ -98,7 +105,7 @@ def test_sdk_stop_does_not_confirm_physical_stop(robot_with_mock_arm, monkeypatc
         robot.stop()
 
     sdk.set_state.assert_called_once_with(4)
-    assert robot.arm.io.stopped.is_set()
+    assert robot.arm.io.sdk_stop_handled.is_set()
     assert not robot.arm.io.closing.is_set()
     assert sdk.get_joint_states.call_count > 1
     assert not robot.arm.physical_stop_confirmed
@@ -166,7 +173,7 @@ def test_robot_stop_propagates_owner_stop_error(robot_with_mock_arm):
 def test_robot_stop_requires_feedback_from_live_owner(robot_with_mock_arm):
     robot, sdk, _, _ = robot_with_mock_arm
     arm = robot.arm
-    arm.io.stopped.set()
+    arm.io.sdk_stop_handled.set()
     arm.io.closing.set()
     arm.process.exitcode = 0
     arm.process.is_alive.return_value = False
@@ -180,7 +187,7 @@ def test_robot_stop_requires_feedback_from_live_owner(robot_with_mock_arm):
 
 def test_robot_stop_fails_on_missing_sdk_acknowledgement(robot_with_mock_arm, monkeypatch):
     robot, sdk, _, advance = robot_with_mock_arm
-    monkeypatch.setattr(robot.arm.io.stopped, "wait", advance)
+    monkeypatch.setattr(robot.arm.io.sdk_stop_handled, "wait", advance)
 
     with pytest.raises(TimeoutError, match="SDK acceptance not confirmed"):
         robot.stop()
@@ -194,7 +201,7 @@ def test_robot_stop_reports_existing_owner_fault_without_waiting(robot_with_mock
     robot, sdk, _, _ = robot_with_mock_arm
     robot.arm.io.fault.value = b"controller connection lost"
     wait = Mock()
-    monkeypatch.setattr(robot.arm.io.stopped, "wait", wait)
+    monkeypatch.setattr(robot.arm.io.sdk_stop_handled, "wait", wait)
 
     with pytest.raises(RobotError, match="controller connection lost"):
         robot.stop()
@@ -233,3 +240,128 @@ def test_robot_stop_preserves_interrupt_during_owner_failure(robot_with_mock_arm
     assert robot.runtime_state.estop_request
     assert robot.arm.io.closing.is_set()
     assert not robot.arm.physical_stop_confirmed
+
+
+@pytest.mark.parametrize("hand_action", [None, "hold", "release"])
+def test_robot_close_confirms_physical_stop_before_hand_and_owner_close(
+    robot_with_mock_arm, monkeypatch, hand_action,
+):
+    robot, sdk, clock, _ = robot_with_mock_arm
+    arm = robot.arm
+    samples = []
+
+    def read(**_):
+        sdk.set_state.assert_called_once_with(4)
+        assert not arm.io.closing.is_set()
+        samples.append(clock.now_ns)
+        return sdk.get_joint_states.return_value
+
+    def after_stop_confirmation():
+        assert arm.physical_stop_confirmed
+        assert not arm.io.closing.is_set()
+        return True
+
+    sdk.get_joint_states.side_effect = read
+    if hand_action is not None:
+        robot.hand = hand = Mock(is_connected=True, control=None)
+        robot.hand_stop_required = True
+        hold = Mock(side_effect=after_stop_confirmation)
+        monkeypatch.setattr(robot, "hold_hand", hold)
+        hand.release.side_effect = after_stop_confirmation
+
+    if hand_action == "release":
+        robot.close(release_hand=True)
+    else:
+        robot.close()
+
+    assert arm.physical_stop_confirmed
+    assert samples[-1] - samples[0] >= round(STANDSTILL_DWELL_S * 1e9)
+    assert arm.is_closed
+    assert robot.arm is None
+    assert not robot.connected
+    if hand_action is not None:
+        hand.disconnect.assert_called_once()
+        if hand_action == "release":
+            hand.release.assert_called_once()
+            hold.assert_not_called()
+        else:
+            hold.assert_called_once()
+            hand.release.assert_not_called()
+
+
+def test_robot_close_reports_failed_physical_stop_after_successful_owner_join(robot_with_mock_arm):
+    robot, sdk, _, _ = robot_with_mock_arm
+    arm = robot.arm
+    velocity = np.full(7, 2 * robot.arm_config.standstill_velocity_tolerance_rad_s)
+    sdk.get_joint_states.return_value = 0, (np.zeros(7), velocity)
+
+    with pytest.raises(TimeoutError, match="arm physical stop execution deadline expired"):
+        robot.close()
+
+    sdk.set_state.assert_called_once_with(4)
+    assert arm.process.exitcode == 0
+    assert arm.is_closed
+    assert not arm.physical_stop_confirmed
+    assert robot.arm is None
+
+
+def test_robot_close_requires_feedback_from_live_owner(robot_with_mock_arm):
+    robot, sdk, _, _ = robot_with_mock_arm
+    arm = robot.arm
+    arm.io.sdk_stop_handled.set()
+    arm.io.closing.set()
+    arm.process.exitcode = 0
+    arm.process.is_alive.return_value = False
+
+    with pytest.raises(RobotError, match="owner unavailable for physical stop verification"):
+        robot.close()
+
+    sdk.get_joint_states.assert_not_called()
+    assert arm.is_closed
+    assert not arm.physical_stop_confirmed
+
+
+def test_robot_close_reports_closed_feedback_channel(robot_with_mock_arm, monkeypatch):
+    robot, _, _, _ = robot_with_mock_arm
+    arm = robot.arm
+    end_of_file = EOFError()
+    monkeypatch.setattr(arm.pipe, "recv", Mock(side_effect=end_of_file))
+
+    with pytest.raises(RobotError, match="feedback channel closed during physical stop") as error:
+        robot.close()
+
+    assert error.value.__cause__ is end_of_file
+    assert arm.is_closed
+    assert not arm.physical_stop_confirmed
+
+
+def test_robot_close_can_retry_owner_cleanup_after_physical_stop(robot_with_mock_arm):
+    robot, sdk, _, _ = robot_with_mock_arm
+    arm = robot.arm
+    join = arm.process.join.side_effect
+    arm.process.join.side_effect = None
+
+    with pytest.raises(TimeoutError, match="owner process still active"):
+        robot.close()
+
+    assert robot.arm is arm
+    assert arm.physical_stop_confirmed
+    previous_count = sdk.get_joint_states.call_count
+    arm.process.join.side_effect = join
+
+    robot.close()
+
+    assert sdk.get_joint_states.call_count == previous_count
+    assert arm.is_closed
+
+
+def test_robot_close_reclaims_channels_when_owner_never_started(robot_with_mock_arm):
+    robot, sdk, _, _ = robot_with_mock_arm
+    arm = robot.arm
+    arm.process = None
+    arm.io.ready.clear()
+
+    robot.close()
+
+    sdk.get_joint_states.assert_not_called()
+    assert arm.is_closed

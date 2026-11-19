@@ -57,7 +57,7 @@ class ArmChannels:
         self, ctx, *, stop_signal, emergency_signal
     ):
         self.stop, self.emergency = stop_signal, emergency_signal
-        self.closing, self.stopped, self.ready = (ctx.Event() for _ in range(3))
+        self.closing, self.sdk_stop_handled, self.ready = (ctx.Event() for _ in range(3))
         self.fault = ctx.Array("c", 1024, lock=False)
         # 仅 Owner 写；先写原因再置 stop，接纳新操作时清除。
         self.stop_reason = ctx.Array("c", 64, lock=False)

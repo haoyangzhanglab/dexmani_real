@@ -13,6 +13,7 @@ from dexmani_real.config.real import RealConfig
 from dexmani_real.control.actions import ActionMapper
 from dexmani_real.data.export import ExportConfig, export_zarr
 from dexmani_real.data.raw import ARM_ACTION_SEMANTICS, TIMING_ROW_DTYPE, RawReader
+from dexmani_real.geometry import kinematics
 from dexmani_real.geometry.kinematics import HandFK, kinematic_urdf, validate_xhand_urdf
 from dexmani_real.replay.trajectory import load_trajectory
 from dexmani_real.robot.commands import RobotCommand
@@ -59,6 +60,32 @@ def test_urdf_validation_rejects_invalid_joint_contract(fault, match):
         joint.set("type", "prismatic")
     with pytest.raises(ValueError, match=match):
         validate_xhand_urdf(ET.tostring(root, encoding="unicode"))
+
+
+@pytest.mark.parametrize("xyz,match", [
+    ("0.0096 0.0228 0.0305", "joint frame differs from right-hand URDF"),
+    ("0.0095 0.0228", "origin xyz must have three finite values"),
+    ("0.0095 nan 0.0305", "origin xyz must have three finite values"),
+    ("0.0095 0.0228 inf", "origin xyz must have three finite values"),
+])
+def test_urdf_validation_rejects_invalid_origin_xyz(xyz, match):
+    root = ET.fromstring(kinematic_urdf("right_hand_link"))
+    origin = root.find("joint[@name='right_hand_thumb_bend_joint']/origin")
+    origin.set("xyz", xyz)
+    with pytest.raises(ValueError, match=match):
+        validate_xhand_urdf(ET.tostring(root, encoding="unicode"))
+
+
+def test_combined_urdf_rejects_cycle_before_joint_validation(tmp_path, monkeypatch):
+    path = tmp_path / "combined.urdf"
+    root = ET.fromstring(kinematic_urdf("right_hand_link"))
+    joint = root.find("joint[@name='right_hand_thumb_bend_joint']")
+    joint.find("child").set("link", "right_hand_link")
+    ET.ElementTree(root).write(path)
+    monkeypatch.setattr(kinematics, "XARM7_XHAND_RIGHT_URDF_PATH", path)
+
+    with pytest.raises(ValueError, match="reaches link right_hand_link more than once"):
+        validate_xhand_urdf()
 
 
 def test_sdk_feedback_and_commands_use_ids_and_radians():

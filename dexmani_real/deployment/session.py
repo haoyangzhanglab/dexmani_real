@@ -669,9 +669,8 @@ class PolicySession:
                 robot.service_feedback()
                 if self.runtime_state.quit_requested or self.runtime_state.estop_request:
                     return
-                future = model.poll()
-                if future is not None:
-                    future.result()
+                episode.poll_model()
+                if model.future is None:
                     break
                 if time.monotonic() >= deadline:
                     raise TimeoutError("episode model task remains pending")

@@ -15,7 +15,7 @@ FINGER_CHAINS = np.arange(1, 21).reshape(5, 4)
 
 
 class HandGeometryRejected(ValueError):
-    """新鲜输入无法定义当前手部几何目标，可短暂保持上一命令。"""
+    """当前输入无法定义可用的手部几何。"""
 
 
 @dataclass(frozen=True)

@@ -197,11 +197,11 @@ class ArmController:
             self.fault(exc)
         finally:
             self.io.publish_status(self.status)
-            self.io.stopped.set()  # 处理结束；停止失败仍保存在 fault。
+            self.io.sdk_stop_handled.set()  # SDK 处理结束，失败保存在 fault。
 
     def motion_operation(self, message: PrepareRequest | HomeRequest | StandstillRequest) -> BaseException | None:
         self.io.stop_reason.value = b""
-        self.io.stopped.clear()
+        self.io.sdk_stop_handled.clear()
         kind = "home" if isinstance(message, HomeRequest) else "prepare"
         error = None
         try:
@@ -331,7 +331,7 @@ class ArmController:
             tick = time.monotonic_ns() + period
             feedback_due = time.monotonic_ns() + feedback_period
             while not self.io.closing.is_set() and not self.io.fault.value:
-                if self.io.stop.is_set() and not self.io.stopped.is_set():
+                if self.io.stop.is_set() and not self.io.sdk_stop_handled.is_set():
                     self.stop()
                     continue
                 if self.pipe.poll():
@@ -356,7 +356,7 @@ class ArmController:
                     tick = (sent_ns if sent_ns is not None else time.monotonic_ns()) + period
                 # 停止可中断等待，目标仅在计划的伺服时刻生效。
                 delay = max(0, min(tick, feedback_due) - time.monotonic_ns()) / 1e9
-                if self.io.stopped.is_set():
+                if self.io.sdk_stop_handled.is_set():
                     self.pipe.poll(delay)
                 else:
                     self.io.stop.wait(delay)
@@ -368,7 +368,7 @@ class ArmController:
                 self.io.closing.set()
                 self.io.stop.set()
         finally:
-            if not self.io.stopped.is_set():
+            if not self.io.sdk_stop_handled.is_set():
                 self.stop()
             try:
                 self.driver.close()

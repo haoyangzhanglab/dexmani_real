@@ -19,16 +19,20 @@
 
 ## 与控制链的关系
 
-[VR 接收端](../dexmani_real/sensor/vr.py) 提供关键点，[VRController](../dexmani_real/teleop/vr.py) 组合腕部映射与 `HandRetargeter` 输出，再由共享动作映射和遥操作循环提交、录制。重定向模块不直接发送设备命令；求解参考从实测姿态建立，仅在命令提交正常返回后更新。
+[VR 接收端](../dexmani_real/sensor/vr.py) 提供关键点，[VRController](../dexmani_real/teleop/vr.py) 组合腕部映射与 `HandRetargeter` 输出。共享动作映射生成机器人目标，由遥操作循环提交、录制。
 
 ## 关节顺序与限位
 
 SDK、遥操作输出、Policy 和 Replay 共用 [SDK 关节表](../dexmani_real/robot/model.py) 的 12 列弧度向量。顺序为拇指 3 轴、食指 3 轴、中指 2 轴、无名指 2 轴和小指 2 轴。`HandFK` 按名称映射到 Pinocchio 的内部列，SDK 与 URDF 的关节值同号，旋转方向由 URDF 的带符号局部轴决定。HOME 配置的 `_deg` 字段先转换为弧度。
 
-额定限位来自仓库的 [右手 URDF](../assets/robots/xhand/xhand_right.urdf)，启动时与 [组合 URDF](../assets/robots/xhand/xarm7_xhand_right.urdf) 对照。实验操作限位来自 [HandConfig](../dexmani_real/config/xhand.py) 的 `qpos_min_rad` 和 `qpos_max_rad`，须在额定范围内。`Robot.validate_command()` 在发送前拒绝越界的普通目标，并报告关节名称。暂停时的实测位置保持按额定限位检查。
+设备启动检查与 `HandFK` 构建都会核对 12 个 SDK 关节的父子连杆、带符号转轴、`origin xyz/rpy` 和额定位置限位。`xyz` 使用米，`rpy` 使用弧度。[右手 URDF](../assets/robots/xhand/xhand_right.urdf) · [组合 URDF](../assets/robots/xhand/xarm7_xhand_right.urdf)
+
+实验操作限位由 `qpos_min_rad` 和 `qpos_max_rad` 设置，须在额定范围内。`Robot.validate_command()` 在发送前拒绝越界的普通目标，并报告关节名称。暂停时的实测位置保持按额定限位检查。[HandConfig](../dexmani_real/config/xhand.py)
 
 ## 提交语义
 
-现场求解的时间间隔从上次命令提交返回算到本周期开始计算目标的时刻。`retarget` 不推进提交参考。拒绝或发送抛错也不推进。成功重发旧命令时，参考位置保持，提交时间更新。零时间间隔返回独立的参考副本，时间倒退报错。
+首个控制目标使用实测手部姿态和起始观测完成时间作为求解参考，后续由已确认的命令更新。现场求解的时间间隔从参考时间算到本周期开始计算目标的时刻。求解拒绝时，可在原租约内重发上一条已确认命令。重发成功后更新参考时间并保留参考位置。
+
+普通写入出现非持久 CRC 且重试仍未确认时，本段继续运行。旧手部参考和可重发目标失效，控制循环等待写入报错后成功查询的关节反馈。下一次求解以该实测关节位置和查询时间建立手部参考，并沿用人体手部标定和 VR 腕部锚点。目标租约和来源时效在等待期间继续生效。
 
 返回[项目架构](../README.md)。

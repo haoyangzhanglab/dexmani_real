@@ -107,7 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="override saved inference steps; ODE uses substeps per control period",
     )
     research.add_argument(
-        "--seed", type=nonnegative_int, default=0, help="fixed inference seed reset at episode start and after HOI recovery"
+        "--seed", type=nonnegative_int, default=0,
+        help="fixed inference seed restored at episode start and whenever the policy context is rebuilt",
     )
     research.add_argument("--device", default="cuda:0")
     return parser

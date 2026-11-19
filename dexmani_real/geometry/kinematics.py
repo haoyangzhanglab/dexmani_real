@@ -22,8 +22,7 @@ from dexmani_real.robot.model import (
 def kinematic_urdf(root_link: str, *, stop_link: str | None = None) -> str:
     """从完整组合 URDF 提取运动学子树，保留原始 joint 定义并移除网格。"""
     root = ET.parse(XARM7_XHAND_RIGHT_URDF_PATH).getroot()
-    if root_link not in {link.attrib["name"] for link in root.findall("link")}:
-        raise ValueError(f"robot URDF is missing {root_link}")
+    link_names = {link.attrib["name"] for link in root.findall("link")}
     children: dict[str, list[tuple[str, str]]] = {}
     joint_names = set()
     for joint in root.findall("joint"):
@@ -41,6 +40,10 @@ def kinematic_urdf(root_link: str, *, stop_link: str | None = None) -> str:
     pending = [root_link]
     while pending:
         name = pending.pop()
+        if name not in link_names:
+            raise ValueError(f"robot URDF is missing link {name}")
+        if name in links:
+            raise ValueError(f"robot URDF reaches link {name} more than once")
         links.add(name)
         if name != stop_link:
             for joint_name, child_link in children.get(name, ()):
@@ -59,20 +62,21 @@ def kinematic_urdf(root_link: str, *, stop_link: str | None = None) -> str:
 
 
 def validate_xhand_urdf(hand_urdf: str | None = None) -> None:
-    """核对实际使用的组合手部模型与右手 URDF 的 12 个 SDK 转动轴。"""
+    """核对 12 个 SDK 转动关节的轴、坐标系和额定位置限位。"""
     names = XHAND_SDK_JOINT_NAMES
-    if len(names) != HAND_DOF or len(set(names)) != HAND_DOF or not all(names):
+    expected = set(names)
+    if len(names) != HAND_DOF or len(expected) != HAND_DOF or "" in expected:
         raise ValueError(f"XHand SDK must define {HAND_DOF} unique joint names")
 
-    def active_joints(root, source):
-        joints = {}
+    def active_joints(root: ET.Element, source: str) -> dict[str, ET.Element]:
+        joints: dict[str, ET.Element] = {}
         for joint in root.findall("joint"):
             name = joint.get("name")
             if not name or name in joints:
                 raise ValueError(f"{source} contains an empty or duplicate joint name {name!r}")
             joints[name] = joint
         active = {name: joint for name, joint in joints.items() if joint.get("type") != "fixed"}
-        missing, extra = set(names) - active.keys(), active.keys() - set(names)
+        missing, extra = expected - active.keys(), active.keys() - expected
         if missing or extra:
             raise ValueError(f"{source} XHand joint mismatch: missing={sorted(missing)}, extra={sorted(extra)}")
         return active
@@ -86,22 +90,27 @@ def validate_xhand_urdf(hand_urdf: str | None = None) -> None:
         for joint in (reference[name], hand[name]):
             if joint.get("type") != "revolute" or joint.find("mimic") is not None:
                 raise ValueError(f"XHand joint {name} must be an independent revolute joint in radians")
+            axis_node, parent, child, limit = (joint.find(tag) for tag in ("axis", "parent", "child", "limit"))
+            if axis_node is None or parent is None or child is None or limit is None:
+                raise ValueError(f"XHand joint {name} requires axis, parent, child and position limits")
+            origin = joint.find("origin")
+            origin_attrs = {} if origin is None else origin.attrib
             try:
-                axis = tuple(map(float, joint.find("axis").attrib["xyz"].split()))
-                origin = joint.find("origin")
-                rpy = tuple(map(float, origin.get("rpy", "0 0 0").split())) if origin is not None else (0.0, 0.0, 0.0)
-                limit = joint.find("limit")
-                bounds = float(limit.get("lower")), float(limit.get("upper"))
-                parent, child = joint.find("parent").attrib["link"], joint.find("child").attrib["link"]
-            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                axis = tuple(map(float, axis_node.attrib["xyz"].split()))
+                xyz = tuple(map(float, origin_attrs.get("xyz", "0 0 0").split()))
+                rpy = tuple(map(float, origin_attrs.get("rpy", "0 0 0").split()))
+                bounds = float(limit.attrib["lower"]), float(limit.attrib["upper"])
+                frame = axis, parent.attrib["link"], child.attrib["link"], xyz, rpy
+            except (KeyError, ValueError) as exc:
                 raise ValueError(f"XHand joint {name} has invalid axis, frame or position limits") from exc
             if len(axis) != 3 or not isclose(hypot(*axis), 1.0, rel_tol=0, abs_tol=1e-9):
                 raise ValueError(f"XHand joint {name} must have a signed unit axis")
-            if len(rpy) != 3 or not all(map(isfinite, rpy)):
-                raise ValueError(f"XHand joint {name} must have a finite three-axis origin rotation in radians")
+            for field, values in (("xyz", xyz), ("rpy", rpy)):
+                if len(values) != 3 or not all(map(isfinite, values)):
+                    raise ValueError(f"XHand joint {name} origin {field} must have three finite values")
             if bounds != (lower, upper):
                 raise ValueError(f"XHand joint {name} URDF limits {bounds} differ from rated limits {(lower, upper)} rad")
-            joint_frames.append((axis, parent, child, rpy))
+            joint_frames.append(frame)
         if joint_frames[0] != joint_frames[1]:
             raise ValueError(f"XHand joint {name} signed axis or joint frame differs from right-hand URDF")
 

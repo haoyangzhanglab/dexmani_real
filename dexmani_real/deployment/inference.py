@@ -23,7 +23,8 @@ class PolicyWorker:
         self.warmed_up = False
         self.model = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-model")
-        self.future = self.close_future = None
+        self.future: Future | None = None
+        self.close_future: Future | None = None
 
     def _submit(self, function, *args, **kwargs):
         if self.close_future is not None or self.future is not None:

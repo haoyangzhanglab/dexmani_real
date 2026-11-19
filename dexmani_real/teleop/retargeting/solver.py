@@ -1,4 +1,4 @@
-"""有界 XHand 重定向；实测起点建立参考，提交尝试正常返回后推进参考。"""
+"""有界 XHand 重定向，使用实测或已确认提交的关节参考。"""
 
 from math import expm1
 
@@ -8,12 +8,12 @@ import numpy as np
 from dexmani_real.control.actions import StartPoseRejected
 from dexmani_real.geometry.kinematics import HandFK
 from dexmani_real.robot.commands import (
+    HandTargetRejected,
     hand_reference_from_feedback,
     validate_hand_target,
 )
 from dexmani_real.robot.model import (
     HAND_DOF,
-    HAND_JOINT_SHAPE,
     XHAND_FINGERTIP_LINK_NAMES,
     XHAND_SDK_JOINT_NAMES,
 )
@@ -40,7 +40,6 @@ FINGER_FRAME_NAMES = (
 class HandRetargeter:
     def __init__(self, config, hand_config):
         config.validate()
-        hand_config.validate_limits()
         self.config = config
         self.fk = HandFK()
         model = self.fk.model
@@ -94,43 +93,36 @@ class HandRetargeter:
         # 优化器的绝对目标收敛容差。
         self.optimizer.set_ftol_abs(LOSS_TOLERANCE)
         self.calibration = None
-        self.reference_qpos = None
-        self.reference_timestamp_ns = None
+        self.reference: tuple[np.ndarray, int] | None = None
         self.rejection_reason = None
 
     def calibrate(self, measurements):
         self.calibration = HandCalibration.from_measurements(measurements, self.config)
 
-    def reset(self, initial_qpos, *, timestamp_ns):
-        qpos = np.asarray(initial_qpos, dtype=np.float64)
+    def clear_reference(self) -> None:
+        self.reference = None
+
+    def reset(self, initial_qpos: np.ndarray, *, timestamp_ns: int) -> None:
         if timestamp_ns <= 0:
             raise ValueError("hand reset timestamp must be positive")
         try:
-            reference = hand_reference_from_feedback(qpos, *self.limits.T)
-        except ValueError as exc:
-            if qpos.shape != HAND_JOINT_SHAPE or not np.isfinite(qpos).all():
-                raise
-            outside = (qpos < self.limits[:, 0]) | (qpos > self.limits[:, 1])
-            joints = "; ".join(
-                f"{XHAND_SDK_JOINT_NAMES[i]}={np.rad2deg(qpos[i]):.2f}° "
-                f"(要求 {np.rad2deg(self.limits[i, 0]):.2f}–"
-                f"{np.rad2deg(self.limits[i, 1]):.2f}°)"
-                for i in np.flatnonzero(outside)
-            )
-            raise StartPoseRejected(f"本段未开始：手部起点超出操作范围：{joints}；请先就位后再次按 B。") from exc
-        self.reference_qpos = reference
-        self.reference_timestamp_ns = int(timestamp_ns)
+            qpos = hand_reference_from_feedback(initial_qpos, *self.limits.T)
+        except HandTargetRejected as exc:
+            raise StartPoseRejected(f"手部实测参考不满足要求，请先就位后再次按 B。{exc}") from exc
+        self.reference = qpos, int(timestamp_ns)
         self.rejection_reason = None
 
-    def retarget(self, landmarks, *, timestamp_ns):
-        if self.calibration is None or self.reference_qpos is None:
+    def retarget(self, landmarks: np.ndarray, *, timestamp_ns: int) -> np.ndarray | None:
+        reference = self.reference
+        if self.calibration is None or reference is None:
             raise RuntimeError("hand retargeting requires calibration and a measured reset pose")
-        if timestamp_ns < self.reference_timestamp_ns:
+        qpos, reference_ns = reference
+        if timestamp_ns < reference_ns:
             raise ValueError("hand computation time moved backwards")
-        dt_s = (timestamp_ns - self.reference_timestamp_ns) * 1e-9
+        dt_s = (timestamp_ns - reference_ns) * 1e-9
         self.rejection_reason = None
         if dt_s == 0:
-            return self.reference_qpos.copy()
+            return qpos.copy()
         try:
             points = prepare_landmarks(landmarks)
             targets = self.calibration.targets(
@@ -142,17 +134,17 @@ class HandRetargeter:
         tau = self.config.smoothing_tau_s
         alpha = 1.0 if tau == 0 else -expm1(-dt_s / tau)
         objective = HandObjective(
-            self.fk, self.frame_ids, targets, self.reference_qpos, dt_s, self.config,
+            self.fk, self.frame_ids, targets, qpos, dt_s, self.config,
         )
         # 搜索的是滤波前候选；补偿 alpha 后，最终命令仍可达到 v_max。
         # 若候选先限为 v_max*dt 再滤波，高频时实际速率上限会降为 alpha*v_max。
         step = self.config.max_joint_speed_rad_s * dt_s / alpha
-        lower = np.maximum(self.limits[:, 0], self.reference_qpos - step)
-        upper = np.minimum(self.limits[:, 1], self.reference_qpos + step)
+        lower = np.maximum(self.limits[:, 0], qpos - step)
+        upper = np.minimum(self.limits[:, 1], qpos + step)
         self.optimizer.set_lower_bounds(lower)
         self.optimizer.set_upper_bounds(upper)
         self.optimizer.set_min_objective(objective)
-        seed = self.reference_qpos.copy()
+        seed = qpos.copy()
         try:
             solution = np.asarray(self.optimizer.optimize(seed), dtype=np.float64)
         except nlopt.RoundoffLimited as exc:
@@ -166,15 +158,14 @@ class HandRetargeter:
         try:
             validate_hand_target(solution, lower, upper)
             # 实测起点或最后提交参考同时作为 warm start、阻尼中心和滤波状态。
-            command = solution if alpha == 1.0 else self.reference_qpos + alpha * (solution - self.reference_qpos)
+            command = solution if alpha == 1.0 else qpos + alpha * (solution - qpos)
             return validate_hand_target(command, *self.limits.T)
         except ValueError as exc:
             self.rejection_reason = str(exc)
             return None
 
-    def commit(self, qpos, *, timestamp_ns):
+    def commit(self, qpos: np.ndarray, *, timestamp_ns: int) -> None:
         # 控制线程仅在发送正常返回后更新最后提交参考。
-        if self.reference_timestamp_ns is None or timestamp_ns < self.reference_timestamp_ns:
+        if self.reference is None or timestamp_ns < self.reference[1]:
             raise ValueError("committed hand time moved backwards or reset is missing")
-        self.reference_qpos = qpos.copy()
-        self.reference_timestamp_ns = int(timestamp_ns)
+        self.reference = qpos.copy(), int(timestamp_ns)

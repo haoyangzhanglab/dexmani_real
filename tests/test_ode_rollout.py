@@ -24,11 +24,13 @@ class Worker:
     poll = PolicyWorker.poll
 
     def predict(self, rows, **kwargs):
+        assert self.future is None
         self.calls.append((rows, kwargs))
         self.future = Future()
+        self.future.set_running_or_notify_cancel()
 
-    def finish(self, target):
-        self.future.set_result(np.full((1, 19), target, dtype=np.float32))
+    def finish(self, target, *, steps=1):
+        self.future.set_result(np.full((steps, 19), target, dtype=np.float32))
 
 
 class Recorder:
@@ -137,7 +139,7 @@ def test_ode_discards_unexecuted_chunk_on_skip(episode):
     rollout, worker, _, robot, step = episode
     rollout.last_slot = 0
     rollout.history = deque([np.zeros(19)], maxlen=2)
-    rollout.first_prediction = False
+    rollout.reset_pending = False
     rollout.prev_action = np.full(19, 10)
     rollout.plan = ActionChunk(np.full((2, 19), 99), 0)
     rollout.cursor = 1
@@ -183,6 +185,54 @@ def test_policy_run_resumes_after_write_crc_without_advancing_ode_history(episod
     assert result.termination_details == "test complete" and not result.errors
     assert rollout.model is worker
     assert robot.send_action.call_count == 3
+
+
+@pytest.mark.parametrize("mode", ["async", "rtc"])
+def test_prefetch_rollout_waits_for_old_prediction_after_write_crc(episode, mode):
+    rollout, worker, recorder, robot, step = episode
+    rollout.execution.mode = mode
+    rollout.execution.action_steps = 2
+    rollout.execution.prefetch_steps = 1
+    rollout.execution.rtc_guidance_cap = 10.0
+    rollout.policy_info.requires_prev_action = False
+    robot.send_action.side_effect = [None, HandCommandUnconfirmed(2, persistent=False), None]
+
+    step(0, 1)
+    worker.finish(10, steps=4)
+    step(1, 2)
+    step(2, 3)
+    old_future = worker.future
+    assert old_future.running()
+    assert rollout.reset_pending and rollout.plan is None and rollout.query is None
+    assert not rollout.finished and not recorder.rows[-1][2]
+    assert [kwargs["reset_episode"] for _, kwargs in worker.calls] == [True, False]
+
+    assert rollout.select_action(3) is None
+    robot.hand_feedback_pending = True
+    step(3, 4)
+    robot.hand_feedback_pending = False
+    step(4, 5)
+    assert worker.future is old_future and not old_future.done()
+    assert not rollout.history and len(recorder.rows) == 3
+    assert len(worker.calls) == 2 and robot.send_action.call_count == 2
+
+    worker.finish(99, steps=4)
+    assert rollout.select_action(5) is None
+    assert worker.future is old_future
+    step(5, 6)
+    assert len(worker.calls) == 3 and worker.future is not old_future
+    rows, kwargs = worker.calls[-1]
+    assert kwargs == {"reset_episode": True}
+    np.testing.assert_array_equal(rows, np.full((2, 19), 6))
+    assert robot.send_action.call_count == 2
+
+    worker.finish(20, steps=4)
+    step(6, 7)
+    assert not rollout.finished and robot.send_action.call_count == 3
+    assert [kwargs["reset_episode"] for _, kwargs in worker.calls] == [True, False, True]
+    command = robot.send_action.call_args.args[0]
+    np.testing.assert_array_equal(np.r_[command.arm_qpos, command.hand_qpos], np.full(19, 20))
+    assert recorder.starts == [0, 3]
 
 
 def test_rollout_ends_only_episode_on_persistent_crc(episode):
