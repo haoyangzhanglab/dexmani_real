@@ -26,7 +26,10 @@ class OSTrackAdapter:
             raise FileNotFoundError(f"OSTrack-256 checkpoint not found: {checkpoint}")
         config_path = root / OSTRACK_CONFIG
         if not config_path.is_file():
-            raise FileNotFoundError(f"OSTrack-256 source/config not found: {config_path}")
+            raise FileNotFoundError(
+                f"OSTrack-256 source/config not found: {config_path}. "
+                "Run bash third_party/cordvip_geometry/scripts/install_perception.sh ostrack."
+            )
 
         sys.path.insert(0, str(root))
         from lib.config.ostrack.config import cfg, update_config_from_file

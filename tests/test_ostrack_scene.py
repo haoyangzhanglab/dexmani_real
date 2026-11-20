@@ -42,12 +42,13 @@ class OSTrackSceneTest(unittest.TestCase):
             self.poses[name] = pose
 
         self.events = []
+        self.reused_images = []
         self.register_snapshots = {name: [] for name in self.names}
         self.register_depths = {name: [] for name in self.names}
         self.track_depths = dict.fromkeys(self.names, 1.0)
         self.scene = SceneTracker.__new__(SceneTracker)
-        self.scene.config = TrackingConfig(tracker_2d="ostrack", segmentation_interval_frames=4)
-        self.scene.segmenter = Mock()
+        self.scene.config = TrackingConfig(segmentation_interval_frames=4)
+        self.scene.segmenter = Mock(spec_set=["detect", "segment_boxes"])
         self.scene.segmenter.detect.side_effect = self.detect
         self.scene.segmenter.segment_boxes.side_effect = self.segment
         self.scene.ostrack = Mock()
@@ -57,6 +58,7 @@ class OSTrackSceneTest(unittest.TestCase):
         )
         self.scene.trackers = {}
         self.scene.renderers = {}
+        render_masks = self.masks.copy()
         for name in self.names:
             self.scene.trackers[name] = SimpleNamespace(
                 estimator=SimpleNamespace(pose_last=None, diameter=1),
@@ -64,9 +66,9 @@ class OSTrackSceneTest(unittest.TestCase):
                 register=Mock(side_effect=lambda *args, name=name: self.register(name)),
             )
             self.scene.renderers[name] = SimpleNamespace(
-                render_roi=lambda directions, pose, *args, name=name: (
-                    self.masks[name][::4, ::4] * pose[2, 3]
-                ),
+                render_roi=Mock(side_effect=lambda directions, pose, *args, name=name: (
+                    render_masks[name][::4, ::4] * pose[2, 3]
+                )),
             )
         self.scene.trackers["tray"].object_from_center[0, 3] = 0.01
         tracker_patch = patch(
@@ -82,8 +84,9 @@ class OSTrackSceneTest(unittest.TestCase):
             for name, box in self.mask_boxes.items()
         ]
 
-    def segment(self, rgb, boxes):
+    def segment(self, rgb, boxes, *, reuse_image=False):
         self.events.append(("segment", tuple(boxes)))
+        self.reused_images.append(reuse_image)
         return {name: self.masks[name] for name in boxes}
 
     def register(self, name):
@@ -130,6 +133,20 @@ class OSTrackSceneTest(unittest.TestCase):
         self.assertEqual(self.scene.last_good_bbox["cup"], self.mask_boxes["cup"])
         return reliable_pose
 
+    def hide_cup_until_reacquire(self, observed_depth):
+        visible_mask = self.masks["cup"]
+        self.masks["cup"] = np.zeros_like(visible_mask)
+        self.depth[visible_mask] = observed_depth
+        self.boxes["cup"] = None
+        reliable_pose = self.scene.trackers["cup"].estimator.pose_last
+        for _ in range(4):
+            result = self.scene.track(self.frame())
+            self.assertFalse(result.valid["cup"])
+            self.assertNotIn("cup", result.poses)
+            self.assertIs(self.scene.trackers["cup"].estimator.pose_last, reliable_pose)
+        self.assertIn("cup", self.scene.next_retry)
+        return visible_mask
+
     def test_normal_tracking_uses_image_masks_only_at_interval(self):
         result = self.initialize()
         self.assertEqual(result.valid, dict.fromkeys(self.names, True))
@@ -146,9 +163,6 @@ class OSTrackSceneTest(unittest.TestCase):
         self.assertEqual(self.scene.segmenter.segment_boxes.call_count, 2)
         self.assertEqual(self.scene.segmenter.segment_boxes.call_args.args[1], self.mask_boxes)
         self.assertEqual(self.scene.segmenter.detect.call_count, 1)
-        self.scene.segmenter.initialize.assert_not_called()
-        self.scene.segmenter.track.assert_not_called()
-        self.scene.segmenter.correct_masks.assert_not_called()
         self.assertEqual(self.scene.ostrack.initialize.call_count, len(self.names))
         priors = self.track_objects_mock.call_args.kwargs["bbox_priors"]
         np.testing.assert_allclose(
@@ -157,6 +171,7 @@ class OSTrackSceneTest(unittest.TestCase):
         )
 
     def test_last_good_box_recovery_is_valid_immediately_and_shares_segmentation(self):
+        self.scene.config = TrackingConfig(segmentation_interval_frames=1)
         self.initialize()
         self.enter_reacquire()
         self.events.clear()
@@ -174,9 +189,11 @@ class OSTrackSceneTest(unittest.TestCase):
         np.testing.assert_array_equal(result.poses["cup"], self.poses["cup"])
 
     def test_dino_runs_only_after_rejected_last_good_box_registration(self):
+        self.scene.config = TrackingConfig(segmentation_interval_frames=1)
         self.initialize()
         previous = self.enter_reacquire()
         self.events.clear()
+        self.reused_images.clear()
         self.register_depths["cup"] = [1.1, 1.0]
         result = self.scene.track(self.frame())
         self.assertEqual(self.events, [
@@ -186,6 +203,7 @@ class OSTrackSceneTest(unittest.TestCase):
         ])
         self.assertIs(self.register_snapshots["cup"][-2], previous)
         self.assertIs(self.register_snapshots["cup"][-1], previous)
+        self.assertEqual(self.reused_images, [False, True])
         self.assertTrue(all(result.valid.values()))
         self.assertEqual(result.failures, {})
 
@@ -203,6 +221,60 @@ class OSTrackSceneTest(unittest.TestCase):
         result = self.scene.track(self.frame())
         self.assertTrue(result.valid["cup"])
         self.assertEqual(self.scene.ostrack.initialize.call_count, len(self.names) + 1)
+
+    def test_disabled_recovery_reports_no_retry_and_keeps_object_invalid(self):
+        self.scene.config = TrackingConfig(recovery_enabled=False)
+        self.initialize()
+        self.enter_reacquire()
+        self.events.clear()
+
+        result = self.scene.track(self.frame())
+
+        self.assertFalse(result.valid["cup"])
+        self.assertNotIn("cup", result.poses)
+        self.assertEqual(result.failures["cup"], "REACQUIRE; recovery disabled")
+        self.assertFalse(any(kind in {"detect", "register"} for kind, _ in self.events))
+
+    def test_complete_foreground_occlusion_recovers_in_last_good_box(self):
+        self.initialize()
+        clear_mask = self.hide_cup_until_reacquire(0.7)
+        self.depth[clear_mask] = 1.0
+        self.masks["cup"] = clear_mask
+
+        result = self.scene.track(self.frame())
+
+        self.assertTrue(result.valid["cup"])
+        self.assertEqual(self.scene.segmenter.detect.call_count, 1)
+        self.scene.ostrack.initialize.assert_called_with("cup", self.rgb, self.mask_boxes["cup"])
+
+    def test_out_of_view_target_reenters_outside_last_good_box(self):
+        self.initialize()
+        self.hide_cup_until_reacquire(1.3)
+        old_box = self.mask_boxes["cup"]
+        new_box = (2, 18, 14, 38)
+        mask = self.masks["cup"]
+        mask[18:38, 2:14] = True
+        self.mask_boxes["cup"] = new_box
+        self.poses["cup"][:2, 3] = [-0.22, 0.1]
+        self.scene.renderers["cup"].render_roi.side_effect = None
+        self.scene.renderers["cup"].render_roi.return_value = mask[::4, ::4]
+
+        def segment(rgb, boxes, *, reuse_image=False):
+            masks = self.segment(rgb, boxes, reuse_image=reuse_image)
+            if boxes.get("cup") == old_box:
+                masks["cup"] = np.zeros_like(mask)
+            return masks
+
+        self.scene.segmenter.segment_boxes.side_effect = segment
+        self.scene.segmenter.segment_boxes.reset_mock()
+        result = self.scene.track(self.frame())
+
+        self.assertTrue(result.valid["cup"])
+        np.testing.assert_array_equal(result.poses["cup"], self.poses["cup"])
+        self.assertEqual(self.scene.segmenter.detect.call_count, 2)
+        self.assertEqual(self.scene.segmenter.segment_boxes.call_args_list[0].args[1]["cup"], old_box)
+        self.scene.segmenter.segment_boxes.assert_called_with(self.rgb, {"cup": new_box}, reuse_image=True)
+        self.scene.ostrack.initialize.assert_called_with("cup", self.rgb, new_box)
 
     def test_invalid_bbox_skips_prior_and_keeps_depth_validation(self):
         self.initialize()
@@ -225,29 +297,55 @@ class OSTrackSceneTest(unittest.TestCase):
         self.scene.track(self.frame())
         self.assertEqual(self.scene.last_good_bbox["cup"], (16, 6, 36, 26))
 
-    def test_default_sam2_video_keeps_event_masks_and_recovery_confirmation(self):
-        self.scene.config = TrackingConfig()
-        self.scene.ostrack = None
-        self.scene.segmenter.initialize.side_effect = self.segment
-        self.scene.segmenter.track.return_value = self.masks
-        self.scene.segmenter.correct_masks.return_value = self.masks
+    def test_early_segmentation_can_validate_occlusion_and_reuses_cad_depth(self):
         self.initialize()
-        self.scene.segmenter.track.assert_not_called()
-        previous = self.scene.trackers["cup"].estimator.pose_last
-        self.track_depths["cup"] = 1.1
+        offset = self.scene.bbox_offsets["cup"].copy()
+        self.masks["cup"] = self.masks["cup"].copy()
+        self.masks["cup"][:, :26] = False
+        self.depth[6:26, 14:26] = 0.7
+        self.boxes["cup"] = None
         result = self.scene.track(self.frame())
         self.assertFalse(result.valid["cup"])
-        self.scene.segmenter.track.assert_called_once()
-        self.assertEqual(self.scene.segmenter.detect.call_count, 1)
-        result = self.scene.track(self.frame())
-        self.assertFalse(result.valid["cup"])
-        self.assertIs(self.scene.trackers["cup"].estimator.pose_last, previous)
-        self.scene.segmenter.correct_masks.assert_called_once()
-        self.assertEqual(self.scene.segmenter.detect.call_count, 2)
-        self.track_depths["cup"] = 1.0
+        self.assertEqual(self.scene.segmenter.segment_boxes.call_count, 1)
         result = self.scene.track(self.frame())
         self.assertTrue(result.valid["cup"])
-        self.assertEqual(tuple(result.poses), self.names)
+        self.assertGreater(result.quality["cup"]["occluded_fraction"], 0)
+        self.assertEqual(self.scene.segmenter.segment_boxes.call_args.args[1], self.mask_boxes)
+        self.assertNotIn("cup", self.track_objects_mock.call_args.kwargs["bbox_priors"])
+        np.testing.assert_array_equal(self.scene.bbox_offsets["cup"], offset)
+        self.assertEqual(self.scene.renderers["cup"].render_roi.call_count, 3)
+        result = self.scene.track(self.frame())
+        self.assertFalse(result.valid["cup"])
+        self.assertEqual(self.scene.segmenter.segment_boxes.call_count, 2)
+        self.assertEqual(self.scene.segmenter.detect.call_count, 1)
+
+    def test_clear_mask_recalibrates_in_tracker_box_coordinates(self):
+        self.initialize()
+        original = self.scene.bbox_offsets["cup"].copy()
+        mask = np.zeros(self.image_shape, bool)
+        mask[7:25, 16:38] = True
+        self.masks["cup"] = mask
+        self.boxes["cup"] = (13, 4, 39, 30)
+        self.poses["cup"][:2, 3] += [0.02, -0.01]
+        for _ in range(4):
+            result = self.scene.track(self.frame())
+        self.assertTrue(result.valid["cup"])
+        offset = self.scene.bbox_offsets["cup"]
+        self.assertFalse(np.allclose(offset, original))
+        np.testing.assert_allclose(offset, [0, 2 / 26], atol=1e-7)
+        self.assertEqual(self.scene.last_good_bbox["cup"], (16, 7, 38, 25))
+        self.scene.track(self.frame())
+        pose, box, offset = self.track_objects_mock.call_args.kwargs["bbox_priors"]["cup"]
+        np.testing.assert_allclose(
+            foundationpose.xy_prior_delta(pose, self.K, box, offset, self.image_shape, 0.2),
+            [0, 0], atol=1e-8,
+        )
+        self.boxes["cup"] = (0, 0, 10, 10)
+        for _ in range(3):
+            result = self.scene.track(self.frame())
+        self.assertTrue(result.valid["cup"])
+        self.assertNotIn("cup", self.scene.bbox_offsets)
+        self.assertEqual(self.scene.ostrack.initialize.call_count, len(self.names))
 
 
 class XYPriorTest(unittest.TestCase):

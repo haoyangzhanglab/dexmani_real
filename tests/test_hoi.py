@@ -35,11 +35,7 @@ from dexmani_real.geometry.hoi import transform_task_points
 from dexmani_real.geometry.kinematics import ArmFK, HandFK, eef_poses
 from dexmani_real.geometry.pose import encode_eef_pose
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
-from dexmani_real.perception.hoi import (
-    build_tracking_config,
-    invalid_hoi_frame,
-    track_hoi_frame,
-)
+from dexmani_real.perception.hoi import build_tracking_config, track_hoi_frame
 from dexmani_real.perception.hoi_worker import run_hoi_worker
 from dexmani_real.robot.model import XARM7_JOINT_NAMES, XHAND_SDK_JOINT_NAMES
 
@@ -139,19 +135,20 @@ class TrackFrameTest(unittest.TestCase):
         self.assertFalse(stale_pose_result.valid)
         self.assertTrue(np.isnan(stale_pose_result.object_pose_camera[1]).all())
 
-    def test_tracking_failure_stays_at_adapter_boundary(self):
+    def test_initialization_failure_returns_invalid_frame(self):
         template = object_template()
         tracker = Mock()
         tracker.initialize.side_effect = TrackingFailure("registration failed")
-        with self.assertRaisesRegex(TrackingFailure, "registration failed"):
-            track_hoi_frame(tracker, object(), template, {}, initialize=True)
-
-        result = invalid_hoi_frame(template, "registration failed")
+        result = track_hoi_frame(tracker, object(), template, {}, initialize=True)
         self.assertFalse(result.valid)
         np.testing.assert_array_equal(result.object_valid, [False, False])
         self.assertTrue(np.isnan(result.object_pose_camera).all())
         self.assertEqual(result.quality, ({}, {}))
         self.assertEqual(result.failures, {"cup": "registration failed", "tray": "registration failed"})
+
+        tracker.initialize.side_effect = RuntimeError("backend failed")
+        with self.assertRaisesRegex(RuntimeError, "backend failed"):
+            track_hoi_frame(tracker, object(), template, {}, initialize=True)
 
 
 class TrackingConfigTest(unittest.TestCase):
@@ -164,12 +161,11 @@ class TrackingConfigTest(unittest.TestCase):
         )
 
     def test_ostrack_defaults_and_explicit_overrides(self):
-        config = build_tracking_config(HOITrackingConfig(tracker_2d="ostrack"))
-        self.assertEqual(config.tracker_2d, "ostrack")
+        config = build_tracking_config(HOITrackingConfig())
         self.assertEqual(config.recovery_retry_interval_frames, 8)
         self.assertEqual(config.ostrack_checkpoint, "third_party/weights/ostrack/OSTrack_ep0300.pth.tar")
         config = build_tracking_config(HOITrackingConfig(
-            tracker_2d="ostrack", ostrack_checkpoint="/tmp/checkpoint.pth.tar",
+            ostrack_checkpoint="/tmp/checkpoint.pth.tar",
             lost_timeout_s=0.4, recovery_retry_interval_frames=5, xy_prior_gain=0,
         ))
         self.assertEqual(config.ostrack_checkpoint, "/tmp/checkpoint.pth.tar")
@@ -181,7 +177,7 @@ class TrackingConfigTest(unittest.TestCase):
         for field, value in (
             ("segmentation_interval_frames", 0),
             ("recovery_enabled", 1),
-            ("tracker_2d", "unknown"),
+            ("recovery_retry_interval_frames", 0),
             ("xy_prior_gain", -0.1),
         ):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
@@ -254,7 +250,7 @@ class HOIAdapterTest(unittest.TestCase):
     def test_worker_and_raw_annotation_agree_after_retry_and_recovery(self):
         camera, template = camera_snapshot(), object_template()
         prompts = {"cup": "a cup", "tray": "a tray"}
-        config = HOITrackingConfig(segmentation_interval_frames=4, tracker_2d="ostrack")
+        config = HOITrackingConfig(segmentation_interval_frames=4)
         sequences, stamps = [12, 12, 13, 14, 15], [120, 120, 130, 140, 150]
         timing = np.zeros(len(sequences), dtype=TIMING_ROW_DTYPE)
         timing["camera_sequence"], timing["camera_ns"] = sequences, stamps
@@ -449,7 +445,7 @@ class HOIExportTest(unittest.TestCase):
             self.assertEqual(path.read_bytes(), original)
             self.assertEqual(list(path.parent.iterdir()), [path])
 
-    def test_annotation_reuse_rejects_missing_pointcloud(self):
+    def test_annotation_reuse_rejects_missing_datasets(self):
         camera = camera_snapshot()
         timing = np.zeros(1, dtype=TIMING_ROW_DTYPE)
         camera_timing = timing[list(CAMERA_TIMING_FIELDS)].astype(CAMERA_TIMING_DTYPE)
@@ -460,15 +456,23 @@ class HOIExportTest(unittest.TestCase):
                     termination_reason="completed", **camera_metadata(camera),
                 )
                 raw.create_dataset("timing/rows", data=timing)
-            write_hoi(
-                episode / "hoi.h5", object_template(), np.broadcast_to(np.eye(4), (1, 2, 4, 4)),
-                camera.T_xarm_base_from_color, camera_timing=camera_timing, quality=[({}, {})],
-                tracking_config={}, object_valid=np.ones((1, 2), dtype=bool),
-            )
-            with h5py.File(episode / "hoi.h5", "r+") as annotated:
-                del annotated["object_pointcloud"]
-            with self.assertRaisesRegex(RawDataError, "HOI object_pointcloud"):
-                annotation.annotate_episodes([episode], episode, tracking_config=HOITrackingConfig())
+            path = episode / "hoi.h5"
+            for field in ("base_from_camera", "object_pose_camera", "object_pointcloud", "quality"):
+                with self.subTest(field=field):
+                    write_hoi(
+                        path, object_template(), np.broadcast_to(np.eye(4), (1, 2, 4, 4)),
+                        camera.T_xarm_base_from_color, camera_timing=camera_timing, quality=[({}, {})],
+                        tracking_config={}, object_valid=np.ones((1, 2), dtype=bool), overwrite=True,
+                    )
+                    with h5py.File(path, "r+") as annotated:
+                        del annotated[field]
+                    with self.assertRaisesRegex(RawDataError, f"HOI {field}"):
+                        annotation.annotate_episodes([episode], episode, tracking_config=HOITrackingConfig())
+
+            with h5py.File(path, "r+") as annotated:
+                annotated.create_group("quality").create_dataset("depth_pixels", shape=(1, 1), dtype=float)
+            with RawReader(episode) as reader, self.assertRaisesRegex(RawDataError, "HOI quality/depth_pixels"):
+                reader.read_hoi_validity()
 
     def test_complete_hoi_export_uses_raw_row_joint_state_and_fk(self):
         template, camera = object_template(), camera_snapshot()

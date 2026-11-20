@@ -48,4 +48,4 @@ Raw 保留采集像素网格上的 RGB-D，解码后的有损 RGB 与现场像�
 
 Zarr 的 `data_processing` 保存实际使用的处理参数。物体点云与关节观测或其 FK 结果一同导出时，`data_processing.object_pointcloud.joint_state_source` 为 `raw_observation_row`。开启去桌面时，归一化系数写入 `data_processing.point_cloud.table_plane_abcd`。部署对应值见 `run_config.yaml` 的 `actual_processing.point_cloud.table_plane_abcd`。接触预训练按同一观测行的手部和物体点云计算 1024 个有序标签。见[标注与查看](object_reconstruction.md#标注与查看)。
 
-已有 Raw 和 `hoi.h5` 可直接复用。曾按相机时间重采样关节的 HOI Zarr 须从原始数据重新导出，确保训练数据统一使用 Raw 行的关节状态。
+已有 `hoi.h5` 在相机来源时间、序列和外参通过核对后可随 Raw 复用。训练用关节和 FK 输入取自对应 Raw 行。[标注与查看](object_reconstruction.md#标注与查看)

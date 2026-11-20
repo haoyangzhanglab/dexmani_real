@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from ctypes import c_byte
@@ -31,8 +32,7 @@ from dexmani_real.perception.hoi import build_tracking_config
 
 STAGES = (
     "foundationpose_track", "foundationpose_register", "ostrack_track",
-    "sam2_initialize", "sam2_track", "sam2_segment_boxes", "sam2_correct_masks",
-    "dino_detect",
+    "sam2_segment_boxes", "dino_detect",
 )
 TELEMETRY_DTYPE = np.dtype([
     ("published_ns", "i8"), ("service_ns", "i8"), ("lag", "i8"),
@@ -77,9 +77,8 @@ def summarize_ms(values):
     }
 
 
-def benchmark_adapter(args, camera, frames, mesh_paths, boxes, checkpoint):
+def benchmark_adapter(args, camera, frames, mesh_paths, boxes, config):
     import torch
-    from cordvip_geometry.ostrack import OSTrackAdapter
 
     boxes = {name: boxes[name] for name in mesh_paths if name in boxes}
     rectifier = RGBDRectifier(
@@ -88,16 +87,21 @@ def benchmark_adapter(args, camera, frames, mesh_paths, boxes, checkpoint):
     )
     images = [rectifier.apply(rgb, depth)[0] for rgb, depth in frames]
 
-    if args.mode == "resident":
-        from cordvip_geometry.tracking import SceneTracker
-
-        # 在适配器完成计时前持有模型，单独测量 OSTrack 的推理时间。
-        _resident_models = SceneTracker(mesh_paths, workspace=ROOT)
-
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     started = time.monotonic_ns()
-    adapter = OSTrackAdapter(ROOT / "third_party/OSTrack", ROOT / Path(checkpoint).expanduser())
+    if args.mode == "resident":
+        from cordvip_geometry import SceneTracker
+
+        scene = SceneTracker(mesh_paths, workspace=ROOT, config=config)
+        adapter = scene.ostrack
+        startup_metric = "resident_startup_ms"
+    else:
+        from cordvip_geometry.ostrack import OSTrackAdapter
+
+        checkpoint = ROOT / Path(config.ostrack_checkpoint).expanduser()
+        adapter = OSTrackAdapter(ROOT / "third_party/OSTrack", checkpoint)
+        startup_metric = "model_load_ms"
     torch.cuda.synchronize()
     loaded = time.monotonic_ns()
     for name, box in boxes.items():
@@ -116,7 +120,7 @@ def benchmark_adapter(args, camera, frames, mesh_paths, boxes, checkpoint):
             elapsed.append(time.monotonic_ns() - started_frame)
     return {
         "mode": args.mode, "device": torch.cuda.get_device_name(),
-        "object_count": len(boxes), "model_load_ms": (loaded - started) / 1e6,
+        "object_count": len(boxes), startup_metric: (loaded - started) / 1e6,
         "initialize_ms": (initialized - loaded) / 1e6,
         "ostrack_frame": summarize_ms(elapsed), "fps": len(elapsed) * 1e9 / sum(elapsed),
         "peak_allocated_mib": torch.cuda.max_memory_allocated() / MIB,
@@ -125,11 +129,11 @@ def benchmark_adapter(args, camera, frames, mesh_paths, boxes, checkpoint):
 
 def instrumented_worker(channels, camera, task, config, raw_telemetry, warmup, profile):
     import torch
-    from cordvip_geometry import tracking
+    from cordvip_geometry import TrackingFailure, tracking
 
     from dexmani_real.perception.hoi_worker import run_hoi_worker
 
-    logging.disable(logging.WARNING)
+    logging.getLogger(run_hoi_worker.__module__).setLevel(logging.ERROR)
     telemetry = np.frombuffer(raw_telemetry, dtype=TELEMETRY_DTYPE)
     read = channels.camera_ring.read
     publish = channels.hoi_ring.write
@@ -170,24 +174,29 @@ def instrumented_worker(channels, camera, task, config, raw_telemetry, warmup, p
                 return operation(*args, **kwargs)
             torch.cuda.synchronize()
             start = time.monotonic_ns()
+            failure = None
             try:
-                return operation(*args, **kwargs)
-            finally:
-                torch.cuda.synchronize()
-                row = telemetry[current_sequence - 1]
-                row["stage_ns"][index] += time.monotonic_ns() - start
-                row["stage_calls"][index] += 1
+                result = operation(*args, **kwargs)
+            except TrackingFailure as error:
+                # 注册证据不足仍消耗时间，场景会继续处理当前帧。
+                failure = error
+                result = None
+            torch.cuda.synchronize()
+            row = telemetry[current_sequence - 1]
+            row["stage_ns"][index] += time.monotonic_ns() - start
+            row["stage_calls"][index] += 1
+            if failure is not None:
+                raise failure
+            return result
 
         setattr(owner, name, timed)
 
     if profile:
         instrument(tracking, "track_objects", "foundationpose_track")
         instrument(tracking.FoundationPoseTracker, "register", "foundationpose_register")
-        for name in ("initialize", "track", "segment_boxes", "correct_masks", "detect"):
-            stage = "dino_detect" if name == "detect" else f"sam2_{name}"
-            instrument(tracking.SAM2Segmenter, name, stage)
-        if config.tracker_2d == "ostrack":
-            instrument(tracking.OSTrackAdapter, "track", "ostrack_track")
+        instrument(tracking.SAM2Segmenter, "segment_boxes", "sam2_segment_boxes")
+        instrument(tracking.SAM2Segmenter, "detect", "dino_detect")
+        instrument(tracking.OSTrackAdapter, "track", "ostrack_track")
     channels.camera_ring.read = read_camera
     channels.hoi_ring.write = publish_hoi
     template, mesh_paths, prompts = task
@@ -204,11 +213,10 @@ def wait_until(condition, process, description, timeout_s=120):
         time.sleep(0.0005)
 
 
-def replay_worker(args, camera, frames, stamps, fps, task, cfg):
+def replay_worker(args, camera, frames, stamps, fps, task, config):
     paired = args.mode == "paired"
     if camera.T_xarm_base_from_color is None:
         raise ValueError("HOI Worker replay requires recorded camera extrinsics")
-    cfg = build_tracking_config(cfg)
     ctx = get_context("spawn")
     channels = SensorChannels(
         ctx, camera=CameraConfig(width=camera.color.width, height=camera.color.height, fps=fps),
@@ -221,7 +229,7 @@ def replay_worker(args, camera, frames, stamps, fps, task, cfg):
     telemetry = np.frombuffer(raw_telemetry, dtype=TELEMETRY_DTYPE)
     worker = ctx.Process(
         target=instrumented_worker,
-        args=(channels, camera, task, cfg, raw_telemetry, args.warmup, paired),
+        args=(channels, camera, task, config, raw_telemetry, args.warmup, paired),
     )
     submitted = np.zeros(len(frames), dtype=np.int64)
     period_ns = round(1e9 / fps)
@@ -257,41 +265,42 @@ def replay_worker(args, camera, frames, stamps, fps, task, cfg):
     finally:
         channels.is_running.value = False
         worker.join(timeout=5)
-        if worker.is_alive():
+        stopped = not worker.is_alive()
+        if not stopped:
             worker.terminate()
             worker.join(timeout=5)
             if worker.is_alive():
                 worker.kill()
                 worker.join()
+    if not stopped:
+        raise TimeoutError("HOI Worker did not stop after replay")
     if worker.exitcode != 0:
         raise RuntimeError(f"HOI Worker exited during shutdown: {worker.exitcode}")
 
     rows = telemetry[args.warmup:]
     recorded = rows["published_ns"] > 0
     processed = rows[recorded]
+    publish_ages_ns = processed["published_ns"] - submitted[args.warmup:][recorded]
     valid = int(processed["valid"].sum())
     elapsed_s = (processed[-1]["published_ns"] - submitted[args.warmup]) / 1e9
     if not paired:
         elapsed_s = max(elapsed_s, len(rows) / fps)
     stats = {
-        "mode": args.mode, "tracker_2d": cfg.tracker_2d, "camera_fps": fps,
+        "mode": args.mode, "camera_fps": fps, "xy_prior_gain": config.xy_prior_gain,
         "object_count": len(task[1]), "include_derived_rgb": not args.no_derived_rgb,
         "warmup_frames": args.warmup, "offered_frames": len(rows),
         "processed_frames": len(processed), "valid_frames": valid,
         "camera_ring_drops": int((~recorded).sum()),
+        "measurement_seconds": elapsed_s,
         "processed_fps": len(processed) / elapsed_s, "valid_fps": valid / elapsed_s,
         "hoi_service": summarize_ms(processed["service_ns"]),
-        "camera_to_hoi_publish": summarize_ms(
-            processed["published_ns"] - submitted[args.warmup:][recorded]
-        ),
+        "camera_to_hoi_publish": summarize_ms(publish_ages_ns),
         "peak_allocated_mib": float(processed["peak_bytes"].max() / MIB),
     }
     if args.warmup:
         stats["startup_warmup_peak_allocated_mib"] = float(
             telemetry[:args.warmup]["peak_bytes"].max() / MIB
         )
-    if cfg.tracker_2d == "ostrack":
-        stats["xy_prior_gain"] = cfg.xy_prior_gain
     if paired:
         stages = {}
         for index, name in enumerate(STAGES):
@@ -305,6 +314,7 @@ def replay_worker(args, camera, frames, stamps, fps, task, cfg):
     else:
         scheduled = pace_start + np.arange(len(rows)) * period_ns
         stats["producer_lateness"] = summarize_ms(submitted[args.warmup:] - scheduled)
+        stats["last_frame_publish_ms"] = float(publish_ages_ns[-1] / 1e6)
         windows = []
         for window in np.array_split(rows, min(3, len(rows))):
             lag = window["lag"][window["published_ns"] > 0]
@@ -316,13 +326,12 @@ def replay_worker(args, camera, frames, stamps, fps, task, cfg):
     return stats
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv=None, *, cli_output=None):
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("mode", choices=("solo", "resident", "paired", "paced"))
     parser.add_argument("episode", type=Path)
     parser.add_argument("--task-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path)
-    parser.add_argument("--tracker", choices=("sam2_video", "ostrack"))
     parser.add_argument("--checkpoint")
     parser.add_argument("--xy-prior-gain", type=float)
     parser.add_argument("--box", nargs=5, action="append", default=[], metavar=("NAME", "X1", "Y1", "X2", "Y2"))
@@ -333,13 +342,17 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.warmup < 0 or args.frames <= 0:
         parser.error("Require nonnegative warmup and positive frame count")
-    cfg = load_config(args.config).hoi_tracking
+    if cli_output is not None:
+        # 模型的原生扩展和子进程也会写 stdout，CLI 保留原通道输出 JSON。
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    options = load_config(args.config).hoi_tracking
     overrides = {
-        "tracker_2d": args.tracker,
         "ostrack_checkpoint": args.checkpoint,
         "xy_prior_gain": args.xy_prior_gain,
     }
-    cfg = replace(cfg, **{name: value for name, value in overrides.items() if value is not None})
+    config = build_tracking_config(
+        replace(options, **{name: value for name, value in overrides.items() if value is not None})
+    )
     standalone = args.mode in ("solo", "resident")
     task = load_hoi_task(args.task_dir)
     if standalone and not args.box:
@@ -351,22 +364,26 @@ def main(argv=None):
         if name in boxes or name not in task[1]:
             parser.error(f"--box object {name!r} must appear once and belong to the task")
         try:
-            boxes[name] = tuple(map(float, values))
+            box = tuple(map(float, values))
         except ValueError:
             parser.error(f"--box {name!r} requires four numeric coordinates")
+        if not (np.isfinite(box).all() and box[0] < box[2] and box[1] < box[3]):
+            parser.error(f"--box {name!r} requires finite XYXY coordinates with positive extent")
+        boxes[name] = box
     count = args.warmup + args.frames + int(standalone)
     camera, frames, stamps, fps = load_replay(args.episode, count, args.camera_fps)
     if standalone:
-        stats = benchmark_adapter(args, camera, frames, task[1], boxes, cfg.ostrack_checkpoint)
+        stats = benchmark_adapter(args, camera, frames, task[1], boxes, config)
     else:
-        stats = replay_worker(args, camera, frames, stamps, fps, task, cfg)
+        stats = replay_worker(args, camera, frames, stamps, fps, task, config)
     stats.update({
         "image_size": [camera.color.width, camera.color.height],
         "recorded_camera_delta": summarize_ms(np.diff(stamps)),
     })
-    print(json.dumps(stats, indent=2, ensure_ascii=False))
+    print(json.dumps(stats, indent=2, ensure_ascii=False), file=cli_output)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    with os.fdopen(os.dup(sys.stdout.fileno()), "w") as output:
+        raise SystemExit(main(cli_output=output))

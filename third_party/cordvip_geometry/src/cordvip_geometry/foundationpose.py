@@ -120,12 +120,19 @@ def _box_geometry(box_xyxy):
     return left + size / 2, size
 
 
-def bbox_center_offset(centered_pose, intrinsics, box_xyxy, image_shape):
-    """用已通过质量校验的注册位姿和 Mask 框对齐居中原点与 2D 框。"""
+def bbox_center_offset(centered_pose, intrinsics, mask_box, image_shape, *, tracker_box=None):
+    """验证 Mask 框中的物体中心，再将它表达在同帧的跟踪框内。"""
     pixel = _project_center(centered_pose, intrinsics, image_shape)
     if pixel is None:
         return None
-    center, size = _box_geometry(box_xyxy)
+    mask_center, mask_size = _box_geometry(mask_box)
+    offset = (mask_center - pixel) / mask_size
+    if not np.all(np.abs(offset) <= 0.5):
+        return None
+    if tracker_box is None:
+        return offset
+    center, size = _box_geometry(tracker_box)
+    # 两个框共用同一像素锚点，后续先验按 OSTrack 的宽高还原。
     offset = (center - pixel) / size
     return offset if np.all(np.abs(offset) <= 0.5) else None
 

@@ -18,14 +18,14 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 用法：conda activate real_robot
       bash third_party/cordvip_geometry/scripts/install_perception.sh [--workspace PATH] [reconstruction|ostrack]
 
-默认安装跟踪依赖，获取 Grounded-SAM-2、FoundationPose 和 nvdiffrast，
+默认安装跟踪依赖，获取 Grounded-SAM-2、FoundationPose、nvdiffrast 和 OSTrack，
 应用推理补丁并编译扩展。需要 conda CUDA 编译器及头文件、CMake、C++、
 系统 Boost（system/program_options）和 OpenMP 开发文件。
 
 reconstruction：在已完成跟踪安装的同一环境中获取 Hunyuan3D，
 应用分层解码补丁并安装重建依赖。
 
-ostrack：在已完成跟踪安装的同一环境中获取 OSTrack，安装轻量推理依赖。
+ostrack：单独安装 OSTrack 源码和推理依赖。
 
 源码按固定 revision 获取。已有目录须为 Git 工作树根目录，HEAD 匹配固定
 revision 时复用本地修改。版本不符或补丁冲突时退出。
@@ -103,12 +103,16 @@ apply_source_patch() {
     fi
 }
 
-mkdir -p third_party
-if [[ "$cordvip_operation" == ostrack ]]; then
+install_ostrack() {
     checkout_source OSTrack https://github.com/botaoye/OSTrack.git 33b5e12586216b7fd0e95d255bd01ba44cbec759
     apply_source_patch OSTrack ostrack_inference.patch
     "$cordvip_python" -m pip install --no-deps easydict==1.13 timm==1.0.19
     printf 'OSTrack 推理源码已安装。将官方 OSTrack-256 权重放到 third_party/weights/ostrack/OSTrack_ep0300.pth.tar。\n'
+}
+
+mkdir -p third_party
+if [[ "$cordvip_operation" == ostrack ]]; then
+    install_ostrack
     exit 0
 fi
 
@@ -136,6 +140,7 @@ else
 
     apply_source_patch Grounded-SAM-2 sam2_inference.patch
     apply_source_patch FoundationPose foundationpose_inference.patch
+    install_ostrack
 
     "$cordvip_python" -m pip install \
         --constraint "$cordvip_constraints" \
@@ -155,7 +160,7 @@ else
     export PATH="$CONDA_PREFIX/bin:$PATH"
     export MAX_JOBS="${MAX_JOBS:-4}"
     "$cordvip_python" -m pip install --no-build-isolation \
-        --constraint "$cordvip_constraints" -e "${cordvip_library}[cloud]"
+        --constraint "$cordvip_constraints" -e "${cordvip_library}[cloud,vision]"
     "$cordvip_python" -m pip install --no-build-isolation --no-deps third_party/nvdiffrast
 
     cordvip_pybind_dir="$("$cordvip_python" -m pybind11 --cmakedir)"

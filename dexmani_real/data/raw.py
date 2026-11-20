@@ -437,7 +437,7 @@ def open_hoi_file(path: Path, raw_meta, raw_timing):
 
     annotations = h5py.File(path, "r")
     try:
-        transform = annotations["base_from_camera"]
+        transform = annotations.get("base_from_camera")
         if not isinstance(transform, h5py.Dataset) or transform.shape != (4, 4):
             raise RawDataError("HOI base_from_camera must be a (4, 4) dataset")
         recorded = decode_camera_extrinsic(raw_meta)
@@ -447,14 +447,21 @@ def open_hoi_file(path: Path, raw_meta, raw_timing):
         names = annotations.get("template/object_names")
         if not isinstance(names, h5py.Dataset) or names.ndim != 1 or not len(names):
             raise RawDataError("HOI template/object_names must be a nonempty one-dimensional dataset")
-        valid = annotations.get("object_valid")
-        if (not isinstance(valid, h5py.Dataset)
-                or valid.shape != (len(raw_timing), len(names)) or valid.dtype != bool):
-            raise RawDataError("Invalid HOI object_valid shape/dtype")
-        cloud = annotations.get("object_pointcloud")
-        if (not isinstance(cloud, h5py.Dataset)
-                or cloud.shape != (len(raw_timing), HOI_NUM_POINTS, 3) or cloud.dtype != np.float32):
-            raise RawDataError("Invalid HOI object_pointcloud shape/dtype")
+        frames, objects = len(raw_timing), len(names)
+        for name, shape, dtype in (
+            ("object_pose_camera", (frames, objects, 4, 4), np.float32),
+            ("object_valid", (frames, objects), bool),
+            ("object_pointcloud", (frames, HOI_NUM_POINTS, 3), np.float32),
+        ):
+            dataset = annotations.get(name)
+            if not isinstance(dataset, h5py.Dataset) or dataset.shape != shape or dataset.dtype != dtype:
+                raise RawDataError(f"{path}: invalid HOI {name} shape/dtype")
+        quality = annotations.get("quality")
+        if not isinstance(quality, h5py.Group):
+            raise RawDataError(f"{path}: missing or invalid HOI quality group")
+        for name, dataset in quality.items():
+            if not isinstance(dataset, h5py.Dataset) or dataset.shape != (frames, objects):
+                raise RawDataError(f"{path}: invalid HOI quality/{name} shape")
         timing = annotations.get("camera_timing")
         if not isinstance(timing, h5py.Dataset) or timing.shape != raw_timing.shape or timing.dtype != CAMERA_TIMING_DTYPE:
             raise RawDataError(f"{path}: missing or invalid HOI camera_timing; re-annotate with --overwrite")

@@ -1,4 +1,4 @@
-"""Grounded-SAM2 检测、单图分割与有界历史视频跟踪。"""
+"""Grounding DINO 检测与 SAM2 单图分割。"""
 
 import sys
 import unicodedata
@@ -6,35 +6,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-
-def prune_state(state, frame_index, history_frames):
-    """保留首帧 conditioning 和近期历史，提示输入与合并输出索引同步裁剪。"""
-
-    cutoff = frame_index - history_frames + 1
-    for output in [
-        state["output_dict"],
-        *state["output_dict_per_obj"].values(),
-        *state["temp_output_dict_per_obj"].values(),
-    ]:
-        for index in list(output["non_cond_frame_outputs"]):
-            if index < cutoff:
-                del output["non_cond_frame_outputs"][index]
-    for index in list(state["frames_already_tracked"]):
-        if index != 0 and index < cutoff:
-            del state["frames_already_tracked"][index]
-    for inputs in (state["point_inputs_per_obj"], state["mask_inputs_per_obj"]):
-        for frames in inputs.values():
-            for index in list(frames):
-                if (
-                    index < cutoff
-                    and index
-                    not in state["consolidated_frame_inds"]["cond_frame_outputs"]
-                ):
-                    del frames[index]
-    state["consolidated_frame_inds"]["non_cond_frame_outputs"].intersection_update(
-        range(max(1, cutoff), frame_index + 1)
-    )
 
 
 def normalize_prompt(text):
@@ -46,52 +17,25 @@ def normalize_prompt(text):
     return text.strip().lower().rstrip(". ") + "."
 
 
-def normalized_rgb_table(device):
-    """预计算 uint8 RGB 的归一化结果，避免逐帧搬运 float64 图像。"""
-    import torch
-
-    # float64 运算配合 float32 均值和标准差，保持 SAM2 输入的舍入结果。
-    values = torch.from_numpy(np.arange(256, dtype=np.float64) / 255.0)
-    values = values.to(device)[:, None].expand(256, 3).clone()
-    mean = torch.tensor((0.485, 0.456, 0.406), device=device, dtype=torch.float32)
-    std = torch.tensor((0.229, 0.224, 0.225), device=device, dtype=torch.float32)
-    return values.sub_(mean).div_(std).float()
-
-
 class SAM2Segmenter:
     def __init__(self, root, checkpoint, config, dino_weights):
         root = Path(root).expanduser().resolve()
         checkpoint = Path(checkpoint).expanduser().resolve()
         sys.path.insert(0, str(root))
         import torch
-        from sam2.build_sam import build_sam2_video_predictor
+        from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
 
         if not torch.cuda.is_available():
             raise RuntimeError("Grounded-SAM2 requires CUDA")
         self.device = torch.device("cuda:0")
-        self.tracker = build_sam2_video_predictor(
+        model = build_sam2(
             config,
             str(checkpoint),
             device=str(self.device),
             apply_postprocessing=False,
-            hydra_overrides_extra=[
-                "++model.non_overlap_masks=true",
-                "++model.non_overlap_masks_for_mem_enc=true",
-                "++model.fill_hole_area=0",
-            ],
         )
-        self.image_predictor = SAM2ImagePredictor(
-            self.tracker, max_hole_area=0, max_sprinkle_area=0
-        )
-        self.normalization_table = normalized_rgb_table(self.device)
-        self.color_channels = torch.arange(3, device=self.device)
-        stride = int(self.tracker.memory_temporal_stride_for_eval)
-        self.history_frames = max(
-            1,
-            (int(self.tracker.num_maskmem) - 1) * stride,
-            int(self.tracker.max_obj_ptrs_in_encoder) - 1,
-        )
+        self.image_predictor = SAM2ImagePredictor(model)
         self.dino_weights = Path(dino_weights).expanduser().resolve()
         self.processor: Any = None
         self.detector: Any = None
@@ -185,12 +129,13 @@ class SAM2Segmenter:
             if masks[i].any()
         ]
 
-    def segment_boxes(self, rgb, boxes):
-        """复用图像 predictor，按对象名返回 mask，不触碰视频状态。"""
+    def segment_boxes(self, rgb, boxes, *, reuse_image=False):
+        """按对象名返回 mask。同一帧增加框提示时可复用已计算的图像特征。"""
         import torch
 
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            self.image_predictor.set_image(np.ascontiguousarray(rgb))
+            if not reuse_image:
+                self.image_predictor.set_image(np.ascontiguousarray(rgb))
             masks, _, _ = self.image_predictor.predict(
                 point_coords=None,
                 point_labels=None,
@@ -201,64 +146,3 @@ class SAM2Segmenter:
             name: np.asarray(mask).reshape(rgb.shape[:2]).astype(bool)
             for name, mask in zip(boxes, masks)
         }
-
-    def correct_masks(self, masks):
-        """校正当前已跟踪帧的已有对象，合并时保留其他对象的当前输出。"""
-        import torch
-
-        index = self.state["num_frames"] - 1
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            for name, mask in masks.items():
-                self.tracker.add_new_mask(
-                    self.state, frame_idx=index, obj_id=name, mask=mask
-                )
-            return self._masks(self.tracker.infer_single_frame(self.state, index))
-
-    def initialize(self, rgb, boxes):
-        """以 {对象名: XYXY 检测框} 初始化新视频，共享首帧图像编码。"""
-        import torch
-
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            self.state = self.tracker.init_state(video_path=None)
-            self.state["video_height"], self.state["video_width"] = rgb.shape[:2]
-            self._append_frame(rgb)
-            for name, box in boxes.items():
-                self.tracker.add_new_points_or_box(
-                    self.state, frame_idx=0, obj_id=name, box=box
-                )
-            return self._masks(self.tracker.infer_single_frame(self.state, 0))
-
-    def track(self, rgb):
-        import torch
-
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            index = self._append_frame(rgb)
-            masks = self._masks(self.tracker.infer_single_frame(self.state, index))
-            prune_state(self.state, index, self.history_frames)
-            return masks
-
-    def _append_frame(self, rgb):
-        import torch
-        from PIL import Image
-
-        size = self.tracker.image_size
-        pixels = np.array(
-            Image.fromarray(rgb)
-            .convert("RGB")
-            .resize((size, size), Image.Resampling.LANCZOS)
-        )
-        pixel_tensor = torch.from_numpy(pixels).to(self.device)
-        tensor = self.normalization_table[pixel_tensor.long(), self.color_channels].permute(
-            2, 0, 1
-        )
-        index = self.state["num_frames"]
-        # 保留绝对帧号，仅保存当前图像。
-        self.state["images"] = {index: tensor}
-        self.state["cached_features"] = {}
-        self.state["num_frames"] = index + 1
-        return index
-
-    @staticmethod
-    def _masks(result):
-        _, ids, logits = result
-        return dict(zip(ids, (logits[:, 0] > 0).detach().cpu().numpy()))

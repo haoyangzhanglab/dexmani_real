@@ -11,8 +11,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 
-from cordvip_geometry.camera import RGBDFrame
-from cordvip_geometry.tracking import SceneTracker, TrackingFailure
+from cordvip_geometry import RGBDFrame, SceneTracker
 
 from dexmani_real.config.perception import HOITrackingConfig
 from dexmani_real.config.real import load_config
@@ -25,11 +24,7 @@ from dexmani_real.data.raw import (
     discover_episode_dirs,
 )
 from dexmani_real.geometry.hoi import load_hoi_task
-from dexmani_real.perception.hoi import (
-    build_tracking_config,
-    invalid_hoi_frame,
-    track_hoi_frame,
-)
+from dexmani_real.perception.hoi import build_tracking_config, track_hoi_frame
 
 
 def annotate_episodes(
@@ -106,13 +101,11 @@ def track_episode(
             {"rgb": rgb, "depth": depth[index], "timestamp_ns": stamps[index]},
             source_sequence=sequences[index],
         )
-        try:
-            result = track_hoi_frame(tracker, frame, template, prompts, initialize=initialize)
-        except TrackingFailure as error:
-            print(f"行 {index}，相机序列 {sequences[index]}: {error}；继续重试")
-            result = invalid_hoi_frame(template, str(error))
-        else:
-            initialize = False
+        result = track_hoi_frame(tracker, frame, template, prompts, initialize=initialize)
+        initialize = initialize and not result.valid
+        if initialize:
+            reason = next(iter(result.failures.values()))
+            print(f"行 {index}，相机序列 {sequences[index]}: {reason}；继续重试")
         poses[index] = result.object_pose_camera
         valid[index] = result.object_valid
         quality.append(result.quality)

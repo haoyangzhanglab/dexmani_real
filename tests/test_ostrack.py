@@ -1,11 +1,12 @@
-"""覆盖 OSTrack-256 框约定和共享状态，测试无需 GPU。"""
+"""覆盖 OSTrack-256 和 SAM2 的推理接口，测试无需 GPU。"""
 
 import sys
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -16,6 +17,7 @@ with patch.object(sys, "path", [str(BACKEND), *sys.path]):
         OSTrackAdapter,
         mask_to_xyxy,
     )
+    from cordvip_geometry.segmentation import SAM2Segmenter
 
 
 class MockUpstreamTracker:
@@ -64,6 +66,8 @@ class OSTrackTest(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "OSTrack-256 checkpoint"):
                 OSTrackAdapter(root, checkpoint)
             checkpoint.touch()
+            with self.assertRaisesRegex(FileNotFoundError, r"install_perception\.sh ostrack"):
+                OSTrackAdapter(root, checkpoint)
             config = root / OSTRACK_CONFIG
             config.parent.mkdir(parents=True)
             config.touch()
@@ -89,3 +93,61 @@ class OSTrackTest(unittest.TestCase):
         self.assertIsNot(adapter._objects["first"].template, first.template)
         self.assertIs(adapter._objects["second"], second)
         self.assertEqual(adapter._objects["first"].state, [0, 5, 10, 12])
+
+
+class SAM2ImagePredictorTest(unittest.TestCase):
+    def test_image_builder_and_same_frame_embedding_reuse(self):
+        model = object()
+        predictor = Mock()
+        build_model = Mock(return_value=model)
+        build_predictor = Mock(return_value=predictor)
+        upstream = {
+            "torch": SimpleNamespace(
+                cuda=SimpleNamespace(is_available=lambda: True),
+                device=str,
+                inference_mode=nullcontext,
+                autocast=lambda *args, **kwargs: nullcontext(),
+                bfloat16=object(),
+            ),
+            "sam2.build_sam": SimpleNamespace(build_sam2=build_model),
+            "sam2.sam2_image_predictor": SimpleNamespace(SAM2ImagePredictor=build_predictor),
+        }
+        rgb = np.zeros((8, 10, 3), dtype=np.uint8)
+        new_rgb = np.ones_like(rgb)
+        both_masks = np.zeros((2, 1, *rgb.shape[:2]), dtype=np.float32)
+        both_masks[0, 0, 1:3, 4:8] = 1
+        both_masks[1, 0, 4:7, 2:3] = 1
+        single_mask = both_masks[0]
+        predictor.predict.side_effect = [
+            (both_masks, None, None), (single_mask, None, None), (both_masks, None, None),
+        ]
+        config = "configs/sam2.1/sam2.1_hiera_s.yaml"
+        boxes = {"first": (4, 1, 8, 3), "second": (2, 4, 3, 7)}
+        rescanned_box = {"second": (4, 1, 8, 3)}
+        with (
+            TemporaryDirectory() as directory,
+            patch.dict(sys.modules, upstream),
+            patch.object(sys, "path", sys.path.copy()),
+        ):
+            root = Path(directory)
+            checkpoint = root / "sam2.1_hiera_small.pt"
+            segmenter = SAM2Segmenter(root, checkpoint, config, root / "dino")
+            current = segmenter.segment_boxes(rgb, boxes)
+            recovered = segmenter.segment_boxes(rgb, rescanned_box, reuse_image=True)
+            segmenter.segment_boxes(new_rgb, boxes)
+
+        build_model.assert_called_once_with(
+            config, str(checkpoint.resolve()), device="cuda:0", apply_postprocessing=False
+        )
+        build_predictor.assert_called_once_with(model)
+        self.assertEqual(predictor.set_image.call_count, 2)
+        self.assertIs(predictor.set_image.call_args_list[0].args[0], rgb)
+        self.assertIs(predictor.set_image.call_args_list[1].args[0], new_rgb)
+        self.assertEqual(predictor.predict.call_count, 3)
+        np.testing.assert_array_equal(
+            predictor.predict.call_args_list[1].kwargs["box"], [(4, 1, 8, 3)]
+        )
+        self.assertEqual(list(current), ["first", "second"])
+        self.assertEqual(current["first"].dtype, np.bool_)
+        np.testing.assert_array_equal(current["first"], both_masks[0, 0].astype(bool))
+        np.testing.assert_array_equal(recovered["second"], single_mask[0].astype(bool))

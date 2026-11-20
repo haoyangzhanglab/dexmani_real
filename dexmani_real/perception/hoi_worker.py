@@ -13,10 +13,7 @@ import numpy as np
 
 from dexmani_real.config.perception import HOI_NUM_POINTS
 from dexmani_real.geometry.hoi import transform_task_points
-from dexmani_real.perception.hoi import (
-    invalid_hoi_frame,
-    track_hoi_frame,
-)
+from dexmani_real.perception.hoi import track_hoi_frame
 
 if TYPE_CHECKING:
     from cordvip_geometry import TrackingConfig
@@ -34,7 +31,7 @@ def run_hoi_worker(
     prompts: dict[str, str],
     tracking_config: TrackingConfig,
 ) -> None:
-    from cordvip_geometry import RGBDFrame, SceneTracker, TrackingFailure
+    from cordvip_geometry import RGBDFrame, SceneTracker
 
     def terminate(signum, frame):
         raise SystemExit(0)
@@ -67,13 +64,9 @@ def run_hoi_worker(
         if int(data["timestamp_ns"]) <= int(command["after_ns"]):
             continue
         frame = RGBDFrame.from_camera(camera, data, source_sequence=sequence)
-        try:
-            result = track_hoi_frame(tracker, frame, template, prompts, initialize=initialize)
-        except TrackingFailure as error:
-            result = invalid_hoi_frame(template, str(error))
-        else:
-            initialize = False
+        result = track_hoi_frame(tracker, frame, template, prompts, initialize=initialize)
         valid = result.valid
+        initialize = initialize and not valid
         points = (
             transform_task_points(
                 template, result.object_pose_camera, camera.T_xarm_base_from_color

@@ -1,7 +1,6 @@
 """点云处理、手表面模板与 HOI 跟踪的实验参数。"""
 
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 
@@ -16,10 +15,9 @@ class HOITrackingConfig:
 
     segmentation_interval_frames: int = 10
     recovery_enabled: bool = True
-    tracker_2d: Literal["sam2_video", "ostrack"] = "sam2_video"
     ostrack_checkpoint: str = "third_party/weights/ostrack/OSTrack_ep0300.pth.tar"
     lost_timeout_s: float = 0.3
-    recovery_retry_interval_frames: int | None = None
+    recovery_retry_interval_frames: int = 8
     xy_prior_gain: float = 0.2
 
 

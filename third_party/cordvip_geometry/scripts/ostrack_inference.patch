@@ -20,7 +20,7 @@ index 47ec6f6..cc0802b 100644
                                       visdom_info=visdom_info)
  
 diff --git a/lib/test/tracker/ostrack.py b/lib/test/tracker/ostrack.py
-index 3674779..3a9f8c6 100644
+index 3674779..bc379ac 100644
 --- a/lib/test/tracker/ostrack.py
 +++ b/lib/test/tracker/ostrack.py
 @@ -20,7 +20,7 @@ class OSTrack(BaseTracker):
@@ -42,13 +42,19 @@ index 3674779..3a9f8c6 100644
          template = self.preprocessor.process(z_patch_arr, z_amask_arr)
          with torch.no_grad():
              self.z_dict1 = template
-@@ -93,7 +94,10 @@ class OSTrack(BaseTracker):
+@@ -93,7 +94,16 @@ class OSTrack(BaseTracker):
          pred_box = (pred_boxes.mean(
              dim=0) * self.params.search_size / resize_factor).tolist()  # (cx, cy, w, h) [0,1]
          # get the final box result
 -        self.state = clip_box(self.map_box_back(pred_box, resize_factor), H, W, margin=10)
 +        mapped_box = self.map_box_back(pred_box, resize_factor)
-+        if not all(map(math.isfinite, mapped_box)):
++        x, y, w, h = mapped_box
++        if (
++            not all(map(math.isfinite, mapped_box))
++            or w <= 0 or h <= 0
++            or x >= W or y >= H
++            or x + w <= 0 or y + h <= 0
++        ):
 +            return {"target_bbox": None}
 +        self.state = clip_box(mapped_box, H, W, margin=min(10, H, W))
  

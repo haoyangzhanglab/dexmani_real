@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from numbers import Real
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 import numpy as np
 
@@ -19,9 +19,6 @@ from .mesh import MeshRaycaster, load_mesh
 from .ostrack import OSTrackAdapter, mask_to_xyxy
 from .segmentation import SAM2Segmenter, normalize_prompt
 from .weights import DEFAULT_MODELS_DIR, GROUNDING_WEIGHTS_DIR, resolve_sam_model
-
-if TYPE_CHECKING:
-    from torch import Tensor
 
 logger = logging.getLogger(__name__)
 PIXEL_STRIDE = 4
@@ -40,30 +37,22 @@ class TrackingConfig:
     min_precision: float = 0.5
     min_recall: float = 0.5
 
-    segmentation_interval_frames: int = 10  # 活动物体的低频周期校正。
-    occlusion_timeout_s: float = 0.5
+    segmentation_interval_frames: int = 10
     max_translation_speed_m_s: float | None = None
     max_rotation_speed_rad_s: float | None = None
 
     recovery_enabled: bool = True
-    recovery_retry_interval_frames: int | None = None
+    recovery_retry_interval_frames: int = 8
     recovery_box_threshold: float = 0.3
     recovery_text_threshold: float = 0.25
 
-    tracker_2d: str = "sam2_video"
     ostrack_checkpoint: str = "third_party/weights/ostrack/OSTrack_ep0300.pth.tar"
     lost_timeout_s: float = 0.3
     xy_prior_gain: float = 0.2
 
     def __post_init__(self):
-        if self.tracker_2d not in ("sam2_video", "ostrack"):
-            raise ValueError("tracker_2d must be 'sam2_video' or 'ostrack'")
         if not isinstance(self.ostrack_checkpoint, str) or not self.ostrack_checkpoint.strip():
             raise ValueError("ostrack_checkpoint must be a nonempty path")
-        if self.recovery_retry_interval_frames is None:
-            object.__setattr__(
-                self, "recovery_retry_interval_frames", 8 if self.tracker_2d == "ostrack" else 15
-            )
         for name in (
             "min_depth_pixels",
             "segmentation_interval_frames",
@@ -74,7 +63,6 @@ class TrackingConfig:
                 raise ValueError(f"{name} must be a positive integer")
         for name in (
             "depth_tolerance_m",
-            "occlusion_timeout_s",
             "lost_timeout_s",
             "max_translation_speed_m_s",
             "max_rotation_speed_rad_s",
@@ -123,49 +111,6 @@ class SceneResult:
     failures: dict[str, str] = field(default_factory=dict)
 
 
-def _classify_quality(metrics, config):
-    """分别判断观测是否充分和是否矛盾，不把观测缺失当作位姿错误。"""
-    if metrics["mask_pixels"] < 0:
-        if (
-            metrics["depth_support_pixels"] < config.min_depth_pixels
-            or metrics["depth_coverage"] < config.min_depth_coverage
-        ):
-            return "OCCLUDED"
-        if metrics["depth_fraction"] < config.min_depth_fraction:
-            return "LOST"
-        return (
-            "VALID"
-            if metrics["depth_pixels"] >= config.min_depth_pixels
-            else "OCCLUDED"
-        )
-
-    mask_supported = (
-        metrics["depth_support_pixels"] >= config.min_depth_pixels
-        and metrics["mask_depth_coverage"] >= config.min_depth_coverage
-    )
-    visible_supported = (
-        metrics["visible_depth_pixels"] >= config.min_depth_pixels
-        and metrics["visible_depth_coverage"] >= config.min_depth_coverage
-    )
-    if (
-        mask_supported
-        and (
-            metrics["depth_fraction"] < config.min_depth_fraction
-            or metrics["supported_recall"] < config.min_recall
-        )
-    ) or (visible_supported and metrics["supported_precision"] < config.min_precision):
-        return "LOST"
-    if (
-        mask_supported
-        and visible_supported
-        and metrics["depth_pixels"] >= config.min_depth_pixels
-        and metrics["precision"] >= config.min_precision
-        and metrics["recall"] >= config.min_recall
-    ):
-        return "VALID"
-    return "OCCLUDED"
-
-
 def pose_quality(mask, observed, rendered, config):
     """前景遮挡只能由 mask 外的有效传感器深度支持。"""
     valid = np.isfinite(observed) & (observed >= 0.001)
@@ -205,7 +150,32 @@ def pose_quality(mask, observed, rendered, config):
         "median_depth_error_m": float(np.median(residual)) if len(residual) else None,
         "occluded_fraction": float(hidden.sum() / max(1, projected_count)),
     }
-    return metrics, _classify_quality(metrics, config)
+    # 有效深度充分时，才将与 Mask 或可见轮廓的分歧判为 LOST。
+    mask_supported = (
+        depth_support_pixels >= config.min_depth_pixels
+        and metrics["mask_depth_coverage"] >= config.min_depth_coverage
+    )
+    visible_supported = (
+        visible_depth_pixels >= config.min_depth_pixels
+        and metrics["visible_depth_coverage"] >= config.min_depth_coverage
+    )
+    if (
+        mask_supported
+        and (
+            metrics["depth_fraction"] < config.min_depth_fraction
+            or metrics["supported_recall"] < config.min_recall
+        )
+    ) or (visible_supported and metrics["supported_precision"] < config.min_precision):
+        return metrics, "LOST"
+    if (
+        mask_supported
+        and visible_supported
+        and matched_count >= config.min_depth_pixels
+        and metrics["precision"] >= config.min_precision
+        and metrics["recall"] >= config.min_recall
+    ):
+        return metrics, "VALID"
+    return metrics, "OCCLUDED"
 
 
 def pose_depth_quality(observed, rendered, config):
@@ -236,7 +206,11 @@ def pose_depth_quality(observed, rendered, config):
         "supported_recall": -1,
         "median_depth_error_m": float(np.median(residual)) if len(residual) else None,
     }
-    return metrics, _classify_quality(metrics, config)
+    if support_count < config.min_depth_pixels or coverage < config.min_depth_coverage:
+        return metrics, "OCCLUDED"
+    if fraction < config.min_depth_fraction:
+        return metrics, "LOST"
+    return metrics, "VALID" if matched_count >= config.min_depth_pixels else "OCCLUDED"
 
 
 def pose_motion(previous, current, tracker, dt, config):
@@ -286,13 +260,9 @@ class SceneTracker:
 
         self.config = config
         workspace = Path(workspace)
-        self.ostrack = (
-            OSTrackAdapter(
-                workspace / "third_party/OSTrack",
-                workspace / Path(config.ostrack_checkpoint).expanduser(),
-            )
-            if config.tracker_2d == "ostrack"
-            else None
+        self.ostrack = OSTrackAdapter(
+            workspace / "third_party/OSTrack",
+            workspace / Path(config.ostrack_checkpoint).expanduser(),
         )
         models_dir = workspace / DEFAULT_MODELS_DIR
         checkpoint, sam_config = resolve_sam_model(models_dir)
@@ -318,12 +288,13 @@ class SceneTracker:
 
         # 预热固定尺寸网络，让 worker 就绪后可直接处理首帧。
         with torch.inference_mode():
-            image_size = self.segmenter.tracker.image_size
+            sam_model = self.segmenter.image_predictor.model
+            image_size = sam_model.image_size
             image = torch.zeros((1, 3, image_size, image_size), device="cuda").to(
                 memory_format=torch.channels_last
             )
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                self.segmenter.tracker.forward_image(image)
+                sam_model.forward_image(image)
             refiner = next(iter(self.trackers.values())).estimator.refiner
             inputs = torch.zeros(
                 (len(self.trackers), 6, *refiner.cfg.input_resize), device="cuda"
@@ -347,18 +318,11 @@ class SceneTracker:
         self.next_retry: dict[str, int] = {}
         self.last_pose: dict[str, tuple[np.ndarray, int]] = {}
         self._set_frame_time(frame, first=True)
-        if self.ostrack is None:
-            self.states = dict.fromkeys(self.trackers, "TRACKING")
-            self.occluded_since: dict[str, int] = {}
-            # 视频模式保存待确认的 (物体原点位姿, 居中网格位姿)。
-            self.pending_pose: dict[str, tuple[np.ndarray, Tensor]] = {}
-            self.last_sam_sequence = self.source_sequence
-        else:
-            self.ostrack.clear()
-            self.invalid_since: dict[str, int] = {}
-            self.last_good_bbox: dict[str, tuple[float, float, float, float]] = {}
-            self.bbox_offsets: dict[str, np.ndarray] = {}
-            self.last_mask_sequence: dict[str, int] = {}
+        self.ostrack.clear()
+        self.invalid_since: dict[str, int] = {}
+        self.last_good_bbox: dict[str, tuple[float, float, float, float]] = {}
+        self.bbox_offsets: dict[str, np.ndarray] = {}
+        self.last_mask_sequence: dict[str, int] = {}
         self.frame_index = 0
         self.last_sam_frame = 0
         self.frame_signature = (
@@ -381,12 +345,8 @@ class SceneTracker:
             name, reason = next(iter(failures.items()))
             raise TrackingFailure(f"{name}: {reason}")
 
-        if self.ostrack is None:
-            masks = self.segmenter.initialize(rgb, boxes)
-            result = self._estimate_sam2_video(rgb, depth_m, frame.K, masks)
-        else:
-            masks = self.segmenter.segment_boxes(rgb, boxes)
-            result = self._estimate_ostrack(self.ostrack, rgb, depth_m, frame.K, initial_masks=masks)
+        masks = self.segmenter.segment_boxes(rgb, boxes)
+        result = self._estimate(rgb, depth_m, frame.K, initial_masks=masks)
         if not all(result.valid.values()):
             raise TrackingFailure(str(result.failures))
         return result
@@ -402,9 +362,7 @@ class SceneTracker:
         rgb, depth_m = self.rectifier.apply(frame.rgb, frame.depth_m)
         self._set_frame_time(frame, first=False)
         self.frame_index += 1
-        if self.ostrack is not None:
-            return self._estimate_ostrack(self.ostrack, rgb, depth_m, frame.K)
-        return self._estimate_sam2_video(rgb, depth_m, frame.K)
+        return self._estimate(rgb, depth_m, frame.K)
 
     def _set_frame_time(self, frame: RGBDFrame, *, first: bool) -> None:
         stamp = int(frame.timestamp_ns)
@@ -422,14 +380,14 @@ class SceneTracker:
         self.source_sequence = sequence
 
     def _detect_boxes(self, rgb, names, *, recovery=False):
-        thresholds: tuple[float, ...]
+        labels = (self.prompts[name] for name in names) if recovery else self.prompts.values()
+        text = ". ".join(labels) + "."
         if recovery:
-            prompts = [self.prompts[name] for name in names]
-            thresholds = (self.config.recovery_box_threshold, self.config.recovery_text_threshold)
+            candidates = self.segmenter.detect(
+                rgb, text, self.config.recovery_box_threshold, self.config.recovery_text_threshold
+            )
         else:
-            prompts = list(self.prompts.values())
-            thresholds = ()
-        candidates = self.segmenter.detect(rgb, ". ".join(prompts) + ".", *thresholds)
+            candidates = self.segmenter.detect(rgb, text)
         by_prompt: dict[str, list[np.ndarray]] = {}
         for candidate in candidates:
             prompt = candidate["label"].strip().lower().rstrip(". ")
@@ -443,11 +401,6 @@ class SceneTracker:
             else:
                 failures[name] = f"expected one detection for {prompt!r}, got {len(matches)}"
         return boxes, failures
-
-    def _redetect_masks(self, rgb, names, result):
-        boxes, failures = self._detect_boxes(rgb, names, recovery=True)
-        result.failures.update(failures)
-        return self.segmenter.segment_boxes(rgb, boxes) if boxes else {}
 
     def _pose_geometry(self, name, pose, K, reference, dt):
         """检查候选刚体位姿，生成与当前 Mask 无关的几何证据。"""
@@ -485,47 +438,7 @@ class SceneTracker:
             )
         return rendered, motion, continuous
 
-    def _refresh_masks(self, rgb):
-        masks = self.segmenter.track(rgb)
-        self.last_sam_frame = self.frame_index
-        self.last_sam_sequence = self.source_sequence
-        return masks
-
-    def _measure_pose(self, result, name, sampled, mask, geometry, last_mask_sequence):
-        rendered, motion, continuous = geometry
-        if mask is None:
-            metrics, verdict = pose_depth_quality(sampled, rendered, self.config)
-        else:
-            metrics, verdict = pose_quality(mask[PIXEL_GRID], sampled, rendered, self.config)
-        metrics.update(
-            mask_source=int(mask is not None),
-            mask_age_frames=self.source_sequence - last_mask_sequence,
-            dt_s=self.frame_dt_s,
-            source_frame_gap=self.source_frame_gap,
-            **motion,
-        )
-        result.quality[name] = metrics
-        if not continuous:
-            result.failures[name] = "implausible pose jump under configured motion limits"
-            return "LOST"
-        if verdict == "VALID":
-            result.failures.pop(name, None)
-        else:
-            result.failures[name] = (
-                "insufficient geometric evidence" if verdict == "OCCLUDED"
-                else "depth or silhouette disagreement"
-            )
-        return verdict
-
-    def _register_pose(self, name, rgb, depth_m, K, mask, sampled):
-        if mask is None:
-            raise TrackingFailure("missing registration mask")
-        valid = mask[PIXEL_GRID] & np.isfinite(sampled) & (sampled >= 0.001)
-        if np.count_nonzero(valid) < self.config.min_depth_pixels:
-            raise TrackingFailure("insufficient segmented depth")
-        return self.trackers[name].register(rgb, depth_m, K, mask)
-
-    def _estimate_ostrack(self, ostrack: OSTrackAdapter, rgb, depth_m, K, *, initial_masks=None):
+    def _estimate(self, rgb, depth_m, K, *, initial_masks=None):
         result = SceneResult(
             poses={},
             quality={name: {} for name in self.trackers},
@@ -533,21 +446,45 @@ class SceneTracker:
         )
         sampled = depth_m[PIXEL_GRID]
 
-        def evaluate(name, pose, mask, reference=None):
-            if mask is not None:
-                self.last_mask_sequence[name] = self.source_sequence
+        def pose_geometry(name, pose, reference=None):
             previous, dt = None, 0.0
             if reference is not None:
                 previous, reference_ns = reference
                 dt = (self.timestamp_ns - reference_ns) / 1e9
             try:
-                geometry = self._pose_geometry(name, pose, K, previous, dt)
+                return self._pose_geometry(name, pose, K, previous, dt)
             except TrackingFailure as error:
                 result.failures[name] = str(error)
+
+        def evaluate(name, mask, geometry):
+            if mask is not None:
+                self.last_mask_sequence[name] = self.source_sequence
+            if geometry is None:
                 return False
-            return self._measure_pose(
-                result, name, sampled, mask, geometry, self.last_mask_sequence[name],
-            ) == "VALID"
+            rendered, motion, continuous = geometry
+            if mask is None:
+                metrics, verdict = pose_depth_quality(sampled, rendered, self.config)
+            else:
+                metrics, verdict = pose_quality(mask[PIXEL_GRID], sampled, rendered, self.config)
+            metrics.update(
+                mask_source=int(mask is not None),
+                mask_age_frames=self.source_sequence - self.last_mask_sequence[name],
+                dt_s=self.frame_dt_s,
+                source_frame_gap=self.source_frame_gap,
+                **motion,
+            )
+            result.quality[name] = metrics
+            if not continuous:
+                result.failures[name] = "implausible pose jump under configured motion limits"
+            elif verdict == "VALID":
+                result.failures.pop(name, None)
+                return True
+            else:
+                result.failures[name] = (
+                    "insufficient geometric evidence" if verdict == "OCCLUDED"
+                    else "depth or silhouette disagreement"
+                )
+            return False
 
         def accept(name, pose):
             if name in self.next_retry:
@@ -558,30 +495,41 @@ class SceneTracker:
             result.poses[name] = pose
             result.valid[name] = True
 
+        def calibrate_offset(name, pose, mask_box, *, tracker_box=None):
+            offset = bbox_center_offset(
+                pose @ self.trackers[name].object_from_center, K, mask_box, depth_m.shape,
+                tracker_box=tracker_box,
+            )
+            if offset is None:
+                self.bbox_offsets.pop(name, None)
+            else:
+                self.bbox_offsets[name] = offset
+
         def register(name, mask):
             tracker = self.trackers[name]
             previous = tracker.estimator.pose_last
             try:
-                pose = self._register_pose(name, rgb, depth_m, K, mask, sampled)
+                if mask is None:
+                    raise TrackingFailure("missing registration mask")
+                valid_depth = mask[PIXEL_GRID] & np.isfinite(sampled) & (sampled >= 0.001)
+                if np.count_nonzero(valid_depth) < self.config.min_depth_pixels:
+                    raise TrackingFailure("insufficient segmented depth")
+                pose = tracker.register(rgb, depth_m, K, mask)
             except TrackingFailure as error:
                 result.failures[name] = str(error)
                 tracker.estimator.pose_last = previous
                 return False
-            if not evaluate(name, pose, mask):
+            if not evaluate(name, mask, pose_geometry(name, pose)):
                 tracker.estimator.pose_last = previous
                 return False
             # 通过 segmented depth 门槛的 Mask 一定能生成非空包围框。
             box = mask_to_xyxy(mask)
             self.last_good_bbox[name] = box
-            if self.config.xy_prior_gain:
-                offset = bbox_center_offset(
-                    pose @ tracker.object_from_center, K, box, depth_m.shape
-                )
-                if offset is None:
-                    self.bbox_offsets.pop(name, None)
-                else:
-                    self.bbox_offsets[name] = offset
-            ostrack.initialize(name, rgb, box)
+            if self.config.xy_prior_gain and result.quality[name]["occluded_fraction"] == 0:
+                calibrate_offset(name, pose, box)
+            else:
+                self.bbox_offsets.pop(name, None)
+            self.ostrack.initialize(name, rgb, box)
             accept(name, pose)
             return True
 
@@ -604,7 +552,7 @@ class SceneTracker:
         priors = {}
         previous = {name: tracker.estimator.pose_last for name, tracker in active.items()}
         for name, tracker in active.items():
-            box = ostrack.track(name, rgb)
+            box = self.ostrack.track(name, rgb)
             if box is None:
                 continue
             boxes[name] = box
@@ -621,26 +569,52 @@ class SceneTracker:
             )
             if active else {}
         )
+        # 深度异常补分割复用本帧的 CAD 深度和运动检查。
+        checks = {
+            name: pose_geometry(name, pose, self.last_pose[name])
+            for name, pose in candidates.items()
+        }
+        elapsed = self.frame_index - self.last_sam_frame
+        interval = self.config.segmentation_interval_frames
+        periodic = elapsed >= interval
+        depth_valid = {
+            name: evaluate(name, None, geometry)
+            for name, geometry in checks.items()
+            if not periodic or name not in boxes
+        }
+        abnormal = [
+            name for name, valid in depth_valid.items()
+            if not valid and (geometry := checks[name]) is not None and geometry[2]
+        ]
         segment_boxes = {name: self.last_good_bbox[name] for name in due}
-        if (
-            active
-            and self.frame_index - self.last_sam_frame >= self.config.segmentation_interval_frames
-        ):
-            segment_boxes.update(boxes)
-            self.last_sam_frame = self.frame_index
+        if periodic or (elapsed >= max(2, interval // 2) and abnormal):
+            active_boxes = boxes | {
+                name: self.last_good_bbox[name] for name in abnormal if name not in boxes
+            }
+            segment_boxes.update(active_boxes)
+        else:
+            active_boxes = {}
         masks = self.segmenter.segment_boxes(rgb, segment_boxes) if segment_boxes else {}
+        if active_boxes:
+            self.last_sam_frame = self.frame_index
 
         for name, pose in candidates.items():
             mask = masks.get(name)
-            if evaluate(name, pose, mask, self.last_pose[name]):
+            if mask is None and name in depth_valid:
+                valid = depth_valid[name]
+            else:
+                valid = evaluate(name, mask, checks[name])
+            if valid:
                 accept(name, pose)
                 box = boxes.get(name)
-                if box is not None and (
-                    mask is not None
-                    or bbox_center_offset(
-                        pose @ self.trackers[name].object_from_center, K, box, depth_m.shape
-                    ) is not None
-                ):
+                if mask is not None and result.quality[name]["occluded_fraction"] == 0:
+                    mask_box = mask_to_xyxy(mask)
+                    self.last_good_bbox[name] = mask_box
+                    if box is not None and self.config.xy_prior_gain:
+                        calibrate_offset(name, pose, mask_box, tracker_box=box)
+                elif box is not None and bbox_center_offset(
+                    pose @ self.trackers[name].object_from_center, K, box, depth_m.shape
+                ) is not None:
                     self.last_good_bbox[name] = box
                 continue
             self.trackers[name].estimator.pose_last = previous[name]
@@ -652,176 +626,26 @@ class SceneTracker:
 
         retry_dino = []
         for name in due:
-            self.next_retry[name] = self.frame_index + cast(int, self.config.recovery_retry_interval_frames)
+            self.next_retry[name] = self.frame_index + self.config.recovery_retry_interval_frames
             if not register(name, masks.get(name)):
                 retry_dino.append(name)
         if retry_dino:
-            for name, mask in self._redetect_masks(rgb, retry_dino, result).items():
-                register(name, mask)
+            recovered_boxes, failures = self._detect_boxes(rgb, retry_dino, recovery=True)
+            result.failures.update(failures)
+            if recovered_boxes:
+                for name, mask in self.segmenter.segment_boxes(
+                    rgb, recovered_boxes, reuse_image=True
+                ).items():
+                    register(name, mask)
 
+        retry_reason = (
+            "awaiting recovery retry" if self.config.recovery_enabled else "recovery disabled"
+        )
         for name, valid in result.valid.items():
             if not valid:
-                reason = result.failures.get(name, "awaiting recovery retry")
+                reason = result.failures.get(name, retry_reason)
                 state = "REACQUIRE" if name in self.next_retry else "TRACKING"
                 result.failures[name] = f"{state}; {reason}"
         if due:
             result.poses = {name: result.poses[name] for name in self.trackers if result.valid[name]}
-        return result
-
-    def _estimate_sam2_video(self, rgb, depth_m, K, masks=None):
-        first = masks is not None
-        # 后端替换 pose_last 而不原地修改旧张量；这些引用始终指向最后可靠位姿。
-        previous = {
-            name: tracker.estimator.pose_last for name, tracker in self.trackers.items()
-        }
-        result = SceneResult(
-            poses={},
-            quality={name: {} for name in self.trackers},
-            valid=dict.fromkeys(self.trackers, False),
-        )
-        confirming = self.pending_pose
-        # 本帧新丢失（包括遮挡超时）的对象，从下一处理帧才开始检测恢复。
-        due = [
-            name
-            for name in self.trackers
-            if self.config.recovery_enabled
-            and self.states[name] == "LOST"
-            and name not in confirming
-            and self.frame_index >= self.next_retry[name]
-        ]
-        candidates: dict[str, np.ndarray] = {}
-        verdicts = dict.fromkeys(self.trackers, "LOST")
-        pose_checks = {}
-        sampled = depth_m[PIXEL_GRID]
-
-        def reject(name, error):
-            verdicts[name] = "LOST"
-            result.failures[name] = str(error)
-
-        expired = {
-            name
-            for name, since in self.occluded_since.items()
-            if (self.timestamp_ns - since) / 1e9 >= self.config.occlusion_timeout_s
-        }
-        for name in expired:
-            reject(name, "occlusion timeout")
-
-        active = {
-            name: tracker
-            for name, tracker in self.trackers.items()
-            if name not in expired
-            and (self.states[name] != "LOST" or name in confirming)
-        }
-        if masks is None and (
-            due
-            or confirming
-            or (
-                active
-                and self.frame_index - self.last_sam_frame
-                >= self.config.segmentation_interval_frames
-            )
-        ):
-            masks = self._refresh_masks(rgb)
-
-        def evaluate(name, pose, mask) -> None:
-            if name not in pose_checks:
-                reference, dt = None, 0.0
-                if name in confirming:
-                    reference = self.pending_pose[name][0]
-                    dt = self.frame_dt_s
-                elif name in self.last_pose and name not in due:
-                    reference, reference_ns = self.last_pose[name]
-                    dt = (self.timestamp_ns - reference_ns) / 1e9
-                # Mask 更新后仅重算可见证据，复用同一候选的位姿检查和渲染。
-                pose_checks[name] = self._pose_geometry(name, pose, K, reference, dt)
-            verdicts[name] = self._measure_pose(
-                result, name, sampled, mask, pose_checks[name], self.last_sam_sequence,
-            )
-
-        def check_candidates():
-            for name, pose in list(candidates.items()):
-                try:
-                    evaluate(name, pose, None if masks is None else masks.get(name))
-                except TrackingFailure as error:
-                    reject(name, error)
-                    del candidates[name]
-
-        def register(name, mask):
-            try:
-                pose = self._register_pose(name, rgb, depth_m, K, mask, sampled)
-                evaluate(name, pose, mask)
-                if verdicts[name] != "VALID":
-                    return False
-            except TrackingFailure as error:
-                reject(name, error)
-                return False
-            candidates[name] = pose
-            return True
-
-        if first:
-            for name in active:
-                register(name, masks.get(name))
-        elif active:
-            for name, tracker in active.items():
-                if name in confirming:
-                    tracker.estimator.pose_last = self.pending_pose[name][1]
-            candidates = track_objects(active, rgb, depth_m, K, self.frame_cache)
-            check_candidates()
-            if masks is None and any(
-                continuous and verdicts[name] != "VALID"
-                for name, (_, _, continuous) in pose_checks.items()
-            ):
-                masks = self._refresh_masks(rgb)
-                # 用当前轮廓区分前景遮挡与位姿不一致。
-                check_candidates()
-
-        if due:
-            for name in due:
-                self.next_retry[name] = (
-                    self.frame_index + cast(int, self.config.recovery_retry_interval_frames)
-                )
-            corrections = {
-                name: mask
-                for name, mask in self._redetect_masks(rgb, due, result).items()
-                if register(name, mask)
-            }
-            if corrections:
-                masks = self.segmenter.correct_masks(corrections)
-                # 校正可能改变任意对象的可见边界；复用各候选的 CAD 深度复查。
-                check_candidates()
-
-        # Mask 合并后统一提交或恢复内部位姿；只有确认过的当前观测进入 poses。
-        for name, tracker in self.trackers.items():
-            state = self.states[name]
-            verdict = verdicts[name]
-            if name in due and verdict == "VALID":
-                self.pending_pose[name] = (
-                    candidates[name],
-                    tracker.estimator.pose_last,
-                )
-                tracker.estimator.pose_last = previous[name]
-                result.failures[name] = "LOST; awaiting second recovery observation"
-                continue
-            if verdict == "VALID":
-                self.states[name] = "TRACKING"
-                self.next_retry.pop(name, None)
-                self.last_pose[name] = candidates[name], self.timestamp_ns
-                result.poses[name] = candidates[name]
-                result.valid[name] = True
-            else:
-                tracker.estimator.pose_last = previous[name]
-                if verdict == "OCCLUDED" and state != "LOST" and not first:
-                    self.states[name] = "OCCLUDED"
-                    self.occluded_since.setdefault(name, self.timestamp_ns)
-                else:
-                    self.states[name] = "LOST"
-                    if state != "LOST":
-                        self.next_retry[name] = self.frame_index + 1
-                reason = result.failures.get(name, "awaiting recovery retry")
-                result.failures[name] = f"{self.states[name]}; {reason}"
-            if self.states[name] != "OCCLUDED":
-                self.occluded_since.pop(name, None)
-            self.pending_pose.pop(name, None)
-            if state != self.states[name]:
-                logger.info("%s: %s -> %s", name, state, self.states[name])
         return result

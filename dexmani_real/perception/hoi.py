@@ -36,26 +36,26 @@ def track_hoi_frame(
     *,
     initialize: bool = False,
 ) -> HOIFrameResult:
-    """读取当前有效位姿，保留无效对象的状态和逐物体质量。"""
-    scene = tracker.initialize(frame, prompts) if initialize else tracker.track(frame)
+    """按模板顺序返回当前结果，初始化证据不足时返回整帧无效。"""
     names = template["object_names"]
     poses = np.full((len(names), 4, 4), np.nan, dtype=np.float32)
+    if initialize:
+        from cordvip_geometry import TrackingFailure
+
+        try:
+            scene = tracker.initialize(frame, prompts)
+        except TrackingFailure as error:
+            return HOIFrameResult(
+                poses, np.zeros(len(names), dtype=bool),
+                tuple({} for _ in names), dict.fromkeys(names, str(error)),
+            )
+    else:
+        scene = tracker.track(frame)
     valid = np.array([scene.valid[name] for name in names], dtype=bool)
     for index, name in enumerate(names):
         if valid[index]:
             poses[index] = scene.poses[name]
     return HOIFrameResult(poses, valid, tuple(scene.quality[name] for name in names), scene.failures)
-
-
-def invalid_hoi_frame(template: Mapping[str, np.ndarray], reason: str) -> HOIFrameResult:
-    """整帧跟踪失败时，逐物体保留失败原因和空质量。"""
-    names = template["object_names"]
-    return HOIFrameResult(
-        np.full((len(names), 4, 4), np.nan, dtype=np.float32),
-        np.zeros(len(names), dtype=bool),
-        tuple({} for _ in names),
-        dict.fromkeys(names, reason),
-    )
 
 
 def build_tracking_config(config: HOITrackingConfig) -> TrackingConfig:

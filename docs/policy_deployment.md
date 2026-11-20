@@ -28,9 +28,9 @@ Checkpoint 描述模型的观测字段、动作、RGB 预处理和控制周期�
 
 只加载可信来源的 Checkpoint 文件或包含 `checkpoints/latest.pt` 的目录。训练 Checkpoint 保存了权重和策略配置，部署会根据保存的配置构造策略，加载过程可能执行代码。`--config` 也只应指定可信的 Python 实验配置。
 
-HOI（`object_pointcloud`）与场景点云（`point_cloud`）是互斥输入。HOI 策略通过 CLI 的 `--task-dir` 或 `PolicySession(..., task_dir=...)` 指定与离线标注共用的任务资产目录。目录支持 `~`，相对路径基于当前工作目录。部署在连接设备前校验任务，`run_config.yaml` 记录实际目录和 `effective_parameters.hoi_tracking`。Checkpoint 的 `task_name` 用作实验标签。跟踪参数见[跟踪配置](object_reconstruction.md#跟踪配置)。
+HOI（`object_pointcloud`）与场景点云（`point_cloud`）是互斥输入。HOI 策略通过 CLI 的 `--task-dir` 或 `PolicySession(..., task_dir=...)` 指定与离线标注共用的任务资产目录。目录支持 `~`，相对路径基于当前工作目录。部署在连接设备前校验任务和跟踪配置，`run_config.yaml` 记录实际目录和 `effective_parameters.hoi_tracking`。Checkpoint 的 `task_name` 用作实验标签。[跟踪配置](object_reconstruction.md#跟踪配置) · [安装与权重路径](../third_party/cordvip_geometry/README.md#安装与命令)
 
-场景点云使用 `RealConfig.pointcloud`，手表面点云使用 `RealConfig.hand_pointcloud`。指尖 FK 与数据导出共用固定五指顺序（thumb、index、middle、ring、pinky）。会话归档的 `training_processing` 来自 Checkpoint，`actual_processing` 记录部署使用的场景及手部点云处理参数。外部实验配置若仍在 `ExecutionConfig(...)` 中设置 HOI 关节反馈间隔上限，请移除该设置。
+场景点云使用 `RealConfig.pointcloud`，手表面点云使用 `RealConfig.hand_pointcloud`。指尖 FK 与数据导出共用固定五指顺序（thumb、index、middle、ring、pinky）。会话归档的 `training_processing` 来自 Checkpoint，`actual_processing` 记录部署使用的场景及手部点云处理参数。
 
 所有策略 RGB 在进入历史前统一为针孔图像，同一相机来源序号复用矫正结果。Policy 在该网格上继续做投影和 resize 坐标变换。图像几何与录制路径见[实验数据](data.md#图像与模型输入)。
 

@@ -212,12 +212,8 @@ class EpisodeVisualizer:
             diagnostics[f"hoi/{device}_source_offset_ms"] = (hoi_timing[f"{device}_ns"] - camera_ns) / 1e6
 
         annotations = self.reader.hoi_file
-        expected = (self.frame_count, annotations["object_valid"].shape[1])
         for name, dataset in annotations["quality"].items():
-            quality = dataset[: self.frame_count]
-            if quality.shape != expected:
-                raise ValueError(f"Invalid HOI quality/{name}: expected selected shape {expected}")
-            for index, values in enumerate(quality.T):
+            for index, values in enumerate(dataset[: self.frame_count].T):
                 # 跟踪后端以 -1 标记未计算的指标。
                 diagnostics[f"hoi/object_{index}/{name}"] = np.where(values == -1, np.nan, values)
 
