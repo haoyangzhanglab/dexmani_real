@@ -8,15 +8,15 @@ if [[ "${1:-}" == "--workspace" ]]; then
 fi
 cordvip_library="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cordvip_operation=tracking
-if [[ "${1:-}" == "reconstruction" ]]; then
-    cordvip_operation=reconstruction
+if [[ "${1:-}" == "reconstruction" || "${1:-}" == "ostrack" ]]; then
+    cordvip_operation="$1"
     shift
 fi
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     cat <<'USAGE'
 用法：conda activate real_robot
-      bash third_party/cordvip_geometry/scripts/install_perception.sh [--workspace PATH] [reconstruction]
+      bash third_party/cordvip_geometry/scripts/install_perception.sh [--workspace PATH] [reconstruction|ostrack]
 
 默认安装跟踪依赖，获取 Grounded-SAM-2、FoundationPose 和 nvdiffrast，
 应用推理补丁并编译扩展。需要 conda CUDA 编译器及头文件、CMake、C++、
@@ -24,6 +24,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 
 reconstruction：在已完成跟踪安装的同一环境中获取 Hunyuan3D，
 应用分层解码补丁并安装重建依赖。
+
+ostrack：在已完成跟踪安装的同一环境中获取 OSTrack，安装轻量推理依赖。
 
 源码按固定 revision 获取。已有目录须为 Git 工作树根目录，HEAD 匹配固定
 revision 时复用本地修改。版本不符或补丁冲突时退出。
@@ -60,14 +62,6 @@ if [[ "$cordvip_operation" == tracking ]]; then
         exit 1
     fi
 fi
-
-cordvip_constraints="$(mktemp)"
-trap 'rm -f "$cordvip_constraints"' EXIT
-"$cordvip_python" - <<'PY' > "$cordvip_constraints"
-from importlib.metadata import version
-for package in ('torch', 'torchvision', 'numpy', 'transformers'):
-    print(f'{package}=={version(package)}')
-PY
 
 checkout_source() {
     local cordvip_name="$1" cordvip_url="$2" cordvip_revision="$3"
@@ -110,6 +104,22 @@ apply_source_patch() {
 }
 
 mkdir -p third_party
+if [[ "$cordvip_operation" == ostrack ]]; then
+    checkout_source OSTrack https://github.com/botaoye/OSTrack.git 33b5e12586216b7fd0e95d255bd01ba44cbec759
+    apply_source_patch OSTrack ostrack_inference.patch
+    "$cordvip_python" -m pip install --no-deps easydict==1.13 timm==1.0.19
+    printf 'OSTrack 推理源码已安装。将官方 OSTrack-256 权重放到 third_party/weights/ostrack/OSTrack_ep0300.pth.tar。\n'
+    exit 0
+fi
+
+cordvip_constraints="$(mktemp)"
+trap 'rm -f "$cordvip_constraints"' EXIT
+"$cordvip_python" - <<'PY' > "$cordvip_constraints"
+from importlib.metadata import version
+for package in ('torch', 'torchvision', 'numpy', 'transformers'):
+    print(f'{package}=={version(package)}')
+PY
+
 if [[ "$cordvip_operation" == reconstruction ]]; then
     checkout_source Hunyuan3D-2.1 https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git 82920d643c0dc2f7bfd7255f45f62d386edfe60c
     apply_source_patch Hunyuan3D-2.1 hunyuan_hierarchical_decode.patch

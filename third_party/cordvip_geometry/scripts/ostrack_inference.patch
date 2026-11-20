@@ -1,0 +1,71 @@
+diff --git a/lib/test/tracker/basetracker.py b/lib/test/tracker/basetracker.py
+index 47ec6f6..cc0802b 100644
+--- a/lib/test/tracker/basetracker.py
++++ b/lib/test/tracker/basetracker.py
+@@ -4,7 +4,6 @@ import torch
+ from _collections import OrderedDict
+ 
+ from lib.train.data.processing_utils import transform_image_to_crop
+-from lib.vis.visdom_cus import Visdom
+ 
+ 
+ class BaseTracker:
+@@ -63,6 +62,8 @@ class BaseTracker:
+         self.next_seq = False
+         if debug > 0 and visdom_info.get('use_visdom', True):
+             try:
++                from lib.vis.visdom_cus import Visdom
++
+                 self.visdom = Visdom(debug, {'handler': self._visdom_ui_handler, 'win_id': 'Tracking'},
+                                      visdom_info=visdom_info)
+ 
+diff --git a/lib/test/tracker/ostrack.py b/lib/test/tracker/ostrack.py
+index 3674779..3a9f8c6 100644
+--- a/lib/test/tracker/ostrack.py
++++ b/lib/test/tracker/ostrack.py
+@@ -20,7 +20,7 @@ class OSTrack(BaseTracker):
+     def __init__(self, params, dataset_name):
+         super(OSTrack, self).__init__(params)
+         network = build_ostrack(params.cfg, training=False)
+-        network.load_state_dict(torch.load(self.params.checkpoint, map_location='cpu')['net'], strict=True)
++        network.load_state_dict(torch.load(self.params.checkpoint, map_location='cpu', weights_only=True)['net'], strict=True)
+         self.cfg = params.cfg
+         self.network = network.cuda()
+         self.network.eval()
+@@ -51,7 +51,8 @@ class OSTrack(BaseTracker):
+         # forward the template once
+         z_patch_arr, resize_factor, z_amask_arr = sample_target(image, info['init_bbox'], self.params.template_factor,
+                                                     output_sz=self.params.template_size)
+-        self.z_patch_arr = z_patch_arr
++        if self.debug:
++            self.z_patch_arr = z_patch_arr
+         template = self.preprocessor.process(z_patch_arr, z_amask_arr)
+         with torch.no_grad():
+             self.z_dict1 = template
+@@ -93,7 +94,10 @@ class OSTrack(BaseTracker):
+         pred_box = (pred_boxes.mean(
+             dim=0) * self.params.search_size / resize_factor).tolist()  # (cx, cy, w, h) [0,1]
+         # get the final box result
+-        self.state = clip_box(self.map_box_back(pred_box, resize_factor), H, W, margin=10)
++        mapped_box = self.map_box_back(pred_box, resize_factor)
++        if not all(map(math.isfinite, mapped_box)):
++            return {"target_bbox": None}
++        self.state = clip_box(mapped_box, H, W, margin=min(10, H, W))
+ 
+         # for debug
+         if self.debug:
+diff --git a/lib/train/__init__.py b/lib/train/__init__.py
+index bef8ff0..e16963c 100644
+--- a/lib/train/__init__.py
++++ b/lib/train/__init__.py
+@@ -1 +1 @@
+-from .admin.multigpu import MultiGPU
++# Inference uses crop helpers without importing training dependencies.
+diff --git a/lib/train/data/__init__.py b/lib/train/data/__init__.py
+index a5de2f3..1e8ba77 100644
+--- a/lib/train/data/__init__.py
++++ b/lib/train/data/__init__.py
+@@ -1,2 +1 @@
+-from .loader import LTRLoader
+-from .image_loader import jpeg4py_loader, opencv_loader, jpeg4py_loader_w_failsafe, default_image_loader
++# Keep processing_utils importable without loading training datasets.

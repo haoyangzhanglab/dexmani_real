@@ -102,7 +102,49 @@ class FoundationPoseTracker:
         return pose
 
 
-def track_objects(trackers, rgb, depth_m, intrinsics, frame_cache):
+def _project_center(centered_pose, intrinsics, image_shape):
+    x, y, z = centered_pose[:3, 3]
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    if not (0 < z < np.inf and 0 < fx < np.inf and 0 < fy < np.inf):
+        return None
+    u = x / z * fx + intrinsics[0, 2]
+    v = y / z * fy + intrinsics[1, 2]
+    height, width = image_shape
+    return (u, v) if 0 <= u < width and 0 <= v < height else None
+
+
+def _box_geometry(box_xyxy):
+    # OSTrack 适配器和已通过深度校验的 Mask 提供图像内非空框。
+    left = np.asarray(box_xyxy[:2])
+    size = np.asarray(box_xyxy[2:]) - left
+    return left + size / 2, size
+
+
+def bbox_center_offset(centered_pose, intrinsics, box_xyxy, image_shape):
+    """用已通过质量校验的注册位姿和 Mask 框对齐居中原点与 2D 框。"""
+    pixel = _project_center(centered_pose, intrinsics, image_shape)
+    if pixel is None:
+        return None
+    center, size = _box_geometry(box_xyxy)
+    offset = (center - pixel) / size
+    return offset if np.all(np.abs(offset) <= 0.5) else None
+
+
+def xy_prior_delta(centered_pose, intrinsics, box_xyxy, offset, image_shape, gain):
+    """以相机系米制单位修正居中原点的 XY，限制异常框的影响。"""
+    pixel = _project_center(centered_pose, intrinsics, image_shape)
+    if pixel is None:
+        return np.zeros(2)
+    center, size = _box_geometry(box_xyxy)
+    limit = size / 2
+    error = np.clip(center - offset * size - pixel, -limit, limit)
+    focal = np.array((intrinsics[0, 0], intrinsics[1, 1]))
+    return gain * error * centered_pose[2, 3] / focal
+
+
+def track_objects(
+    trackers, rgb, depth_m, intrinsics, frame_cache, *, bbox_priors=None, xy_prior_gain=0.2
+):
     """合批生成候选位姿；调用方逐对象校验，拒绝时恢复原 pose_last。"""
     import torch
     from learning.training.predict_pose_refine import (
@@ -113,11 +155,21 @@ def track_objects(trackers, rgb, depth_m, intrinsics, frame_cache):
     names = list(trackers)
     estimators = [tracker.estimator for tracker in trackers.values()]
     refiner = estimators[0].refiner
-    # 遮挡改变可见 mask 中心，不能将其当作刚体中心。
     poses = torch.cat(
         [estimator.pose_last.reshape(1, 4, 4) for estimator in estimators]
     )
     with torch.inference_mode():
+        if bbox_priors and xy_prior_gain:
+            # 同一已验证位姿的 CPU 副本用于投影，避免按对象回读 CUDA 张量。
+            deltas = np.zeros((len(names), 2), dtype=np.float32)
+            for index, name in enumerate(names):
+                if name in bbox_priors:
+                    centered_pose, box_xyxy, offset = bbox_priors[name]
+                    deltas[index] = xy_prior_delta(
+                        centered_pose, intrinsics, box_xyxy, offset,
+                        depth_m.shape, xy_prior_gain,
+                    )
+            poses[:, :2, 3] += poses.new_tensor(deltas)
         rgb_tensor, xyz_map = prepare_tracking_frame(
             rgb, depth_m, intrinsics, refiner.cfg.input_resize, frame_cache
         )

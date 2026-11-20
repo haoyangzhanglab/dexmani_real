@@ -163,18 +163,36 @@ class TrackingConfigTest(unittest.TestCase):
             TrackingConfig(segmentation_interval_frames=3, recovery_enabled=False),
         )
 
-    def test_tracking_config_rejects_invalid_values_before_loading_backend(self):
-        with self.assertRaisesRegex(ValueError, "segmentation_interval_frames"):
-            HOITrackingConfig(segmentation_interval_frames=0)
-        with self.assertRaisesRegex(TypeError, "recovery_enabled"):
-            HOITrackingConfig(recovery_enabled=1)  # type: ignore[arg-type]
+    def test_ostrack_defaults_and_explicit_overrides(self):
+        config = build_tracking_config(HOITrackingConfig(tracker_2d="ostrack"))
+        self.assertEqual(config.tracker_2d, "ostrack")
+        self.assertEqual(config.recovery_retry_interval_frames, 8)
+        self.assertEqual(config.ostrack_checkpoint, "third_party/weights/ostrack/OSTrack_ep0300.pth.tar")
+        config = build_tracking_config(HOITrackingConfig(
+            tracker_2d="ostrack", ostrack_checkpoint="/tmp/checkpoint.pth.tar",
+            lost_timeout_s=0.4, recovery_retry_interval_frames=5, xy_prior_gain=0,
+        ))
+        self.assertEqual(config.ostrack_checkpoint, "/tmp/checkpoint.pth.tar")
+        self.assertEqual(config.lost_timeout_s, 0.4)
+        self.assertEqual(config.recovery_retry_interval_frames, 5)
+        self.assertEqual(config.xy_prior_gain, 0)
+
+    def test_effective_tracking_config_rejects_invalid_values(self):
+        for field, value in (
+            ("segmentation_interval_frames", 0),
+            ("recovery_enabled", 1),
+            ("tracker_2d", "unknown"),
+            ("xy_prior_gain", -0.1),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                build_tracking_config(HOITrackingConfig(**{field: value}))
 
     def test_backend_config_cannot_bypass_experiment_settings(self):
         backend = TrackingConfig(min_depth_pixels=20)
         with self.assertRaisesRegex(TypeError, "HOITrackingConfig"):
-            build_tracking_config(backend)
+            build_tracking_config(backend)  # type: ignore[arg-type]
         with self.assertRaisesRegex(TypeError, "HOITrackingConfig"):
-            RealConfig(hoi_tracking=backend)
+            RealConfig(hoi_tracking=backend)  # type: ignore[arg-type]
 
     def test_annotation_cli_loads_shared_experiment(self):
         with TemporaryDirectory() as directory:
@@ -219,24 +237,24 @@ class HOIAdapterTest(unittest.TestCase):
             is_running=running,
             hoi_ready=SimpleNamespace(value=False),
         )
+        effective_config = build_tracking_config(config)
         with (
-            patch("cordvip_geometry.tracking.SceneTracker", return_value=tracker) as factory,
+            patch("cordvip_geometry.SceneTracker", return_value=tracker) as factory,
             patch("dexmani_real.perception.hoi_worker.signal.signal"),
             patch("dexmani_real.perception.hoi_worker.time.sleep"),
             patch(
                 "dexmani_real.perception.hoi_worker.transform_task_points", wraps=transform_task_points
             ) as transform,
-            patch.object(sys, "path", list(sys.path)),
         ):
-            run_hoi_worker(shared, camera, template, {}, prompts, config)
+            run_hoi_worker(shared, camera, template, {}, prompts, effective_config)
         self.assertTrue(shared.hoi_ready.value)
-        self.assertEqual(factory.call_args.kwargs["config"], build_tracking_config(config))
+        self.assertIs(factory.call_args.kwargs["config"], effective_config)
         return published, [call.args[1] for call in transform.call_args_list]
 
     def test_worker_and_raw_annotation_agree_after_retry_and_recovery(self):
         camera, template = camera_snapshot(), object_template()
         prompts = {"cup": "a cup", "tray": "a tray"}
-        config = HOITrackingConfig(segmentation_interval_frames=4)
+        config = HOITrackingConfig(segmentation_interval_frames=4, tracker_2d="ostrack")
         sequences, stamps = [12, 12, 13, 14, 15], [120, 120, 130, 140, 150]
         timing = np.zeros(len(sequences), dtype=TIMING_ROW_DTYPE)
         timing["camera_sequence"], timing["camera_ns"] = sequences, stamps
@@ -304,8 +322,8 @@ class HOIAdapterTest(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "hoi.h5"
             tracking = asdict(build_tracking_config(config))
-            write_hoi(
-                path,
+            published_path = write_hoi(
+                str(path),
                 template,
                 poses,
                 extrinsic,
@@ -314,7 +332,10 @@ class HOIAdapterTest(unittest.TestCase):
                 tracking_config=tracking,
                 object_valid=valid,
             )
-            with h5py.File(path, "r") as saved:
+            self.assertIsInstance(published_path, Path)
+            self.assertEqual(published_path, path)
+            self.assertTrue(published_path.is_file())
+            with h5py.File(published_path, "r") as saved:
                 self.assertEqual(json.loads(saved.attrs["tracking_config"]), tracking)
                 np.testing.assert_array_equal(saved["object_pose_camera"][:], poses)
                 np.testing.assert_array_equal(saved["object_valid"][:], valid)
@@ -388,6 +409,46 @@ class HOIAdapterTest(unittest.TestCase):
 
 
 class HOIExportTest(unittest.TestCase):
+    def test_camera_timing_requires_consistent_sequence_timestamps(self):
+        rows = np.zeros(3, dtype=TIMING_ROW_DTYPE)
+        rows["control_ns"] = rows["observation_ns"] = [100, 110, 120]
+        rows["camera_sequence"] = [7, 7, 8]
+        rows["camera_ns"] = [80, 80, 90]
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "data.h5"
+            with h5py.File(path, "w") as raw:
+                raw.create_group("meta").attrs["termination_reason"] = "completed"
+                raw.create_dataset("timing/rows", data=rows)
+            with RawReader(directory) as reader:
+                np.testing.assert_array_equal(reader.read_timing(source_clocks=("camera_ns",)), rows)
+
+            rows["camera_ns"][1] = 81
+            with h5py.File(path, "r+") as raw:
+                raw["timing/rows"][1] = rows[1]
+            with RawReader(directory) as reader, self.assertRaisesRegex(RawDataError, "camera sequence or timestamp at row 1"):
+                reader.read_timing(source_clocks=("camera_ns",))
+
+    def test_annotation_publish_failure_preserves_existing_file_and_cleans_temporary_file(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "hoi.h5"
+            original = b"existing annotation"
+            path.write_bytes(original)
+
+            with self.assertRaises(FileExistsError):
+                write_hoi(
+                    path,
+                    object_template(),
+                    np.broadcast_to(np.eye(4), (1, 2, 4, 4)),
+                    np.eye(4),
+                    camera_timing=np.array([(100, 1)], dtype=CAMERA_TIMING_DTYPE),
+                    quality=[({}, {})],
+                    tracking_config={},
+                    object_valid=np.ones((1, 2), dtype=bool),
+                )
+
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
     def test_annotation_reuse_rejects_missing_pointcloud(self):
         camera = camera_snapshot()
         timing = np.zeros(1, dtype=TIMING_ROW_DTYPE)

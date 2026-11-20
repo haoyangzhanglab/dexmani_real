@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -11,8 +11,7 @@ import numpy as np
 from dexmani_real.config.perception import HOITrackingConfig
 
 if TYPE_CHECKING:
-    from cordvip_geometry.camera import RGBDFrame
-    from cordvip_geometry.tracking import SceneTracker, TrackingConfig
+    from cordvip_geometry import RGBDFrame, SceneTracker, TrackingConfig
 
 
 @dataclass(frozen=True)
@@ -64,9 +63,6 @@ def build_tracking_config(config: HOITrackingConfig) -> TrackingConfig:
     if not isinstance(config, HOITrackingConfig):
         raise TypeError("tracking_config must be HOITrackingConfig")
 
-    from cordvip_geometry.tracking import TrackingConfig
+    from cordvip_geometry import TrackingConfig
 
-    return TrackingConfig(
-        segmentation_interval_frames=config.segmentation_interval_frames,
-        recovery_enabled=config.recovery_enabled,
-    )
+    return TrackingConfig(**asdict(config))

@@ -26,7 +26,7 @@ python scripts/export_zarr.py /data/episodes/pick --output /data/pick.zarr \
 
 ### 跟踪配置
 
-在线与离线默认每 10 个处理帧做一次 SAM2 周期校正，并开启丢失恢复。用可信本地 Python 文件导出 `CONFIG` 即可调整参数。
+在线与离线默认使用 `sam2_video`，每 10 个处理帧周期刷新 SAM2，并在深度验证失败等事件发生时补充分割。安装 OSTrack 后，可用可信本地 Python 文件导出 `CONFIG`，为一次实验选择 `ostrack`。
 
 ```python
 from dexmani_real.config.perception import HOITrackingConfig
@@ -34,17 +34,33 @@ from dexmani_real.config.real import RealConfig
 
 CONFIG = RealConfig(
     hoi_tracking=HOITrackingConfig(
-        segmentation_interval_frames=15,
-        recovery_enabled=True,
+        tracker_2d="ostrack",
+        segmentation_interval_frames=10,
+        xy_prior_gain=0.2,
     ),
 )
 ```
 
-`annotate_episodes.py` 和 `run_policy.py` 均从 `--config experiment.py` 读取 `RealConfig.hoi_tracking`。使用新参数重算已有标注时传入 `--overwrite`。部署有会话输出目录时，将两个实际参数写入 `run_config.yaml` 的 `effective_parameters.hoi_tracking`。标注将完整后端配置写入 `hoi.h5` 根属性 `tracking_config`。
+`annotate_episodes.py` 和 `run_policy.py` 均从 `--config experiment.py` 读取 `RealConfig.hoi_tracking`。使用新参数重算已有标注时传入 `--overwrite`。默认权重为 `third_party/weights/ostrack/OSTrack_ep0300.pth.tar`，可通过 `ostrack_checkpoint` 指定绝对路径或相对仓库根目录的路径。`xy_prior_gain=0` 关闭二维位姿辅助。`recovery_retry_interval_frames` 省略时，OSTrack 模式使用 8 帧，SAM2 视频模式使用 15 帧。
+
+部署在连接设备前解析和校验 HOI 配置，有会话输出目录时将有效配置写入 `run_config.yaml` 的 `effective_parameters.hoi_tracking`。离线标注用同一套默认值和校验，并将有效配置写入 `hoi.h5` 根属性 `tracking_config`。安装和恢复流程见[感知后端说明](../third_party/cordvip_geometry/README.md#安装与命令)。
+
+### 跟踪基准
+
+在同一 CUDA 环境中，用同一个有标定、RGB-D 和任务模板的 Episode 分别回放两种模式。默认先逐帧预热 50 帧，再投递 300 个测量帧。`paired` 等待每帧发布，用于比较同一批输入的耗时。`paced` 按相机频率向 Camera Ring 送帧，分别报告投递数、实际处理数、有效 FPS 和来源到发布延迟。相机帧率取自录制配置，也可用 `--camera-fps` 显式指定。
+
+```bash
+python scripts/benchmark_ostrack.py paired EPISODE --task-dir TASK --tracker sam2_video
+python scripts/benchmark_ostrack.py paired EPISODE --task-dir TASK --tracker ostrack
+python scripts/benchmark_ostrack.py paced EPISODE --task-dir TASK --tracker sam2_video
+python scripts/benchmark_ostrack.py paced EPISODE --task-dir TASK --tracker ostrack
+```
+
+独立 OSTrack 使用 `solo`，共驻 FoundationPose 和 SAM2 使用 `resident`。两者都用 `--box NAME X1 Y1 X2 Y2` 提供去畸变后首帧的 XYXY 框，可重复传入多个对象。Worker 回放使用常规初始化流程，可用 `--xy-prior-gain 0` 核对二维先验的影响。
 
 ## 跟踪与逐行快照
 
-在线 Worker 从 Camera Ring 读取，离线标注从 Raw 读取。两条路径共用 `track_hoi_frame()` 和 `transform_task_points()`，按模板顺序处理位姿和有效性。离线标注额外保存逐物体质量。每个在线请求和每个离线 Raw Episode 分别初始化跟踪，失败时用下一来源帧重试。在线跳过已处理的相机序列，离线同序列的记录行复用跟踪结果。意外后端错误沿各入口的故障路径传播。质量与恢复规则见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)和[遮挡恢复](../third_party/cordvip_geometry/README.md#遮挡恢复)。
+在线 Worker 从 Camera Ring 读取，离线标注从 Raw 读取。两条路径共用 `track_hoi_frame()` 和 `transform_task_points()`，按模板顺序处理位姿和有效性。离线标注额外保存逐物体质量。每个在线请求和每个离线 Raw Episode 分别初始化跟踪，初始化失败时用下一来源帧重试。在线跳过已处理的相机序列，离线要求同序列具有相同来源时间，并复用跟踪结果。意外后端错误沿各入口的故障路径传播。质量与恢复规则见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)和[遮挡恢复](../third_party/cordvip_geometry/README.md#遮挡恢复)。
 
 在线将当前控制采样行的最新 Arm / Hand 实测关节状态与可用的 HOI 物体点云组合。离线将 `hoi.h5` 的物体点云与对应 Raw 行的 `arm_qpos`、`hand_qpos` 组合。两条路径都用本行实测关节生成 `joint_state`，并通过 FK 计算 `eef_pose`、指尖和手点云。
 

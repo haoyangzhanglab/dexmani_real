@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import signal
-import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -15,13 +14,13 @@ import numpy as np
 from dexmani_real.config.perception import HOI_NUM_POINTS
 from dexmani_real.geometry.hoi import transform_task_points
 from dexmani_real.perception.hoi import (
-    build_tracking_config,
     invalid_hoi_frame,
     track_hoi_frame,
 )
 
 if TYPE_CHECKING:
-    from dexmani_real.config.perception import HOITrackingConfig
+    from cordvip_geometry import TrackingConfig
+
     from dexmani_real.geometry.camera import CameraSnapshot
 
 logger = logging.getLogger(__name__)
@@ -33,12 +32,9 @@ def run_hoi_worker(
     template: Mapping[str, np.ndarray],
     mesh_paths: dict[str, Path],
     prompts: dict[str, str],
-    tracking_config: HOITrackingConfig,
+    tracking_config: TrackingConfig,
 ) -> None:
-    root = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(root / "third_party/cordvip_geometry/src"))
-    from cordvip_geometry.camera import RGBDFrame
-    from cordvip_geometry.tracking import SceneTracker, TrackingFailure
+    from cordvip_geometry import RGBDFrame, SceneTracker, TrackingFailure
 
     def terminate(signum, frame):
         raise SystemExit(0)
@@ -48,7 +44,7 @@ def run_hoi_worker(
     active_request = last_sequence = 0
     initialize = True
     tracker = SceneTracker(
-        mesh_paths, workspace=root, config=build_tracking_config(tracking_config)
+        mesh_paths, workspace=Path(__file__).resolve().parents[2], config=tracking_config,
     )
     invalid_points = np.zeros((HOI_NUM_POINTS, 3), np.float32)
     shared.hoi_ready.value = True

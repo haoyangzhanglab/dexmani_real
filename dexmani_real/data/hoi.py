@@ -28,7 +28,8 @@ def write_hoi(
     tracking_config,
     object_valid,
     overwrite=False,
-) -> None:
+) -> Path:
+    """原子发布 HOI 标注并返回实际写入的路径。"""
     import h5py
 
     base_from_camera = validate_rigid_transform(base_from_camera, label="HOI base_from_camera")
@@ -93,3 +94,4 @@ def write_hoi(
         except BaseException:
             logger.exception("HOI temporary file cleanup also failed: %s", temporary)
         raise
+    return path

@@ -39,6 +39,7 @@ def annotate_episodes(
     tracking_config: HOITrackingConfig,
     overwrite: bool = False,
 ) -> None:
+    config = build_tracking_config(tracking_config)
     tracker = None
 
     for episode in episodes:
@@ -50,14 +51,12 @@ def annotate_episodes(
                 continue
             if tracker is None:
                 template, mesh_paths, prompts = load_hoi_task(Path(task).expanduser().resolve())
-                tracker = SceneTracker(
-                    mesh_paths, workspace=ROOT, config=build_tracking_config(tracking_config)
-                )
+                tracker = SceneTracker(mesh_paths, workspace=ROOT, config=config)
             poses, base_from_camera, camera_timing, quality, valid = track_episode(
                 reader, tracker, template, prompts
             )
 
-        write_hoi(
+        output = write_hoi(
             output,
             template,
             poses,
@@ -65,7 +64,7 @@ def annotate_episodes(
             camera_timing=camera_timing,
             quality=quality,
             object_valid=valid,
-            tracking_config=asdict(tracker.config),
+            tracking_config=asdict(config),
             overwrite=overwrite,
         )
         print(f"{output} 已写入 {len(poses)} 帧")
@@ -90,16 +89,6 @@ def track_episode(
     camera_timing = timing[list(CAMERA_TIMING_FIELDS)].astype(CAMERA_TIMING_DTYPE)
     sequences, stamps = camera_timing["camera_sequence"], camera_timing["camera_ns"]
     new_sequence = np.r_[True, sequences[1:] != sequences[:-1]]
-    invalid_sequence = sequences <= 0
-    invalid_sequence[1:] |= sequences[1:] < sequences[:-1]
-    time_conflict = np.r_[False, ~new_sequence[1:] & (stamps[1:] != stamps[:-1])]
-    bad_rows = np.flatnonzero(invalid_sequence | time_conflict)
-    if bad_rows.size:
-        index = bad_rows[0]
-        reason = (
-            "非法相机序列" if invalid_sequence[index] else "相同相机序列的来源时间冲突"
-        )
-        raise RawDataError(f"{reason}，行 {index}")
 
     objects = len(template["object_names"])
     poses = np.empty((frames, objects, 4, 4), np.float32)

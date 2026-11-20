@@ -1,6 +1,7 @@
 """点云处理、手表面模板与 HOI 跟踪的实验参数。"""
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
@@ -11,14 +12,15 @@ HOI_MAX_OBJECTS = HOI_NUM_POINTS // HOI_MIN_POINTS_PER_OBJECT
 
 @dataclass(frozen=True)
 class HOITrackingConfig:
+    """实验参数在 HOI 入口转换为后端的有效配置。"""
+
     segmentation_interval_frames: int = 10
     recovery_enabled: bool = True
-
-    def __post_init__(self) -> None:
-        if type(self.segmentation_interval_frames) is not int or self.segmentation_interval_frames < 1:
-            raise ValueError("hoi_tracking.segmentation_interval_frames must be a positive integer")
-        if type(self.recovery_enabled) is not bool:
-            raise TypeError("hoi_tracking.recovery_enabled must be bool")
+    tracker_2d: Literal["sam2_video", "ostrack"] = "sam2_video"
+    ostrack_checkpoint: str = "third_party/weights/ostrack/OSTrack_ep0300.pth.tar"
+    lost_timeout_s: float = 0.3
+    recovery_retry_interval_frames: int | None = None
+    xy_prior_gain: float = 0.2
 
 
 @dataclass(frozen=True)

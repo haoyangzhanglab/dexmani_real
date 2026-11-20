@@ -10,6 +10,7 @@
 | --- | --- |
 | `Grounded-SAM-2/` | SAM2 单图分割和视频掩码跟踪。 |
 | `FoundationPose/` | RGB-D 位姿注册和跟踪。 |
+| `OSTrack/` | 可选的 OSTrack-256 二维框跟踪。 |
 | `nvdiffrast/` | FoundationPose 使用的 CUDA 光栅化。 |
 | `Hunyuan3D-2.1/` | 可选的单图网格重建。 |
 
@@ -34,6 +35,12 @@ python -m cordvip_geometry download
 | --- | --- |
 | refine | `2023-10-28-18-33-37` |
 | score | `2024-01-11-20-02-45` |
+
+使用 OSTrack 时，在同一环境中安装固定版本的官方源码和推理依赖。将官方 `vitb_256_mae_ce_32x4_ep300` 权重保存为 `third_party/weights/ostrack/OSTrack_ep0300.pth.tar`。[OSTrack-256 权重](https://drive.google.com/file/d/1dySfPrSk-knAEo0lTXqZ1kMk3BCvVofV/view)
+
+```bash
+bash third_party/cordvip_geometry/scripts/install_perception.sh ostrack
+```
 
 需要单图重建时，在完成跟踪安装的同一环境中安装 Hunyuan3D 依赖，再下载对应权重：
 
@@ -80,11 +87,11 @@ if result.valid["apple"]:
 | `valid` | 覆盖全部对象，表示当前帧位姿是否有效。 |
 | `failures` | 无效对象的失败原因或等待重试状态。 |
 
-- 每段调用 `initialize()`，复用模型并重置位姿、视频状态及场景缓存。
+- 每段调用 `initialize()`，复用模型并重置位姿、二维跟踪状态及场景缓存。
 - 同一段内相机参数和图像尺寸须保持固定。RGB 和 depth 必须匹配同一彩色相机网格。
 - `RGBDRectifier` 按 `distortion_model` 与 `distortion_coeffs` 初始化，可接受带 `distortion.` 前缀的模型名。`none` 直接返回输入的 RGB 和 depth，`brown_conrady` 在系数非零时建立映射。映射对 RGB 使用双线性采样，对深度使用最近邻采样，越界填零。
 - 初始化时检测匹配、深度或候选位姿不满足要求，抛出 `TrackingFailure`，后续新帧重试初始化；全部对象注册成功后才进入正常跟踪。
-- 跟踪期逐对象返回有效性。观测不足进入 OCCLUDED，充分几何矛盾或非法候选位姿进入 LOST。检测、分割、注册或跟踪的后端异常（包括 CUDA OOM）直接传播，调用方终止运行并停止使用该实例。
+- 跟踪期逐对象返回有效性。检测、分割、注册或跟踪的后端异常（包括 CUDA OOM）沿调用链传播。两种模式的观测失效与恢复见[遮挡恢复](#遮挡恢复)和[OSTrack 跟踪与恢复](#ostrack-跟踪与恢复)。
 
 `SAM2Segmenter` 提供单图和视频接口：
 
@@ -111,7 +118,7 @@ if result.valid["apple"]:
 | `min_depth_coverage` | 0.5 | 检查区域的最低有效深度覆盖率 |
 | `min_precision`、`min_recall` | 0.5 | 可见轮廓的最低一致性 |
 
-TRACKING 和 OCCLUDED 对象先合批执行 FoundationPose，再验证候选。注册用 Mask 深度生成平移初值。正常跟踪可用实测深度直接验证候选。
+仍在尝试正常跟踪的对象合批执行 FoundationPose，再验证候选。注册用 Mask 深度生成平移初值。正常跟踪可用实测深度直接验证候选。
 
 每个候选的 SE(3)、运动连续性和 CAD 渲染只计算一次。相机射线、实测深度、SAM2 Mask 和渲染深度共用 stride=4 的像素网格，640×480 图像对应 160×120 个采样位置。`MeshRaycaster` 将 CAD 局部包围盒的 8 个角点投影到图像，扩展 8 像素余量后裁剪到网格，只渲染区域内的射线。深度回填到完整网格，区域外为零。包围盒跨越 1 mm 近平面时使用全图，完全位于近平面后方时返回全零。
 
@@ -153,6 +160,8 @@ FoundationPose 输出须为有限 `[4,4]` 位姿，齐次末行容差为 `1e-6`�
 
 ## 事件触发分割
 
+本节和下节描述默认的 `sam2_video` 模式。
+
 首帧用 Grounding DINO 检测框初始化 SAM2 视频状态。后续帧在 LOST 重检到期、恢复确认或周期到期时刷新。若当前帧尚无 Mask，通过位姿和运动检查的候选在纯深度验证失败时也会触发刷新，并用当前 Mask 复查。各对象共享同帧结果，每个来源帧最多追加一次图像。
 
 深度异常按帧处理。持续遮挡时，下一帧若仍需用当前轮廓区分遮挡和位姿偏差，可以再次刷新。
@@ -191,9 +200,19 @@ FoundationPose 输出须为有限 `[4,4]` 位姿，齐次末行容差为 `1e-6`�
 
 在线发布、离线存储和训练过滤见[主项目说明](../../docs/object_reconstruction.md#标注与查看)。
 
+## OSTrack 跟踪与恢复
+
+设置 `TrackingConfig(tracker_2d="ostrack")` 后，首帧由 Grounding DINO 检测，SAM2 单图分割，FoundationPose 注册。用通过几何检查的 Mask 生成各物体的 OSTrack 模板和初始框。全场景共享一份 ViT-B，各物体依次推理。场景以半开区间的 `XYXY` 表示框，适配器在调用官方 OSTrack 时做 `XYWH` 转换。
+
+`TRACKING` 中每帧更新二维框和 6D 候选。每 10 个处理帧用当前框批量做 SAM2 单图分割，其余正常帧用 CAD 深度验证。失败帧保留最后可靠内部位姿作为下次 refinement 的初值，并发布当前无效。连续无效 0.3 秒进入 `REACQUIRE`。
+
+`REACQUIRE` 先用最后可靠框分割和注册，再对仍失败的对象用 DINO 重检。恢复通过同样的几何检查后，从当前 Mask 重置模板并当帧发布有效位姿。失败后间隔 8 个处理帧重试。
+
+FoundationPose 的 `pose_last` 使用居中网格。注册时用 Mask 框宽、高归一化框中心与居中原点投影的偏移。后续从当前框中心扣除按当前宽、高还原的偏移，得到居中原点的目标像素。合批 refinement 前将像素残差按半个框宽、高限幅，以默认 gain 0.2 修正候选的相机系 XY 平移。先验保持候选 Z 和旋转，对外位姿仍对应原始网格。初始投影不在 Mask 框内的对象跳过先验，`xy_prior_gain=0` 可关闭先验。
+
 ## 推理实现
 
-`SceneTracker` 在构造时加载 Grounding DINO 并预热固定尺寸网络。每段首帧先对 RGB-D 去畸变，再检测目标并用框初始化 SAM2，所有物体共享一次图像编码。每个描述须匹配唯一候选；缺失或多个匹配均终止初始化。每次 SAM2 推理按最高 mask 分数分配重叠像素。
+`SceneTracker` 在构造时加载 Grounding DINO，并预热 SAM2 图像编码器和 FoundationPose refiner。每段首帧先对 RGB-D 去畸变，再检测目标并用框调用 SAM2，所有物体共享一次图像编码。每个描述须匹配唯一候选，缺失或多个匹配均终止初始化。SAM2 视频分支按最高 mask 分数分配重叠像素。
 
 SAM2 流式前处理使用 1024 输入和 LANCZOS 缩放，上传 uint8 图像后查表获得 float32 输入，保持 float64 归一化后转 float32 的数值结果。[SAM2 补丁](scripts/sam2_inference.patch) 保留多尺度图像特征，仅计算 memory attention 所需的最终层位置编码。
 
@@ -211,6 +230,7 @@ Hunyuan3D 重建使用分层体积解码、完整 attention 和 Marching Cubes�
 | --- | --- |
 | `camera.py`、`mesh.py` | 相机去畸变、网格处理与射线深度 |
 | `segmentation.py`、`reconstruction.py`、`foundationpose.py` | 模型加载与推理 |
+| `ostrack.py` | 共享 OSTrack 网络与逐对象模板 |
 | `tracking.py` | 多物体跟踪与轮廓/深度质量检查 |
 | `cli.py`、`visualization.py`、`weights.py` | 命令行、结果预览与模型下载 |
 

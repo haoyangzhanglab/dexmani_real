@@ -34,6 +34,7 @@ from dexmani_real.deployment.preflight import (
 from dexmani_real.deployment.rollout import EpisodeResult, Rollout, utc_now
 from dexmani_real.geometry.hoi import load_hoi_task
 from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
+from dexmani_real.perception.hoi import build_tracking_config
 from dexmani_real.robot.commands import (
     FeedbackUnavailable,
     HomeTimeout,
@@ -71,6 +72,7 @@ from dexmani_real.utils.table_plane import load_table_plane, resolve_table_plane
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from cordvip_geometry import TrackingConfig
     from dexmani_policy.deployment import PolicyInfo
 
     from dexmani_real.geometry.camera import CameraSnapshot
@@ -114,6 +116,7 @@ class PolicySession:
 
         self.runtime, self.policy = runtime, policy
         self.task_dir = task_dir
+        self.hoi_tracking: TrackingConfig
         self.weights, self.inference_steps = weights, inference_steps
         self.info: PolicyInfo
         self.observations: ObservationBuilder
@@ -229,6 +232,7 @@ class PolicySession:
                 raise ValueError("HOI policy requires explicit task_dir (--task-dir)")
             self.task_dir = Path(self.task_dir).expanduser().resolve()
             self.hoi_inputs = load_hoi_task(self.task_dir)
+            self.hoi_tracking = build_tracking_config(self.runtime.hoi_tracking)
         if needs.point_cloud and self.runtime.pointcloud.remove_table:
             self.table_plane_abcd = load_table_plane(self.runtime.environment.table_plane_path)
         self.actual_processing = collect_data_processing(
@@ -259,7 +263,7 @@ class PolicySession:
             **robot_recording_parameters(runtime),
         }
         if needs.hoi:
-            self.effective_parameters["hoi_tracking"] = asdict(runtime.hoi_tracking)
+            self.effective_parameters["hoi_tracking"] = asdict(self.hoi_tracking)
         if self.info.action_mode == "eef":
             self.effective_parameters.update(
                 motion=asdict(runtime.motion),
@@ -354,7 +358,7 @@ class PolicySession:
             channels = self.sensors.channels
             self.sensors.start(self.process_context.Process(
                 name="hoi", target=run_hoi_worker,
-                args=(channels, self.camera_snapshot, *self.hoi_inputs, self.runtime.hoi_tracking),
+                args=(channels, self.camera_snapshot, *self.hoi_inputs, self.hoi_tracking),
             ), ring=channels.hoi_ring, may_start=self.startup_allowed)
             deadline = time.monotonic() + 120
             while True:

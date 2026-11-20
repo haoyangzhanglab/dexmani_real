@@ -536,7 +536,7 @@ class RawReader:
         return hz
 
     def read_timing(self, stop: int | None = None, *, source_clocks: Iterable[str] = ()) -> np.ndarray:
-        """读取并校验所选时间行；连续段由 segment_starts 指定。"""
+        """读取所选时间行，校验指定来源。请求相机时间时同时校验来源序列。"""
         rows = self["timing/rows"][:stop]
         control, observation = rows["control_ns"], rows["observation_ns"]
         for bad, detail, offset in (
@@ -551,9 +551,16 @@ class RawReader:
             stamps = rows[key]
             invalid = (stamps <= 0) | (stamps > observation)
             invalid[1:] |= stamps[1:] < stamps[:-1]
+            if key == "camera_ns":
+                sequence = rows["camera_sequence"]
+                invalid |= sequence <= 0
+                invalid[1:] |= (sequence[1:] < sequence[:-1]) | (
+                    (sequence[1:] == sequence[:-1]) & (stamps[1:] != stamps[:-1])
+                )
             indices = np.flatnonzero(invalid)
             if len(indices):
-                raise RawDataError(f"Raw {self.path}: invalid source timestamp: {key} at row {indices[0]}")
+                source = "camera sequence or timestamp" if key == "camera_ns" else f"source timestamp: {key}"
+                raise RawDataError(f"Raw {self.path}: invalid {source} at row {indices[0]}")
         return rows
 
     @property
