@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from dexmani_real.config.perception import DEFAULT_HOI_MAX_JOINT_GAP_S
+
 DEFAULT_NUM_EPISODES = 20
 DEFAULT_MAX_DURATION_S = 60.0
 
@@ -21,8 +23,9 @@ class ExecutionConfig:
     # 回放测量后的暂定来源年龄预算，非真机安全保证。
     hoi_max_age_s: float = 0.25
     # 相机时刻的关节插值的前后反馈最大间隔；不外推、不代表硬件同步。
-    hoi_max_joint_gap_s: float = 0.10
+    hoi_max_joint_gap_s: float = DEFAULT_HOI_MAX_JOINT_GAP_S
 
 POLICY_RUNTIME_SECTIONS = (
-    "execution", "arm", "hand", "motion", "camera", "pointcloud", "hand_pointcloud", "environment",
+    "execution", "arm", "hand", "motion", "camera", "pointcloud", "hand_pointcloud",
+    "hoi_tracking", "environment",
 )

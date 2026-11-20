@@ -33,6 +33,15 @@ def validate_joint_gap(value):
         raise ValueError("hoi_max_joint_gap_s 必须为有限正数")
 
 
+def interpolate_joint_bracket(lo, hi, before, after, target, max_gap_s):
+    """对已选定的关节端点插值，时间可为标量或可广播的列。"""
+    span_ns = hi - lo
+    valid = (lo <= target) & (target <= hi) & (span_ns <= max_gap_s * 1e9)
+    # 精确命中时两端是同一样本，其有效权重为零。
+    fraction = (target - lo) / (span_ns + (span_ns == 0))
+    return before + fraction * (after - before), valid
+
+
 def interpolate_joints(stamps, positions, targets, max_gap_s):
     """返回关节和有效标志；无法插值的位置为 NaN。
 
@@ -59,10 +68,10 @@ def interpolate_joints(stamps, positions, targets, max_gap_s):
     right = np.searchsorted(stamps, targets).clip(0, len(stamps) - 1)
     exact = stamps[right] == targets
     left = np.where(exact, right, np.maximum(0, right - 1))
-    lo, hi = stamps[left], stamps[right]
-    span_ns = hi - lo
-    valid = (lo <= targets) & (targets <= hi) & (span_ns <= max_gap_s * 1e9)
-    fraction = np.divide(targets - lo, span_ns, out=np.zeros(len(targets)), where=span_ns != 0)
-    values = positions[left] + fraction[:, None] * (positions[right] - positions[left])
+    values, valid = interpolate_joint_bracket(
+        stamps[left, None], stamps[right, None], positions[left], positions[right],
+        targets[:, None], max_gap_s,
+    )
+    valid = valid[:, 0]
     values[~valid] = np.nan
     return values, valid

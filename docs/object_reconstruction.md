@@ -1,108 +1,69 @@
 # 物体重建与 HOI
 
-HOI（Hand–Object Interaction，手物交互）观测用手部与物体点云描述操作场景，供 CordViP 等策略训练与部署使用。
+CordViP 的 `hand_pointcloud` 和 `object_pointcloud` 默认各包含 1024 个米制 float32 XYZ，坐标系均为 xArm Base。通用场景字段 `point_cloud` 单独由 RGB-D 反投影和场景滤波生成。
 
-## 点云与资产
+## 固定模板与坐标变换
 
-物体点云来自固定网格表面模板，由 RGB-D 跟踪位姿逐帧变换。手点云来自固定的 link 局部模板，由机械臂和手部关节通过 FK 变换。两者均为 xArm base 坐标系下的米制 float32 XYZ，保留点序和分段。
-
-任务模板、FoundationPose 和 MeshRaycaster 使用由同一米制 CAD 经 `simplify_mesh()` 处理后的几何，保留物体坐标原点与朝向。任务模板共 1024 点，按处理后的网格表面积分配配额，每对象至少 64 点，最多 16 个对象。每个对象以 `seed=0` 按面积均匀采样 8 倍候选点，再确定性地执行 FPS。手模板沿用各 link 的面积配额与 URDF visual 变换，使用同一采样函数。
-
-手模板保存 float32 `points[N,3]`，按 `part_names` 和整数 `part_offsets` 对应 URDF link。`hand_geometry()` 接收 EEF 变换 `[T,4,4]` 与 SDK 顺序的手关节 `[T,12]`，通过批量 FK 返回所选的指尖 `[T,5,3]` 和表面点 `[T,N,3]`；导出、部署和可视化共用此接口，保留模板点序与分段。
-
-通用场景 `point_cloud` 由 `PointCloudProcessor` 处理 RGB-D，包含深度滤波、桌面裁剪、体素降采样和离群点过滤；HOI 点云直接使用固定 CAD/URDF 表面模板。
-
-任务模板保存 `points_local`、`object_names` 和 `offsets`。部署与离线标注共用任务解析，核对模板和 `task.json` 的对象集合，按模板顺序匹配网格和 prompt。
-
-通用场景点云在过滤后无有效点时返回 float32 `[0,6]`。非空但不足目标点数时循环重复已有行，等于目标点数时按原顺序输出，超过时按 XYZ 执行 FPS，颜色随源点同行。场景和模板共用 CPU QuickFPS。遇到重复源索引时保留首次出现的顺序，再用未选行补足。
+- **手部。** 手模板按 URDF 的 visual 变换在 link 局部坐标系采样，以 `part_names` 和 `part_offsets` 保留分段和点序。xArm 的 7 个关节通过 FK 得到 `T_base_from_eef`，XHand 的 12 个 SDK 关节按现有映射进入 URDF FK。`hand_geometry()` 按 `T_base_from_eef @ T_eef_from_hand @ T_hand_from_link` 变换各段，并可同时生成指尖坐标。
+- **物体。** CAD 网格为米制，简化后保留原点和朝向。任务模板的 `points_local` 按网格表面积分配，共 1024 点，每对象至少 64 点。FoundationPose 输出 `T_camera_from_object`，`transform_task_points()` 用 `T_base_from_camera @ T_camera_from_object` 将各段局部点变换到基座，沿用 `object_names` 和 `offsets` 的顺序。
 
 ## 实验流程
 
-从仓库根目录运行，使用 `real_robot` 环境。用 `--task-dir` 为准备、采样、标注和部署指定同一个任务资产目录。目录可放在仓库外，显式路径支持 `~`，相对路径以当前目录为准。Raw 和 checkpoint 中的任务标签用于标识实验。
-
-物体模板采样使用 trimesh 读取 CAD，并用 Open3D 简化超过 20,000 个三角面的网格。两项依赖与跟踪共用，安装见[后端说明](../third_party/cordvip_geometry/README.md#安装与命令)。
-
-### 任务资产
-
-`task.json` 的 `objects` 列表定义对象名称和顺序，例如 `{"objects": [{"name": "apple", "size_axis": "x", "size_meters": 0.08}]}`。对象输入放在 `<task-dir>/<name>/`，参考图默认为 `reference.jpg`，已有米制网格放在 `mesh/mesh_m.obj`。
-
-- 分割使用对象名作为默认 `prompt`，可用 `image` 指定其他参考图。有多个候选时，`instance` 指定去重并过滤空 mask 后按置信度排序的零起始索引。
-- 重建保存 `reconstruction/` 下的中间结果。可设置 `seed`、`steps`、`octree_resolution` 和 `num_chunks`。
-- 重建后使用 `scale_to_meters`，或配对的 `size_axis` 和 `size_meters` 生成米制网格，保留原点和朝向。复用已有网格时检查网格有效性和所给轴尺寸，尺寸容差为 `rtol=1e-4, atol=1e-6 m`。
-
-### 采集、标注与部署
+在 `real_robot` 环境中，从仓库根目录运行。为准备、采样、标注和部署指定同一个任务资产目录。其 `task.json` 的 `objects` 列表定义对象名称和顺序。每个对象的参考图默认为 `<name>/reference.jpg`，已有米制 CAD 放在 `<name>/mesh/mesh_m.obj`。资产准备的尺度、实例选择与后端依赖见[感知后端说明](../third_party/cordvip_geometry/README.md#安装与命令)。
 
 ```bash
 python scripts/collect_teleop.py pick --episodes-dir /data/episodes
 python scripts/cordvip/prepare_task.py --task-dir /data/tasks/pick
 python scripts/cordvip/sample_template.py --task-dir /data/tasks/pick
 python scripts/cordvip/annotate_episodes.py /data/episodes/pick --task-dir /data/tasks/pick
-python scripts/export_zarr.py /data/episodes/pick --fields joint_state action hand_pointcloud object_pointcloud
+python scripts/export_zarr.py /data/episodes/pick --output /data/pick.zarr \
+    --fields joint_state action hand_pointcloud object_pointcloud
 ```
 
-`sample_template.py` 生成 `hoi/template.npz`，默认复用已有模板。更新 CAD 或按当前简化规则重建模板时，沿用上例路径，依次给 `sample_template.py` 和 `annotate_episodes.py` 加上 `--overwrite`，再用 `export_zarr.py` 重新导出。原 Zarr 路径已存在时，用 `--output` 指定新路径。修改手部 URDF 或 Visual Mesh 后，用 `python scripts/generate_hand_template.py --overwrite` 重建手模板并重新导出训练数据。
+`sample_template.py` 生成或复用任务目录下的 `hoi/template.npz`。更换 CAD 后，给模板采样与标注命令依次加 `--overwrite`，再导出到新的 Zarr 路径。项目已提供默认手模板。修改手部 URDF 或 visual 网格后，可用 `python scripts/generate_hand_template.py --overwrite` 重新生成。
 
-在 dexmani_policy 中训练后，用 `python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick` 部署。
+标注支持单个 Episode 或直接包含 `episode_*` 子目录的数据目录，使用 Raw 中的 RGB-D、深度单位与相机外参。训练后通过 `python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick` 部署。完整训练命令见 [README 的 CordViP 流程](../README.md#从示教训练并部署-cordvip)。
 
-标注输入也可直接指定单个 Episode，如 `/data/episodes/pick/episode_001`。目录输入只处理其直接包含的 `episode_*` 子目录。标注读取 Raw 内的 RGB-D、深度单位与相机外参。离线可用 `--segmentation-interval-frames` 或 Python 入口 `annotate_episodes(..., tracking_config=...)` 调整 SAM2 周期，设为 1 时活动对象每个处理帧都刷新。见[后端分割规则](../third_party/cordvip_geometry/README.md#事件触发分割)。
+### 跟踪配置
+
+在线与离线默认每 10 个处理帧做一次 SAM2 周期校正，并开启丢失恢复。用可信本地 Python 文件导出 `CONFIG` 即可调整参数。
+
+```python
+from dexmani_real.config.perception import HOITrackingConfig
+from dexmani_real.config.real import RealConfig
+
+CONFIG = RealConfig(
+    hoi_tracking=HOITrackingConfig(
+        segmentation_interval_frames=15,
+        recovery_enabled=True,
+    ),
+)
+```
+
+`annotate_episodes.py` 和 `run_policy.py` 均从 `--config experiment.py` 读取 `RealConfig.hoi_tracking`。使用新参数重算已有标注时传入 `--overwrite`。部署有会话输出目录时，将两个实际参数写入 `run_config.yaml` 的 `effective_parameters.hoi_tracking`。标注将完整后端配置写入 `hoi.h5` 根属性 `tracking_config`。
 
 ## 跟踪与时间对齐
 
-在线 worker 加载并预热模型后宣告就绪。每段首帧对 RGB-D 去畸变，经 Grounding DINO、SAM2 和 FoundationPose 注册得到初始位姿。每个 `prompt` 须匹配唯一候选，参考图的 `instance` 只用于资产准备。后续对活动对象合批 refinement，在 CAD 投影区域渲染深度并验证候选。有当前帧的 SAM2 Mask 时，同时检查可见轮廓。见[后端质量规则](../third_party/cordvip_geometry/README.md#质量检查)。
+在线 Worker 从 Camera Ring 读取，离线标注从 Raw 读取。两条路径共用 `track_hoi_frame()` 和 `transform_task_points()`，按模板顺序处理位姿、有效性与质量。每个在线请求和每个离线 Raw Episode 分别初始化跟踪，失败时用下一来源帧重试。在线跳过已处理的相机序列，离线同序列的记录行复用跟踪结果。意外后端错误沿各入口的故障路径传播。质量与恢复规则见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)和[遮挡恢复](../third_party/cordvip_geometry/README.md#遮挡恢复)。
 
-当前按非对称物体跟踪；对称物体的旋转歧义见 [Object Symmetry](../third_party/cordvip_geometry/README.md#object-symmetry)。
+在线从反馈历史查找相邻端点，离线在各 Raw 连续段内批量查找。两者使用同一插值规则，将所需臂手关节对齐到物体点云对应的原始相机时间。精确命中直接取样，其余目标须被前后反馈包围，且间隔不超过 `execution.hoi_max_joint_gap_s`（默认 0.10 秒）。相同时间戳的冲突反馈会报错。导出和部署可通过同一个 `--config experiment.py` 设置该间隔。
 
-模型跨段复用，初始化重置视频、位姿和相机缓存，段内相机参数及图像尺寸固定。在线和离线共用 `SceneTracker`，SAM2 默认每 10 个处理帧进行一次周期校正。通过位姿和运动检查的候选若在无当前 Mask 时深度验证失败，会触发同帧分割复查。帧输入必须包含真实相机时间和来源序列。在线跳过已处理的序列，离线同序列的行复用对应相机帧的结果。跳过的来源帧不补造 SAM2 图像。
-
-对象独立维护 TRACKING、OCCLUDED、LOST。证据不足时保留可靠内部位姿继续跟踪，当前帧标为无效。明确几何矛盾、位姿检查失败或遮挡超时会进入 LOST。恢复经过检测、分割、注册及下一处理帧的再次验证，两帧可信后才发布有效位姿。初始化因观测证据不满足要求而失败时，在后续新观测重试。状态和配置见[后端说明](../third_party/cordvip_geometry/README.md#遮挡恢复)。
-
-检测、分割、注册和跟踪的后端异常直接传播，不转为无效观测，也不在合批失败后逐对象重跑。在线 Worker 因此退出，由会话现有故障路径停止设备并收尾；离线标注立即报错，已有完整 `hoi.h5` 保留。
-
-在线任一必需对象无效时发布零点云和 `valid=False`，全部恢复后重新发布有效点云。感知 Worker 只在请求有效期间持续处理。部署控制层遇到临时 HOI 失效会保持机器人并保留当前请求，待感知恢复后重建策略上下文；恢复期限和停止条件见[策略部署的 HOI 暂停与恢复](policy_deployment.md#hoi-暂停与恢复)。
-
-HOI 的 `joint_state`、`eef_pose`、指尖及手点云共用插值到相机来源时间的关节。插值要求前后反馈间隔不超过 `execution.hoi_max_joint_gap_s`，默认 0.10 秒；精确命中直接取样，禁止外推和跨连续区间插值。
-
-在线每段按观测所需设备建立反馈历史，关节对齐暂不可用时进入 HOI 暂停与恢复。离线导出要求各原生连续段的所选行均能对齐。控制检查与 Raw 保留最新实测反馈。见[数据时间与导出规则](data.md)。
+对齐关节用于策略的 `joint_state`、`eef_pose`、指尖和手点云。Raw 和设备反馈检查使用实测反馈。在线对齐缺失时走现有暂停与恢复流程，离线严格导出报告不可对齐的设备与原始行号。参见[部署恢复流程](policy_deployment.md#hoi-暂停与恢复)和[实验数据](data.md)。
 
 ## 标注与查看
 
-标注要求 `rgb.mp4` 的帧数和纳秒时间戳均与 [Raw 控制时间轴](data.md#图像与模型输入) 一致。逐帧标注完成后原子发布 `episode/hoi.h5`。默认校验已有标注与 Raw 的相机来源时间和外参，校验通过后跳过。`--overwrite` 在重算成功后原子替换标注。遮挡与恢复期间保留原始行和时间戳，并记录无效状态。
+标注沿用 Raw 相机来源时间与序列。无效对象的位姿为 NaN，保留逐对象有效性和已有质量指标。只有全部对象有效时才计算该帧物体点云，否则点云为零且整帧无效。离线分块计算并原子发布 `hoi.h5`。复用标注前检查点云和有效性数组的结构，并核对 Raw 的相机时间、序列与外参。`--overwrite` 在重算成功后替换旧文件。
 
-| 内容 | 路径或位置 |
+| HDF5 字段 | 内容 |
 | --- | --- |
-| 策略使用的基座系物体点云 | `hoi.h5:/object_pointcloud` |
-| 物体局部到相机的位姿 | `hoi.h5:/object_pose_camera` |
-| 逐对象有效性，bool `[T,O]` | `hoi.h5:/object_valid` |
-| 逐帧、逐对象质量指标 | `hoi.h5:/quality/` |
-| 固定模板、对象顺序及点分段 | `hoi.h5:/template/` |
-| 逐行相机来源时间及帧序列 | `hoi.h5:/camera_timing` 的 `camera_ns` 和 `camera_sequence`，读取时与 Raw 对应字段逐行核对 |
-| 相机到基座的变换 | 读取 HOI 时，`hoi.h5:/base_from_camera` 与 Raw 的 `camera_T_xarm_base_from_color` 均必填，须各自为合法刚体变换，并在现有比较容差内一致 |
-| 实际跟踪配置 | `hoi.h5` 根属性 `tracking_config` |
+| `object_pointcloud` | 基座系物体点云，float32 `[T,1024,3]` |
+| `object_pose_camera`、`object_valid` | 物体到相机位姿与逐对象有效性 |
+| `quality/`、`template/` | 逐对象质量指标和有序固定模板 |
+| `camera_timing`、`base_from_camera` | 与 Raw 核对的相机来源时间、序列和外参 |
 
-`quality` 组始终存在，可以为空。缺失或为 `None` 的指标保存为 NaN；纯深度路径未计算的 Mask 指标为 −1，可视化均显示为曲线缺口。指标含义见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)。
+```bash
+python scripts/visualize_episode.py /data/episodes/pick/episode_001 --max-frames 50
+python -B -m unittest discover -s tests -v
+```
 
-无效对象的位姿为 NaN；只有全部对象有效时才生成模板点云，否则该帧物体点云全零。整帧有效性由 `object_valid.all(axis=1)` 决定。
-
-导出 `object_pointcloud` 要求所选 Raw 的每帧物体均有效，可以合并采用不同模板的录制。每帧物体点云沿用当前录制的点顺序，接触标签由对应帧的手部和物体点云生成。手模板的 link 名称须有效映射到 FK。导出规则见[按需导出](data.md#按需导出)。
-
-[visualize_episode.py](../scripts/visualize_episode.py) 使用相同插值规则。HOI 诊断、关节和触觉曲线与逐帧 RGB-D、几何共用帧号 `step` 和相对首帧观测的整数纳秒 `time`。关节与相机的来源时差以毫秒显示，逐物体质量和整帧有效性按列发送。无效物体点云和不可对齐的手几何隐藏，保留对应行的时间位置。
-
-可视化启动前要求展示范围内的 `observation_ns` 严格递增。查看 HOI 时还校验控制时钟，并要求所读的相机、臂和手来源时间为正、不晚于观测且不倒退。
-
-- `--max-frames N` 只解码并展示前 N 帧图像。关节插值仍可读取同一原生段内所需的邻点。查看 HOI 时，仍核对标注和 Raw 的完整相机来源时间及帧序列。
-- `--no-hoi`（Python 参数 `hoi=False`）完全绕过标注，手部几何使用 Raw 关节；与 `--info` 组合也不打开 HOI 文件。
-
-## 代码入口与参考
-
-| 模块 | 职责 |
-| --- | --- |
-| [cordvip_geometry](../third_party/cordvip_geometry/) | 分割、重建、尺度调整和 RGB-D 位姿跟踪 |
-| [geometry/hoi.py](../dexmani_real/geometry/hoi.py) | 任务资产、固定采样及点云坐标变换 |
-| [perception/hoi_worker.py](../dexmani_real/perception/hoi_worker.py) | 在线物体点云生成 |
-| [perception/hand_cloud.py](../dexmani_real/perception/hand_cloud.py) | 手部模板加载与 FK 几何 |
-| [utils/timing.py](../dexmani_real/utils/timing.py) | 时钟调度、来源时效及离线批量关节插值 |
-| [data/hoi.py](../dexmani_real/data/hoi.py)、[data/export.py](../dexmani_real/data/export.py) | 标注发布、区间对齐与训练数据导出 |
-
-实现借鉴 [GALATEA `36b90481` 的遮挡感知轮廓评估](https://github.com/boyuan-an/GALATEA/blob/36b90481ba458d9beb5b6ac1396c639ea49a4747/recon/galatea_recon/pipeline/object_quality.py) 和固定表面点采样思路，以实测 RGB-D 和机器人 FK 为依据。
-
-执行链路见[策略部署](policy_deployment.md)。返回[项目首页](../README.md)。
+用实际 Episode 路径核对手物点云在同一帧的基座几何、关节来源时差、逐物体质量和有效性。可视化保留无效行的时间位置，并隐藏无效物体点云和无法对齐的手部几何。使用 `--no-hoi` 可查看原始关节几何。严格 HOI 导出要求所选行的物体均有效，且所需关节均能对齐。完整规则见[数据导出](data.md#按需导出)。

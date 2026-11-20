@@ -11,7 +11,11 @@ from dexmani_real.config.control import (
     MotionConfig,
 )
 from dexmani_real.config.deployment import ExecutionConfig
-from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
+from dexmani_real.config.perception import (
+    HandCloudConfig,
+    HOITrackingConfig,
+    PointCloudConfig,
+)
 from dexmani_real.config.sensor import CameraConfig, VRConfig
 from dexmani_real.config.teleop import (
     HandRetargetingConfig,
@@ -36,6 +40,11 @@ class RealConfig:
     hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
     hand_retargeting: HandRetargetingConfig = field(default_factory=HandRetargetingConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
+    hoi_tracking: HOITrackingConfig = field(default_factory=HOITrackingConfig)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.hoi_tracking, HOITrackingConfig):
+            raise TypeError("hoi_tracking must be HOITrackingConfig")
 
 
 def load_config(path: str | Path | None = None) -> RealConfig:

@@ -18,11 +18,12 @@ import numpy as np
 import zarr
 
 from dexmani_real.config.perception import (
+    DEFAULT_HOI_MAX_JOINT_GAP_S,
     HOI_NUM_POINTS,
     HandCloudConfig,
     PointCloudConfig,
 )
-from dexmani_real.data.hoi import align_hoi_episode, read_hoi_validity
+from dexmani_real.data.hoi import align_hoi_episode
 from dexmani_real.data.raw import (
     ACTION_TARGET_FIELDS,
     RawDataError,
@@ -68,7 +69,7 @@ class ExportConfig:
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
-    hoi_max_joint_gap_s: float = 0.10
+    hoi_max_joint_gap_s: float = DEFAULT_HOI_MAX_JOINT_GAP_S
 
 
 # 输出字段直接对应 Raw 输入；FK 和相机计算由下方普通条件启用。
@@ -334,7 +335,7 @@ def prepare_raw(reader, processing, fields, clocks, hoi_devices):
             raise RawDataError("episode contains no rows")
         boundaries = np.r_[reader.segment_starts, reader.num_frames]
         if "object_pointcloud" in fields:
-            valid = read_hoi_validity(reader)
+            valid = reader.read_hoi_validity()
             if not valid.all():
                 raise RawDataError(f"HOI contains invalid rows: first at {int(np.flatnonzero(~valid)[0])}")
         include_actions = bool({"action", "action_ee"}.intersection(fields))

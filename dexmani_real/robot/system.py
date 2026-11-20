@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from operator import itemgetter
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -22,7 +23,11 @@ from dexmani_real.robot.commands import (
 )
 from dexmani_real.robot.xhand.feedback import XHandFeedback
 from dexmani_real.runtime.state import INITIAL_STATE_TIMEOUT_S
-from dexmani_real.utils.timing import next_tick_ns, sample_is_fresh
+from dexmani_real.utils.timing import (
+    interpolate_joint_bracket,
+    next_tick_ns,
+    sample_is_fresh,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,22 +90,20 @@ class Robot:
             return None
         result = {}
         for name, history in self.joint_history.items():
-            if not history:
-                return None
-            right = bisect_left(history, timestamp_ns, key=lambda sample: sample[0])
+            right = bisect_left(history, timestamp_ns, key=itemgetter(0))
             if right == len(history):
                 return None
-            hi, q_hi = history[right]
+            hi, after = history[right]
             if hi == timestamp_ns:
-                q = q_hi.copy()
+                qpos = after.copy()
             else:
                 if right == 0:
                     return None
-                lo, q_lo = history[right - 1]
-                if hi - lo > max_gap_s * 1e9:
+                lo, before = history[right - 1]
+                qpos, valid = interpolate_joint_bracket(lo, hi, before, after, timestamp_ns, max_gap_s)
+                if not valid:
                     return None
-                q = q_lo + ((timestamp_ns - lo) / (hi - lo)) * (q_hi - q_lo)
-            result[name + "_qpos"] = q
+            result[name + "_qpos"] = qpos
         return result
 
     def check(self) -> None:

@@ -80,7 +80,7 @@ class SensorChannels:
             else None
         )
 
-        self.hoi_ring = self.hoi_request = self.hoi_ready = None
+        self.hoi_ring = self.hoi_request = self.hoi_ready = self.hoi_request_lock = None
         if hoi:
             fields: list[tuple] = [
                 ("episode_id", "u8"), ("timestamp_ns", "u8"), ("source_camera_sequence", "u8"),
@@ -92,6 +92,8 @@ class SensorChannels:
             self.hoi_request = SharedRing(ctx, np.dtype([
                 ("episode_id", "u8"), ("after_ns", "u8"), ("after_sequence", "u8"),
             ]), 3)
+            # 请求写入与 Worker 最终验序和发布互斥，推理在锁外完成。
+            self.hoi_request_lock = ctx.Lock()
             self.hoi_ready = ctx.RawValue("b", False)
 
         self.is_running = ctx.RawValue("b", True)

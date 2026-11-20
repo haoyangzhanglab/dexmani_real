@@ -30,7 +30,7 @@ flowchart TD
 | 查看采集配置（不连接设备） | `python scripts/collect_teleop.py TASK --print-config` |
 | VR 采集 / 仅遥操作 | `python scripts/collect_teleop.py TASK` / 加 `--no-record` |
 | 键盘调整姿态 | `python scripts/keyboard_teleop.py` |
-| 查看记录 | `python scripts/visualize_episode.py EPISODE`（`--no-hoi` 绕过标注，`--max-frames N` 按需读取前 N 帧） |
+| 查看记录 | `python scripts/visualize_episode.py EPISODE`（`--no-hoi` 绕过标注，`--max-frames N` 只解码和显示前 N 帧图像） |
 | 导出训练数据 | `python scripts/export_zarr.py episodes/TASK`（可加 `--fields joint_state action` 指定字段） |
 | 策略评估并录制 | `python scripts/run_policy.py CHECKPOINT --record-raw` |
 | 回放具有完整目标的 Raw 连续段 | `python scripts/replay_episode.py episodes/pick/episode_001 --segment 0`（替换实际采集目录，段号从 0 开始） |
@@ -56,7 +56,7 @@ python scripts/run_policy.py "$RUN/train/checkpoints/latest.pt" \
     --task-dir "$ASSETS" --output "$RUN/evaluation"
 ```
 
-`run_config.yaml` 保存训练处理参数和部署实际使用的场景、手部点云处理参数。场景点云去桌面时记录归一化平面系数。场景点云过滤为空时，在线继续使用最近一次非空结果，直到其来源过期。
+`run_config.yaml` 保存训练处理参数，以及部署实际使用的场景和手部点云处理参数。场景点云去桌面时记录归一化平面系数。场景点云过滤为空时，在线继续使用最近一次非空结果，直到其来源过期。HOI 标注与部署可传同一个 `--config experiment.py`，部署在 `effective_parameters.hoi_tracking` 记录实际跟踪参数。配置与验收方法见[物体重建与 HOI](docs/object_reconstruction.md#跟踪配置)。
 
 物理回放要求先将机器人就位到所选连续段的起点。连接设备前，回放检查原始 Raw 所选段的每行是否都有完整、有限且在限位内的臂手绝对目标。能定位到具体行时，错误会给出 Raw 内从 0 开始的绝对行号。通过检查后按 Raw 标称频率顺序重发目标，慢槽会延长播放时间。播放结束并停稳后保持连接，按 H 回到初始位并退出，按 S/Q 停止并退出，Esc 急停。会话耗时包含等待按键和回位。
 

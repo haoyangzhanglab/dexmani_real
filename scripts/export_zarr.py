@@ -13,6 +13,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
+from dexmani_real.config.perception import DEFAULT_HOI_MAX_JOINT_GAP_S
 from dexmani_real.config.real import load_config
 from dexmani_real.data.export import (
     FIELD_INPUTS,
@@ -50,16 +51,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help="Trusted Python experiment file exporting CONFIG: RealConfig; execution.hoi_max_joint_gap_s bounds joint interpolation intervals (default 0.10 s)",
+        help=(
+            "Trusted Python experiment file exporting CONFIG: RealConfig. "
+            f"execution.hoi_max_joint_gap_s bounds joint interpolation intervals (default {DEFAULT_HOI_MAX_JOINT_GAP_S:.2f} s)."
+        ),
     )
     parser.add_argument(
         "--fields", nargs="+", choices=tuple(FIELD_INPUTS),
         help=(
             "Defaults to all Raw-derived fields, plus object_pointcloud if every selected episode "
             "has hoi.h5. RGB/depth use the fixed-K pinhole grid. "
-            "action and action_ee hold the last confirmed arm and hand target within each segment, "
-            "starting from its measured joint state. "
-            "joint_state stores measured feedback."
+            "action and action_ee hold confirmed joint targets within each segment and fill "
+            "leading rows from joint feedback. With object_pointcloud, exported joint observations "
+            "and their FK geometry use the camera timestamp."
         ),
     )
     parser.add_argument(

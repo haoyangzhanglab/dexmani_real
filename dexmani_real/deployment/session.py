@@ -260,6 +260,8 @@ class PolicySession:
             "execution": execution,
             **robot_recording_parameters(runtime),
         }
+        if needs.hoi:
+            self.effective_parameters["hoi_tracking"] = asdict(runtime.hoi_tracking)
         if self.info.action_mode == "eef":
             self.effective_parameters.update(
                 motion=asdict(runtime.motion),
@@ -354,7 +356,7 @@ class PolicySession:
             channels = self.sensors.channels
             self.sensors.start(self.process_context.Process(
                 name="hoi", target=run_hoi_worker,
-                args=(channels, self.camera_snapshot, *self.hoi_inputs),
+                args=(channels, self.camera_snapshot, *self.hoi_inputs, self.runtime.hoi_tracking),
             ), ring=channels.hoi_ring, may_start=self.startup_allowed)
             deadline = time.monotonic() + 120
             while True:

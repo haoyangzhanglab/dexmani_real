@@ -50,6 +50,7 @@ from dexmani_real.utils.log import error_detail
 logger = logging.getLogger(__name__)
 
 HOI_HOLD_REFRESH_S = 1.0
+HOI_REQUEST_LOCK_TIMEOUT_S = 0.10
 
 
 def utc_now():
@@ -127,6 +128,20 @@ class Rollout:
         )
         return "; ".join(issues) if issues else None
 
+    def _request_hoi(self, episode_id: int) -> None:
+        channels = self.sensors.channels
+        lock = channels.hoi_request_lock
+        # 子进程被强行终止时可能遗留发布锁，控制和收尾只能有界等待。
+        if not lock.acquire(timeout=HOI_REQUEST_LOCK_TIMEOUT_S):
+            raise TimeoutError("HOI request lock timed out")
+        try:
+            channels.hoi_request.write(
+                episode_id=episode_id, after_ns=time.monotonic_ns(),
+                after_sequence=channels.camera_ring.latest_sequence,
+            )
+        finally:
+            lock.release()
+
     def stop(self, detail, *, run_end_reason=RunEndReason.CANCELLED):
         if self.finished:
             return
@@ -141,9 +156,7 @@ class Rollout:
         self.result.termination_details = detail
         self._clear_policy_context()
         if self.observations.needs.hoi:
-            channels = self.sensors.channels
-            channels.hoi_request.write(episode_id=0, after_ns=ended_ns,
-                                       after_sequence=channels.camera_ring.latest_sequence)
+            self._request_hoi(0)
 
     def snapshot_result(self) -> EpisodeResult:
         """活动 Recorder 提供当前快照，释放后保留最后的完整结果。"""
@@ -170,8 +183,8 @@ class Rollout:
     def fail(self, stage, error):
         if isinstance(error, KeyboardInterrupt):
             self.runtime_state.request_emergency_stop()
-        self.stop(None, run_end_reason=RunEndReason.FAILED)
         self.result.errors.append(error_detail(stage, error))
+        self.stop(None, run_end_reason=RunEndReason.FAILED)
 
     def run(self, *, poll_operator):
         """运行结束先停设备；段间及最终资源收尾由 Session 编排。"""
@@ -305,9 +318,7 @@ class Rollout:
             raise OperationCancelled("cancelled before preparation")
         self.robot.stop()
         if self.observations.needs.hoi:
-            channels = self.sensors.channels
-            channels.hoi_request.write(episode_id=self.result.index, after_ns=time.monotonic_ns(),
-                                       after_sequence=channels.camera_ring.latest_sequence)
+            self._request_hoi(self.result.index)
         # 先检查各来源就绪；只有 HOI 预热会消费这次模型载荷。
         initial_hoi = self.observations.needs.hoi
         warmup_needed = initial_hoi and not self.model.hoi_warmed_up

@@ -16,9 +16,13 @@ os.environ.setdefault("RUST_LOG", "error")
 import cv2
 import numpy as np
 
-from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
+from dexmani_real.config.perception import (
+    DEFAULT_HOI_MAX_JOINT_GAP_S,
+    HandCloudConfig,
+    PointCloudConfig,
+)
 from dexmani_real.config.real import load_config
-from dexmani_real.data.hoi import align_hoi_episode, read_hoi_validity
+from dexmani_real.data.hoi import align_hoi_episode
 from dexmani_real.data.raw import (
     TACTILE_FINGER_ORDER,
     RawReader,
@@ -86,7 +90,7 @@ class EpisodeVisualizer:
         table_plane_path: str | Path | None,
         max_frames: int | None = None,
         hoi: bool = True,
-        hoi_max_joint_gap_s: float = 0.10,
+        hoi_max_joint_gap_s: float = DEFAULT_HOI_MAX_JOINT_GAP_S,
         pointcloud_config: PointCloudConfig | None = None,
         hand_pointcloud_config: HandCloudConfig = HandCloudConfig(),  # noqa: B008 — 不可变配置可共享。
     ):
@@ -109,8 +113,8 @@ class EpisodeVisualizer:
                     stop=self.frame_count, source_clocks=("camera_ns", "arm_ns", "hand_ns"),
                 )
                 stamps = hoi_timing["observation_ns"]
-                self.reader["object_pointcloud"]
-                self.hoi_valid = read_hoi_validity(self.reader, stop=self.frame_count)
+                self.object_cloud = self.reader["object_pointcloud"]
+                self.hoi_valid = self.reader.read_hoi_validity(stop=self.frame_count)
                 boundaries = np.r_[self.reader.segment_starts, self.reader.num_frames]
                 self.hoi_alignment = align_hoi_episode(self.reader, hoi_timing, boundaries, hoi_max_joint_gap_s)
             else:
@@ -246,7 +250,7 @@ class EpisodeVisualizer:
         if self.hoi_alignment:
             points = None
             if self.hoi_valid[step_idx]:
-                points = self.reader["object_pointcloud"][step_idx]
+                points = self.object_cloud[step_idx]
                 if not np.isfinite(points).all():
                     raise ValueError(
                         f"object_pointcloud contains nonfinite coordinates at row {step_idx}"

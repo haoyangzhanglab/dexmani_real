@@ -432,7 +432,7 @@ class RawWriter:
 
 
 def open_hoi_file(path: Path, raw_meta, raw_timing):
-    """打开标注并核对相机外参与逐行来源时间。"""
+    """校验标注的可读结构及其与 Raw 的相机对应关系。"""
     import h5py
 
     annotations = h5py.File(path, "r")
@@ -444,11 +444,20 @@ def open_hoi_file(path: Path, raw_meta, raw_timing):
         annotated = validate_rigid_transform(transform[()], label="HOI base_from_camera")
         if not np.allclose(recorded, annotated, atol=ROTATION_ATOL, rtol=0):
             raise RawDataError("HOI base_from_camera conflicts with Raw camera_T_xarm_base_from_color")
+        names = annotations.get("template/object_names")
+        if not isinstance(names, h5py.Dataset) or names.ndim != 1 or not len(names):
+            raise RawDataError("HOI template/object_names must be a nonempty one-dimensional dataset")
+        valid = annotations.get("object_valid")
+        if (not isinstance(valid, h5py.Dataset)
+                or valid.shape != (len(raw_timing), len(names)) or valid.dtype != bool):
+            raise RawDataError("Invalid HOI object_valid shape/dtype")
+        cloud = annotations.get("object_pointcloud")
+        if (not isinstance(cloud, h5py.Dataset)
+                or cloud.shape != (len(raw_timing), HOI_NUM_POINTS, 3) or cloud.dtype != np.float32):
+            raise RawDataError("Invalid HOI object_pointcloud shape/dtype")
         timing = annotations.get("camera_timing")
-        if timing is None:
-            raise RawDataError(f"{path}: missing HOI camera_timing; re-annotate with --overwrite")
         if not isinstance(timing, h5py.Dataset) or timing.shape != raw_timing.shape or timing.dtype != CAMERA_TIMING_DTYPE:
-            raise RawDataError(f"{path}: invalid HOI camera_timing; re-annotate with --overwrite")
+            raise RawDataError(f"{path}: missing or invalid HOI camera_timing; re-annotate with --overwrite")
         if not np.array_equal(timing[:], raw_timing.fields(CAMERA_TIMING_FIELDS)[:]):
             raise RawDataError(f"{path}: HOI camera_timing differs from Raw; re-annotate with --overwrite")
     except BaseException:
@@ -571,6 +580,8 @@ class RawReader:
         return starts.astype(np.intp, copy=False)
 
     def __getitem__(self, name):
+        if name == "object_pointcloud":
+            return self.hoi_file[name]
         if name not in self.dataset_cache:
             if name in {"hand_contact", "hand_tactile_force"}:
                 self.validate_tactile_metadata()
@@ -583,15 +594,13 @@ class RawReader:
                 and self.meta["arm_action_semantics"] != ARM_ACTION_SEMANTICS
             ):
                 raise RawDataError(f"Raw arm_action_semantics: expected {ARM_ACTION_SEMANTICS}")
-            array = (self.hoi_file if name == "object_pointcloud" else self.data_file)[name]
+            array = self.data_file[name]
             import h5py
             if not isinstance(array, h5py.Dataset):
                 raise RawDataError(f"Raw {name}: expected a dataset")
             spec: tuple[tuple[int, ...], np.dtype] | None
             if name == "depth":
                 spec = (self.meta["camera_color_height"], self.meta["camera_color_width"]), np.dtype(np.uint16)
-            elif name == "object_pointcloud":
-                spec = (HOI_NUM_POINTS, 3), np.dtype(np.float32)
             else:
                 spec = ROBOT_DATASET_SPECS.get(name, VR_DATASET_SPECS.get(name))
             if spec is not None:
@@ -610,6 +619,10 @@ class RawReader:
         if self._hoi_file is None:
             self._hoi_file = open_hoi_file(self.path / "hoi.h5", self.meta, self["timing/rows"])
         return self._hoi_file
+
+    def read_hoi_validity(self, stop: int | None = None) -> np.ndarray:
+        """由逐物体掩码计算所选前缀的整帧有效性。"""
+        return self.hoi_file["object_valid"][:stop].all(axis=1)
 
     def read_camera(self, *, include_depth=True, include_extrinsics=True) -> CameraSnapshot:
         return decode_camera_metadata(

@@ -56,7 +56,7 @@ def load_hoi_task(
 
 
 def validate_task_template(template: Mapping[str, np.ndarray]) -> None:
-    """资产文件和 Raw 标注共用同一模板结构。"""
+    """校验任务模板的固定点数和对象分段。"""
     validate_point_segments(
         template["points_local"], template["object_names"], template["offsets"],
         num_points=HOI_NUM_POINTS, label="HOI template",

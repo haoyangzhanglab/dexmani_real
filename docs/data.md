@@ -30,13 +30,13 @@ Raw 的手部关节列通过 `meta.hand_joint_names` 和 `meta.joint_units` 校�
 
 Raw 保留采集像素网格上的 RGB-D，解码后的有损 RGB 与现场像素值可能有差异。点云取色使用这一路 RGB-D。在线策略 RGB、Canonical RGB/depth 和 Raw 可视化使用同一针孔图像几何，沿用固定 K、原分辨率和光轴。RGB 双线性采样，depth 最近邻采样，越界填零。含图像的 Zarr 标记 `image_geometry="pinhole"`。
 
-读取深度时要求 Raw 记录对齐到彩色网格的深度及其正尺度。读取 RGB 时要求 `rgb.mp4` 包含视频流，并检查像素尺寸和纳秒时基，逐帧核对时间戳是否等于该行 `control_ns` 减去首行 `control_ns`。完整读取时还检查 `rgb.mp4` 帧数与 `timing/rows` 一致。限帧可视化只检查所选前缀。
+读取深度时要求 Raw 记录对齐到彩色网格的深度及其正尺度。读取 RGB 时要求 `rgb.mp4` 包含视频流，并检查像素尺寸和纳秒时基，逐帧核对时间戳是否等于该行 `control_ns` 减去首行 `control_ns`。完整读取时还检查 `rgb.mp4` 帧数与 `timing/rows` 一致。限帧可视化只解码和检查所选视频前缀，HOI 关节对齐可在同一连续段内读取额外邻点。
 
 模型所需模态经投影进入策略历史。Raw 录制保留实测关节、触觉和原始 RGB-D。启用录制时，普通 RGB 策略与 Raw 共用相机源帧。HOI 或场景点云策略的 RGB 跟随对应的派生观测，Raw 从相机通道单独取帧。触觉缺失可随 Raw 保存。导出时只检查所选模态，现有无 Mask 的触觉字段要求所有指尖有效。
 
 ## 按需导出
 
-- 每次 `export_zarr.py INPUT_ROOT` 发布一份固定字段的 Zarr。默认导出由 Raw 生成的全部字段，所选录制均有 `hoi.h5` 时一并导出 `object_pointcloud`。用 `--fields ...` 可指定字段。纯关节导出跳过相机，纯 RGB 跳过深度单位，选择 `object_pointcloud` 时才读取 HOI。
+- 每次 `export_zarr.py INPUT_ROOT` 发布一份固定字段的 Zarr。默认导出由 Raw 生成的全部字段，所选录制均有 `hoi.h5` 时一并导出 `object_pointcloud`。用 `--fields ...` 可指定字段。纯关节导出跳过相机，纯 RGB 跳过深度单位。与 `object_pointcloud` 一同导出的关节观测及其 FK 结果使用原始相机时间。
 - 用 `--output` 指定输出路径，否则默认写入当前目录的 `datasets/<输入目录名>.zarr`，单个 Episode 使用其父目录名。新产物完整后原子发布，路径须尚不存在。
 - 同一产物的 `task_name` 取自各 Raw 一致的 `meta.task_label`。`action_space="joint"` 标记采集动作空间。含动作的产物使用根属性 `action_semantics="held_accepted_joint_target"`。
 - 选择 `action` 或 `action_ee` 时，导出器构造同一份关节目标序列。两列目标均有限的行使用原目标。两列目标均为 NaN 的等待行沿用本段上一条成功目标，段首等待行统一填入段首实测关节状态。使用 HOI 对齐关节反馈时，段首填充值也来自这组对齐反馈。每段独立填充并保留原时间轴。`action_ee` 将同一序列的臂关节目标经 FK 转为末端位姿，并保留手关节目标。

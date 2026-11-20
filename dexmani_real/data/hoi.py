@@ -102,6 +102,21 @@ def write_hoi(
     return path
 
 
+def _joint_lookahead(rows, clock, start, end, stamp, target):
+    """延伸到最后所需的右端点，并读完该时间戳的重复反馈。"""
+    stamps = []
+    for index in range(start, end):
+        row = rows[index]
+        next_stamp = int(row[clock])
+        if stamp >= target and next_stamp != stamp:
+            break
+        if not stamp <= next_stamp <= row["observation_ns"]:
+            raise RawDataError(f"Invalid HOI source timestamp: {clock} at row {index}")
+        stamps.append(next_stamp)
+        stamp = next_stamp
+    return stamps
+
+
 def align_hoi_episode(
     reader: RawReader, timing: np.ndarray, boundaries: np.ndarray, max_gap_s: float,
     *, devices: tuple[str, ...] = ("arm", "hand"), require_complete: bool = False,
@@ -121,32 +136,13 @@ def align_hoi_episode(
         for device in devices:
             name, clock = f"{device}_qpos", f"{device}_ns"
             stamps = timing[clock][start:selected_end]
-            values = reader[name][start:selected_end]
-            neighbors: list[tuple[int, int]] = []
-            index, stamp = int(selected_end) - 1, int(stamps[-1])
-            # 顺序查找尾部时钟，只保留各目标真正需要的邻点；长时间重复
-            # 反馈或缺少右邻点时，也不加载整段尾部 qpos。
-            for target in np.unique(targets[targets > stamp]):
-                while index + 1 < end and stamp < target:
-                    left_index, left_stamp = index, stamp
-                    index += 1
-                    row = reader["timing/rows"][index]
-                    stamp = int(row[clock])
-                    if stamp <= 0 or stamp < left_stamp or stamp > row["observation_ns"]:
-                        raise ValueError(f"Invalid HOI source timestamp: {clock}")
-                if stamp < target:
-                    break
-                needed = (
-                    ((index, stamp),) if stamp == target
-                    else ((left_index, left_stamp), (index, stamp))
+            if selected_end < end:
+                extra_stamps = _joint_lookahead(
+                    reader["timing/rows"], clock, selected_end, end, int(stamps[-1]), int(targets[-1]),
                 )
-                for neighbor in needed:
-                    if neighbor[0] >= selected_end and (not neighbors or neighbor[0] > neighbors[-1][0]):
-                        neighbors.append(neighbor)
-            if neighbors:
-                indices, extra_stamps = zip(*neighbors)
-                stamps = np.r_[stamps, extra_stamps]
-                values = np.concatenate((values, reader[name][list(indices)]))
+                if extra_stamps:
+                    stamps = np.r_[stamps, extra_stamps]
+            values = reader[name][start : start + len(stamps)]
             positions, valid = interpolate_joints(stamps, values, targets, max_gap_s)
             joints[name][start:selected_end] = positions
             if require_complete and not valid.all():
@@ -155,21 +151,3 @@ def align_hoi_episode(
             row, device = min(gaps)
             raise RawDataError(f"{device}: unalignable row {row} in segment {segment}")
     return joints
-
-
-def read_hoi_validity(reader: RawReader, stop: int | None = None) -> np.ndarray:
-    """整帧有效性唯一来自所选范围内的逐物体有效性。"""
-    import h5py
-
-    data = reader.hoi_file
-    objects = data["object_valid"]
-    names = data["template/object_names"]
-    if not isinstance(names, h5py.Dataset) or names.ndim != 1 or not len(names):
-        raise RawDataError("HOI template/object_names must be a nonempty one-dimensional dataset")
-    if (
-        not isinstance(objects, h5py.Dataset)
-        or objects.dtype != bool
-        or objects.shape != (reader.num_frames, names.shape[0])
-    ):
-        raise RawDataError("Invalid HOI object_valid shape/dtype")
-    return objects[:stop].all(axis=1)

@@ -1,4 +1,4 @@
-"""点云处理与手表面模板的实验参数。"""
+"""点云处理、手表面模板与 HOI 跟踪的实验参数。"""
 
 from dataclasses import dataclass
 
@@ -7,6 +7,19 @@ import numpy as np
 HOI_NUM_POINTS = 1024
 HOI_MIN_POINTS_PER_OBJECT = 64
 HOI_MAX_OBJECTS = HOI_NUM_POINTS // HOI_MIN_POINTS_PER_OBJECT
+DEFAULT_HOI_MAX_JOINT_GAP_S = 0.10
+
+
+@dataclass(frozen=True)
+class HOITrackingConfig:
+    segmentation_interval_frames: int = 10
+    recovery_enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.segmentation_interval_frames) is not int or self.segmentation_interval_frames < 1:
+            raise ValueError("hoi_tracking.segmentation_interval_frames must be a positive integer")
+        if type(self.recovery_enabled) is not bool:
+            raise TypeError("hoi_tracking.recovery_enabled must be bool")
 
 
 @dataclass(frozen=True)

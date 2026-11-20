@@ -28,7 +28,7 @@ Checkpoint 描述模型的观测字段、动作、RGB 预处理和控制周期�
 
 只加载可信来源的 Checkpoint 文件或包含 `checkpoints/latest.pt` 的目录。训练 Checkpoint 保存了权重和策略配置，部署会根据保存的配置构造策略，加载过程可能执行代码。`--config` 也只应指定可信的 Python 实验配置。
 
-HOI（`object_pointcloud`）与场景点云（`point_cloud`）是互斥输入。HOI 策略通过 CLI 的 `--task-dir` 或 `PolicySession(..., task_dir=...)` 指定与离线标注共用的任务资产目录。目录支持 `~`，相对路径基于当前工作目录。部署在创建设备前解析并校验任务，`run_config.yaml` 记录实际目录。Checkpoint 的 `task_name` 用作实验标签。
+HOI（`object_pointcloud`）与场景点云（`point_cloud`）是互斥输入。HOI 策略通过 CLI 的 `--task-dir` 或 `PolicySession(..., task_dir=...)` 指定与离线标注共用的任务资产目录。目录支持 `~`，相对路径基于当前工作目录。部署在连接设备前校验任务，`run_config.yaml` 记录实际目录和 `effective_parameters.hoi_tracking`。Checkpoint 的 `task_name` 用作实验标签。跟踪参数见[跟踪配置](object_reconstruction.md#跟踪配置)。
 
 场景点云使用 `RealConfig.pointcloud`，手表面点云使用 `RealConfig.hand_pointcloud`。指尖 FK 与数据导出共用固定五指顺序（thumb、index、middle、ring、pinky）。会话归档的 `training_processing` 来自 Checkpoint，`actual_processing` 记录部署使用的场景及手部点云处理参数。HOI 的关节对齐预算记入 `effective_parameters.execution.hoi_max_joint_gap_s`。
 
@@ -106,7 +106,7 @@ HOLD 对模型和 Raw 均只读取视觉来源元数据，来源时效、设备�
 
 运行期间按启动时间与预算直接判断是否到期，推理等待、动作提交、HOI HOLD 和 RESUMING 都计入同一预算。恢复不会重新计时；总预算到期沿正常停止路径结束本段，`termination_details` 为 `duration_timeout`。暂停不重置控制时钟，也不补跑过去的控制槽；下一控制时刻由启动时间、最后控制槽和固定周期派生。
 
-整个恢复区间保留同一 HOI 请求、Worker、模型和 Raw Episode。设备反馈、其他必需模态或录制失败仍沿用原停止路径；操作员结束和急停始终有效。
+整个恢复区间保留同一 HOI 请求、Worker、模型和 Raw Episode。Worker 只发布仍属当前请求的结果。控制端在有限时间内更新请求，超时进入会话故障收尾。设备反馈、其他必需模态或录制失败仍沿用原停止路径，操作员结束和急停始终有效。
 
 ## 观测构建
 

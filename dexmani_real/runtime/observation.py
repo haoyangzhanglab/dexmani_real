@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from dexmani_real.config.perception import DEFAULT_HOI_MAX_JOINT_GAP_S
 from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.robot.xhand.feedback import expire_tactile, tactile_validity
 from dexmani_real.utils.timing import sample_is_fresh
@@ -53,7 +54,8 @@ class Observation:
 
 
 def read_observation(
-    channels, robot, *, needs: ObservationNeeds, joint_gap_s=0.10, include_visual_payloads=True,
+    channels, robot, *, needs: ObservationNeeds,
+    joint_gap_s=DEFAULT_HOI_MAX_JOINT_GAP_S, include_visual_payloads=True,
 ) -> Observation:
     """按需读取快照；就绪检查可只读取视觉来源元数据。"""
     control_ns = time.monotonic_ns()
