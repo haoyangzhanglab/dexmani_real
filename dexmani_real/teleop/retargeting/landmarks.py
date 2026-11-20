@@ -1,6 +1,6 @@
 """HTS 右手 21 点：掌坐标、固定骨长标定和 XHand 的降维几何目标。"""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -65,19 +65,31 @@ def rotate_vectors(vectors: np.ndarray, axes: np.ndarray, angles: np.ndarray) ->
 
 
 def prepare_landmarks(landmarks: np.ndarray) -> np.ndarray:
-    """已准入的米制右手输入；输出掌系 (+X 掌侧、+Y 拇指侧、+Z 指向中指)。"""
+    """将米制右手输入转换到 SLSQP 使用的掌系。"""
+    return _prepare_landmarks(landmarks, side_index=17)
+
+
+def prepare_geort_landmarks(landmarks: np.ndarray) -> np.ndarray:
+    """复现 GeoRT Manus 掌系，以食指和无名指 MCP 定义横向。"""
+    return _prepare_landmarks(landmarks, side_index=13)
+
+
+def _prepare_landmarks(landmarks: np.ndarray, *, side_index: int) -> np.ndarray:
     points = np.asarray(landmarks, dtype=np.float64)
+    if points.shape != (21, 3) or not np.isfinite(points).all():
+        raise HandGeometryRejected("right-hand landmarks must be finite with shape (21, 3)")
     lengths = np.linalg.norm(points[BONE_CHILDREN] - points[BONE_PARENTS], axis=1)
     if np.any(lengths < 0.002) or np.any(lengths > 0.18):
         raise HandGeometryRejected("hand bone lengths must be between 2 and 180 mm")
     centered = points - points[0]
     forward = centered[9]
-    side = centered[5] - centered[17]
+    side = centered[5] - centered[side_index]
     forward = forward / np.linalg.norm(forward)
     side = side - np.dot(side, forward) * forward
-    if np.linalg.norm(side) < 0.01:
-        raise HandGeometryRejected("degenerate palm: index/pinky span is below 10 mm")
-    side /= np.linalg.norm(side)
+    span = np.linalg.norm(side)
+    if span < 0.01:
+        raise HandGeometryRejected("degenerate palm: projected MCP span is below 10 mm")
+    side /= span
     # 由有序解剖标记确定法向，不用 SVD 的任意符号，也不引入反射矩阵。
     normal = np.cross(side, forward)
     return centered @ np.column_stack((normal, side, forward))
@@ -107,6 +119,20 @@ class HandCalibration:
             raise ValueError("hand calibration bone lengths are unstable")
         return cls(median[:15].reshape(5, 3), float(median[15]))
 
+    @classmethod
+    def from_recording(cls, metadata: Mapping[str, object]) -> "HandCalibration":
+        bone_lengths = np.asarray(metadata["bone_lengths"], dtype=np.float64)
+        palm_width = float(metadata["palm_width"])
+        values = np.r_[bone_lengths.ravel(), palm_width]
+        if bone_lengths.shape != (5, 3) or not np.all(np.isfinite(values) & (values > 0)):
+            raise ValueError("recorded hand calibration requires 15 positive bone lengths and a positive palm width")
+        return cls(bone_lengths, palm_width)
+
+    def validate_lengths(self, measured: np.ndarray, *, tolerance: float) -> None:
+        reference = np.r_[self.bone_lengths.ravel(), self.palm_width]
+        if np.max(np.abs(measured / reference - 1.0)) > tolerance:
+            raise HandGeometryRejected("hand bone lengths changed beyond the calibrated tolerance")
+
     def targets(
         self, points: np.ndarray, geometry: HandGeometry, config: HandRetargetingConfig,
         *, fk: HandFK, frame_ids: Sequence[int],
@@ -115,9 +141,7 @@ class HandCalibration:
         bones = np.diff(points[FINGER_CHAINS], axis=1)
         lengths = np.linalg.norm(bones, axis=2)
         measured = np.r_[lengths.ravel(), np.linalg.norm(points[5] - points[17])]
-        reference = np.r_[self.bone_lengths.ravel(), self.palm_width]
-        if np.max(np.abs(measured / reference - 1.0)) > config.bone_length_tolerance:
-            raise HandGeometryRejected("hand bone lengths changed beyond the calibrated tolerance")
+        self.validate_lengths(measured, tolerance=config.bone_length_tolerance)
         unit_bones = bones / lengths[:, :, None]
         proximal = unit_bones[:, 0].copy()
         proximal[0] = unit_bones[0, 1]

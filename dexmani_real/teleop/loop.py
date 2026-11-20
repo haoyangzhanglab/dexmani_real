@@ -296,6 +296,8 @@ class TeleopLoop:
                         "bone_lengths": calibration.bone_lengths.tolist(),
                         "palm_width": calibration.palm_width,
                     }
+                    if runtime.hand_retargeting.backend == "geort":
+                        effective_parameters["hand_retargeting_checkpoint"] = retargeter.checkpoint_metadata
                 metadata = episode_recording_metadata(
                     self.camera_snapshot, effective_parameters,
                     tactile_reset=self.robot.hand.tactile_reset_metadata,

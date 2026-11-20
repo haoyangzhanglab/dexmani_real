@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
@@ -72,8 +73,16 @@ class HandRetargetingConfig:
     max_joint_speed_rad_s: float = 4.0
     max_evaluations: int = 50
     max_solve_time_s: float = 0.025
+    backend: Literal["slsqp", "geort"] = "slsqp"
+    geort_checkpoint_dir: str | None = None
 
     def validate(self) -> None:
+        if self.backend not in ("slsqp", "geort"):
+            raise ValueError("hand_retargeting.backend must be 'slsqp' or 'geort'")
+        if self.backend == "geort" and (
+            not isinstance(self.geort_checkpoint_dir, str) or not self.geort_checkpoint_dir.strip()
+        ):
+            raise ValueError("hand_retargeting.geort_checkpoint_dir is required for GeoRT")
         for name in ("calibration_samples", "max_evaluations"):
             value = getattr(self, name)
             if type(value) is not int or value < 2:

@@ -93,6 +93,7 @@ def run_teleop(
             "config", record=record, vr_pos_scale=runtime.teleop.vr_pos_scale,
             ema_alpha_pos=runtime.teleop.ema_alpha_pos, ema_alpha_rot=runtime.teleop.ema_alpha_rot,
             target_max_age_s=runtime.teleop.target_max_age_s, hand_enabled=runtime.hand.enabled,
+            hand_retargeting_backend=runtime.hand_retargeting.backend if runtime.hand.enabled else None,
         )
     controller = VRController(
         ActionMapper.for_mode(
@@ -299,11 +300,7 @@ def calibrate_hand(loop, cancel_epoch) -> None:
     retargeter = loop.controller.hand_retargeter
     if retargeter is None:
         return
-    from dexmani_real.teleop.retargeting.landmarks import (
-        HandGeometryRejected,
-        hand_lengths,
-        prepare_landmarks,
-    )
+    from dexmani_real.teleop.retargeting.landmarks import HandGeometryRejected
 
     config = loop.runtime.hand_retargeting
     print("正在标定手部骨长：请保持右手清晰可见；无需保持伸直。S 或 Esc 可取消，按两次 Q 退出。", flush=True)
@@ -341,7 +338,7 @@ def calibrate_hand(loop, cancel_epoch) -> None:
             ):
                 last_sequence = sequence
                 try:
-                    measurement = hand_lengths(prepare_landmarks(frame["landmarks"]))
+                    measurement = retargeter.calibration_measurement(frame["landmarks"])
                 except HandGeometryRejected as exc:
                     last_error = str(exc)
                 else:
@@ -356,8 +353,11 @@ def calibrate_hand(loop, cancel_epoch) -> None:
 def build_hand_retargeter(runtime):
     if not runtime.hand.enabled:
         return None
+    config = runtime.hand_retargeting
+    if config.backend == "geort":
+        from dexmani_real.teleop.retargeting.geort import GeoRTRetargeter
+
+        return GeoRTRetargeter(config, runtime.hand)
     from dexmani_real.teleop.retargeting.solver import HandRetargeter
 
-    return HandRetargeter(
-        runtime.hand_retargeting, runtime.hand,
-    )
+    return HandRetargeter(config, runtime.hand)
