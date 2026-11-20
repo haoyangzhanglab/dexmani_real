@@ -6,7 +6,10 @@ import time
 from collections.abc import Sequence
 from dataclasses import asdict, replace
 from importlib.metadata import version
+from math import acos, degrees
 from typing import cast
+
+import numpy as np
 
 from dexmani_real.control.actions import StartPoseRejected
 from dexmani_real.control.ik import IKReferenceError
@@ -31,6 +34,7 @@ from dexmani_real.runtime.home import (
 )
 from dexmani_real.runtime.observation import (
     RAW_RECORDING_NEEDS,
+    Observation,
     ObservationNeeds,
     check_device_feedback,
     check_observation,
@@ -83,6 +87,7 @@ class TeleopLoop:
         self.episode_vr_epoch: int | None = None
         self.next_tick_ns: int | None = None
         self.control_dt_ns = control_dt_ns
+        self.previous_wrist: tuple[int, int, np.ndarray, np.ndarray] | None = None
 
         self.recorder: EpisodeRecorder | None = None
         self.episode_deadline_ns: int | None = None
@@ -114,6 +119,7 @@ class TeleopLoop:
             else:
                 self.record_error("stop", exc)
                 logger.exception("teleop stop also failed")
+        self.previous_wrist = None
         self.controller.clear()
 
         if self.runtime_state.estop_request:
@@ -602,6 +608,47 @@ class TeleopLoop:
             issues.append("vr_waiting_for_current_connection")
         return issues
 
+    def accept_wrist_observation(self, row: Observation) -> bool:
+        """拦截腕姿跳变，并在首次下发前等待新腕包。"""
+        vr = cast(dict, row.vr)
+        control_ns = row.control_timestamp_ns
+        recv_ns = int(vr["wrist_recv_ts_ns"])
+        position = vr["wrist_pos"]
+        quaternion = vr["wrist_quat_wxyz"]
+        current = control_ns, recv_ns, position, quaternion
+        if self.previous_wrist is None:
+            self.previous_wrist = current
+            return False
+
+        previous_ns, previous_recv_ns, previous_position, previous_quaternion = self.previous_wrist
+        interval_ns = control_ns - previous_ns
+        # 漏拍后仍限制单次允许的位姿变化。
+        budget_s = min(interval_ns, 1.5 * self.control_dt_ns) / 1e9
+        displacement_m = float(np.linalg.norm(position - previous_position))
+        dot = abs(float(np.dot(quaternion, previous_quaternion)))
+        rotation_deg = degrees(2.0 * acos(min(dot, 1.0)))
+        config = self.runtime.teleop
+        if (
+            displacement_m > config.vr_max_wrist_speed_m_s * budget_s
+            or rotation_deg > config.vr_max_wrist_angular_speed_deg_s * budget_s
+        ):
+            self.request_episode_end("vr_pose_jump")
+            sequence_id = int(vr["sequence_id"])
+            logger.warning(
+                "VR 腕姿突变，结束本段，序号 %d，位移 %.1f mm，转角 %.1f°，间隔 %.1f ms（限值使用 %.1f ms）",
+                sequence_id, displacement_m * 1e3, rotation_deg, interval_ns / 1e6, budget_s * 1e3,
+            )
+            if self.timing is not None:
+                self.timing.add(
+                    "vr_pose_jump", timestamp_ns=control_ns, vr_sequence_id=sequence_id,
+                    displacement_m=displacement_m, rotation_deg=rotation_deg,
+                    interval_ns=interval_ns, budget_s=budget_s,
+                )
+            return False
+
+        self.previous_wrist = current
+        return self.target_deadline_ns is not None or recv_ns > previous_recv_ns
+
     def handle_executor_stop(self, unknown_reason="executor_stopped_unknown"):
         self.robot.check()
         self.request_episode_end(self.robot.arm.stop_reason or unknown_reason)
@@ -662,7 +709,8 @@ class TeleopLoop:
         if issues:
             self.request_episode_end("control_sources: " + "; ".join(issues))
             return
-        self.execute_control_step(row)
+        if self.accept_wrist_observation(row):
+            self.execute_control_step(row)
 
     def service_episode(self, timeout):
         if not self.runtime_state.estop_request and not self.check_vr_connection():

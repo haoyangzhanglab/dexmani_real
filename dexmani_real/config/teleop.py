@@ -18,6 +18,8 @@ class TeleopConfig:
     vr_stale_threshold_s: float = 0.5
     # 命令目标租约，与来源观测 TTL 独立。
     target_max_age_s: float = 0.25
+    vr_max_wrist_speed_m_s: float = 1.4
+    vr_max_wrist_angular_speed_deg_s: float = 650.0
 
     def validate(self) -> None:
         if not (0.0 <= self.ema_alpha_pos <= 1.0 and 0.0 <= self.ema_alpha_rot <= 1.0):
@@ -27,6 +29,10 @@ class TeleopConfig:
             for v in (self.vr_pos_scale, self.vr_stale_threshold_s, self.target_max_age_s)
         ):
             raise ValueError("VR position scale, source age and target lease must be finite and positive")
+        for name in ("vr_max_wrist_speed_m_s", "vr_max_wrist_angular_speed_deg_s"):
+            value = getattr(self, name)
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"teleop.{name} must be finite and positive")
 
 
 @dataclass(frozen=True)

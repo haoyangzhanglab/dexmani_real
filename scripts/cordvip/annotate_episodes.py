@@ -1,4 +1,9 @@
-"""离线跟踪已发布 Raw，短暂缺帧时保持最近一次完整场景。"""
+"""
+离线跟踪已发布 Raw，短暂缺帧时保持最近一次完整场景。
+python scripts/cordvip/annotate_episodes.py \
+  episodes/pnp_apple_banana/episode_20261120_193502 \
+  --task-dir assets/pointcloud_template/object/pnp_apple_banana
+"""
 
 import argparse
 import math

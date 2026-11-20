@@ -1,0 +1,18 @@
+{
+  "objects": [
+    {
+      "name": "bucket",
+      "prompt": "woven basket",
+      "image": "../bucket.jpg",
+      "instance": 0,
+      "scale_to_meters": 0.10512595322279937
+    },
+    {
+      "name": "lid",
+      "prompt": "round green lid",
+      "image": "../lid.jpg",
+      "instance": 0,
+      "scale_to_meters": 0.10975750435171036
+    }
+  ]
+}

@@ -157,6 +157,7 @@ class XHand:
             "unconfirmed_writes": 0,
         }
         self.next_warning_ns: dict[str, int] = {}
+        self._overcurrent_warned = False
         self.control: Any = None
         self.command: Any = None
         self.tactile_reset_metadata: dict[str, object] = {}
@@ -183,6 +184,7 @@ class XHand:
             self.consecutive_read_crc = 0
             self.consecutive_write_crc = 0
             self.next_warning_ns.clear()
+            self._overcurrent_warned = False
             self.tactile_reset_metadata = {}
             self._tactile_bias = self._tactile_bias_time_ns = None
             self._tactile_bias_applied = False
@@ -498,11 +500,10 @@ class XHand:
         return state
 
     def send_action(self, target: np.ndarray, *, deadline_ns: int, check_abort) -> None:
-        code = self.send_position(
+        """提交位置目标，按期返回的过流告警只反映设备状态。"""
+        self.send_position(
             target, tor_max=self.cfg.tor_max, deadline_ns=deadline_ns, check_abort=check_abort,
         )
-        if code == OVERCURRENT_WARNING_CODE:
-            raise XHandError("send", code, "overcurrent warning; position submission not confirmed")
 
     def _send_with_crc_retry(self, prepare, *, deadline_ns: int, check_abort=None) -> int:
         """仅重试 CRC 回执；成功和过流回执都须在期内收到。"""
@@ -561,7 +562,7 @@ class XHand:
     def hold(
         self, qpos: np.ndarray, *, timestamp_ns: int, tor_max: tuple[int, ...], check_abort=None,
     ) -> bool:
-        """用新鲜反馈生成额定范围内的保持目标，返回 SDK 是否确认提交。"""
+        """用新鲜反馈提交额定范围内的保持目标。"""
         max_age_s = self.hold_feedback_max_age_s
         if not sample_is_fresh(timestamp_ns, max_age_s, time.monotonic_ns()):
             logger.warning("XHand hold skipped: position feedback unavailable/stale")
@@ -572,10 +573,11 @@ class XHand:
             logger.warning("XHand hold skipped: invalid position feedback (%s)", exc)
             return False
         target = np.clip(feedback, XHAND_RATED_QPOS_MIN_RAD, XHAND_RATED_QPOS_MAX_RAD)
-        return self.send_position(
+        self.send_position(
             target, tor_max=tor_max,
             deadline_ns=timestamp_ns + int(max_age_s * 1e9), check_abort=check_abort,
-        ) == 0
+        )
+        return True
 
     def release(self) -> bool:
         """显式提交 Passive，返回 SDK 是否确认提交。"""
@@ -607,11 +609,12 @@ class XHand:
             self.consecutive_write_crc += 1
             self.crc_counts["write_errors"] += 1
             self.warn_limited("write_crc", "XHand write CRC; target delivery unconfirmed")
-        elif code == OVERCURRENT_WARNING_CODE:
-            self.warn_overcurrent("send", error.error_message)
-        elif self.consecutive_write_crc:
-            self.crc_counts["write_recoveries"] += 1
-            self.consecutive_write_crc = 0
+        else:
+            if self.consecutive_write_crc:
+                self.crc_counts["write_recoveries"] += 1
+                self.consecutive_write_crc = 0
+            if code == OVERCURRENT_WARNING_CODE:
+                self.warn_overcurrent("send", error.error_message)
         return code
 
     def warn_limited(self, key: str, message: str, *args) -> None:
@@ -621,8 +624,9 @@ class XHand:
             self.next_warning_ns[key] = now_ns + 1_000_000_000
 
     def warn_overcurrent(self, operation: str, message: str) -> None:
-        self.warn_limited("overcurrent", "XHand 过流告警：%s code=%d msg=%s",
-                          operation, OVERCURRENT_WARNING_CODE, message)
+        if not self._overcurrent_warned:
+            logger.warning("XHand 过流告警：%s code=%d msg=%s", operation, OVERCURRENT_WARNING_CODE, message)
+            self._overcurrent_warned = True
 
     def _make_command(self, qpos: np.ndarray) -> Any:
         """用首帧已校验的关节位置初始化命令。"""
