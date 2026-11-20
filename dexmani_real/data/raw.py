@@ -542,11 +542,11 @@ class RawReader:
         for bad, detail, offset in (
             ((control < 0) | (observation < control), "invalid_control_or_observation_clock", 0),
             (np.diff(control) <= 0, "control_clock_not_increasing", 1),
+            (observation[1:] <= observation[:-1], "observation_clock_not_increasing", 1),
         ):
             indices = np.flatnonzero(bad)
             if len(indices):
                 raise RawDataError(f"Raw {self.path}: {detail} at row {int(indices[0]) + offset}")
-        self._validate_observation_clock(observation)
         for key in source_clocks:
             stamps = rows[key]
             invalid = (stamps <= 0) | (stamps > observation)
@@ -555,13 +555,6 @@ class RawReader:
             if len(indices):
                 raise RawDataError(f"Raw {self.path}: invalid source timestamp: {key} at row {indices[0]}")
         return rows
-
-    def _validate_observation_clock(self, stamps: np.ndarray) -> None:
-        indices = np.flatnonzero(stamps[1:] <= stamps[:-1])
-        if len(indices):
-            raise RawDataError(
-                f"Raw {self.path}: observation_clock_not_increasing at row {int(indices[0]) + 1}"
-            )
 
     @property
     def segment_starts(self) -> np.ndarray:
@@ -652,12 +645,6 @@ class RawReader:
                 f"Raw hand_tactile_scale_divisor: expected {XHAND_TACTILE_SCALE_DIVISOR}, "
                 f"got {divisor!r}"
             )
-
-    def read_observation_stamps(self, stop: int | None = None) -> np.ndarray:
-        """只读取观测时钟，校验所选时间戳严格递增。"""
-        stamps = self["timing/rows"].fields("observation_ns")[:stop]
-        self._validate_observation_clock(stamps)
-        return stamps
 
     def iter_rgb_frames(self):
         """按 Raw 行读取图像，核对纳秒 PTS，消费结束时检查帧数。"""

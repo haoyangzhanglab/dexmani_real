@@ -1,20 +1,18 @@
-"""发布 HOI 标注，并按 Raw 连续区间对齐关节。"""
+"""生成物体点云并原子发布 HOI 标注。"""
 
 import json
 import logging
 import os
 import tempfile
-from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
 
 from dexmani_real.config.perception import HOI_NUM_POINTS
-from dexmani_real.data.raw import CAMERA_TIMING_DTYPE, RawDataError, RawReader
+from dexmani_real.data.raw import CAMERA_TIMING_DTYPE
 from dexmani_real.geometry.hoi import transform_task_points
 from dexmani_real.geometry.pose import validate_rigid_transform
 from dexmani_real.utils.io import publish
-from dexmani_real.utils.timing import interpolate_joints
 
 logger = logging.getLogger(__name__)
 
@@ -30,15 +28,16 @@ def write_hoi(
     tracking_config,
     object_valid,
     overwrite=False,
-):
+) -> None:
     import h5py
 
     base_from_camera = validate_rigid_transform(base_from_camera, label="HOI base_from_camera")
-    poses = np.asarray(poses, dtype=np.float32)
+    poses = np.array(poses, dtype=np.float32, copy=True)
     frames = len(poses)
     if camera_timing.shape != (frames,) or camera_timing.dtype != CAMERA_TIMING_DTYPE:
         raise ValueError("HOI camera_timing must match the pose rows")
-    expected = (frames, len(template["object_names"]))
+    objects = len(template["object_names"])
+    expected = (frames, objects)
     if poses.shape != (*expected, 4, 4):
         raise ValueError("HOI pose shape mismatch")
     object_valid = np.asarray(object_valid)
@@ -46,14 +45,9 @@ def write_hoi(
         raise ValueError("HOI validity shape/dtype mismatch")
     if not np.isfinite(poses[object_valid]).all():
         raise ValueError("Nonfinite valid HOI pose")
-    poses = poses.copy()
     poses[~object_valid] = np.nan
     valid = object_valid.all(axis=1)
-    if (
-        frames == 0
-        or len(quality) != frames
-        or any(len(row) != len(template["object_names"]) for row in quality)
-    ):
+    if frames == 0 or len(quality) != frames or any(len(row) != objects for row in quality):
         raise ValueError("HOI quality shape does not match poses/template")
     path = Path(path)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
@@ -99,55 +93,3 @@ def write_hoi(
         except BaseException:
             logger.exception("HOI temporary file cleanup also failed: %s", temporary)
         raise
-    return path
-
-
-def _joint_lookahead(rows, clock, start, end, stamp, target):
-    """延伸到最后所需的右端点，并读完该时间戳的重复反馈。"""
-    stamps = []
-    for index in range(start, end):
-        row = rows[index]
-        next_stamp = int(row[clock])
-        if stamp >= target and next_stamp != stamp:
-            break
-        if not stamp <= next_stamp <= row["observation_ns"]:
-            raise RawDataError(f"Invalid HOI source timestamp: {clock} at row {index}")
-        stamps.append(next_stamp)
-        stamp = next_stamp
-    return stamps
-
-
-def align_hoi_episode(
-    reader: RawReader, timing: np.ndarray, boundaries: np.ndarray, max_gap_s: float,
-    *, devices: tuple[str, ...] = ("arm", "hand"), require_complete: bool = False,
-) -> dict[str, np.ndarray]:
-    """对齐已校验的时间前缀；只在同一原生段内读取所需邻点。"""
-    count = len(timing)
-    joints = {
-        f"{device}_qpos": np.empty((count, *reader[f"{device}_qpos"].shape[1:]))
-        for device in devices
-    }
-    for segment, (start, end) in enumerate(pairwise(boundaries)):
-        if start >= count:
-            break
-        selected_end = min(end, count)
-        targets = timing["camera_ns"][start:selected_end]
-        gaps = []
-        for device in devices:
-            name, clock = f"{device}_qpos", f"{device}_ns"
-            stamps = timing[clock][start:selected_end]
-            if selected_end < end:
-                extra_stamps = _joint_lookahead(
-                    reader["timing/rows"], clock, selected_end, end, int(stamps[-1]), int(targets[-1]),
-                )
-                if extra_stamps:
-                    stamps = np.r_[stamps, extra_stamps]
-            values = reader[name][start : start + len(stamps)]
-            positions, valid = interpolate_joints(stamps, values, targets, max_gap_s)
-            joints[name][start:selected_end] = positions
-            if require_complete and not valid.all():
-                gaps.append((start + np.flatnonzero(~valid)[0], device))
-        if gaps:
-            row, device = min(gaps)
-            raise RawDataError(f"{device}: unalignable row {row} in segment {segment}")
-    return joints

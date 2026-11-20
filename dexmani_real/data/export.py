@@ -18,12 +18,10 @@ import numpy as np
 import zarr
 
 from dexmani_real.config.perception import (
-    DEFAULT_HOI_MAX_JOINT_GAP_S,
     HOI_NUM_POINTS,
     HandCloudConfig,
     PointCloudConfig,
 )
-from dexmani_real.data.hoi import align_hoi_episode
 from dexmani_real.data.raw import (
     ACTION_TARGET_FIELDS,
     RawDataError,
@@ -54,7 +52,6 @@ from dexmani_real.robot.model import (
 )
 from dexmani_real.utils.io import publish
 from dexmani_real.utils.table_plane import normalize_table_plane
-from dexmani_real.utils.timing import validate_joint_gap
 
 CANONICAL_FORMAT = "dexmani.real.canonical"
 logger = logging.getLogger(__name__)
@@ -69,7 +66,6 @@ class ExportConfig:
     pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
     hand_pointcloud: HandCloudConfig = field(default_factory=HandCloudConfig)
     table_plane_abcd: tuple[float, float, float, float] | None = None
-    hoi_max_joint_gap_s: float = DEFAULT_HOI_MAX_JOINT_GAP_S
 
 
 # 输出字段直接对应 Raw 输入；FK 和相机计算由下方普通条件启用。
@@ -170,7 +166,7 @@ def iter_canonical_blocks(
     hand_fk,
     hand_cloud,
     camera,
-    alignment,
+    action_targets: np.ndarray | None,
 ):
     frames = reader.num_frames
     fields = specs.keys()
@@ -189,12 +185,8 @@ def iter_canonical_blocks(
         )
     # 视频容器归 RawReader 所有，退出 reader 上下文时统一关闭。
     images = reader.iter_rgb_frames() if "rgb" in inputs else None
-    # 联合物体点云输出使用对齐观测，其余输出仍读取原始关节。
     with raw_input():
-        sources = {
-            name: alignment[name] if name in alignment else reader[name]
-            for name in inputs - {"rgb"}
-        }
+        sources = {name: reader[name] for name in inputs - {"rgb", *ACTION_TARGET_FIELDS}}
     for start in range(0, frames, chunk_frames):
         end = min(frames, start + chunk_frames)
         count = end - start
@@ -234,13 +226,15 @@ def iter_canonical_blocks(
             block["object_pointcloud"] = raw["object_pointcloud"]
         if "joint_state" in fields:
             block["joint_state"] = np.concatenate((raw["arm_qpos"], raw["hand_qpos"]), axis=1, dtype=np.float32)
-        if "action" in fields:
-            block["action"] = np.concatenate(
-                (raw["action_arm_joint_target"], raw["action_hand_joint_target"]), axis=1, dtype=np.float32,
-            )
-        if "action_ee" in fields:
-            poses = eef_poses(raw["action_arm_joint_target"], arm_fk=arm_fk)
-            block["action_ee"] = np.concatenate((encode_eef_pose(poses), raw["action_hand_joint_target"]), axis=1, dtype=np.float32)
+        if action_targets is not None:
+            targets = action_targets[start:end]
+            if "action" in fields:
+                block["action"] = targets.astype(np.float32)
+            if "action_ee" in fields:
+                poses = eef_poses(targets[:, :ARM_DOF], arm_fk=arm_fk)
+                block["action_ee"] = np.concatenate(
+                    (encode_eef_pose(poses), targets[:, ARM_DOF:]), axis=1, dtype=np.float32,
+                )
         if {"eef_pose", "fingertip_xyz", "hand_pointcloud"}.intersection(fields):
             poses = eef_poses(raw["arm_qpos"], arm_fk=arm_fk)
             if "eef_pose" in fields:
@@ -300,7 +294,7 @@ def raw_input():
         raise
 
 
-def held_joint_targets(reader, boundaries, alignment):
+def held_joint_targets(reader, boundaries):
     """使用最近一次完整提交的目标，保留 float64 以供动作 FK。"""
     targets = np.concatenate([reader[field][:] for field in ACTION_TARGET_FIELDS], axis=1)
     accepted = np.isfinite(targets).all(axis=1)
@@ -318,17 +312,15 @@ def held_joint_targets(reader, boundaries, alignment):
         segment[hold] = targets[latest[hold]]
         if latest[0] < 0:
             # 段首实测与训练中的初始参考一致。
-            arm = alignment["arm_qpos"] if "arm_qpos" in alignment else reader["arm_qpos"]
-            hand = alignment["hand_qpos"] if "hand_qpos" in alignment else reader["hand_qpos"]
-            initial = np.concatenate((arm[start], hand[start]))
+            initial = np.concatenate((reader["arm_qpos"][start], reader["hand_qpos"][start]))
             if not np.isfinite(initial).all():
                 raise RawDataError(f"Raw actions require finite initial joint state at row {start}")
             segment[latest < 0] = initial
     return targets
 
 
-def prepare_raw(reader, processing, fields, clocks, hoi_devices):
-    """验证完整 Raw，并准备低维关节对齐；RGB-D 仍在写入时单遍读取。"""
+def prepare_raw(reader, fields, clocks, *, include_actions):
+    """校验 Raw 并准备逐段保持的动作目标。"""
     with raw_input():
         validate_task_label(reader.meta["task_label"])
         if reader.num_frames <= 0:
@@ -338,21 +330,9 @@ def prepare_raw(reader, processing, fields, clocks, hoi_devices):
             valid = reader.read_hoi_validity()
             if not valid.all():
                 raise RawDataError(f"HOI contains invalid rows: first at {int(np.flatnonzero(~valid)[0])}")
-        include_actions = bool({"action", "action_ee"}.intersection(fields))
-        if include_actions:
-            clocks = clocks | {"arm_ns", "hand_ns"}
-        timing = reader.read_timing(source_clocks=clocks)
-        alignment = {}
-        if hoi_devices:
-            alignment = align_hoi_episode(
-                reader, timing, boundaries, processing.hoi_max_joint_gap_s,
-                devices=hoi_devices, require_complete=True,
-            )
-        if include_actions:
-            targets = held_joint_targets(reader, boundaries, alignment)
-            alignment["action_arm_joint_target"] = targets[:, :ARM_DOF]
-            alignment["action_hand_joint_target"] = targets[:, ARM_DOF:]
-        return alignment, export_camera(reader, fields), boundaries
+        reader.read_timing(source_clocks=clocks)
+        action_targets = held_joint_targets(reader, boundaries) if include_actions else None
+        return action_targets, export_camera(reader, fields), boundaries
 
 
 def export_zarr(
@@ -374,12 +354,9 @@ def export_zarr(
         "object_pointcloud": "camera_ns",
     }
     clocks = {source_clocks[name] for name in inputs if name in source_clocks}
-    hoi_devices = tuple(
-        device for device in ("arm", "hand")
-        if "object_pointcloud" in inputs and f"{device}_qpos" in inputs
-    )
-    if hoi_devices:
-        validate_joint_gap(processing.hoi_max_joint_gap_s)
+    include_actions = bool(inputs.intersection(ACTION_TARGET_FIELDS))
+    if include_actions:
+        clocks.update(("arm_ns", "hand_ns"))
     if "point_cloud" in fields:
         processing.pointcloud.validate()
         if processing.pointcloud.remove_table:
@@ -407,8 +384,8 @@ def export_zarr(
                 with raw_input():
                     reader = RawReader(episode)
                 with reader:
-                    alignment, camera, boundaries = prepare_raw(
-                        reader, processing, fields, clocks, hoi_devices,
+                    action_targets, camera, boundaries = prepare_raw(
+                        reader, fields, clocks, include_actions=include_actions,
                     )
                     specs = canonical_array_specs(fields, processing, camera)
                     with raw_input():
@@ -431,7 +408,7 @@ def export_zarr(
                             raise RawDataError("inconsistent field shape")
                     blocks = iter_canonical_blocks(
                         reader, processing, specs=specs, inputs=inputs, arm_fk=arm_fk, hand_fk=hand_fk,
-                        hand_cloud=hand_cloud, camera=camera, alignment=alignment,
+                        hand_cloud=hand_cloud, camera=camera, action_targets=action_targets,
                     )
                     append_rows(arrays, offset, blocks, reader.num_frames)
                 # 整条输入与关闭成功后才提交来源及段边界。
@@ -458,8 +435,8 @@ def export_zarr(
             metadata["point_cloud"] = processing_metadata(processing.pointcloud, processing.table_plane_abcd)
         if "hand_pointcloud" in fields:
             metadata["hand_pointcloud"] = {"num_points": processing.hand_pointcloud.num_points}
-        if hoi_devices:
-            metadata["object_pointcloud"] = {"max_joint_gap_s": processing.hoi_max_joint_gap_s}
+        if "object_pointcloud" in fields and {"arm_qpos", "hand_qpos"}.intersection(inputs):
+            metadata["object_pointcloud"] = {"joint_state_source": "raw_observation_row"}
         selection = {"rejected_episodes": rejected, "excluded_episodes": sorted(excluded)}
         root.attrs.update(**selection, source_episodes=sources, source_row_ranges=ranges, data_processing=metadata)
         root.create_group("meta").create_dataset("episode_ends", data=np.asarray(ends, dtype=np.int64))

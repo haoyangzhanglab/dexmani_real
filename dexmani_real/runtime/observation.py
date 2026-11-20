@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dexmani_real.config.perception import DEFAULT_HOI_MAX_JOINT_GAP_S
 from dexmani_real.ipc.sensors import read_camera_frame
 from dexmani_real.robot.xhand.feedback import expire_tactile, tactile_validity
 from dexmani_real.utils.timing import sample_is_fresh
@@ -15,7 +14,6 @@ _RECOVERABLE_HOI_ISSUES = frozenset({
     "hoi_unavailable",
     "hoi_pose_invalid",
     "hoi_stale",
-    "hoi_joint_alignment_unavailable",
 })
 _HOI_METADATA_FIELDS = ("episode_id", "timestamp_ns", "source_camera_sequence", "valid")
 
@@ -24,7 +22,6 @@ _HOI_METADATA_FIELDS = ("episode_id", "timestamp_ns", "source_camera_sequence", 
 class ObservationNeeds:
     camera_fields: tuple[str, ...] = ()
     hoi: bool = False
-    hoi_joint_devices: tuple[str, ...] = ()
     point_cloud: bool = False
     vr: bool = False
     required_tactile: tuple[str, ...] = ()
@@ -50,12 +47,11 @@ class Observation:
     pointcloud_timestamp_ns: int | None = None
     control_timestamp_ns: int = -1
     hoi: dict | None = None
-    aligned_joints: dict | None = None
 
 
 def read_observation(
     channels, robot, *, needs: ObservationNeeds,
-    joint_gap_s=DEFAULT_HOI_MAX_JOINT_GAP_S, include_visual_payloads=True,
+    include_visual_payloads=True,
 ) -> Observation:
     """按需读取快照；就绪检查可只读取视觉来源元数据。"""
     control_ns = time.monotonic_ns()
@@ -85,16 +81,12 @@ def read_observation(
         else:
             camera = read_camera_frame(channels, fields=camera_fields)
     vr_result = channels.vr_ring.read() if needs.vr else None
-    aligned_joints = None
-    if needs.hoi_joint_devices and hoi is not None and hoi["valid"]:
-        aligned_joints = robot.aligned_joints(int(hoi["timestamp_ns"]), joint_gap_s)
     observed_ns = time.monotonic_ns()
     hand = expire_tactile(state.hand, max_age_s=robot.hand_config.tactile_max_age_s, now_ns=observed_ns)
     return Observation(
         arm=state.arm,
         hand=hand,
         hoi=hoi,
-        aligned_joints=aligned_joints,
         camera=camera,
         vr=vr_result[0] if vr_result is not None else None,
         point_cloud=cloud["point_cloud"] if cloud is not None and include_visual_payloads else None,
@@ -129,8 +121,6 @@ def check_observation(row, runtime, needs, *, now_ns=None):
     # 派生图像与对应的点云或 HOI 观测共用来源时间。
     if needs.hoi:
         issues.extend(_hoi_issues(row.hoi, runtime, now))
-        if needs.hoi_joint_devices and row.aligned_joints is None:
-            issues.append("hoi_joint_alignment_unavailable")
     elif needs.point_cloud:
         if row.pointcloud_timestamp_ns is None:
             issues.append("pointcloud_unavailable")
@@ -138,7 +128,7 @@ def check_observation(row, runtime, needs, *, now_ns=None):
             issues.append("pointcloud_stale")
     elif needs.camera_fields:
         if row.camera is None:
-            issues.append("camera_source_unavailable_or_unmatched")
+            issues.append("camera_source_unavailable")
         elif not sample_is_fresh(row.camera["timestamp_ns"], runtime.camera.max_frame_age_s, now):
             issues.append("camera_source_stale")
     if needs.vr:

@@ -83,11 +83,6 @@ class Rollout:
         self.execution = runtime.execution
         self.robot, self.sensors = robot, sensors
         model_needs = observations.needs
-        if model_needs.hoi_joint_devices:
-            robot.enable_joint_history(
-                self.execution.hoi_max_age_s + self.execution.hoi_max_joint_gap_s,
-                devices=model_needs.hoi_joint_devices,
-            )
         self.observations = observations
         # 派生 Ring 只提供模型图像，Raw RGB-D 由相机 Ring 提供。
         self.read_raw_camera = record_raw and (model_needs.hoi or model_needs.point_cloud)
@@ -241,7 +236,6 @@ class Rollout:
             self.sensors.channels,
             self.robot,
             needs=self.read_needs,
-            joint_gap_s=self.execution.hoi_max_joint_gap_s,
             include_visual_payloads=include_visual_payloads,
         )
         raw = row
@@ -254,7 +248,7 @@ class Rollout:
             hand = expire_tactile(row.hand, max_age_s=self.runtime.hand.tactile_max_age_s, now_ns=observed_ns)
             raw = replace(
                 row, hand=hand, camera=camera, point_cloud=None, pointcloud_timestamp_ns=None,
-                hoi=None, aligned_joints=None, observation_timestamp_ns=observed_ns,
+                hoi=None, observation_timestamp_ns=observed_ns,
             )
         return row, raw
 
@@ -619,7 +613,7 @@ class Rollout:
             self.recorder.check_error()
         if self.duration_expired():
             return
-        if self.observations.needs.hoi:
+        if self.observations.needs.hoi and self.state != "HOI_HOLD":
             issues = check_hoi_status(self.sensors.channels, self.runtime)
             if issues:
                 self._enter_hoi_hold()

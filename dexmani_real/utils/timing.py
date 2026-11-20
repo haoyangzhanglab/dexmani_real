@@ -1,4 +1,4 @@
-"""绝对时钟调度、来源时效判断与关节时间插值。"""
+"""绝对时钟调度与来源时效判断。"""
 
 from __future__ import annotations
 
@@ -26,52 +26,3 @@ def sampling_clock_ns(control_hz: float) -> int:
 def sample_is_fresh(timestamp_ns, max_age_s, now_ns):
     stamp = int(timestamp_ns)
     return 0 < stamp <= now_ns and now_ns - stamp < int(max_age_s * 1e9)
-
-
-def validate_joint_gap(value):
-    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-        raise ValueError("hoi_max_joint_gap_s 必须为有限正数")
-
-
-def interpolate_joint_bracket(lo, hi, before, after, target, max_gap_s):
-    """对已选定的关节端点插值，时间可为标量或可广播的列。"""
-    span_ns = hi - lo
-    valid = (lo <= target) & (target <= hi) & (span_ns <= max_gap_s * 1e9)
-    # 精确命中时两端是同一样本，其有效权重为零。
-    fraction = (target - lo) / (span_ns + (span_ns == 0))
-    return before + fraction * (after - before), valid
-
-
-def interpolate_joints(stamps, positions, targets, max_gap_s):
-    """返回关节和有效标志；无法插值的位置为 NaN。
-
-    调用方按连续区间提供历史；精确命中直接取样，否则要求前后样本间隔不超预算。
-    """
-    import numpy as np
-
-    stamps = np.asarray(stamps, dtype=np.int64)
-    positions = np.asarray(positions, dtype=np.float64)
-    targets = np.atleast_1d(np.asarray(targets, dtype=np.int64))
-    if (
-        stamps.ndim != 1
-        or not len(stamps)
-        or positions.ndim != 2
-        or len(positions) != len(stamps)
-        or np.any(stamps <= 0)
-        or np.any(stamps[1:] < stamps[:-1])
-        or not np.isfinite(positions).all()
-    ):
-        raise ValueError("Invalid joint history")
-    duplicate = stamps[1:] == stamps[:-1]
-    if np.any(np.any(positions[1:] != positions[:-1], axis=1) & duplicate):
-        raise ValueError("Conflicting joint states at the same timestamp")
-    right = np.searchsorted(stamps, targets).clip(0, len(stamps) - 1)
-    exact = stamps[right] == targets
-    left = np.where(exact, right, np.maximum(0, right - 1))
-    values, valid = interpolate_joint_bracket(
-        stamps[left, None], stamps[right, None], positions[left], positions[right],
-        targets[:, None], max_gap_s,
-    )
-    valid = valid[:, 0]
-    values[~valid] = np.nan
-    return values, valid

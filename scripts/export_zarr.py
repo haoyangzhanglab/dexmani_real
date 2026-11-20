@@ -13,7 +13,6 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from dexmani_real.config.perception import DEFAULT_HOI_MAX_JOINT_GAP_S
 from dexmani_real.config.real import load_config
 from dexmani_real.data.export import (
     FIELD_INPUTS,
@@ -51,10 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help=(
-            "Trusted Python experiment file exporting CONFIG: RealConfig. "
-            f"execution.hoi_max_joint_gap_s bounds joint interpolation intervals (default {DEFAULT_HOI_MAX_JOINT_GAP_S:.2f} s)."
-        ),
+        help="Trusted Python experiment file exporting CONFIG: RealConfig.",
     )
     parser.add_argument(
         "--fields", nargs="+", choices=tuple(FIELD_INPUTS),
@@ -62,8 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Defaults to all Raw-derived fields, plus object_pointcloud if every selected episode "
             "has hoi.h5. RGB/depth use the fixed-K pinhole grid. "
             "action and action_ee hold confirmed joint targets within each segment and fill "
-            "leading rows from joint feedback. With object_pointcloud, exported joint observations "
-            "and their FK geometry use the camera timestamp."
+            "leading rows from the segment's first joint feedback. Joint observations and their FK "
+            "geometry use measured joints from each Raw row. HOI clouds use annotations for those rows."
         ),
     )
     parser.add_argument(
@@ -99,7 +95,6 @@ def load_processing_config(path: Path | None, fields) -> ExportConfig:
         pointcloud=runtime.pointcloud,
         hand_pointcloud=runtime.hand_pointcloud,
         table_plane_abcd=plane,
-        hoi_max_joint_gap_s=runtime.execution.hoi_max_joint_gap_s,
     )
 
 

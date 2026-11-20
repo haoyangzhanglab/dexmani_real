@@ -30,7 +30,7 @@ Checkpoint 描述模型的观测字段、动作、RGB 预处理和控制周期�
 
 HOI（`object_pointcloud`）与场景点云（`point_cloud`）是互斥输入。HOI 策略通过 CLI 的 `--task-dir` 或 `PolicySession(..., task_dir=...)` 指定与离线标注共用的任务资产目录。目录支持 `~`，相对路径基于当前工作目录。部署在连接设备前校验任务，`run_config.yaml` 记录实际目录和 `effective_parameters.hoi_tracking`。Checkpoint 的 `task_name` 用作实验标签。跟踪参数见[跟踪配置](object_reconstruction.md#跟踪配置)。
 
-场景点云使用 `RealConfig.pointcloud`，手表面点云使用 `RealConfig.hand_pointcloud`。指尖 FK 与数据导出共用固定五指顺序（thumb、index、middle、ring、pinky）。会话归档的 `training_processing` 来自 Checkpoint，`actual_processing` 记录部署使用的场景及手部点云处理参数。HOI 的关节对齐预算记入 `effective_parameters.execution.hoi_max_joint_gap_s`。
+场景点云使用 `RealConfig.pointcloud`，手表面点云使用 `RealConfig.hand_pointcloud`。指尖 FK 与数据导出共用固定五指顺序（thumb、index、middle、ring、pinky）。会话归档的 `training_processing` 来自 Checkpoint，`actual_processing` 记录部署使用的场景及手部点云处理参数。外部实验配置若仍在 `ExecutionConfig(...)` 中设置 HOI 关节反馈间隔上限，请移除该设置。
 
 所有策略 RGB 在进入历史前统一为针孔图像，同一相机来源序号复用矫正结果。Policy 在该网格上继续做投影和 resize 坐标变换。图像几何与录制路径见[实验数据](data.md#图像与模型输入)。
 
@@ -78,7 +78,7 @@ HOI（`object_pointcloud`）与场景点云（`point_cloud`）是互斥输入。
 
 ## 观测与录制
 
-HOI 的关节与 FK 观测使用按相机来源时间对齐的关节，设备反馈检查使用最新实测值。对齐暂不可用或 HOI 点云过期时进入下述恢复流程。对齐规则见[物体重建与 HOI](object_reconstruction.md#跟踪与时间对齐)。
+HOI 策略使用当前控制采样行的 Arm / Hand 实测关节，通过 FK 计算派生几何，并与当前可用的物体点云组合。点云保留原始相机序列和来源时间，关节保留各自的反馈时间。软件按控制采样行配对这组异步快照，设备反馈仍按各自来源时间检查时效。见[物体重建与 HOI](object_reconstruction.md#跟踪与逐行快照)。
 
 初始观测须在各自等待期限内通过校验。截止时优先报告已有的具体反馈或观测问题，只有观测有效但已到期时报告初始观测超时。
 
@@ -94,13 +94,13 @@ HOI 的关节与 FK 观测使用按相机来源时间对齐的关节，设备反
 
 ## HOI 暂停与恢复
 
-HOI Worker 启动时最多等待 120 秒完成模型加载和后端预热。每段另有最多 120 秒用于等待初次注册及有效观测，证据暂时不足时继续处理后续帧。感知后端异常会终止 Worker，会话报告退出的进程名和退出码，并停止和收尾。运行期间，仅 HOI 不可用、位姿无效、过期或关节对齐暂不可用时，Rollout 执行以下流程。
+HOI Worker 启动时最多等待 120 秒完成模型加载和后端预热。每段另有最多 120 秒用于等待初次注册及有效观测，证据暂时不足时继续处理后续帧。感知后端异常会终止 Worker，会话报告退出的进程名和退出码，并停止和收尾。运行期间，HOI 不可用、位姿无效或点云超过 `execution.hoi_max_age_s` 时，Rollout 执行以下流程。
 
 1. **HOI_HOLD**：清空策略历史和动作计划，提交机械臂减速保持。XHand 在取得有效反馈后提交实测位置保持。两者确认后每 1 秒刷新一次机械臂的 2 秒命令租约与手部保持。在途旧预测完成后回收结果，推理异常仍会终止运行。
-2. **RESUMING**：当前 episode 的新鲜 HOI、关节对齐及其他必需输入全部有效，且旧预测已回收后，使用新的有效观测重建历史。首帧沿用正常启动的历史填充方式，首个预测调用策略的 `reset_episode()`，将推理随机数生成器重置到 `--seed` 指定的种子，不重复预热模型。
+2. **RESUMING**：当前 episode 的 HOI 新鲜且有效，其他必需输入有效，旧预测已回收后，使用新的有效观测重建历史。首帧沿用正常启动的历史填充方式，首个预测调用策略的 `reset_episode()`，将推理随机数生成器重置到 `--seed` 指定的种子，不重复预热模型。
 3. **RUNNING**：首条新策略动作发送成功、整轮预算未到期并完成控制记账后恢复运行；提交前再次检查 HOI。此前再次遮挡则回到 HOLD，同一次录制间断不重复标记。
 
-HOLD 对模型和 Raw 均只读取视觉来源元数据，来源时效、设备反馈、模型所需触觉及必要的关节对齐照常检查。RESUMING 在下一控制采样时重新读取完整观测。进入 HOLD 时标记录制间断，新 Raw 段从首条恢复动作成功提交的那一拍开始。运行中正常等待时保留观测，两列动作目标均填 NaN。停止前未完成提交的终止拍省略。
+HOLD 对模型和 Raw 均只读取视觉来源元数据，来源时效、设备反馈和模型所需触觉照常检查。RESUMING 在下一控制采样时重新读取完整观测。进入 HOLD 时标记录制间断，新 Raw 段从首条恢复动作成功提交的那一拍开始。运行中正常等待时保留观测，两列动作目标均填 NaN。停止前未完成提交的终止拍省略。
 
 每轮默认运行预算 60 秒，CLI 用 `--max-duration` 覆盖，Python 入口使用 `PolicySession(..., max_duration_s=...)`；CLI 的 `none` 与 Python 的 `None` 表示直到用户停止或真实失败。计时从准备完成并取得运动授权后开始，初始观测等待、模型预热、Recorder 初始化和设备准备不消耗运行预算。启动、观测、预热及关闭仍有各自等待期限。
 

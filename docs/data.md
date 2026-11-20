@@ -16,7 +16,7 @@ Raw 按字段使用固定类型。关节、绝对关节目标、VR 腕部位姿�
 
 ## 时间与动作
 
-`timing/rows` 保留控制采样时刻、观测完成时刻及各来源的主机单调时钟时间，单位为纳秒。相机派生观测沿用相机来源时间，重复读取保留原时间。多来源观测按这些时间做软件对齐，时间戳记录的是主机侧查询或接收时刻。
+`timing/rows` 保留控制采样时刻、观测完成时刻及各来源的主机单调时钟时间，单位为纳秒。相机派生观测沿用原始相机序列和来源时间，重复读取保留原时间。Arm 和 Hand 各自保留反馈来源时间。这些时间戳记录主机侧查询或接收时刻。软件按 Raw 行配对快照，允许相机、Arm 和 Hand 在不同物理时刻采样。
 
 Raw 的 `action_arm_joint_target` 和 `action_hand_joint_target` 保存已在主机侧完整且按时提交的臂手绝对关节目标。VR 只写成功提交的行。策略正常等待且这一拍没有新指令时，保留观测行，两列目标均填 NaN。停止前未完成提交的终止拍省略。设备实际执行和到位以实测反馈为准。
 
@@ -30,20 +30,22 @@ Raw 的手部关节列通过 `meta.hand_joint_names` 和 `meta.joint_units` 校�
 
 Raw 保留采集像素网格上的 RGB-D，解码后的有损 RGB 与现场像素值可能有差异。点云取色使用这一路 RGB-D。在线策略 RGB、Canonical RGB/depth 和 Raw 可视化使用同一针孔图像几何，沿用固定 K、原分辨率和光轴。RGB 双线性采样，depth 最近邻采样，越界填零。含图像的 Zarr 标记 `image_geometry="pinhole"`。
 
-读取深度时要求 Raw 记录对齐到彩色网格的深度及其正尺度。读取 RGB 时要求 `rgb.mp4` 包含视频流，并检查像素尺寸和纳秒时基，逐帧核对时间戳是否等于该行 `control_ns` 减去首行 `control_ns`。完整读取时还检查 `rgb.mp4` 帧数与 `timing/rows` 一致。限帧可视化只解码和检查所选视频前缀，HOI 关节对齐可在同一连续段内读取额外邻点。
+读取深度时要求 Raw 记录对齐到彩色网格的深度及其正尺度。读取 RGB 时要求 `rgb.mp4` 包含视频流，并检查像素尺寸和纳秒时基，逐帧核对时间戳是否等于该行 `control_ns` 减去首行 `control_ns`。完整读取时还检查 `rgb.mp4` 帧数与 `timing/rows` 一致。限帧可视化只解码和检查所选视频前缀。
 
 模型所需模态经投影进入策略历史。Raw 录制保留实测关节、触觉和原始 RGB-D。启用录制时，普通 RGB 策略与 Raw 共用相机源帧。HOI 或场景点云策略的 RGB 跟随对应的派生观测，Raw 从相机通道单独取帧。触觉缺失可随 Raw 保存。导出时只检查所选模态，现有无 Mask 的触觉字段要求所有指尖有效。
 
 ## 按需导出
 
-- 每次 `export_zarr.py INPUT_ROOT` 发布一份固定字段的 Zarr。默认导出由 Raw 生成的全部字段，所选录制均有 `hoi.h5` 时一并导出 `object_pointcloud`。用 `--fields ...` 可指定字段。纯关节导出跳过相机，纯 RGB 跳过深度单位。与 `object_pointcloud` 一同导出的关节观测及其 FK 结果使用原始相机时间。
+- 每次 `export_zarr.py INPUT_ROOT` 发布一份固定字段的 Zarr。默认导出由 Raw 生成的全部字段，所选录制均有 `hoi.h5` 时一并导出 `object_pointcloud`。用 `--fields ...` 可指定字段。纯关节导出跳过相机，纯 RGB 跳过深度单位。关节观测和 FK 派生结果使用对应 Raw 行的原始关节状态，物体点云使用该行对应的 HOI 标注。
 - 用 `--output` 指定输出路径，否则默认写入当前目录的 `datasets/<输入目录名>.zarr`，单个 Episode 使用其父目录名。新产物完整后原子发布，路径须尚不存在。
 - 同一产物的 `task_name` 取自各 Raw 一致的 `meta.task_label`。`action_space="joint"` 标记采集动作空间。含动作的产物使用根属性 `action_semantics="held_accepted_joint_target"`。
-- 选择 `action` 或 `action_ee` 时，导出器构造同一份关节目标序列。两列目标均有限的行使用原目标。两列目标均为 NaN 的等待行沿用本段上一条成功目标，段首等待行统一填入段首实测关节状态。使用 HOI 对齐关节反馈时，段首填充值也来自这组对齐反馈。每段独立填充并保留原时间轴。`action_ee` 将同一序列的臂关节目标经 FK 转为末端位姿，并保留手关节目标。
-- 每个原生连续段成为一个 Zarr episode，`source_episodes` 和 `source_row_ranges=[start, stop)` 与 `episode_ends` 逐段对应。位置对齐和采样窗口限于段内。同一采集的各段属于同一个训练或验证分组，`val_episodes` 和 `max_train_episodes` 按采集组计数。
-- 所选数据缺失、损坏或所需的 HOI 关节对齐无法覆盖整段时，放弃该条 Raw 的全部结果，继续处理其他采集。完整有效的截断前缀仍可导出。没有可用采集时导出失败。权限、磁盘和输出写入错误会终止导出，并保留原始错误。
+- 选择 `action` 或 `action_ee` 时，导出器构造同一份关节目标序列。两列目标均有限的行使用原目标。两列目标均为 NaN 的等待行沿用本段上一条成功目标。首次成功提交前的等待行使用段首 Raw 行的实测关节状态。每段独立填充并保留原时间轴。`action_ee` 将同一序列的臂关节目标经 FK 转为末端位姿，并保留手关节目标。
+- 每个原生连续段成为一个 Zarr episode，`source_episodes` 和 `source_row_ranges=[start, stop)` 与 `episode_ends` 逐段对应。采样窗口限于段内。同一采集的各段属于同一个训练或验证分组，`val_episodes` 和 `max_train_episodes` 按采集组计数。
+- 所选数据缺失、损坏或所选 HOI 行含无效对象时，放弃该条 Raw 的全部结果，继续处理其他采集。完整有效的截断前缀仍可导出。没有可用采集时导出失败。权限、磁盘和输出写入错误会终止导出，并保留原始错误。
 - 根属性 `rejected_episodes` 保存被拒的入口名和原因。臂手目标的有限值与 NaN 混杂或含无穷值时，原因给出首个问题的 Raw 绝对行号。`excluded_episodes` 保存显式排除的入口名。排除后仍有两个入口指向同一目录时会报错。
 
 配套 Policy 的 Real 原生 ODE 使用同一关节 `action` 序列，可用 `export_zarr.py INPUT_ROOT --fields joint_state point_cloud action` 导出。
 
-Zarr 的 `data_processing` 保存实际使用的处理参数。开启去桌面时，归一化系数写入 `data_processing.point_cloud.table_plane_abcd`。部署对应值见 `run_config.yaml` 的 `actual_processing.point_cloud.table_plane_abcd`。接触预训练按同一帧的手部和物体点云计算 1024 个有序标签。见[标注与查看](object_reconstruction.md#标注与查看)。
+Zarr 的 `data_processing` 保存实际使用的处理参数。物体点云与关节观测或其 FK 结果一同导出时，`data_processing.object_pointcloud.joint_state_source` 为 `raw_observation_row`。开启去桌面时，归一化系数写入 `data_processing.point_cloud.table_plane_abcd`。部署对应值见 `run_config.yaml` 的 `actual_processing.point_cloud.table_plane_abcd`。接触预训练按同一观测行的手部和物体点云计算 1024 个有序标签。见[标注与查看](object_reconstruction.md#标注与查看)。
+
+已有 Raw 和 `hoi.h5` 可直接复用。曾按相机时间重采样关节的 HOI Zarr 须从原始数据重新导出，确保训练数据统一使用 Raw 行的关节状态。

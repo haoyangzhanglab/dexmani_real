@@ -251,8 +251,6 @@ class PolicySession:
             execution["rtc_guidance_cap"] = runtime.execution.rtc_guidance_cap
         if needs.hoi:
             execution["hoi_max_age_s"] = runtime.execution.hoi_max_age_s
-        if needs.hoi_joint_devices:
-            execution["hoi_max_joint_gap_s"] = runtime.execution.hoi_max_joint_gap_s
         self.effective_parameters = {
             "policy": policy_parameters,
             "seed": self.seed, "device": self.device,

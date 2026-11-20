@@ -9,7 +9,7 @@ CordViP 的 `hand_pointcloud` 和 `object_pointcloud` 默认各包含 1024 个�
 
 ## 实验流程
 
-在 `real_robot` 环境中，从仓库根目录运行。为准备、采样、标注和部署指定同一个任务资产目录。其 `task.json` 的 `objects` 列表定义对象名称和顺序。每个对象的参考图默认为 `<name>/reference.jpg`，已有米制 CAD 放在 `<name>/mesh/mesh_m.obj`。资产准备的尺度、实例选择与后端依赖见[感知后端说明](../third_party/cordvip_geometry/README.md#安装与命令)。
+在 `real_robot` 环境中，从仓库根目录运行。为准备、采样、标注和部署指定同一个任务资产目录。采样按 `task.json` 的 `objects` 列表生成模板，后续标注与部署沿用模板的 `object_names` 顺序。每个对象的参考图默认为 `<name>/reference.jpg`，已有米制 CAD 放在 `<name>/mesh/mesh_m.obj`。资产准备的尺度、实例选择与后端依赖见[感知后端说明](../third_party/cordvip_geometry/README.md#安装与命令)。
 
 ```bash
 python scripts/collect_teleop.py pick --episodes-dir /data/episodes
@@ -42,13 +42,13 @@ CONFIG = RealConfig(
 
 `annotate_episodes.py` 和 `run_policy.py` 均从 `--config experiment.py` 读取 `RealConfig.hoi_tracking`。使用新参数重算已有标注时传入 `--overwrite`。部署有会话输出目录时，将两个实际参数写入 `run_config.yaml` 的 `effective_parameters.hoi_tracking`。标注将完整后端配置写入 `hoi.h5` 根属性 `tracking_config`。
 
-## 跟踪与时间对齐
+## 跟踪与逐行快照
 
-在线 Worker 从 Camera Ring 读取，离线标注从 Raw 读取。两条路径共用 `track_hoi_frame()` 和 `transform_task_points()`，按模板顺序处理位姿、有效性与质量。每个在线请求和每个离线 Raw Episode 分别初始化跟踪，失败时用下一来源帧重试。在线跳过已处理的相机序列，离线同序列的记录行复用跟踪结果。意外后端错误沿各入口的故障路径传播。质量与恢复规则见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)和[遮挡恢复](../third_party/cordvip_geometry/README.md#遮挡恢复)。
+在线 Worker 从 Camera Ring 读取，离线标注从 Raw 读取。两条路径共用 `track_hoi_frame()` 和 `transform_task_points()`，按模板顺序处理位姿和有效性。离线标注额外保存逐物体质量。每个在线请求和每个离线 Raw Episode 分别初始化跟踪，失败时用下一来源帧重试。在线跳过已处理的相机序列，离线同序列的记录行复用跟踪结果。意外后端错误沿各入口的故障路径传播。质量与恢复规则见[后端说明](../third_party/cordvip_geometry/README.md#质量检查)和[遮挡恢复](../third_party/cordvip_geometry/README.md#遮挡恢复)。
 
-在线从反馈历史查找相邻端点，离线在各 Raw 连续段内批量查找。两者使用同一插值规则，将所需臂手关节对齐到物体点云对应的原始相机时间。精确命中直接取样，其余目标须被前后反馈包围，且间隔不超过 `execution.hoi_max_joint_gap_s`（默认 0.10 秒）。相同时间戳的冲突反馈会报错。导出和部署可通过同一个 `--config experiment.py` 设置该间隔。
+在线将当前控制采样行的最新 Arm / Hand 实测关节状态与可用的 HOI 物体点云组合。离线将 `hoi.h5` 的物体点云与对应 Raw 行的 `arm_qpos`、`hand_qpos` 组合。两条路径都用本行实测关节生成 `joint_state`，并通过 FK 计算 `eef_pose`、指尖和手点云。
 
-对齐关节用于策略的 `joint_state`、`eef_pose`、指尖和手点云。Raw 和设备反馈检查使用实测反馈。在线对齐缺失时走现有暂停与恢复流程，离线严格导出报告不可对齐的设备与原始行号。参见[部署恢复流程](policy_deployment.md#hoi-暂停与恢复)和[实验数据](data.md)。
+软件按观测行配对快照，相机、Arm 和 Hand 可以在不同物理时刻采样。物体点云仍对应原始相机序列和来源时间，Arm 和 Hand 各自保留反馈时间。在线继续检查 HOI 有效性、新鲜度和设备反馈。参见[部署恢复流程](policy_deployment.md#hoi-暂停与恢复)和[实验数据](data.md)。
 
 ## 标注与查看
 
@@ -66,4 +66,4 @@ python scripts/visualize_episode.py /data/episodes/pick/episode_001 --max-frames
 python -B -m unittest discover -s tests -v
 ```
 
-用实际 Episode 路径核对手物点云在同一帧的基座几何、关节来源时差、逐物体质量和有效性。可视化保留无效行的时间位置，并隐藏无效物体点云和无法对齐的手部几何。使用 `--no-hoi` 可查看原始关节几何。严格 HOI 导出要求所选行的物体均有效，且所需关节均能对齐。完整规则见[数据导出](data.md#按需导出)。
+用实际 Episode 路径核对同一 Raw 行的手物点云。Time Series 的 HOI 页签显示整帧有效性、逐物体质量，以及 Arm 和 Hand 各自的反馈时间减去相机来源时间的毫秒差。可视化保留无效行的时间位置和本行 FK 手部几何，隐藏无效物体点云。`--no-hoi` 跳过 HOI 标注。严格 HOI 导出要求所选行的物体均有效。完整规则见[数据导出](data.md#按需导出)。

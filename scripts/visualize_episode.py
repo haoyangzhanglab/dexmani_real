@@ -16,13 +16,8 @@ os.environ.setdefault("RUST_LOG", "error")
 import cv2
 import numpy as np
 
-from dexmani_real.config.perception import (
-    DEFAULT_HOI_MAX_JOINT_GAP_S,
-    HandCloudConfig,
-    PointCloudConfig,
-)
+from dexmani_real.config.perception import HandCloudConfig, PointCloudConfig
 from dexmani_real.config.real import load_config
-from dexmani_real.data.hoi import align_hoi_episode
 from dexmani_real.data.raw import (
     TACTILE_FINGER_ORDER,
     RawReader,
@@ -32,7 +27,6 @@ from dexmani_real.geometry.kinematics import ArmFK, HandFK
 from dexmani_real.perception.hand_cloud import HandPointCloud, hand_geometry
 from dexmani_real.perception.pointcloud import PointCloudProcessor
 from dexmani_real.utils.table_plane import load_table_plane
-from dexmani_real.utils.timing import validate_joint_gap
 from dexmani_real.utils.visualization.rerun import (
     episode_blueprint,
     log_camera_geometry,
@@ -90,7 +84,6 @@ class EpisodeVisualizer:
         table_plane_path: str | Path | None,
         max_frames: int | None = None,
         hoi: bool = True,
-        hoi_max_joint_gap_s: float = DEFAULT_HOI_MAX_JOINT_GAP_S,
         pointcloud_config: PointCloudConfig | None = None,
         hand_pointcloud_config: HandCloudConfig = HandCloudConfig(),  # noqa: B008 — 不可变配置可共享。
     ):
@@ -105,21 +98,16 @@ class EpisodeVisualizer:
                 raise ValueError("episode must contain at least one row")
             if max_frames is not None:
                 self.frame_count = min(self.frame_count, max_frames)
-            hoi_timing = None
-            self.hoi_alignment: dict[str, np.ndarray] = {}
-            if hoi and (self.reader.path / "hoi.h5").is_file():
-                validate_joint_gap(hoi_max_joint_gap_s)
-                hoi_timing = self.reader.read_timing(
-                    stop=self.frame_count, source_clocks=("camera_ns", "arm_ns", "hand_ns"),
-                )
-                stamps = hoi_timing["observation_ns"]
+            show_hoi = hoi and (self.reader.path / "hoi.h5").is_file()
+            source_clocks = ("camera_ns", "arm_ns", "hand_ns") if show_hoi else ()
+            timing = self.reader.read_timing(stop=self.frame_count, source_clocks=source_clocks)
+            stamps = timing["observation_ns"]
+            self.time_ns = stamps - stamps[0]
+
+            self.object_cloud = None
+            if show_hoi:
                 self.object_cloud = self.reader["object_pointcloud"]
                 self.hoi_valid = self.reader.read_hoi_validity(stop=self.frame_count)
-                boundaries = np.r_[self.reader.segment_starts, self.reader.num_frames]
-                self.hoi_alignment = align_hoi_episode(self.reader, hoi_timing, boundaries, hoi_max_joint_gap_s)
-            else:
-                stamps = self.reader.read_observation_stamps(stop=self.frame_count)
-            self.time_ns = stamps - stamps[0]
 
             if not self.reader.rgb_path.is_file():
                 raise FileNotFoundError(self.reader.rgb_path)
@@ -178,6 +166,9 @@ class EpisodeVisualizer:
                     labels = tuple(str(i) for i in range(values.shape[1]))
                 series.append((path, values, labels))
                 series_groups.setdefault(group, []).append(path)
+            hoi_series = self.log_recording_data(series, timing if show_hoi else None)
+            if hoi_series:
+                series_groups["HOI"] = hoi_series
             rr.send_blueprint(
                 episode_blueprint(
                     series_groups.items(),
@@ -185,7 +176,6 @@ class EpisodeVisualizer:
                 ),
                 make_active=True, make_default=True,
             )
-            self.log_recording_data(series, hoi_timing)
         except BaseException as exc:
             self.close(exc)
             raise
@@ -204,7 +194,7 @@ class EpisodeVisualizer:
 
     def log_recording_data(
         self, series: list[tuple[str, np.ndarray, tuple[str, ...]]], hoi_timing: np.ndarray | None,
-    ) -> None:
+    ) -> list[str]:
         steps = np.arange(self.frame_count)
         indexes = [
             self.rr.TimeSequenceColumn("step", steps),
@@ -214,16 +204,9 @@ class EpisodeVisualizer:
             log_series(path, values, labels=labels, indexes=indexes)
         log_camera_geometry(self.camera_model.color, self.T_xarm_base_from_color)
         if hoi_timing is None:
-            return
+            return []
 
-        alignment = self.hoi_alignment
-        diagnostics = {
-            "hoi/alignment_available": (
-                np.isfinite(alignment["arm_qpos"]).all(axis=1)
-                & np.isfinite(alignment["hand_qpos"]).all(axis=1)
-            ),
-            "hoi/valid": self.hoi_valid,
-        }
+        diagnostics = {"hoi/valid": self.hoi_valid}
         camera_ns = hoi_timing["camera_ns"]
         for device in ("arm", "hand"):
             diagnostics[f"hoi/{device}_source_offset_ms"] = (hoi_timing[f"{device}_ns"] - camera_ns) / 1e6
@@ -240,6 +223,7 @@ class EpisodeVisualizer:
 
         for entity, values in diagnostics.items():
             self.rr.send_columns(entity, indexes=indexes, columns=self.rr.Scalar.columns(scalar=values))
+        return list(diagnostics)
 
     def log_step(self, step_idx: int, rgb: np.ndarray) -> None:
         self.rr.set_time_sequence("step", step_idx)
@@ -247,7 +231,7 @@ class EpisodeVisualizer:
         depth = self.log_camera(step_idx, rgb)
         self.log_pointcloud(rgb, depth)
         self.log_hand_geometry(step_idx)
-        if self.hoi_alignment:
+        if self.object_cloud is not None:
             points = None
             if self.hoi_valid[step_idx]:
                 points = self.object_cloud[step_idx]
@@ -258,9 +242,8 @@ class EpisodeVisualizer:
             log_points("object_pointcloud", points, colors=[255, 170, 0])
 
     def log_hand_geometry(self, step_idx: int) -> None:
-        joints = self.hoi_alignment or self.state
-        arm = joints["arm_qpos"][step_idx]
-        hand = joints["hand_qpos"][step_idx]
+        arm = self.state["arm_qpos"][step_idx]
+        hand = self.state["hand_qpos"][step_idx]
         pose = self.arm_fk.forward(arm) if np.isfinite(arm).all() else None
         fingertips, cloud = None, None
         if pose is not None and np.isfinite(hand).all():
@@ -370,7 +353,6 @@ def main(argv: list[str] | None = None) -> int:
         hoi=not args.no_hoi,
         pointcloud_config=runtime.pointcloud if args.point_cloud else None,
         hand_pointcloud_config=runtime.hand_pointcloud,
-        hoi_max_joint_gap_s=runtime.execution.hoi_max_joint_gap_s,
     )
     try:
         logger.info("Logging %d frames to Rerun...", viz.frame_count)

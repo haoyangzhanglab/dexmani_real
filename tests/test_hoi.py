@@ -10,7 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Lock
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import h5py
 import numpy as np
@@ -167,7 +167,7 @@ class TrackingConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "segmentation_interval_frames"):
             HOITrackingConfig(segmentation_interval_frames=0)
         with self.assertRaisesRegex(TypeError, "recovery_enabled"):
-            HOITrackingConfig(recovery_enabled=1)
+            HOITrackingConfig(recovery_enabled=1)  # type: ignore[arg-type]
 
     def test_backend_config_cannot_bypass_experiment_settings(self):
         backend = TrackingConfig(min_depth_pixels=20)
@@ -192,13 +192,6 @@ class TrackingConfigTest(unittest.TestCase):
             with patch.object(annotation, "annotate_episodes") as annotate:
                 self.assertEqual(annotation.main(args), 0)
             self.assertEqual(annotate.call_args.kwargs["tracking_config"], HOITrackingConfig(7, False))
-
-
-class RawFixture(SimpleNamespace):
-    def __getitem__(self, key):
-        if key != "depth":
-            raise KeyError(key)
-        return self.depth
 
 
 class HOIAdapterTest(unittest.TestCase):
@@ -272,13 +265,14 @@ class HOIAdapterTest(unittest.TestCase):
         tracker.reset_mock()
         tracker.initialize.side_effect = [TrackingFailure("missing detection"), initial]
         tracker.track.side_effect = [partial, recovered]
-        reader = RawFixture(
+        reader = MagicMock(
+            spec=RawReader,
             num_frames=len(sequences),
-            depth=depth,
             read_camera=lambda: camera,
             read_timing=Mock(return_value=timing),
             iter_rgb_frames=lambda: iter(rgb),
         )
+        reader.__getitem__.side_effect = {"depth": depth}.__getitem__
         with redirect_stdout(io.StringIO()):
             poses, extrinsic, camera_timing, quality, valid = annotation.track_episode(
                 reader, tracker, template, prompts
@@ -374,7 +368,6 @@ class HOIAdapterTest(unittest.TestCase):
         rollout.preparation_issue = None
         rollout.runtime_state = SimpleNamespace(stop_signal=Event())
         rollout.observations = SimpleNamespace(needs=SimpleNamespace(hoi=True))
-        rollout._clear_policy_context = Mock()
         request = Mock()
 
         def locked(*, timeout):
@@ -384,7 +377,10 @@ class HOIAdapterTest(unittest.TestCase):
 
         lock = Mock(acquire=Mock(side_effect=locked))
         rollout.sensors = SimpleNamespace(channels=SimpleNamespace(hoi_request_lock=lock, hoi_request=request))
-        with self.assertRaisesRegex(TimeoutError, "HOI request lock timed out"):
+        with (
+            patch.object(rollout, "_clear_policy_context"),
+            self.assertRaisesRegex(TimeoutError, "HOI request lock timed out"),
+        ):
             rollout.fail("control", RuntimeError("HOI worker exited"))
         self.assertEqual(rollout.result.errors[0]["message"], "HOI worker exited")
         request.write.assert_not_called()
@@ -413,21 +409,26 @@ class HOIExportTest(unittest.TestCase):
             with self.assertRaisesRegex(RawDataError, "HOI object_pointcloud"):
                 annotation.annotate_episodes([episode], episode, tracking_config=HOITrackingConfig())
 
-    def test_complete_hoi_export_uses_camera_time_for_joint_state_and_fk(self):
+    def test_complete_hoi_export_uses_raw_row_joint_state_and_fk(self):
         template, camera = object_template(), camera_snapshot()
-        timings = np.zeros(3, dtype=TIMING_ROW_DTYPE)
-        timings["arm_ns"] = [1000, 1020, 1040]
-        timings["hand_ns"] = [1000, 1024, 1040]
-        timings["camera_ns"] = [1000, 1030, 1040]
-        timings["camera_sequence"] = [1, 2, 3]
-        timings["control_ns"] = [1006, 1034, 1046]
-        timings["observation_ns"] = timings["control_ns"] + 1
+        frames = 5
+        ms = 1_000_000
+        timings = np.zeros(frames, dtype=TIMING_ROW_DTYPE)
+        timings["arm_ns"] = np.array([1000, 1020, 1040, 1060, 1080]) * ms
+        timings["hand_ns"] = np.array([1000, 1024, 1040, 1064, 1084]) * ms
+        # 第二段的末帧相机时间晚于所有关节反馈。
+        timings["camera_ns"] = np.array([1000, 1030, 1040, 1070, 1090]) * ms
+        timings["camera_sequence"] = np.arange(1, frames + 1)
+        timings["control_ns"] = np.array([1006, 1034, 1046, 1076, 1094]) * ms
+        timings["observation_ns"] = timings["control_ns"] + ms
 
-        arm_joints = np.arange(3)[:, None] * np.full((1, len(XARM7_JOINT_NAMES)), 0.02)
-        hand_joints = np.arange(3)[:, None] * np.full((1, len(XHAND_SDK_JOINT_NAMES)), 0.04)
-        arm_target, hand_target = arm_joints + 0.01, hand_joints + 0.01
+        arm_joints = np.arange(frames)[:, None] * np.full((1, len(XARM7_JOINT_NAMES)), 0.02)
+        hand_joints = np.arange(frames)[:, None] * np.full((1, len(XHAND_SDK_JOINT_NAMES)), 0.04)
+        arm_target = np.full_like(arm_joints, np.nan)
+        hand_target = np.full_like(hand_joints, np.nan)
+        arm_target[1], hand_target[1] = arm_joints[1] + 0.01, hand_joints[1] + 0.01
         camera_timing = timings[list(CAMERA_TIMING_FIELDS)].astype(CAMERA_TIMING_DTYPE)
-        scenes = [scene_result(motion=motion) for motion in (0, 0.25, 0.5)]
+        scenes = [scene_result(motion=0.25 * row) for row in range(frames)]
         poses = np.array([[scene.poses[name] for name in template["object_names"]] for scene in scenes])
         with TemporaryDirectory() as directory:
             episode = Path(directory) / "episode_fixture"
@@ -444,7 +445,7 @@ class HOIExportTest(unittest.TestCase):
                     **camera_metadata(camera),
                 )
                 raw.create_dataset("timing/rows", data=timings)
-                raw.create_dataset("timing/segment_starts", data=np.array([0], dtype=np.int64))
+                raw.create_dataset("timing/segment_starts", data=np.array([0, 3], dtype=np.int64))
                 raw.create_dataset("arm_qpos", data=arm_joints)
                 raw.create_dataset("hand_qpos", data=hand_joints)
                 raw.create_dataset("action_arm_joint_target", data=arm_target)
@@ -455,9 +456,9 @@ class HOIExportTest(unittest.TestCase):
                 poses,
                 camera.T_xarm_base_from_color,
                 camera_timing=camera_timing,
-                quality=[({}, {})] * 3,
+                quality=[({}, {})] * frames,
                 tracking_config=asdict(TrackingConfig()),
-                object_valid=np.ones((3, 2), dtype=bool),
+                object_valid=np.ones((frames, 2), dtype=bool),
             )
             with RawReader(episode) as reader:
                 np.testing.assert_array_equal(
@@ -472,33 +473,61 @@ class HOIExportTest(unittest.TestCase):
                 "hand_pointcloud",
                 "object_pointcloud",
                 "action",
+                "action_ee",
             )
-            result = export_zarr(episode, output, processing=ExportConfig(), fields=fields)
-            self.assertEqual(result["total_frames"], 3)
-            data = zarr.open_group(str(output), mode="r")["data"]
+            with patch("dexmani_real.data.export.MAX_BATCH_FRAMES", 2):
+                result = export_zarr(episode, output, processing=ExportConfig(), fields=fields)
+            self.assertEqual(result["total_frames"], frames)
+            root = zarr.open_group(str(output), mode="r")
+            data = root["data"]
             self.assertEqual(set(data), set(fields))
-            expected_arm, expected_hand = arm_joints.copy(), hand_joints.copy()
-            expected_arm[1] += 0.5 * (arm_joints[2] - arm_joints[1])
-            expected_hand[1] += 0.375 * (hand_joints[2] - hand_joints[1])
-            np.testing.assert_allclose(
-                data["joint_state"][:], np.column_stack((expected_arm, expected_hand))
+            for name in fields:
+                self.assertEqual(data[name].dtype, np.float32)
+            np.testing.assert_array_equal(root["meta/episode_ends"][:], [3, 5])
+            self.assertEqual(
+                root.attrs["data_processing"]["object_pointcloud"],
+                {"joint_state_source": "raw_observation_row"},
             )
-            np.testing.assert_allclose(data["action"][:], np.column_stack((arm_target, hand_target)))
+            np.testing.assert_array_equal(
+                data["joint_state"][:], np.column_stack((arm_joints, hand_joints)).astype(np.float32)
+            )
             np.testing.assert_array_equal(data["object_pointcloud"][:], cloud)
 
             arm_fk, hand_fk = ArmFK(), HandFK()
-            eef = eef_poses(expected_arm, arm_fk=arm_fk)
+            eef = eef_poses(arm_joints, arm_fk=arm_fk)
             expected_geometry = hand_geometry(
                 eef,
-                expected_hand,
+                hand_joints,
                 arm_fk=arm_fk,
                 hand_fk=hand_fk,
                 hand_cloud=HandPointCloud(hand_fk, HOI_NUM_POINTS),
             )
             np.testing.assert_allclose(data["eef_pose"][:], encode_eef_pose(eef), atol=1e-7)
             for name, expected in expected_geometry.items():
-                self.assertEqual(data[name].dtype, np.float32)
                 np.testing.assert_allclose(data[name][:], expected, atol=1e-7)
+
+            # 等待行沿用本段已提交的目标，每段开头使用该段首行的原始关节反馈。
+            expected_arm_target = np.stack(
+                (arm_joints[0], arm_target[1], arm_target[1], arm_joints[3], arm_joints[3])
+            )
+            expected_hand_target = np.stack(
+                (hand_joints[0], hand_target[1], hand_target[1], hand_joints[3], hand_joints[3])
+            )
+            expected_action = np.column_stack((expected_arm_target, expected_hand_target)).astype(np.float32)
+            np.testing.assert_array_equal(data["action"][:], expected_action)
+            target_poses = eef_poses(expected_arm_target, arm_fk=arm_fk)
+            np.testing.assert_allclose(
+                data["action_ee"][:],
+                np.column_stack((encode_eef_pose(target_poses), expected_hand_target)),
+                atol=1e-7,
+            )
+            object_action_output = Path(directory) / "object_action.zarr"
+            export_zarr(
+                episode, object_action_output, processing=ExportConfig(), fields=("object_pointcloud", "action"),
+            )
+            object_action = zarr.open_group(str(object_action_output), mode="r")
+            self.assertNotIn("object_pointcloud", object_action.attrs["data_processing"])
+            np.testing.assert_array_equal(object_action["data/action"][:], expected_action)
 
 
 if __name__ == "__main__":

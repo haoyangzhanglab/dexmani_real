@@ -31,10 +31,6 @@ FIELD_DEPENDENCIES = {
     "camera_extrinsic": ("camera_static",),
 }
 
-JOINT_OBSERVATION_FIELDS = frozenset(
-    field for field, sources in FIELD_DEPENDENCIES.items() if {"arm", "hand"}.intersection(sources)
-)
-
 
 class ObservationBuilder:
     last_rgb_sequence: int | None
@@ -51,7 +47,6 @@ class ObservationBuilder:
         self.joint_devices = tuple(name for name in ("arm", "hand") if name in self.dependencies)
         self.needs = ObservationNeeds(
             hoi="hoi" in self.dependencies,
-            hoi_joint_devices=self.joint_devices if "hoi" in self.dependencies else (),
             camera_fields=("rgb",) if "rgb" in self.dependencies else (),
             point_cloud="cloud" in self.dependencies,
             required_tactile=tuple(c for c in ("aggregate", "dense") if c in self.dependencies),
@@ -68,13 +63,8 @@ class ObservationBuilder:
     def project(self, row):
         values = {}
         for device in self.joint_devices:
-            name = f"{device}_qpos"
-            qpos = (
-                row.aligned_joints[name]
-                if self.needs.hoi_joint_devices
-                else getattr(row, device)["qpos"][0]
-            )
-            values[name] = qpos.copy()
+            qpos = getattr(row, device)["qpos"][0]
+            values[f"{device}_qpos"] = qpos.copy()
         # Ring 快照独立持有原始大数组，RGB 矫正结果单独进入模型历史。
         for name in self.fields:
             if name == "finger_tactile_force":

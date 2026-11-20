@@ -7,7 +7,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 from dexmani_real.config.deployment import ExecutionConfig
-from dexmani_real.deployment.observation import JOINT_OBSERVATION_FIELDS
 from dexmani_real.geometry.pose import EEF_POSE_DIM
 from dexmani_real.robot.commands import COMMAND_LEASE_NS
 from dexmani_real.robot.model import ARM_DOF, HAND_DOF
@@ -15,7 +14,6 @@ from dexmani_real.runtime.preflight import (
     validate_robot_config,
     validate_xhand_target_rate,
 )
-from dexmani_real.utils.timing import validate_joint_gap
 
 if TYPE_CHECKING:
     from dexmani_real.config.real import RealConfig
@@ -28,8 +26,6 @@ def validate_execution_config(info, execution: ExecutionConfig) -> None:
         raise NotImplementedError("Policy does not support RTC")
 
     if "object_pointcloud" in info.observation_fields:
-        if JOINT_OBSERVATION_FIELDS.intersection(info.observation_fields):
-            validate_joint_gap(execution.hoi_max_joint_gap_s)
         age = execution.hoi_max_age_s
         if type(age) not in (int, float) or not math.isfinite(age) or age <= 0:
             raise ValueError("hoi_max_age_s requires a finite positive value")
