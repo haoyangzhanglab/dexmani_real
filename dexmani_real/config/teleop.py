@@ -71,8 +71,12 @@ class HandRetargetingConfig:
     max_joint_speed_rad_s: float = 4.0
     max_evaluations: int = 50
     max_solve_time_s: float = 0.025
+    use_geometry_seed: bool = True
+    direction_scale_m: float = 0.005
 
     def validate(self) -> None:
+        if type(self.use_geometry_seed) is not bool:
+            raise ValueError("hand_retargeting.use_geometry_seed must be a boolean")
         for name in ("calibration_samples", "max_evaluations"):
             value = getattr(self, name)
             if type(value) is not int or value < 2:
@@ -89,7 +93,7 @@ class HandRetargetingConfig:
             value = getattr(self, name)
             if not np.isfinite(value) or value <= 0:
                 raise ValueError(f"hand_retargeting.{name} must be finite and positive")
-        for name in ("damping_s", "smoothing_tau_s"):
+        for name in ("damping_s", "smoothing_tau_s", "direction_scale_m"):
             value = getattr(self, name)
             if not np.isfinite(value) or value < 0:
                 raise ValueError(f"hand_retargeting.{name} must be finite and non-negative")

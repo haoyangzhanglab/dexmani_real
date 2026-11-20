@@ -6,12 +6,11 @@ from dataclasses import dataclass
 import numpy as np
 
 from dexmani_real.config.teleop import HandRetargetingConfig
-from dexmani_real.geometry.kinematics import HandFK
 
 BONE_CHILDREN = np.arange(1, 21)
 BONE_PARENTS = BONE_CHILDREN - 1
 BONE_PARENTS[::4] = 0
-FINGER_CHAINS = np.arange(1, 21).reshape(5, 4)
+FINGER_CHAINS = BONE_CHILDREN.reshape(5, 4)
 
 
 class HandGeometryRejected(ValueError):
@@ -102,12 +101,7 @@ class HandCalibration:
             raise ValueError("hand calibration bone lengths are unstable")
         return cls(median[:15].reshape(5, 3), float(median[15]))
 
-    def validate_lengths(self, measured: np.ndarray, *, tolerance: float) -> None:
-        reference = np.r_[self.bone_lengths.ravel(), self.palm_width]
-        if np.max(np.abs(measured / reference - 1.0)) > tolerance:
-            raise HandGeometryRejected("hand bone lengths changed beyond the calibrated tolerance")
-
-    def finger_directions(self, unit_bones: np.ndarray) -> np.ndarray:
+    def _finger_directions(self, unit_bones: np.ndarray) -> np.ndarray:
         """拇指使用最后两段，其余手指合并远端两段。"""
         directions = unit_bones[:, [0, 2]]
         directions[0] = unit_bones[0, 1:]
@@ -118,16 +112,20 @@ class HandCalibration:
         ) / distal_lengths.sum(axis=1)[:, None]
         return directions
 
-    def project_fingertips(
-        self, points: np.ndarray, geometry: HandGeometry, *, fk: HandFK, tolerance: float,
+    def project_qpos(
+        self, points: np.ndarray, geometry: HandGeometry, *, tolerance: float,
     ) -> np.ndarray:
-        """把 HTS 骨段方向映到 XHand 机构，生成五个掌系指尖参考。"""
+        """将 HTS 骨段方向投影为 SDK 顺序的 XHand 关节角。"""
         bones = np.diff(points[FINGER_CHAINS], axis=1)
         lengths = np.linalg.norm(bones, axis=2)
-        measured = np.r_[lengths.ravel(), np.linalg.norm(points[5] - points[17])]
-        self.validate_lengths(measured, tolerance=tolerance)
+        palm_width = np.linalg.norm(points[5] - points[17])
+        if (
+            np.any(np.abs(lengths / self.bone_lengths - 1.0) > tolerance)
+            or abs(palm_width / self.palm_width - 1.0) > tolerance
+        ):
+            raise HandGeometryRejected("hand bone lengths changed beyond the calibrated tolerance")
         unit_bones = bones / lengths[:, :, None]
-        directions = self.finger_directions(unit_bones)
+        directions = self._finger_directions(unit_bones)
         base = project_direction(unit_bones[0, 0], geometry.base_axes[0])
         angles = np.empty(2)
         angles[0] = signed_angle(geometry.base_directions[0], base, geometry.base_axes[0])
@@ -147,10 +145,9 @@ class HandCalibration:
         # 平行轴使远段绝对角可直接减去近端旋转；保留反向轴符号。
         flex = signed_angle(geometry.neutral_directions, directions, geometry.flex_axes)
         flex[:, 1] -= geometry.flex_coupling * flex[:, 0]
-        requested = np.empty_like(geometry.limit_centers)
-        requested[geometry.base_indices] = angles
-        requested[geometry.flex_indices] = flex
+        requested_q = np.empty_like(geometry.limit_centers)
+        requested_q[geometry.base_indices] = angles
+        requested_q[geometry.flex_indices] = flex
         # 选择离操作区间最近的 2π 分支；保留越限请求的任务空间信息。
         center = geometry.limit_centers
-        requested = center + np.arctan2(np.sin(requested - center), np.cos(requested - center))
-        return fk.forward(requested, fk.fingertip_frame_ids)[:, :3, 3]
+        return center + np.arctan2(np.sin(requested_q - center), np.cos(requested_q - center))

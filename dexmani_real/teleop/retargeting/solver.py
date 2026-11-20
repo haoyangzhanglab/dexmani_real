@@ -1,10 +1,11 @@
-"""基于官方 DexPilot 向量目标的有界 XHand 重定向。"""
+"""结合 DexPilot 向量与指节方向目标的有界 XHand 重定向。"""
 
 from collections.abc import Callable, Sequence
 from math import expm1
 
 import nlopt
 import numpy as np
+from dex_retargeting.robot_wrapper import RobotWrapper
 
 from dexmani_real.config.teleop import HandRetargetingConfig
 from dexmani_real.config.xhand import HandConfig
@@ -18,7 +19,6 @@ from dexmani_real.robot.commands import (
 from dexmani_real.robot.model import (
     HAND_DOF,
     XHAND_FINGERTIP_LINK_NAMES,
-    XHAND_RIGHT_URDF_PATH,
     XHAND_SDK_JOINT_NAMES,
 )
 from dexmani_real.teleop.retargeting.landmarks import (
@@ -44,36 +44,63 @@ def _smoothstep(value: np.ndarray) -> np.ndarray:
     return value * value * (3.0 - 2.0 * value)
 
 
+def _segment_directions(positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    segments = np.diff(positions, axis=1).reshape(-1, 3)
+    lengths = np.linalg.norm(segments, axis=1, keepdims=True)
+    return segments / lengths, lengths
+
+
+class _HandRobot(RobotWrapper):
+    """供 DexPilot 使用的 HandFK 模型和单次回调运动学结果。"""
+
+    def __init__(self, fk: HandFK):
+        self.model, self.data, self.pin = fk.model, fk.data, fk.pin
+        self.with_jacobians = False
+
+    def compute_forward_kinematics(self, qpos: np.ndarray) -> None:
+        if self.with_jacobians:
+            self.pin.computeJointJacobians(self.model, self.data, qpos)
+        else:
+            self.pin.forwardKinematics(self.model, self.data, qpos)
+        self.pin.updateFramePlacements(self.model, self.data)
+
+    def get_link_pose(self, link_id: int) -> np.ndarray:
+        return self.data.oMf[link_id].homogeneous
+
+    def compute_single_link_local_jacobian(self, _qpos: np.ndarray, link_id: int) -> np.ndarray:
+        return self.pin.getFrameJacobian(self.model, self.data, link_id, self.pin.ReferenceFrame.LOCAL)
+
+
 class HandRetargeter:
     def __init__(self, config: HandRetargetingConfig, hand_config: HandConfig):
         import torch
         from dex_retargeting.optimizer import DexPilotOptimizer
-        from dex_retargeting.robot_wrapper import RobotWrapper
 
         config.validate()
         self.config = config
+        self._direction_weight = config.direction_scale_m**2 / config.huber_delta_m
         self.limits = np.column_stack((hand_config.qpos_min_rad, hand_config.qpos_max_rad))
         self.calibration: HandCalibration | None = None
         self.reference: tuple[np.ndarray, int] | None = None
         self.rejection_reason: str | None = None
         self.fk = HandFK()
         model = self.fk.model
-        names = [
-            name for pair, tip in zip(FINGER_FRAME_NAMES, XHAND_FINGERTIP_LINK_NAMES)
-            for name in (*pair, tip)
+        finger_frames = [
+            (model.getFrameId(proximal), model.getFrameId(distal), tip)
+            for (proximal, distal), tip in zip(FINGER_FRAME_NAMES, self.fk.fingertip_frame_ids, strict=True)
         ]
-        frame_ids = [model.getFrameId(name) for name in names]
-        if max(frame_ids) >= model.nframes:
+        if any(max(proximal, distal) >= model.nframes for proximal, distal, _ in finger_frames):
             raise ValueError("XHand retargeting frames are missing from the URDF")
-        neutral = self.fk.forward(np.zeros(HAND_DOF), frame_ids)
+        self._finger_frame_ids = tuple(fid for finger in finger_frames for fid in finger)
+        neutral = self.fk.forward(np.zeros(HAND_DOF), self._finger_frame_ids)
         positions = neutral[:, :3, 3].reshape(5, 3, 3)
         segments = np.diff(positions, axis=1)
         segment_lengths = np.linalg.norm(segments, axis=2)
         origins, axes = self.fk.neutral_joint_geometry()
         # 目标 Frame 的父关节就是屈曲关节；沿 URDF 链取基部，避免维护第二份关节表。
         flex_joints = [
-            [model.frames[fid].parent for fid in frame_ids[start:start + 2]]
-            for start in range(0, len(frame_ids), 3)
+            (model.frames[proximal].parent, model.frames[distal].parent)
+            for proximal, distal, _ in finger_frames
         ]
         flex_indices = np.array([
             [XHAND_SDK_JOINT_NAMES.index(model.names[jid]) for jid in pair]
@@ -105,7 +132,7 @@ class HandRetargeter:
             base_directions=project_direction(base_vectors, base_axes),
         )
         self._dexpilot = DexPilotOptimizer(
-            RobotWrapper(str(XHAND_RIGHT_URDF_PATH)), list(XHAND_SDK_JOINT_NAMES),
+            _HandRobot(self.fk), list(XHAND_SDK_JOINT_NAMES),
             list(XHAND_FINGERTIP_LINK_NAMES), "right_hand_link",
             huber_delta=config.huber_delta_m, norm_delta=0.0, project_dist=0.0, escape_dist=0.0,
         )
@@ -139,32 +166,42 @@ class HandRetargeter:
         calibration, reference = self.calibration, self.reference
         if calibration is None or reference is None:
             raise RuntimeError("hand retargeting requires calibration and a measured reset pose")
-        qpos, reference_ns = reference
+        q_prev, reference_ns = reference
         if timestamp_ns < reference_ns:
             raise ValueError("hand computation time moved backwards")
         dt_s = (timestamp_ns - reference_ns) * 1e-9
         self.rejection_reason = None
         if dt_s == 0:
-            return qpos.copy()
+            return q_prev.copy()
         tau = self.config.smoothing_tau_s
         alpha = 1.0 if tau == 0 else -expm1(-dt_s / tau)
         try:
             points = prepare_landmarks(landmarks)
-            objective = self._objective(points, calibration, qpos, dt_s)
+            requested_q = calibration.project_qpos(
+                points, self.geometry, tolerance=self.config.bone_length_tolerance,
+            )
+            objective = self._objective(points, requested_q, q_prev, dt_s)
             # 在滤波前放宽速度界，使滤波后的目标仍可达到配置的最大关节速度。
             step = self.config.max_joint_speed_rad_s * dt_s / alpha
-            lower = np.maximum(self.limits[:, 0], qpos - step)
-            upper = np.minimum(self.limits[:, 1], qpos + step)
+            lower = np.maximum(self.limits[:, 0], q_prev - step)
+            upper = np.minimum(self.limits[:, 1], q_prev + step)
+            initial_q = q_prev
+            if self.config.use_geometry_seed:
+                geometry_seed = np.clip(requested_q, lower, upper)
+                no_gradient = np.empty(0)
+                previous_cost = objective(q_prev, no_gradient)
+                if objective(geometry_seed, no_gradient) < previous_cost:
+                    initial_q = geometry_seed
             self.optimizer.set_lower_bounds(lower)
             self.optimizer.set_upper_bounds(upper)
             self.optimizer.set_min_objective(objective)
-            solution = self.optimizer.optimize(qpos.copy())
+            solution = self.optimizer.optimize(initial_q.copy())
             if not np.isfinite(self.optimizer.last_optimum_value()):
                 raise ValueError("hand solver objective is non-finite")
             solution = validate_hand_target(solution, lower, upper)
             if alpha == 1.0:
                 return solution
-            return validate_hand_target(qpos + alpha * (solution - qpos), *self.limits.T)
+            return validate_hand_target(q_prev + alpha * (solution - q_prev), *self.limits.T)
         except nlopt.RoundoffLimited as exc:
             self.rejection_reason = f"hand solver failed: {type(exc).__name__}: {exc}"
         except (HandGeometryRejected, HandTargetRejected) as exc:
@@ -178,12 +215,17 @@ class HandRetargeter:
         self.reference = qpos.copy(), int(timestamp_ns)
 
     def _objective(
-        self, points: np.ndarray, calibration: HandCalibration, qpos: np.ndarray, dt_s: float,
+        self, points: np.ndarray, requested_q: np.ndarray, q_prev: np.ndarray, dt_s: float,
     ) -> Callable[[np.ndarray, np.ndarray], float]:
+        frame_ids = self._finger_frame_ids if self._direction_weight else self.fk.fingertip_frame_ids
+        positions = self.fk.forward(requested_q, frame_ids)[:, :3, 3]
+        target_directions = None
+        if self._direction_weight:
+            finger_positions = positions.reshape(5, 3, 3)
+            target_directions, _ = _segment_directions(finger_positions)
+            positions = finger_positions[:, -1]
         projected = np.zeros((6, 3))
-        projected[1:] = calibration.project_fingertips(
-            points, self.geometry, fk=self.fk, tolerance=self.config.bone_length_tolerance,
-        )
+        projected[1:] = positions
         target_vectors = projected[self._task] - projected[self._origin]
         human_origin, human_task = self._dexpilot.target_link_human_indices[:, :10]
         human_vectors = points[human_task] - points[human_origin]
@@ -195,9 +237,8 @@ class HandRetargeter:
         thumb_gains = gains[:4]
         # 留给无名指主导动作的空间随领先幅度连续变化。
         thumb_gains *= _smoothstep((thumb_gaps[2] - thumb_gaps) / 0.005)
-        pair_gains = gains[4:]
-        pair_gains[:] = np.minimum(
-            pair_gains, np.minimum(thumb_gains[self._origin[4:10] - 2], thumb_gains[self._task[4:10] - 2]),
+        pair_gains = np.minimum(
+            gains[4:], np.minimum(thumb_gains[self._origin[4:10] - 2], thumb_gains[self._task[4:10] - 2]),
         )
         target_thumb_vectors = target_vectors[:4]
         projected_gaps = np.linalg.norm(target_thumb_vectors, axis=1)
@@ -206,14 +247,37 @@ class HandRetargeter:
         target_vectors[4:10] += pair_gains[:, None] * (human_vectors[4:] - target_vectors[4:10])
         self._contact_scales[:4] = 1.0 + 15.0 * thumb_gains
         self._contact_scales[4:] = 1.0 + 5.0 * pair_gains
-        dexpilot_objective = self._dexpilot.get_objective_function(target_vectors, np.empty(0), qpos)
+        dexpilot_objective = self._dexpilot.get_objective_function(target_vectors, np.empty(0), q_prev)
+        robot = self._dexpilot.robot
         damping = self.config.damping_s / dt_s
 
         def objective(candidate: np.ndarray, gradient: np.ndarray) -> float:
+            robot.with_jacobians = bool(gradient.size)
             value = dexpilot_objective(candidate, gradient)
-            difference = candidate - qpos
+            difference = candidate - q_prev
             if gradient.size:
                 gradient[:] = 2.0 * gradient + damping * difference
-            return 2.0 * value + 0.5 * damping * np.dot(difference, difference)
+            value = 2.0 * value + 0.5 * damping * np.dot(difference, difference)
+            if target_directions is not None:
+                value += self._direction_loss(target_directions, gradient)
+            return value
 
         return objective
+
+    def _direction_loss(self, target_directions: np.ndarray, gradient: np.ndarray) -> float:
+        pin, model, data = self.fk.pin, self.fk.model, self.fk.data
+        placements = data.oMf
+        positions = np.stack([placements[fid].translation for fid in self._finger_frame_ids])
+        directions, lengths = _segment_directions(positions.reshape(5, 3, 3))
+        residual = directions - target_directions
+        weight = self._direction_weight / len(residual)
+        if gradient.size:
+            jacobians = np.stack([
+                pin.getFrameJacobian(model, data, fid, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)[:3]
+                for fid in self._finger_frame_ids
+            ])[..., self._dexpilot.idx_pin2target].reshape(5, 3, 3, HAND_DOF)
+            segment_jacobians = np.diff(jacobians, axis=1).reshape(-1, 3, HAND_DOF)
+            # 将单位向量雅可比的切平面投影作用到残差上。
+            tangent_residual = residual - directions * np.sum(residual * directions, axis=1, keepdims=True)
+            gradient += weight * np.einsum("si,sij->j", tangent_residual / lengths, segment_jacobians)
+        return 0.5 * weight * np.sum(residual**2)
