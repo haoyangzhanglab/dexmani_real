@@ -75,3 +75,95 @@ index a5de2f3..1e8ba77 100644
 -from .loader import LTRLoader
 -from .image_loader import jpeg4py_loader, opencv_loader, jpeg4py_loader_w_failsafe, default_image_loader
 +# Keep processing_utils importable without loading training datasets.
+diff --git a/lib/models/layers/attn.py b/lib/models/layers/attn.py
+index e1ae7c2..39eec48 100644
+--- a/lib/models/layers/attn.py
++++ b/lib/models/layers/attn.py
+@@ -1,7 +1,7 @@
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+-from timm.models.layers import trunc_normal_
++from timm.layers import trunc_normal_
+ 
+ from lib.models.layers.rpe import generate_2d_concatenated_self_attention_relative_positional_encoding_index
+ 
+diff --git a/lib/models/layers/attn_blocks.py b/lib/models/layers/attn_blocks.py
+index 75eacd5..680c616 100644
+--- a/lib/models/layers/attn_blocks.py
++++ b/lib/models/layers/attn_blocks.py
+@@ -1,7 +1,7 @@
+ import math
+ import torch
+ import torch.nn as nn
+-from timm.models.layers import Mlp, DropPath, trunc_normal_, lecun_normal_
++from timm.layers import Mlp, DropPath, trunc_normal_, lecun_normal_
+ 
+ from lib.models.layers.attn import Attention
+ 
+diff --git a/lib/models/layers/patch_embed.py b/lib/models/layers/patch_embed.py
+index f55522d..61db799 100644
+--- a/lib/models/layers/patch_embed.py
++++ b/lib/models/layers/patch_embed.py
+@@ -1,6 +1,6 @@
+ import torch.nn as nn
+ 
+-from timm.models.layers import to_2tuple
++from timm.layers import to_2tuple
+ 
+ 
+ class PatchEmbed(nn.Module):
+diff --git a/lib/models/layers/rpe.py b/lib/models/layers/rpe.py
+index 060a51e..5109afe 100644
+--- a/lib/models/layers/rpe.py
++++ b/lib/models/layers/rpe.py
+@@ -1,6 +1,6 @@
+ import torch
+ import torch.nn as nn
+-from timm.models.layers import trunc_normal_
++from timm.layers import trunc_normal_
+ 
+ 
+ def generate_2d_relative_positional_encoding_index(z_shape, x_shape):
+diff --git a/lib/models/ostrack/base_backbone.py b/lib/models/ostrack/base_backbone.py
+index 9490b9e..a02a922 100644
+--- a/lib/models/ostrack/base_backbone.py
++++ b/lib/models/ostrack/base_backbone.py
+@@ -4,7 +4,7 @@ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ from timm.models.vision_transformer import resize_pos_embed
+-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
++from timm.layers import DropPath, to_2tuple, trunc_normal_
+ 
+ from lib.models.layers.patch_embed import PatchEmbed
+ from lib.models.ostrack.utils import combine_tokens, recover_tokens
+diff --git a/lib/models/ostrack/vit.py b/lib/models/ostrack/vit.py
+index 17ba7a1..726da56 100644
+--- a/lib/models/ostrack/vit.py
++++ b/lib/models/ostrack/vit.py
+@@ -28,9 +28,8 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ 
+ from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
+-from timm.models.helpers import build_model_with_cfg, named_apply, adapt_input_conv
+-from timm.models.layers import Mlp, DropPath, trunc_normal_, lecun_normal_
+-from timm.models.registry import register_model
++from timm.layers import Mlp, DropPath, trunc_normal_, lecun_normal_
++from timm.models import adapt_input_conv, build_model_with_cfg, named_apply, register_model
+ 
+ from lib.models.layers.patch_embed import PatchEmbed
+ from lib.models.ostrack.base_backbone import BaseBackbone
+diff --git a/lib/models/ostrack/vit_ce.py b/lib/models/ostrack/vit_ce.py
+index 94b4ffc..945af04 100644
+--- a/lib/models/ostrack/vit_ce.py
++++ b/lib/models/ostrack/vit_ce.py
+@@ -8,7 +8,7 @@ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ 
+-from timm.models.layers import to_2tuple
++from timm.layers import to_2tuple
+ 
+ from lib.models.layers.patch_embed import PatchEmbed
+ from .utils import combine_tokens, recover_tokens

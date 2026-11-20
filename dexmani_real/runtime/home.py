@@ -105,8 +105,8 @@ def _hand_sample(robot):
     return frame[0]
 
 
-def _home_hand(robot, check) -> np.ndarray:
-    """确认 XHand 到位并返回碰撞规划使用的稳定手型。"""
+def home_hand(robot, check) -> np.ndarray:
+    """执行 XHand 回位，返回确认稳定的关节姿态。"""
     cfg = robot.hand_config
     deadline = time.monotonic_ns() + int(HAND_HOME_TIMEOUT_S * 1e9)
     target = cfg.home_qpos_rad
@@ -193,9 +193,9 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
     cfg, hand_cfg = robot.arm_config, robot.hand_config
     hand_enabled = hand_cfg.enabled
 
-    # 等待机械臂停稳时继续刷新 XHand 反馈，供手部回位使用。
+    # 等待机械臂停稳时刷新反馈，随后直接发送 XHand HOME 目标。
     try:
-        robot.stop(service=robot.service_feedback if hand_enabled else None)
+        robot.stop(hold_hand=False, service=robot.service_feedback if hand_enabled else None)
     except Exception as exc:
         raise RobotError(f"HOME initial stop could not be confirmed: {exc}") from exc
     try:
@@ -227,7 +227,7 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
         model = robot.home_collision_model
 
         if hand_enabled:
-            hand_anchor = _home_hand(robot, check)
+            hand_anchor = home_hand(robot, check)
         deadline = time.monotonic_ns() + int(ARM_HOME_TIMEOUT_S * 1e9)
 
         def check_arm():
@@ -258,10 +258,7 @@ def home_robot(state, robot, *, environment, cancel_epoch, cancel_requested):
             check_arm()
             if not hand_enabled:
                 return
-            sample = _hand_sample(robot)
-            if np.max(np.abs(sample["qpos"] - hand_anchor)) > HAND_HOLD_TOLERANCE_RAD:
-                raise OperationCancelled("XHand moved from HOME planning posture")
-            stamp = int(sample["timestamp_ns"])
+            stamp = int(_hand_sample(robot)["timestamp_ns"])
             if stamp > published_hand_stamp and not state.stop_signal.is_set():
                 robot.arm.publish_home_hand_stamp(stamp)
                 published_hand_stamp = stamp

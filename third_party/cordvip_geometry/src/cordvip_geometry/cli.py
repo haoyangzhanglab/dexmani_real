@@ -29,7 +29,7 @@ def add_segment_arguments(parser, workspace):
     source.add_argument("--image", type=Path, help="按 EXIF 纠正朝向的物体照片")
     source.add_argument("--rgbd", type=Path, help="含 rgb uint8 [H,W,3] 的 NPZ（仅读取 rgb）")
     parser.add_argument("--prompt", required=True, help="英文物体描述")
-    parser.add_argument("--instance", type=int, help="去重后按置信度降序排列的零起始候选索引")
+    parser.add_argument("--instance", type=int, help="分割后按检测置信度降序排列的零起始候选索引")
     parser.add_argument("--headless", action="store_true")
     add_models_directory(parser, workspace)
     parser.add_argument("--sam-variant", choices=SAM_MODELS, help="官方 SAM2.1 型号，默认 small")
@@ -115,6 +115,16 @@ def parse_args(argv=None, *, workspace=None):
     args = parser.parse_args(argv)
     if args.command == "reconstruct" and args.headless and args.preview:
         parser.error("--headless 与 --preview 不能同时使用")
+    if args.command in {"generate", "reconstruct"}:
+        from .reconstruction import validate_reconstruction_parameters
+
+        try:
+            validate_reconstruction_parameters(
+                seed=args.seed, steps=args.steps, octree_resolution=args.octree_resolution,
+                num_chunks=args.num_chunks,
+            )
+        except ValueError as error:
+            parser.error(str(error))
     if hasattr(args, "models_dir"):
         args.models_dir = args.models_dir.expanduser().resolve()
     if args.command in {"scale", "reconstruct"}:
@@ -145,7 +155,13 @@ def main(argv=None):
         download_models(args.models, args.models_dir, args.sam_variant)
         return 0
     from .mesh import load_mesh, scale_mesh
-    from .visualization import choose, preview_mesh, save_candidates, save_selection
+    from .visualization import (
+        choose,
+        load_rgb_image,
+        preview_mesh,
+        save_candidates,
+        save_selection,
+    )
 
     if command == "preview":
         preview_mesh(args.mesh, units=args.units)
@@ -164,14 +180,24 @@ def main(argv=None):
             preview_mesh(output / "mesh_m.obj", units="m")
         return 0
     import numpy as np
-    from PIL import Image, ImageOps
+    from PIL import Image
 
-    if command in {"segment", "reconstruct"}:
+    if command == "select":
+        with Image.open(args.segmentation_dir / "rgb.png") as image:
+            rgb = np.asarray(image.convert("RGB")).copy()
+        with np.load(args.segmentation_dir / "candidates.npz", allow_pickle=False) as saved:
+            masks, boxes, scores, labels = (saved[key] for key in ("masks", "boxes", "scores", "labels"))
+        if masks.dtype != bool or masks.ndim != 3 or masks.shape[1:] != rgb.shape[:2]:
+            raise ValueError("保存的候选 mask 与 rgb.png 尺寸或类型不匹配")
+        candidates = [
+            {"mask": mask, "box_xyxy": box, "score": float(score), "label": str(label)}
+            for mask, box, score, label in zip(masks, boxes, scores, labels, strict=True)
+        ]
+    elif command in {"segment", "reconstruct"}:
         from .segmentation import SAM2Segmenter
 
         if args.image is not None:
-            with Image.open(args.image) as image:
-                rgb = np.asarray(ImageOps.exif_transpose(image).convert("RGB")).copy()
+            rgb = load_rgb_image(args.image)
         else:
             with np.load(args.rgbd, allow_pickle=False) as saved:
                 rgb = saved["rgb"]
@@ -187,48 +213,28 @@ def main(argv=None):
         if not candidates:
             raise ValueError("没有检测到目标，请调整 prompt")
         if command == "segment" and args.list_only:
-            Image.fromarray(rgb).save(output / "rgb.png")
             save_candidates(output, rgb, candidates)
             return 0
+
+    if command in {"segment", "select", "reconstruct"}:
         index = choose(rgb, candidates, args.instance, headless=args.headless)
-        save_selection(output, rgb, candidates, index)
-        del segmenter
-        if command == "segment":
+        rgba = save_selection(output, rgb, candidates, index)
+        if command != "reconstruct":
             return 0
+        del segmenter
         import gc
 
         import torch
 
         gc.collect()
         torch.cuda.empty_cache()
-    elif command == "select":
-        with Image.open(args.segmentation_dir / "rgb.png") as image:
-            rgb = np.asarray(image.convert("RGB")).copy()
-        with np.load(args.segmentation_dir / "candidates.npz", allow_pickle=False) as saved:
-            masks = saved["masks"]
-            boxes = saved["boxes"]
-            scores = saved["scores"]
-            labels = saved["labels"]
-        candidates = [
-            {
-                "mask": mask,
-                "box_xyxy": boxes[i],
-                "score": float(scores[i]),
-                "label": str(labels[i]),
-            }
-            for i, mask in enumerate(masks)
-        ]
-        index = choose(rgb, candidates, args.instance, headless=args.headless)
-        save_selection(output, rgb, candidates, index)
-        return 0
     from .reconstruction import load_shape_model, reconstruct_mesh
 
     model = load_shape_model(
         args.workspace / "third_party/Hunyuan3D-2.1",
         args.models_dir / SHAPE_WEIGHTS_DIR,
     )
-    image_path = output / "foreground_rgba.png" if command == "reconstruct" else args.image
-    with Image.open(image_path) as image:
+    with (Image.open(args.image) if command == "generate" else rgba) as image:
         mesh = reconstruct_mesh(
             model,
             image,

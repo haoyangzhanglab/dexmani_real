@@ -16,6 +16,7 @@ from dexmani_real.ipc.sensors import SensorChannels, snapshot_camera_parameters
 from dexmani_real.robot.commands import OperationCancelled, RobotError
 from dexmani_real.robot.system import Robot
 from dexmani_real.robot.xhand.feedback import TACTILE_CHANNELS
+from dexmani_real.runtime.home import home_hand
 from dexmani_real.runtime.keyboard import Keyboard
 from dexmani_real.runtime.lifecycle import (
     CAMERA_READY_TIMEOUT_S,
@@ -58,6 +59,7 @@ def run_teleop(
     period_ns = sampling_clock_ns(runtime.teleop.control_hz)
     if runtime.hand.enabled:
         validate_xhand_target_rate(runtime.teleop.control_hz)
+        runtime.hand.validate_home()
     runtime.teleop.validate()
     lease_ns = int(runtime.teleop.target_max_age_s * 1e9)
     if period_ns >= lease_ns:
@@ -93,8 +95,12 @@ def run_teleop(
             "config", record=record, vr_pos_scale=runtime.teleop.vr_pos_scale,
             ema_alpha_pos=runtime.teleop.ema_alpha_pos, ema_alpha_rot=runtime.teleop.ema_alpha_rot,
             target_max_age_s=runtime.teleop.target_max_age_s, hand_enabled=runtime.hand.enabled,
-            hand_retargeting_backend=runtime.hand_retargeting.backend if runtime.hand.enabled else None,
         )
+    hand_retargeter = None
+    if runtime.hand.enabled:
+        from dexmani_real.teleop.retargeting.solver import HandRetargeter
+
+        hand_retargeter = HandRetargeter(runtime.hand_retargeting, runtime.hand)
     controller = VRController(
         ActionMapper.for_mode(
             "eef",
@@ -103,7 +109,7 @@ def run_teleop(
             motion=runtime.motion,
             environment=runtime.environment,
         ),
-        build_hand_retargeter(runtime),
+        hand_retargeter,
         runtime.teleop,
         vr_to_robot_rotation,
         timing=timing,
@@ -184,6 +190,19 @@ def run_teleop(
 
             robot.check_services = check_services
             robot.connect()
+            if runtime.hand.enabled:
+                # 立即请求机械臂停止，手部回位完成后再保持实测位置。
+                runtime_state.stop_signal.set()
+
+                def check_startup_home():
+                    if (
+                        loop.poll_blocking_commands()
+                        or runtime_state.cancel_epoch != startup_cancel_epoch
+                    ):
+                        raise OperationCancelled("XHand startup HOME cancelled")
+
+                logger.info("XHand 启动回位。")
+                home_hand(robot, check_startup_home)
             # 相机/VR 启动和标定期间保持停止，不撤销操作者的启动意图。
             robot.stop()
             if record:
@@ -300,11 +319,15 @@ def calibrate_hand(loop, cancel_epoch) -> None:
     retargeter = loop.controller.hand_retargeter
     if retargeter is None:
         return
-    from dexmani_real.teleop.retargeting.landmarks import HandGeometryRejected
+    from dexmani_real.teleop.retargeting.landmarks import (
+        HandGeometryRejected,
+        hand_lengths,
+        prepare_landmarks,
+    )
 
-    config = loop.runtime.hand_retargeting
+    config = retargeter.config
     print("正在标定手部骨长：请保持右手清晰可见；无需保持伸直。S 或 Esc 可取消，按两次 Q 退出。", flush=True)
-    deadline = time.monotonic() + config.calibration_timeout_s
+    deadline_ns = time.monotonic_ns() + int(config.calibration_timeout_s * 1e9)
     measurements: list[np.ndarray] = []
     channels = loop.sensors.channels
     connection_epoch = channels.vr_connection_epoch.value
@@ -314,10 +337,6 @@ def calibrate_hand(loop, cancel_epoch) -> None:
         if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
             raise OperationCancelled("hand calibration cancelled")
         loop.robot.service_idle()
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"hand calibration timed out ({len(measurements)}/{config.calibration_samples}): {last_error}"
-            )
         current_epoch = channels.vr_connection_epoch.value
         if current_epoch != connection_epoch:
             connection_epoch = current_epoch
@@ -334,30 +353,22 @@ def calibrate_hand(loop, cancel_epoch) -> None:
             if (
                 int(frame["connection_epoch"]) == connection_epoch
                 and sequence > last_sequence
+                and stamp < deadline_ns
                 and sample_is_fresh(stamp, loop.runtime.teleop.vr_stale_threshold_s, now_ns)
             ):
                 last_sequence = sequence
                 try:
-                    measurement = retargeter.calibration_measurement(frame["landmarks"])
+                    measurement = hand_lengths(prepare_landmarks(frame["landmarks"]))
                 except HandGeometryRejected as exc:
                     last_error = str(exc)
                 else:
                     measurements.append(measurement)
+                    if len(measurements) == config.calibration_samples:
+                        continue  # 不再等待采样，先复核取消状态和连接 epoch。
+        if time.monotonic_ns() >= deadline_ns:
+            raise RuntimeError(
+                f"hand calibration timed out ({len(measurements)}/{config.calibration_samples}): {last_error}"
+            )
         time.sleep(0.005)
-    if loop.poll_blocking_commands() or loop.runtime_state.cancel_epoch != cancel_epoch:
-        raise OperationCancelled("hand calibration cancelled")
     retargeter.calibrate(measurements)
     logger.info("Hand morphology calibrated from %s distinct landmark packets", len(measurements))
-
-
-def build_hand_retargeter(runtime):
-    if not runtime.hand.enabled:
-        return None
-    config = runtime.hand_retargeting
-    if config.backend == "geort":
-        from dexmani_real.teleop.retargeting.geort import GeoRTRetargeter
-
-        return GeoRTRetargeter(config, runtime.hand)
-    from dexmani_real.teleop.retargeting.solver import HandRetargeter
-
-    return HandRetargeter(config, runtime.hand)

@@ -30,7 +30,8 @@ ostrack：单独安装 OSTrack 源码和推理依赖。
 源码按固定 revision 获取。已有目录须为 Git 工作树根目录，HEAD 匹配固定
 revision 时复用本地修改。版本不符或补丁冲突时退出。
 工作目录默认为当前目录，--workspace 必须放在首位。
-安装不下载模型或访问设备，后续命令见完成提示。
+安装不下载模型权重。编译 CUDA 扩展时，PyTorch 默认使用可见 GPU 的架构。
+在无可见 GPU 的环境编译时，通过 TORCH_CUDA_ARCH_LIST 指定目标架构。
 USAGE
     exit 0
 fi
@@ -45,6 +46,10 @@ if [[ -z "${CONDA_PREFIX:-}" ]]; then
     exit 1
 fi
 cordvip_python="$CONDA_PREFIX/bin/python"
+if [[ ! -x "$cordvip_python" ]] || ! "$cordvip_python" -m pip --version >/dev/null; then
+    printf 'Expected an executable Python with pip in the conda prefix: %s\n' "$CONDA_PREFIX" >&2
+    exit 1
+fi
 
 if ! command -v git >/dev/null; then
     printf 'Missing tool: git\n' >&2
@@ -148,7 +153,7 @@ else
         iopath==0.1.10 \
         ninja==1.13.2 \
         kornia==0.7.3 \
-        warp-lang==1.5.1 \
+        warp-lang==1.8.1 \
         ruamel.yaml==0.18.6 \
         transformations==2024.5.24 \
         cmeel-eigen==3.4.1 \

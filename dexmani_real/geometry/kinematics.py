@@ -160,7 +160,6 @@ class HandFK:
         self.sdk_to_urdf = np.array([
             XHAND_SDK_JOINT_NAMES.index(name) for name in active
         ], dtype=np.intp)
-        self.urdf_to_sdk = np.argsort(self.sdk_to_urdf)
         self.fingertip_frame_ids = tuple(self.model.getFrameId(n) for n in XHAND_FINGERTIP_LINK_NAMES)
         if any(fid >= self.model.nframes for fid in self.fingertip_frame_ids):
             raise ValueError("fingertip frame is missing from the hand URDF")
@@ -188,22 +187,6 @@ class HandFK:
             self.pin.updateFramePlacement(self.model, self.data, fid).homogeneous
             for fid in frame_ids
         ], out=out)
-
-    def positions_and_jacobians(
-        self, qpos: np.ndarray, frame_ids: Sequence[int],
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """手基座系位置及其对 SDK 顺序关节的解析导数；一次 FK 服务所有目标。"""
-        q = validate_hand_qpos(qpos)[self.sdk_to_urdf]
-        self.pin.computeJointJacobians(self.model, self.data, q)
-        self.pin.updateFramePlacements(self.model, self.data)
-        positions = np.stack([self.data.oMf[fid].translation for fid in frame_ids])
-        jacobians = np.stack([
-            self.pin.getFrameJacobian(
-                self.model, self.data, fid, self.pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
-            )[:3]
-            for fid in frame_ids
-        ])[:, :, self.urdf_to_sdk]
-        return positions, jacobians
 
 
 def eef_poses(arm_qpos: np.ndarray, *, arm_fk: ArmFK) -> np.ndarray:

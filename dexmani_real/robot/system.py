@@ -390,11 +390,11 @@ class Robot:
                 self.runtime_state.request_emergency_stop()
             errors.append((stage, exc))
 
-    def stop(self, *, service=None) -> None:
-        """请求机械臂停止，同时保持 XHand 位置，并确认机械臂停稳。"""
+    def stop(self, *, hold_hand: bool = True, service=None) -> None:
+        """请求并确认机械臂停稳，可同时保持 XHand 位置。"""
         self.runtime_state.stop_signal.set()
         errors: list[tuple[str, BaseException]] = []
-        if self.hand_stop_required:
+        if hold_hand and self.hand_stop_required:
             with self._stop_stage(errors, "hand_hold"):
                 if not self.hold_hand():
                     raise FeedbackUnavailable("XHand position hold not confirmed")

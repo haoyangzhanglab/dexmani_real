@@ -5,6 +5,7 @@ import sys
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, replace
+from importlib.metadata import version
 from typing import cast
 
 from dexmani_real.control.actions import StartPoseRejected
@@ -289,15 +290,13 @@ class TeleopLoop:
                     "vr_to_robot_rotation": self.controller.rotation.as_matrix().tolist(),
                 }
                 retargeter = self.controller.hand_retargeter
-                if retargeter is not None:
-                    calibration = retargeter.calibration
-                    effective_parameters["hand_retargeting"] = asdict(runtime.hand_retargeting)
-                    effective_parameters["hand_retargeting_calibration"] = {
-                        "bone_lengths": calibration.bone_lengths.tolist(),
-                        "palm_width": calibration.palm_width,
-                    }
-                    if runtime.hand_retargeting.backend == "geort":
-                        effective_parameters["hand_retargeting_checkpoint"] = retargeter.checkpoint_metadata
+                calibration = retargeter.calibration
+                effective_parameters["hand_retargeting"] = asdict(retargeter.config)
+                effective_parameters["dex_retargeting_version"] = version("dex-retargeting")
+                effective_parameters["hand_retargeting_calibration"] = {
+                    "bone_lengths": calibration.bone_lengths.tolist(),
+                    "palm_width": calibration.palm_width,
+                }
                 metadata = episode_recording_metadata(
                     self.camera_snapshot, effective_parameters,
                     tactile_reset=self.robot.hand.tactile_reset_metadata,

@@ -4,6 +4,15 @@ import os
 import sys
 
 
+def load_rgb_image(path):
+    """读取参考照片并按 EXIF 朝向得到独立的 RGB 数组。"""
+    import numpy as np
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as image:
+        return np.asarray(ImageOps.exif_transpose(image).convert("RGB")).copy()
+
+
 def require_display():
     if sys.platform.startswith("linux") and not (
         os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
@@ -61,6 +70,7 @@ def save_candidates(output, rgb, candidates):
     import numpy as np
     from PIL import Image
 
+    Image.fromarray(rgb).save(output / "rgb.png")
     np.savez_compressed(
         output / "candidates.npz",
         masks=np.stack([c["mask"] for c in candidates]),
@@ -152,5 +162,7 @@ def save_selection(output, rgb, candidates, index):
     overlay(rgb, candidate, index).save(output / "overlay.png")
     alpha = mask.astype(np.uint8) * 255
     Image.fromarray(alpha).save(output / "mask.png")
-    Image.fromarray(np.dstack((rgb, alpha))).save(output / "foreground_rgba.png")
+    rgba = Image.fromarray(np.dstack((rgb, alpha)))
+    rgba.save(output / "foreground_rgba.png")
     print(f"已确认候选 {index}；全分辨率 mask、RGBA 与 overlay：{output}", flush=True)
+    return rgba

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .mesh import simplify_mesh
+from .mesh import load_mesh
 
 
 class TrackingFailure(RuntimeError):
@@ -51,51 +51,60 @@ def prepare_tracking_frame(rgb, depth_m, intrinsics, render_size, cache):
 
 
 class FoundationPoseTracker:
-    def __init__(self, root, mesh, *, shared_with=None):
-        root = Path(root).expanduser().resolve()
-        self.mesh = simplify_mesh(mesh)
+    def __init__(self, root, mesh_path, *, shared_with=None):
+        self.mesh = load_mesh(mesh_path, simplify=True)
 
         if shared_with is None:
             import torch
 
             if not torch.cuda.is_available():
                 raise RuntimeError("FoundationPose requires CUDA")
-            sys.path.insert(0, str(root))
+            sys.path.insert(0, str(Path(root).expanduser().resolve()))
             estimator_module = importlib.import_module("estimater")
             import nvdiffrast.torch as dr
 
             estimator_type = estimator_module.FoundationPose
             context = dr.RasterizeCudaContext()
+            scorer = refiner = None
         else:
-            estimator_type = type(shared_with.estimator)
-            context = shared_with.estimator.glctx
+            shared = shared_with.estimator
+            estimator_type = type(shared)
+            context, scorer, refiner = shared.glctx, shared.scorer, shared.refiner
 
         self.estimator = estimator_type(
             mesh=self.mesh,
             glctx=context,
-            scorer=shared_with.estimator.scorer if shared_with is not None else None,
-            refiner=shared_with.estimator.refiner if shared_with is not None else None,
+            scorer=scorer,
+            refiner=refiner,
         )
         # 连续性检查在 CPU 上执行；静态几何只复制一次。
         self.object_from_center = np.linalg.inv(
             self.estimator.tf_to_centered_mesh.detach().cpu().numpy()
         )
 
-    def register(self, rgb, depth_m, intrinsics, mask):
+    def register(self, rgb, depth_m, intrinsics, mask, *, quick=False):
         import torch
 
-        self.estimator.pose_last = None
-        with torch.backends.cudnn.flags(
-            enabled=True, deterministic=True, benchmark=False
-        ):
-            pose = self.estimator.register(
-                K=intrinsics,
-                rgb=rgb,
-                depth=depth_m,
-                ob_mask=mask,
-                iteration=5,
-            )
-        if self.estimator.pose_last is None:
+        estimator = self.estimator
+        estimator.pose_last = None
+        rotations = estimator.rot_grid
+        if quick:
+            # 跨视角和面内旋转粗采样，快速恢复仍可找回大角度转动的物体。
+            estimator.rot_grid = rotations[::7]
+        try:
+            with torch.backends.cudnn.flags(
+                enabled=True, deterministic=True, benchmark=False
+            ):
+                pose = estimator.register(
+                    K=intrinsics,
+                    rgb=rgb,
+                    depth=depth_m,
+                    ob_mask=mask,
+                    iteration=2 if quick else 5,
+                )
+        finally:
+            estimator.rot_grid = rotations
+        if estimator.pose_last is None:
             raise TrackingFailure(
                 "FoundationPose registration did not initialize tracking"
             )
@@ -149,10 +158,29 @@ def xy_prior_delta(centered_pose, intrinsics, box_xyxy, offset, image_shape, gai
     return gain * error * centered_pose[2, 3] / focal
 
 
-def track_objects(
-    trackers, rgb, depth_m, intrinsics, frame_cache, *, bbox_priors=None, xy_prior_gain=0.2
+def refinement_xy_delta(
+    centered_pose, intrinsics, image_shape, box, offset, gain, predicted_xy, max_delta_m,
 ):
-    """合批生成候选位姿；调用方逐对象校验，拒绝时恢复原 pose_last。"""
+    """在运动预测上计算二维框残差，合成一个有界的相机系平移。"""
+    delta = np.zeros(2)
+    if predicted_xy is not None:
+        delta = predicted_xy - centered_pose[:2, 3]
+        centered_pose = centered_pose.copy()
+        centered_pose[:2, 3] = predicted_xy
+    if box is not None and offset is not None and gain:
+        delta += xy_prior_delta(centered_pose, intrinsics, box, offset, image_shape, gain)
+    if predicted_xy is not None:
+        distance = np.linalg.norm(delta)
+        if distance > max_delta_m:
+            delta *= max_delta_m / distance
+    return delta
+
+
+def track_objects(
+    trackers, rgb, depth_m, intrinsics, frame_cache, *,
+    xy_deltas=None, seed_poses=None,
+):
+    """合批生成候选。传入显式相机系初值时保留 pose_last。"""
     import torch
     from learning.training.predict_pose_refine import (
         render_crops,
@@ -162,20 +190,14 @@ def track_objects(
     names = list(trackers)
     estimators = [tracker.estimator for tracker in trackers.values()]
     refiner = estimators[0].refiner
-    poses = torch.cat(
-        [estimator.pose_last.reshape(1, 4, 4) for estimator in estimators]
-    )
+    if seed_poses is None:
+        poses = torch.cat([estimator.pose_last.reshape(1, 4, 4) for estimator in estimators])
+    else:
+        centered = [seed_poses[name] @ tracker.object_from_center for name, tracker in trackers.items()]
+        poses = torch.as_tensor(np.stack(centered), device="cuda", dtype=torch.float32)
     with torch.inference_mode():
-        if bbox_priors and xy_prior_gain:
-            # 同一已验证位姿的 CPU 副本用于投影，避免按对象回读 CUDA 张量。
-            deltas = np.zeros((len(names), 2), dtype=np.float32)
-            for index, name in enumerate(names):
-                if name in bbox_priors:
-                    centered_pose, box_xyxy, offset = bbox_priors[name]
-                    deltas[index] = xy_prior_delta(
-                        centered_pose, intrinsics, box_xyxy, offset,
-                        depth_m.shape, xy_prior_gain,
-                    )
+        if xy_deltas:
+            deltas = np.asarray([xy_deltas.get(name, (0, 0)) for name in names], dtype=np.float32)
             poses[:, :2, 3] += poses.new_tensor(deltas)
         rgb_tensor, xyz_map = prepare_tracking_frame(
             rgb, depth_m, intrinsics, refiner.cfg.input_resize, frame_cache
@@ -218,6 +240,7 @@ def track_objects(
         )
         output = (poses @ mesh_transforms).cpu().numpy()
 
-    for index, estimator in enumerate(estimators):
-        estimator.pose_last = poses[index : index + 1]
+    if seed_poses is None:
+        for index, estimator in enumerate(estimators):
+            estimator.pose_last = poses[index : index + 1]
     return dict(zip(names, output))

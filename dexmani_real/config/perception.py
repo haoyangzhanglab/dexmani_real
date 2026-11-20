@@ -16,9 +16,11 @@ class HOITrackingConfig:
     segmentation_interval_frames: int = 10
     recovery_enabled: bool = True
     ostrack_checkpoint: str = "third_party/weights/ostrack/OSTrack_ep0300.pth.tar"
-    lost_timeout_s: float = 0.3
-    recovery_retry_interval_frames: int = 8
+    lost_timeout_s: float = 0.1
+    recovery_retry_interval_frames: int = 2
     xy_prior_gain: float = 0.2
+    kalman_xy_prior: bool = False
+    recovery_crop: bool = True
 
 
 @dataclass(frozen=True)

@@ -18,16 +18,26 @@
 
 `third_party/FoundationPose/mycpp/build/` 中的 `mycpp` 扩展供位姿跟踪在运行时加载，清理构建产物时须保留。
 
+### 模块职责
+
+| 模块 | 职责 |
+| --- | --- |
+| `camera.py`、`mesh.py` | 米制 RGB-D、相机去畸变、网格与射线深度 |
+| `segmentation.py`、`reconstruction.py` | 单图检测、分割与网格重建 |
+| `foundationpose.py`、`ostrack.py` | 共享模型的 6D 位姿计算与 2D 框跟踪 |
+| `tracking.py`、`kalman.py` | 多物体跟踪、几何检查与短时 XY 预测 |
+| `cli.py`、`visualization.py`、`weights.py` | 命令行、分割产物和预览、固定版本模型下载 |
+
 ## 安装与命令
 
-在兼容 Torch/CUDA 的 `real_robot` 环境中，从仓库根目录安装跟踪依赖，再下载 Grounding DINO 和 SAM2 权重。
+在已有兼容 CUDA、PyTorch、torchvision、NumPy 和 Transformers 的 `real_robot` 环境中，从仓库根目录安装跟踪依赖，再下载 Grounding DINO 和 SAM2 权重。
 
 ```bash
 bash third_party/cordvip_geometry/scripts/install_perception.sh
 python -m cordvip_geometry download
 ```
 
-默认安装包含 OSTrack、Grounded-SAM-2、FoundationPose 和 nvdiffrast 的固定版本源码、推理补丁和扩展，并安装后端的 `cloud` 和 `vision` 依赖。可运行 `bash third_party/cordvip_geometry/scripts/install_perception.sh ostrack` 单独安装 OSTrack。仅生成模板时，在主项目环境中运行 `python -m pip install -e 'third_party/cordvip_geometry[cloud]'`，安装网格读取、简化和射线渲染依赖。
+默认安装包含 OSTrack、Grounded-SAM-2、FoundationPose 和 nvdiffrast 的固定版本源码、推理补丁和扩展，并安装后端的 `cloud` 和 `vision` 依赖。在没有可见 GPU 的环境中编译 CUDA 扩展时，用 `TORCH_CUDA_ARCH_LIST` 指定目标架构。可运行 `bash third_party/cordvip_geometry/scripts/install_perception.sh ostrack` 单独安装 OSTrack。仅生成模板时，在主项目环境中运行 `python -m pip install -e 'third_party/cordvip_geometry[cloud]'`，安装网格读取、简化和射线渲染依赖。
 
 `download` 命令默认将检测和分割权重写入 `third_party/weights/`。跟踪还需准备下表中的文件。FoundationPose 每个模型目录都放入对应的 `config.yml` 和 `model_best.pth`。
 
@@ -53,7 +63,9 @@ python -m cordvip_geometry scale --mesh /tmp/apple/mesh_unscaled.obj --size-axis
 
 重建先输出 `mesh_unscaled.obj`，提供尺度后另存米制的 `mesh_m.obj`。尺度使用 `--scale-to-meters`，或配对的 `--size-axis` / `--size-meters`。
 
-`segment` 保存 mask、RGBA 和叠加预览。使用 `--list-only` 时保存原图与候选，随后可通过 `select --segmentation-dir ...` 选择物体。
+`generate` 和 `reconstruct` 在加载模型前检查 `seed`、`steps`、`octree_resolution` 和 `num_chunks`。这些整数参数也用于主项目的 `task.json`。
+
+`segment` 保存 Mask、RGBA 和叠加预览。使用 `--list-only` 时保存 `rgb.png` 和 `candidates.npz`，随后可通过 `select --segmentation-dir ...` 选择物体。`select` 要求候选数组条目数一致，且所有 Mask 与保存的 RGB 图像尺寸相同。
 
 检测框裁剪到图像边界并移除退化框后，按标签执行 CPU NMS（IoU 0.8）。单图分割再过滤空 mask；`--instance` 对应剩余候选按置信度降序排列的零起始索引。
 
@@ -98,6 +110,8 @@ if result.valid["apple"]:
 
 `reconstruction.load_shape_model()` 加载可复用的 Hunyuan3D 模型；`reconstruct_mesh(model, rgba, ...)` 清理退化面并返回简化网格；`scale_mesh()` 返回保留原点和朝向的缩放副本，由调用方保存。
 
+FoundationPose、MeshRaycaster 和任务模板共用网格简化流程。简化产生空表面或无效面积时立即报错。任务命令与资产结构见[主项目实验流程](../../docs/object_reconstruction.md#实验流程)。
+
 ## 质量检查
 
 `SceneTracker(..., config=TrackingConfig(...))` 配置质量阈值：
@@ -114,7 +128,7 @@ if result.valid["apple"]:
 
 每个候选的 SE(3)、运动连续性和 CAD 渲染只计算一次。相机射线、实测深度、SAM2 Mask 和渲染深度共用 stride=4 的像素网格，640×480 图像对应 160×120 个采样位置。`MeshRaycaster` 将 CAD 局部包围盒的 8 个角点投影到图像，扩展 8 像素余量后裁剪到网格，只渲染区域内的射线。深度回填到完整网格，区域外为零。包围盒跨越 1 mm 近平面时使用全图，完全位于近平面后方时返回全零。
 
-新 Mask 参与验证时复用本帧 CAD 深度。`pose_quality()` 用 Mask 外更近且超出容差的有效深度识别前景遮挡。无当前 Mask 时使用 `pose_depth_quality()`，按有效深度与 CAD 深度的绝对差是否超过容差判断匹配。
+新 Mask 参与验证时复用本帧 CAD 深度。`pose_quality()` 用 Mask 外更近且超出容差的有效深度识别前景遮挡。无当前 Mask 时，`pose_depth_quality()` 将明显近于 CAD 的深度视作可能的前景遮挡，从匹配率分母中排除。明显远于 CAD 的有效深度继续计为不匹配。
 
 两个质量函数均返回 `(metrics, verdict)`。其中 `OCCLUDED` 和 `LOST` 表示本帧证据的分类。
 
@@ -124,7 +138,7 @@ if result.valid["apple"]:
 | OCCLUDED | 证据不足，且没有充分支持的几何矛盾 |
 | LOST | 有充分支持的深度或轮廓矛盾 |
 
-有 Mask 时，分别检查 Mask 和去除前景遮挡后的 CAD 可见区域。相应区域达到最少支持点数及覆盖率，才能将不匹配判为 LOST；VALID 要求两个区域的支持均充分。纯深度路径先检查支持点数和覆盖率，再判断深度匹配比例。
+有 Mask 时，分别检查 Mask 和去除前景遮挡后的 CAD 可见区域。相应区域达到最少支持点数及覆盖率，才能将不匹配判为 LOST；VALID 要求两个区域的支持均充分。纯深度验证检查全投影的有效深度覆盖率，以及去掉前景遮挡后的深度匹配率。直接匹配仍须达到点数下限（默认 8 点）和面积门槛（默认 25%）。当实测前景遮住至少一半投影，且剩余可见区域的深度覆盖率达标时，面积门槛按剩余可见区域计算。其余情况按全投影计算。
 
 FoundationPose 输出须为有限 `[4,4]` 位姿，齐次末行容差为 `1e-6`，SO(3) 容差为 `1e-3`，且居中网格位于相机前方。非法候选在渲染前拒绝，帧末统一恢复未通过对象的内部位姿。此检查使用网格中心，允许 CAD 原点偏离物体。
 
@@ -132,12 +146,13 @@ FoundationPose 输出须为有限 `[4,4]` 位姿，齐次末行容差为 `1e-6`�
 
 | 字段 | 含义 |
 | --- | --- |
-| `depth_pixels`、`depth_fraction` | 匹配点数及比例；Mask 路径以 Mask 内有效深度数为分母 |
+| `depth_pixels`、`depth_fraction` | 匹配点数及比例。有 Mask 时以 Mask 内有效深度数为分母，纯深度时以去掉可能的前景遮挡后剩余的有效深度数为分母 |
 | `depth_support_pixels`、`depth_coverage` | 检查区域的支持点数，以及 CAD 总投影中的有效深度比例 |
 | `mask_depth_coverage`、`visible_depth_coverage` | Mask 和去遮挡后 CAD 可见区域的有效深度覆盖率 |
+| `median_depth_error_m` | 有效深度残差的中位数。纯深度路径按 CAD 总投影统计，包含近端遮挡 |
 | `precision`、`recall`、`iou` | 可见轮廓一致性 |
 | `supported_precision`、`supported_recall` | 有效深度支持下的可见轮廓一致性 |
-| `occluded_fraction` | 有深度证据支持的前景遮挡比例 |
+| `occluded_fraction` | CAD 总投影中被更近深度遮挡的比例。有 Mask 时只统计 Mask 外的遮挡 |
 | `mask_source`、`mask_age_frames` | 是否使用当前 Mask，以及距该物体最近一次分割的相机来源序列差 |
 | `dt_s`、`source_frame_gap` | 相邻处理观测的真实时间与来源序列间隔 |
 | `translation_delta_m`、`rotation_delta_rad`、`pose_dt_s` | 相对参考位姿的平移、旋转和时间间隔 |
@@ -154,16 +169,19 @@ FoundationPose 输出须为有限 `[4,4]` 位姿，齐次末行容差为 `1e-6`�
 
 首帧由 Grounding DINO 检测、SAM2 单图分割、FoundationPose 注册，通过几何检查的 Mask 用于建立 OSTrack 模板。全场景共享一份 ViT-B，各物体依次推理。项目内部用半开 `XYXY` 框，适配器在调用官方 OSTrack 时转换 `XYWH`。
 
-- `TRACKING` 中每帧更新二维框，合批产生 6D 候选。每 `segmentation_interval_frames` 个处理帧（默认 10）批量分割。候选通过刚体和运动检查但深度证据不足时，可提前分割，最短间隔为周期的一半向下取整且至少为 2 帧。复用当前 CAD 渲染来验证新 Mask。失败时回滚到最后可靠内部位姿并发布当前无效。
-- `REACQUIRE` 从连续无效满 `lost_timeout_s`（默认 0.3 秒）后的下一处理帧开始。用最后可靠框分割和注册，对仍失败的对象再做 DINO 检测。通过几何检查后用当前 Mask 重置模板并当帧发布有效位姿。失败时每 `recovery_retry_interval_frames`（默认 8）个处理帧重试。`recovery_enabled=False` 时保持无效并报告恢复已禁用。
+- `TRACKING` 中每帧更新二维框，合批产生 6D 候选。每 `segmentation_interval_frames` 个处理帧（默认 10）批量分割。有当前框且候选通过刚体和运动检查时，深度证据不足可提前分割，最短间隔为周期的一半向下取整且至少为 2 帧。复用当前 CAD 渲染来验证新 Mask。失败时回滚到最后可靠内部位姿。
+- 紧接可靠观测的一帧若跟踪失败，可用当帧可见深度验证原候选，或用短时 XY 预测重新 refinement 并走当前帧的几何检查。只有全部必需物体都有可靠或备用位姿时才发布这帧。备用位姿使用当前相机时间，下一帧仍从最后可靠位姿跟踪和计算恢复时限。
+- 启用 `recovery_enabled` 时，当前位姿无效且距最近可靠位姿的相机时间达到 `lost_timeout_s`（默认 0.1 秒），当帧进入 `REACQUIRE`。DINO 用原提示词检测，同标签有多框时选得分最高的框。单物体首次恢复且有有效 OSTrack 框时，`recovery_crop` 以框为中心裁剪，目标边长为框长边的两倍且至少为 256 像素，裁剪尺寸受原图限制。SAM2 在原图上分割映射回来的检测框。首次恢复以 36 个旋转候选和两轮 refinement 做粗注册，Mask 内深度匹配比例门槛为常规阈值的 80%（默认 40%）。通过几何检查后发布当前位姿并重置 OSTrack 模板。失败后每 `recovery_retry_interval_frames`（默认 2）个处理帧以全图和完整注册重试。关闭恢复开关后，物体继续尝试局部跟踪。
 
 分割和重试按实际处理帧计数，失效期限和运动连续性按相机来源时间计算。`RGBDFrame` 的 `source_sequence` 和 `timestamp_ns` 来自 Camera Ring 或 Raw timing。调用方跳过重复序列，SceneTracker 要求新序列递增、时间不倒退。在线发布、离线存储和训练过滤见[主项目说明](../../docs/object_reconstruction.md#标注与查看)。
 
-FoundationPose 的 `pose_last` 使用居中网格。注册和后续经几何验证的无遮挡 Mask 将居中原点投影锚定到紧致 Mask 框，再换算到同帧 OSTrack 框的归一化坐标。后续像素残差按半个框宽、高限幅，以默认 gain 0.2 修正 refinement 前候选的相机系 XY 平移。先验保持 Z 和旋转，对外位姿仍对应原始网格。`xy_prior_gain=0` 可关闭先验。
+FoundationPose 的 `pose_last` 使用居中网格。注册和后续经几何验证的无遮挡 Mask 将居中原点投影锚定到紧致 Mask 框，再换算到同帧 OSTrack 框的归一化坐标。后续像素残差按半个框宽、高限幅，以默认 gain 0.2 修正 refinement 前候选的相机系 XY 平移。`xy_prior_gain=0` 可关闭框修正。
+
+实验开关 `kalman_xy_prior` 用通过几何检查的居中网格 XY 更新匀速滤波器。注册或两次有效观测相隔超过 150 ms 时重置速度。预测只用作 refinement 初值，与二维框修正合成后限制在 30 mm 与网格直径四分之一中的较小值。先验保持 Z 和旋转，对外位姿对应原始网格。该开关默认关闭。
 
 ## 推理实现
 
-`SceneTracker` 在构造时加载 Grounding DINO，并预热 SAM2 图像编码器和 FoundationPose refiner。每个物体描述须匹配唯一候选。SAM2 使用 `build_sam2` 构建图像模型，同帧多个物体和 DINO 兜底共享一次图像编码。[SAM2 补丁](scripts/sam2_inference.patch) 保留多尺度图像特征，省去额外尺度的位置编码。
+`SceneTracker` 在构造时加载 Grounding DINO，并预热 SAM2 图像编码器和 FoundationPose refiner。初始化时每个物体描述须匹配唯一候选。SAM2 使用 `build_sam2` 构建图像模型，同帧跟踪与重新检测共享一次图像编码。[SAM2 补丁](scripts/sam2_inference.patch) 保留多尺度图像特征，省去额外尺度的位置编码。
 
 FoundationPose 后续帧复用图像缓冲、相机投影矩阵及采样网格常量，共享深度预处理。内部位姿保留在 GPU，各物体独立渲染，观测裁剪与归一化合批执行两轮 refinement。
 
@@ -172,17 +190,3 @@ RGB 与几何输入共用采样网格：refine 直接裁剪 XYZ，score 从裁�
 FoundationPose [推理补丁](scripts/foundationpose_inference.patch) 按上述两份权重的固定格式加载模型，使用局部固定种子采样网格直径。refine 和 score 直接返回位姿与分数；可视化由调用入口负责。
 
 Hunyuan3D 重建使用分层体积解码、完整 attention 和 Marching Cubes。
-
-## 模块职责
-
-| 模块 | 职责 |
-| --- | --- |
-| `camera.py`、`mesh.py` | 相机去畸变、网格处理与射线深度 |
-| `segmentation.py`、`reconstruction.py`、`foundationpose.py` | 模型加载与推理 |
-| `ostrack.py` | 共享 OSTrack 网络与逐对象模板 |
-| `tracking.py` | 多物体跟踪与轮廓/深度质量检查 |
-| `cli.py`、`visualization.py`、`weights.py` | 命令行、结果预览与模型下载 |
-
-FoundationPose 与 MeshRaycaster 使用 `simplify_mesh()` 处理后的 CAD 网格。主项目生成表面模板时复用同一网格简化函数，再由 `geometry/hoi.py` 采样。后端不依赖主项目或 fpsample。
-
-任务命令与资产结构见[主项目实验流程](../../docs/object_reconstruction.md#实验流程)。

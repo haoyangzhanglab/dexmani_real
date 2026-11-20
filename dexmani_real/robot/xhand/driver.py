@@ -17,7 +17,6 @@ from dexmani_real.robot.commands import (
     HandCommandUnconfirmed,
     OperationCancelled,
     RobotError,
-    hand_reference_from_feedback,
     validate_hand_qpos,
     validate_hand_target,
 )
@@ -562,20 +561,19 @@ class XHand:
     def hold(
         self, qpos: np.ndarray, *, timestamp_ns: int, tor_max: tuple[int, ...], check_abort=None,
     ) -> bool:
-        """以新鲜的实测位置提交保持，返回 SDK 是否确认提交。"""
+        """用新鲜反馈生成额定范围内的保持目标，返回 SDK 是否确认提交。"""
         max_age_s = self.hold_feedback_max_age_s
         if not sample_is_fresh(timestamp_ns, max_age_s, time.monotonic_ns()):
             logger.warning("XHand hold skipped: position feedback unavailable/stale")
             return False
         try:
-            reference = hand_reference_from_feedback(
-                qpos, XHAND_RATED_QPOS_MIN_RAD, XHAND_RATED_QPOS_MAX_RAD,
-            )
+            feedback = validate_hand_qpos(qpos)
         except (TypeError, ValueError, OverflowError) as exc:
             logger.warning("XHand hold skipped: invalid position feedback (%s)", exc)
             return False
+        target = np.clip(feedback, XHAND_RATED_QPOS_MIN_RAD, XHAND_RATED_QPOS_MAX_RAD)
         return self.send_position(
-            reference, tor_max=tor_max,
+            target, tor_max=tor_max,
             deadline_ns=timestamp_ns + int(max_age_s * 1e9), check_abort=check_abort,
         ) == 0
 

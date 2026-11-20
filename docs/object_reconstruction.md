@@ -20,9 +20,9 @@ python scripts/export_zarr.py /data/episodes/pick --output /data/pick.zarr \
     --fields joint_state action hand_pointcloud object_pointcloud
 ```
 
-`sample_template.py` 生成或复用任务目录下的 `hoi/template.npz`。更换 CAD 后，给模板采样与标注命令依次加 `--overwrite`，再导出到新的 Zarr 路径。项目已提供默认手模板。修改手部 URDF 或 visual 网格后，可用 `python scripts/generate_hand_template.py --overwrite` 重新生成。
+`prepare_task.py` 先检查待重建对象的参考图路径、尺度和重建参数，再加载模型。米制网格写完后才发布到 `<name>/mesh/mesh_m.obj`。`sample_template.py` 在生成或复用 `hoi/template.npz` 前检查所需 CAD 文件，生成时最多支持 16 个对象。更换 CAD 后，给模板采样与标注命令依次加 `--overwrite`，再导出到新的 Zarr 路径。项目已提供默认手模板。修改手部 URDF 或 visual 网格后，可用 `python scripts/generate_hand_template.py --overwrite` 重新生成。
 
-标注支持单个 Episode 或直接包含 `episode_*` 子目录的数据目录，使用 Raw 中的 RGB-D、深度单位与相机外参。训练后通过 `python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick` 部署。完整训练命令见 [README 的 CordViP 流程](../README.md#从示教训练并部署-cordvip)。
+标注支持单个 Episode 或直接包含 `episode_*` 子目录的数据目录。新标注先校验 Raw 相机时间、序列、段界、标定和深度数组，再加载模型跟踪。训练后通过 `python scripts/run_policy.py CHECKPOINT --task-dir /data/tasks/pick` 部署。完整训练命令见 [README 的 CordViP 流程](../README.md#从示教训练并部署-cordvip)。
 
 ### 跟踪配置
 
@@ -41,26 +41,14 @@ CONFIG = RealConfig(hoi_tracking=HOITrackingConfig(segmentation_interval_frames=
 | --- | --- | --- |
 | `ostrack_checkpoint` | `third_party/weights/ostrack/OSTrack_ep0300.pth.tar` | 接受绝对路径或相对仓库根目录的路径。 |
 | `segmentation_interval_frames` | `10` | 按实际处理帧计数的分割周期。 |
-| `lost_timeout_s` | `0.3` | 按相机来源时间计算的连续失效期限。 |
-| `recovery_enabled` | `True` | 允许进入恢复阶段后执行重新注册。 |
-| `recovery_retry_interval_frames` | `8` | 失败后等待的处理帧数。 |
-| `xy_prior_gain` | `0.2` | 二维位姿先验增益，设为 `0` 可关闭。 |
+| `lost_timeout_s` | `0.1` | 当前位姿未通过验证时，距该物体最近一次有效观测达到此年龄，即在当前帧尝试重新检测。 |
+| `recovery_enabled` | `True` | 启用重新检测与注册。关闭后继续用局部跟踪尝试恢复。 |
+| `recovery_retry_interval_frames` | `2` | 相邻两次恢复尝试至少相隔的处理帧数。 |
+| `recovery_crop` | `True` | 用当前 OSTrack 框裁剪单物体首次恢复的 DINO 输入。 |
+| `xy_prior_gain` | `0.2` | 二维框对位姿初值的修正增益，设为 `0` 可关闭框修正。 |
+| `kalman_xy_prior` | `False` | 实验性开关，将已验证位姿的 XY 运动预测用于普通跟踪初值。 |
 
 部署在连接设备前解析和校验 HOI 配置，有会话输出目录时将有效配置写入 `run_config.yaml` 的 `effective_parameters.hoi_tracking`。离线标注用同一套默认值和校验，并将有效配置写入 `hoi.h5` 根属性 `tracking_config`。安装和恢复流程见[感知后端说明](../third_party/cordvip_geometry/README.md#安装与命令)。
-
-### 跟踪基准
-
-在同一 CUDA 环境中，用同一个有标定、RGB-D 和任务模板的 Episode 对比两个版本。Worker 默认逐帧预热 50 帧，再投递 300 个测量帧。相机帧率取自录制配置，也可用 `--camera-fps` 显式指定。
-
-- `paired` 等待每帧发布，并用录制的来源时间驱动跟踪。端到端延迟按实际向 Camera Ring 投递到 HOI 发布之间的耗时计算。
-- `paced` 按指定帧率投递，以回放投递时刻作为相机来源时间，报告处理数、丢帧、有效 FPS 和末帧发布延迟。有效 FPS 以所有必需物体都有效的发布数除以 `measurement_seconds`，计时包含末帧收尾。部署仍单独检查观测新鲜度。
-
-```bash
-python scripts/benchmark_ostrack.py paired EPISODE --task-dir TASK
-python scripts/benchmark_ostrack.py paced EPISODE --task-dir TASK
-```
-
-独立 OSTrack 使用 `solo`，与其他场景模型共驻时使用 `resident`。两者都用 `--box NAME X1 Y1 X2 Y2` 提供去畸变后首帧的 XYXY 框，可重复传入多个对象。首帧用于初始化模板，之后再预热和计时。Worker 回放使用常规初始化流程，可用 `--xy-prior-gain 0` 核对二维先验的影响。`paired` 的分阶段 p50/p95 按该阶段在单帧内的总耗时统计。显存峰值取 PyTorch 分配量。基准结果以 JSON 写入标准输出，日志写入标准错误。
 
 ## 跟踪与逐行快照
 
@@ -68,22 +56,27 @@ python scripts/benchmark_ostrack.py paced EPISODE --task-dir TASK
 
 在线将当前控制采样行的最新 Arm / Hand 实测关节状态与可用的 HOI 物体点云组合。离线将 `hoi.h5` 的物体点云与对应 Raw 行的 `arm_qpos`、`hand_qpos` 组合。两条路径都用本行实测关节生成 `joint_state`，并通过 FK 计算 `eef_pose`、指尖和手点云。
 
-软件按观测行配对快照，相机、Arm 和 Hand 可以在不同物理时刻采样。物体点云仍对应原始相机序列和来源时间，Arm 和 Hand 各自保留反馈时间。在线继续检查 HOI 有效性、新鲜度和设备反馈。参见[部署恢复流程](policy_deployment.md#hoi-暂停与恢复)和[实验数据](data.md)。
+软件按观测行配对快照，相机、Arm 和 Hand 可以在不同物理时刻采样。短暂失效时，在线可沿用同一段上一次通过校验的完整物体点云和伴随 RGB，使用原始相机时间检查时效。Arm 和 Hand 保留各自的实测反馈时间。[部署恢复流程](policy_deployment.md#hoi-暂停与恢复) · [实验数据](data.md)
 
 ## 标注与查看
 
-标注沿用 Raw 相机来源时间与序列。无效对象的位姿为 NaN，保留逐对象有效性和已有质量指标。只有全部对象有效时才计算该帧物体点云，否则点云为零且整帧无效。离线分块计算并原子发布 `hoi.h5`。复用、可视化和导出使用同一套标注结构及 Raw 相机对齐检查。`--overwrite` 在重算成功后替换旧文件。
+标注沿用 Raw 相机来源时间与序列。每行按观测时间与来源相机时间之差检查时效，达到 `execution.hoi_max_age_s`（默认 0.25 秒）即无效。同一相机序列对应的重复行也逐行检查。时效内缺少完整点云时，可沿用同一 Raw 段最近一次直接通过跟踪校验的完整观测，仍按该观测的原始相机时间计算年龄。`tracking_config.short_hold.held_rows` 记录保持行的零基 Raw 行号及实际采用的相机序列。保持和过期行的几何质量指标留空，无效对象的位姿存为 NaN，整帧不完整时物体点云为零。
+
+首次短暂失跟时，可用当前 RGB-D 验证备用位姿。仍采用备用位姿的行和物体名记录在 `tracking_config.provisional_rows`。开启 `--repair-gaps` 时可用可靠位姿重新 refinement 这些行。
+
+离线分块计算并原子发布 `hoi.h5`。复用、可视化和导出使用同一套标注结构及 Raw 相机对齐检查。`--overwrite` 在重算成功后替换旧文件。
+
+离线标注可加 `--repair-gaps`。同一 Raw 段内，缺帧两侧须有通过几何验证且未过期的物体位姿，两者相距不超过 1 秒。先从后一个位姿反向 refinement，仍无效的帧再以前一个可靠位姿为初值分别 refinement。每帧须通过当帧的时效检查和 RGB-D 几何验证。证据不足时停止，接回相邻有效帧时拒绝超过 90° 的单帧翻转。回补结果使用该帧自身的几何指标，保持资格沿用原跟踪结果。最终保留的回补位姿按物体名记录相机序列，见 `tracking_config.offline_backtrack`。用 `--repair-gaps --overwrite` 重算已有标注。[GALATEA 的反向恢复](https://github.com/boyuan-an/GALATEA/blob/36b90481ba458d9beb5b6ac1396c639ea49a4747/recon/galatea_recon/pipeline/object_recovery_fp.py#L287-L300) · [CordViP 的逐帧跟踪](https://github.com/xuanxuanzzzii/cordvip/blob/ad6d441abe7b0480cf79b0311db266965c1313b6/generate_pc/FoundationPose/get_foundation.py#L107-L152)
 
 | HDF5 字段 | 内容 |
 | --- | --- |
 | `object_pointcloud` | 基座系物体点云，float32 `[T,1024,3]` |
-| `object_pose_camera`、`object_valid` | 物体到相机位姿与逐对象有效性 |
+| `object_pose_camera`、`object_valid` | 物体到相机位姿与逐对象可用性，包含期限内的保持位姿 |
 | `quality/`、`template/` | 逐对象质量指标和有序固定模板 |
 | `camera_timing`、`base_from_camera` | 与 Raw 核对的相机来源时间、序列和外参 |
 
 ```bash
 python scripts/visualize_episode.py /data/episodes/pick/episode_001 --max-frames 50
-python -B -m unittest discover -s tests -v
 ```
 
 用实际 Episode 路径核对同一 Raw 行的手物点云。Time Series 的 HOI 页签显示整帧有效性、逐物体质量，以及 Arm 和 Hand 各自的反馈时间减去相机来源时间的毫秒差。可视化保留无效行的时间位置和本行 FK 手部几何，隐藏无效物体点云。`--no-hoi` 跳过 HOI 标注。严格 HOI 导出要求所选行的物体均有效。完整规则见[数据导出](data.md#按需导出)。

@@ -58,19 +58,24 @@ def copy_samples(ring: SharedRing) -> dict:
 
 def summarize_control(samples: list[dict]) -> dict:
     durations: dict[str, list[float]] = {"hand_feedback": [], "hand_send": []}
+    retarget_durations_ns = []
+    retarget_failures = 0
     missed_slots = skipped_ticks = 0
     crc_counts = None
     for sample in samples:
         event = sample["event"]
         if event in durations:
             durations[event].append((sample["finished_ns"] - sample["timestamp_ns"]) / 1e6)
+        elif event == "hand_retarget":
+            retarget_durations_ns.append(sample["finished_ns"] - sample["timestamp_ns"])
+            retarget_failures += not sample["succeeded"]
         elif event == "control_miss":
             missed_slots += sample["slots"]
         elif event == "control_skip":
             skipped_ticks += 1
         elif event == "xhand_crc":
             crc_counts = sample["counts"]
-    return {
+    summary = {
         **{
             event: {"samples": len(values), "p95_ms": float(np.percentile(values, 95)) if values else None}
             for event, values in durations.items()
@@ -79,6 +84,12 @@ def summarize_control(samples: list[dict]) -> dict:
         "control_skipped_ticks": skipped_ticks,
         "xhand_session_crc_counts": crc_counts,
     }
+    if retarget_durations_ns:
+        summary["hand_retarget"] = {
+            "duration_ms": _milliseconds(retarget_durations_ns),
+            "failed_samples": retarget_failures,
+        }
+    return summary
 
 
 class ArmTiming:
@@ -315,6 +326,9 @@ def summarize_timing(trace: dict) -> dict:
         "servo": servo_dropped,
         "feedback": trace["feedback"]["dropped"],
     }
+    hand_retarget = summarize_control(control["samples"]).get("hand_retarget")
+    if hand_retarget is not None:
+        summary["hand_retarget"] = hand_retarget
     if trace["metadata"].get("mode") == "replay":
         summary["replay"] = _summarize_replay(trace, by_goal)
     return summary
@@ -324,7 +338,7 @@ def main() -> None:
     import argparse
     import json
 
-    parser = argparse.ArgumentParser(description="离线汇总 xArm 调度时序与实测跟踪误差")
+    parser = argparse.ArgumentParser(description="离线汇总 xArm 调度、跟踪误差和 XHand 重定向时延")
     parser.add_argument("trace", type=Path, help="--timing-output 生成的 JSON 文件")
     args = parser.parse_args()
     with args.trace.open(encoding="utf-8") as source:

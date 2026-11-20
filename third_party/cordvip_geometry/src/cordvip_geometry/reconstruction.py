@@ -1,12 +1,23 @@
 """Hunyuan3D 单图重建；模型在一批物体之间复用。"""
 
 import sys
+from numbers import Integral
 from pathlib import Path
 
 import numpy as np
 
 from .mesh import simplify_mesh
 from .weights import SHAPE_CHECKPOINT_PATH, SHAPE_CONFIG_PATH
+
+
+def validate_reconstruction_parameters(*, seed=0, steps=50, octree_resolution=384, num_chunks=8000):
+    """校验命令行与任务配置共用的重建参数。"""
+    for name, value, minimum in (
+        ("seed", seed, 0), ("steps", steps, 1),
+        ("octree_resolution", octree_resolution, 16), ("num_chunks", num_chunks, 1),
+    ):
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
+            raise ValueError(f"{name} 必须是大于等于 {minimum} 的整数")
 
 
 def load_shape_model(source_root, weights_dir):
@@ -26,12 +37,13 @@ def load_shape_model(source_root, weights_dir):
             "Hunyuan conditioner must use embedded model config, without downloads"
         )
 
-    sys.path.insert(0, str(root / "hy3dshape"))
     import torch
-    from hy3dshape import Hunyuan3DDiTFlowMatchingPipeline
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; shape generation was not started")
+    sys.path.insert(0, str(root / "hy3dshape"))
+    from hy3dshape import Hunyuan3DDiTFlowMatchingPipeline
+
     pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_single_file(
         str(checkpoint_path),
         str(config_path),
@@ -50,15 +62,17 @@ def load_shape_model(source_root, weights_dir):
 def reconstruct_mesh(
     pipeline, image, *, seed=0, steps=50, octree_resolution=384, num_chunks=8000
 ):
-    import torch
-
     if image.mode != "RGBA":
         raise ValueError("重建输入必须是带前景 alpha 的 RGBA 图像")
     alpha = np.asarray(image)[..., 3]
     if not np.any(alpha > 0) or not np.any(alpha == 0):
         raise ValueError("重建输入须包含前景和透明背景")
-    if seed < 0 or steps < 1 or octree_resolution < 16 or num_chunks < 1:
-        raise ValueError("非法重建参数")
+    validate_reconstruction_parameters(
+        seed=seed, steps=steps, octree_resolution=octree_resolution, num_chunks=num_chunks,
+    )
+
+    import torch
+
     with torch.inference_mode():
         meshes = pipeline(
             image=image,

@@ -1,0 +1,2 @@
+# 保留补丁上下文中的上游 CRLF 和空行前缀。
+ostrack_inference.patch -text whitespace=cr-at-eol,-blank-at-eol

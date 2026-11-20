@@ -33,9 +33,11 @@ def tracking_status(status: VRReceiveStatus, reference: str) -> str:
     if status.lines_received == 0:
         return status.transport_message or "No telemetry received."
     if status.parse_errors == status.lines_received:
-        return f"Received {status.lines_received} lines that could not be parsed as HTS telemetry."
-    pose = "head pose" if reference == "head" else "right wrist pose"
-    return f"Received HTS telemetry. Still waiting for a valid {pose}."
+        message = f"Received {status.lines_received} lines that could not be parsed as HTS telemetry."
+    else:
+        pose = "head pose" if reference == "head" else "right wrist pose"
+        message = f"Still waiting for a valid {pose}."
+    return f"{status.transport_message} {message}" if status.transport_message else message
 
 
 def wait_for_vr_tracking(

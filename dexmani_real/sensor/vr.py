@@ -137,6 +137,7 @@ def iter_vr_events(
     )
 
     mode = TransportMode(config.transport)
+    client_config = None
     if mode == TransportMode.UDP:
         receiver = UDPLineReceiver(UDPReceiverConfig(config.host, config.port, timeout_s=1.0))
     elif mode == TransportMode.TCP_SERVER:
@@ -144,9 +145,10 @@ def iter_vr_events(
             TCPServerConfig(config.host, config.port, accept_timeout_s=1.0, read_timeout_s=1.0)
         )
     else:
-        receiver = TCPClientLineReceiver(
-            TCPClientConfig(config.host, config.port, connect_timeout_s=1.0, read_timeout_s=1.0)
+        client_config = TCPClientConfig(
+            config.host, config.port, connect_timeout_s=1.0, read_timeout_s=1.0
         )
+        receiver = TCPClientLineReceiver(client_config)
     assembler = HandFrameAssembler(include_wall_time=False) if source == "hand" else None
     sequence_id = landmarks_sequence_id = 0
     if not running():
@@ -157,25 +159,38 @@ def iter_vr_events(
         while running():
             try:
                 line = receiver.recv_line()
-                recv_ts_ns = receiver.last_recv_ts_ns
+            except UnicodeDecodeError:
+                line = None
             except TransportTimeoutError as exc:
                 if status is not None:
                     status.transport_message = str(exc)
                 yield None
                 continue
-            except TransportDisconnectedError as exc:
+            except (TransportDisconnectedError, ConnectionError) as exc:
+                if isinstance(exc, ConnectionError):
+                    if client_config is None:
+                        raise
+                    exc = TransportDisconnectedError(str(exc))
                 if status is not None:
                     status.transport_message = str(exc)
                 if assembler is not None:
                     assembler.reset()
                 # 先通知调用方撤销旧连接，再尝试客户端重连。
                 yield exc
-                if mode == TransportMode.TCP_CLIENT:
+                if client_config is not None:
                     receiver.close()
-                    if running():
-                        time.sleep(0.25)
-                    if running():
-                        receiver.open()
+                    while running():
+                        time.sleep(client_config.reconnect_delay_s)
+                        if not running():
+                            break
+                        try:
+                            receiver.open()
+                        except (ConnectionError, TimeoutError) as error:
+                            if status is not None:
+                                status.transport_message = str(error)
+                            yield None
+                        else:
+                            break
                 continue
             if not running():
                 break
@@ -183,12 +198,15 @@ def iter_vr_events(
                 status.lines_received += 1
                 status.transport_message = None
             try:
-                packet = parse_line(line)
+                packet = parse_line(line) if line is not None else None
             except ParseError:
+                packet = None
+            if packet is None:
                 if status is not None:
                     status.parse_errors += 1
                 yield None
                 continue
+            recv_ts_ns = receiver.last_recv_ts_ns
             if source == "head":
                 if isinstance(packet, HeadPosePacket):
                     sequence_id += 1

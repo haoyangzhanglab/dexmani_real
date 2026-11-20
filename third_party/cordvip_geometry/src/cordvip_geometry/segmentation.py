@@ -21,6 +21,8 @@ class SAM2Segmenter:
     def __init__(self, root, checkpoint, config, dino_weights):
         root = Path(root).expanduser().resolve()
         checkpoint = Path(checkpoint).expanduser().resolve()
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"SAM2 checkpoint not found: {checkpoint}")
         sys.path.insert(0, str(root))
         import torch
         from sam2.build_sam import build_sam2
@@ -68,7 +70,7 @@ class SAM2Segmenter:
         finally:
             modeling_grounding_dino.load_cuda_kernels = loader
 
-    def detect(self, rgb, text, box_threshold=0.3, text_threshold=0.25):
+    def detect(self, rgb, text, box_threshold=0.3, text_threshold=0.25, *, upscale=True):
         """返回同标签 NMS 去重后的检测框、分数和标签，按置信度降序排列。"""
         text = normalize_prompt(text)
         import torch
@@ -76,8 +78,14 @@ class SAM2Segmenter:
         from torchvision.ops import batched_nms
 
         self.load_grounding()
+        height, width = rgb.shape[:2]
+        size = self.processor.image_processor.size
+        resize = (
+            upscale or min(height, width) > size["shortest_edge"]
+            or max(height, width) > size["longest_edge"]
+        )
         inputs = self.processor(
-            images=Image.fromarray(rgb), text=text, return_tensors="pt"
+            images=Image.fromarray(rgb), text=text, return_tensors="pt", do_resize=resize
         ).to(self.device)
         with torch.inference_mode():
             outputs = self.detector(**inputs)
@@ -86,13 +94,13 @@ class SAM2Segmenter:
                 inputs.input_ids,
                 box_threshold=box_threshold,
                 text_threshold=text_threshold,
-                target_sizes=[rgb.shape[:2]],
+                target_sizes=[(height, width)],
             )[0]
 
         boxes = detections["boxes"].detach().float().cpu()
         scores = detections["scores"].detach().float().cpu()
-        boxes[:, 0::2].clamp_(0, rgb.shape[1])
-        boxes[:, 1::2].clamp_(0, rgb.shape[0])
+        boxes[:, 0::2].clamp_(0, width)
+        boxes[:, 1::2].clamp_(0, height)
         valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
         boxes = boxes[valid]
         scores = scores[valid]
@@ -137,12 +145,8 @@ class SAM2Segmenter:
             if not reuse_image:
                 self.image_predictor.set_image(np.ascontiguousarray(rgb))
             masks, _, _ = self.image_predictor.predict(
-                point_coords=None,
-                point_labels=None,
                 box=np.stack(list(boxes.values())),
                 multimask_output=False,
             )
-        return {
-            name: np.asarray(mask).reshape(rgb.shape[:2]).astype(bool)
-            for name, mask in zip(boxes, masks)
-        }
+        masks = masks.reshape(len(boxes), *rgb.shape[:2]).astype(bool, copy=False)
+        return dict(zip(boxes, masks))

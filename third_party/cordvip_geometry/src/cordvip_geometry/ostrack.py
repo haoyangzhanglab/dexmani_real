@@ -12,10 +12,11 @@ OSTRACK_CONFIG = "experiments/ostrack/vitb_256_mae_ce_32x4_ep300.yaml"
 
 
 def mask_to_xyxy(mask):
-    ys, xs = np.nonzero(mask)
-    if not xs.size:
+    rows = np.flatnonzero(mask.any(axis=1))
+    if not rows.size:
         return None
-    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+    columns = np.flatnonzero(mask.any(axis=0))
+    return int(columns[0]), int(rows[0]), int(columns[-1]) + 1, int(rows[-1]) + 1
 
 
 class OSTrackAdapter:
@@ -69,8 +70,7 @@ class OSTrackAdapter:
         if box is None:
             return None
         x, y, w, h = box
-        height, width = rgb.shape[:2]
-        return x, y, min(width, x + w), min(height, y + h)
+        return x, y, x + w, y + h
 
     def clear(self):
         self._objects.clear()

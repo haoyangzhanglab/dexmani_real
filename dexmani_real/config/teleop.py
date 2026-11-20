@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 
@@ -51,38 +50,23 @@ class KeyboardTeleopConfig:
 
 @dataclass(frozen=True)
 class HandRetargetingConfig:
-    """米/弧度/秒；权重作用于无量纲残差，默认值是待真机验证的起点。"""
+    """XHand DexPilot 的标定和求解参数，单位为米、弧度、秒。"""
 
     calibration_samples: int = 25
     calibration_timeout_s: float = 5.0
     calibration_max_relative_mad: float = 0.10
     bone_length_tolerance: float = 0.35
     huber_delta_m: float = 0.02
-    shape_weight: float = 0.25
-    tip_weight: float = 2.0
-    proximal_direction_weight: float = 2.0
-    direction_weight: float = 1.0
-    # 单位方向弦长；0.3 约为 17.3°。Huber / delta 限制大残差的牵引。
-    direction_huber_delta: float = 0.3
-    pinch_weight: float = 8.0
     pinch_start_m: float = 0.03
     pinch_full_m: float = 0.015
-    # 近端正则系数按 1/dt 缩放，相当于离散阻尼；不是力或实测速度约束。
+    # 正则系数按 1/dt 缩放，形成离散阻尼。
     damping_s: float = 0.002
-    smoothing_tau_s: float = 0.02
+    smoothing_tau_s: float = 0.030
     max_joint_speed_rad_s: float = 4.0
     max_evaluations: int = 50
     max_solve_time_s: float = 0.025
-    backend: Literal["slsqp", "geort"] = "slsqp"
-    geort_checkpoint_dir: str | None = None
 
     def validate(self) -> None:
-        if self.backend not in ("slsqp", "geort"):
-            raise ValueError("hand_retargeting.backend must be 'slsqp' or 'geort'")
-        if self.backend == "geort" and (
-            not isinstance(self.geort_checkpoint_dir, str) or not self.geort_checkpoint_dir.strip()
-        ):
-            raise ValueError("hand_retargeting.geort_checkpoint_dir is required for GeoRT")
         for name in ("calibration_samples", "max_evaluations"):
             value = getattr(self, name)
             if type(value) is not int or value < 2:
@@ -93,20 +77,17 @@ class HandRetargetingConfig:
                 raise ValueError(f"hand_retargeting.{name} must be finite and in (0, 1)")
         for name in (
             "calibration_timeout_s",
-            "huber_delta_m", "direction_huber_delta", "pinch_start_m", "pinch_full_m",
+            "huber_delta_m", "pinch_start_m", "pinch_full_m",
             "max_joint_speed_rad_s", "max_solve_time_s",
         ):
             value = getattr(self, name)
             if not np.isfinite(value) or value <= 0:
                 raise ValueError(f"hand_retargeting.{name} must be finite and positive")
-        for name in (
-            "shape_weight", "tip_weight", "direction_weight", "pinch_weight",
-            "proximal_direction_weight", "damping_s", "smoothing_tau_s",
-        ):
+        for name in ("damping_s", "smoothing_tau_s"):
             value = getattr(self, name)
             if not np.isfinite(value) or value < 0:
                 raise ValueError(f"hand_retargeting.{name} must be finite and non-negative")
-        if not 0 < self.pinch_full_m < self.pinch_start_m:
+        if self.pinch_full_m >= self.pinch_start_m:
             raise ValueError("pinch distances must satisfy 0 < full < start")
 
 

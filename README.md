@@ -35,6 +35,8 @@ flowchart TD
 | 策略评估并录制 | `python scripts/run_policy.py CHECKPOINT --record-raw` |
 | 回放具有完整目标的 Raw 连续段 | `python scripts/replay_episode.py episodes/pick/episode_001 --segment 0`（替换实际采集目录，段号从 0 开始） |
 
+VR 采集或仅遥操作启动时，启用的 XHand 一连接就会向 `hand.home_qpos_deg` 配置的位置回位。手部到位并停稳后，才继续启动 VR 和录制所需的相机。
+
 HOI 数据先完成[物体资产准备与离线标注](docs/object_reconstruction.md)。具体选项见各入口的 `--help`。
 
 ### 从示教训练并部署 CordViP
@@ -56,7 +58,7 @@ python scripts/run_policy.py "$RUN/train/checkpoints/latest.pt" \
     --task-dir "$ASSETS" --output "$RUN/evaluation"
 ```
 
-`run_config.yaml` 保存训练处理参数，以及部署实际使用的场景和手部点云处理参数。场景点云去桌面时记录归一化平面系数。场景点云过滤为空时，在线继续使用最近一次非空结果，直到其来源过期。HOI 标注与部署可传同一个 `--config experiment.py`，部署在 `effective_parameters.hoi_tracking` 记录实际跟踪参数。配置与验收方法见[物体重建与 HOI](docs/object_reconstruction.md#跟踪配置)。
+`run_config.yaml` 保存训练处理参数，以及部署实际使用的场景和手部点云处理参数。场景点云去桌面时记录归一化平面系数。场景点云过滤为空时，在线继续使用最近一次非空结果，直到其来源过期。HOI 标注与部署可传同一个 `--config experiment.py`，部署在 `effective_parameters.hoi_tracking` 记录实际跟踪参数。[跟踪配置](docs/object_reconstruction.md#跟踪配置)
 
 物理回放要求先将机器人就位到所选连续段的起点。连接设备前，回放检查原始 Raw 所选段的每行是否都有完整、有限且在限位内的臂手绝对目标。能定位到具体行时，错误会给出 Raw 内从 0 开始的绝对行号。通过检查后按 Raw 标称频率顺序重发目标，慢槽会延长播放时间。播放结束并停稳后保持连接，按 H 回到初始位并退出，按 S/Q 停止并退出，Esc 急停。会话耗时包含等待按键和回位。
 
@@ -84,7 +86,7 @@ CONFIG = replace(base, teleop=replace(base.teleop, control_hz=20.0))
 
 VR 朝向标定复用 `CONFIG.vr`，用 `python scripts/calibrate_vr_heading.py --config experiment.py` 启动，临时端口可用 `--port` 覆盖。默认监听 TCP 8000。使用 USB 时先执行 `adb reverse tcp:8000 tcp:8000`，在 Quest 的 Hand Tracking Streamer 里选 **TCP Wired**。无线时选 **TCP Wireless**，填入 Quest 可达的电脑 IP 和端口。启动脚本后戴上头显，打开 **Head Pose**，再点 **Start**。标定结果保存成功后，电脑会播报「轴向已标定」。 [HTS 连接说明](https://github.com/wengmister/hand-tracking-streamer/blob/main/CONNECTIONS.md)
 
-VR 接收器报告 TCP 断开时，程序请求停止并结束当前段。重连后按 B 启动新段，以当时的实测臂姿态重新定锚。设置 `hand.enabled=False` 并使用 `--no-record` 时，只需右腕输入。触及工作空间边界时，成功提交新目标后会丢弃超界的手势位移，让反向输入从边界开始响应。
+VR 接收器报告 TCP 断开时，程序请求停止并结束当前段。`tcp_client` 会在已建立的连接断开后重试连接。重连后按 B 启动新段，以当时的实测臂姿态重新定锚。设置 `hand.enabled=False` 并使用 `--no-record` 时，只需右腕输入。触及工作空间边界时，成功提交新目标后会丢弃超界的手势位移，让反向输入从边界开始响应。
 
 VR 遥操作第一次按 Q 播报准备退出，当前操作继续。再次按 Q 停止并保存当前录制，收尾后播报「操作结束」再退出。Esc 立即请求急停。
 
@@ -142,6 +144,8 @@ python scripts/replay_episode.py EPISODE --segment 0 --timing-output traces/repl
 ```
 
 会话结束后输出 JSON。`control` 收集输入、求解和提交事件，`servo` 收集常规跟随的 SDK 调用时刻与关节参考，`feedback` 收集 SDK 查询与实测关节。用 `control_ns` 对齐一拍内的事件，用 `goal_published_ns` 对齐伺服参考与 `arm_publish.timestamp_ns`。各缓冲保留最近的样本，`dropped` 为已覆盖或收尾时无法完整取得的条数。短段对照宜在约两分钟内结束会话。
+
+有手部重定向事件时，时序 JSON 和离线汇总都提供手部求解耗时分位数与失败次数。逐拍失败原因见 `control.samples` 中的 `hand_retarget` 事件。
 
 ```bash
 python -m dexmani_real.runtime.teleop_timing episodes/vr-16hz/TASK-timing.json

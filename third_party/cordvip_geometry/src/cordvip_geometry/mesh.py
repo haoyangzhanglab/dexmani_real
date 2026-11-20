@@ -2,6 +2,7 @@
 
 import logging
 from itertools import product
+from numbers import Real
 
 import numpy as np
 
@@ -22,16 +23,19 @@ def simplify_mesh(mesh):
     )
     reduced.vertex_colors = o3d.utility.Vector3dVector(visual.vertex_colors[:, :3] / 255.0)
     reduced = reduced.simplify_quadric_decimation(MAX_MESH_FACES)
-    return trimesh.Trimesh(
+    simplified = trimesh.Trimesh(
         vertices=np.asarray(reduced.vertices),
         faces=np.asarray(reduced.triangles),
         vertex_colors=np.rint(np.asarray(reduced.vertex_colors) * 255).astype(np.uint8),
         process=False,
     )
+    if not 0 < simplified.area < np.inf:
+        raise ValueError("Mesh simplification produced no finite, nonzero surface area")
+    return simplified
 
 
-def load_mesh(path):
-    """按文件单位加载三角网格，保留原点和朝向。"""
+def load_mesh(path, *, simplify=False):
+    """按文件单位加载三角网格，可选简化并检查实际使用的表面。"""
     import trimesh
 
     mesh = trimesh.load(str(path), process=False)
@@ -45,13 +49,15 @@ def load_mesh(path):
         raise ValueError("Mesh contains nonfinite vertices")
     if np.any(mesh.faces < 0) or np.any(mesh.faces >= len(mesh.vertices)):
         raise ValueError("Mesh has invalid vertex indices")
-    areas = mesh.area_faces
-    total = areas.sum()
-    if not np.isfinite(areas).all() or not np.isfinite(total) or total <= 0:
+    if not 0 < mesh.area < np.inf:
         raise ValueError(f"Mesh has no finite, nonzero surface area: {path}")
+    if simplify:
+        try:
+            mesh = simplify_mesh(mesh)
+        except ValueError as error:
+            raise ValueError(f"{path}: {error}") from error
     degenerate = int(np.count_nonzero(~mesh.nondegenerate_faces()))
     if degenerate:
-        # 少量退化面不影响剩余表面；不在加载时改写资产或改变三角面顺序。
         logger.warning("%s: %d/%d degenerate faces", path, degenerate, len(mesh.faces))
     return mesh
 
@@ -65,7 +71,9 @@ def validate_scale(*, scale_to_meters=None, size_axis=None, size_meters=None):
     if size_axis is not None and size_axis not in ("x", "y", "z"):
         raise ValueError("实测轴必须为 x、y 或 z")
     if any(
-        value is not None and (not np.isfinite(value) or value <= 0)
+        value is not None and (
+            isinstance(value, bool) or not isinstance(value, Real) or not 0 < float(value) < np.inf
+        )
         for value in (scale_to_meters, size_meters)
     ):
         raise ValueError("尺度必须为有限正数")
@@ -85,7 +93,7 @@ def scale_mesh(mesh, *, scale_to_meters=None, size_axis=None, size_meters=None):
         scale_to_meters = size_meters / extent
     result = mesh.copy()
     result.apply_scale(scale_to_meters)
-    if not np.isfinite(result.vertices).all() or not np.isfinite(result.area) or result.area <= 0:
+    if not np.isfinite(result.vertices).all() or not 0 < result.area < np.inf:
         raise ValueError("Scaled mesh has no finite, nonzero surface area")
     return result
 

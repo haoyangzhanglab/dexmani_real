@@ -96,8 +96,14 @@ class VRController:
         retargeter = self.hand_retargeter
         if retargeter is not None:
             hand_started_ns = time.monotonic_ns() if timing is not None else None
+            hand_rejection: str | None
             try:
                 hand = retargeter.retarget(row.vr["landmarks"], timestamp_ns=control_ns)
+            except BaseException as exc:
+                hand_rejection = str(exc)
+                raise
+            else:
+                hand_rejection = retargeter.rejection_reason if hand is None else None
             finally:
                 if timing is not None:
                     timing.add(
@@ -106,10 +112,10 @@ class VRController:
                         finished_ns=time.monotonic_ns(),
                         control_ns=row.control_timestamp_ns,
                         succeeded=hand is not None,
-                        rejection_reason=retargeter.rejection_reason if hand is None else None,
+                        rejection_reason=hand_rejection,
                     )
             if hand is None:
-                return ActionResult(None, None, retargeter.rejection_reason), anchor, discarded_position_m
+                return ActionResult(None, None, hand_rejection), anchor, discarded_position_m
         ik_started_ns = time.monotonic_ns() if timing is not None else None
         result = None
         try:

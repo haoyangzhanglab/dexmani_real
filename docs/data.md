@@ -8,6 +8,8 @@ Raw 读取要求有效的 `meta.termination_reason`，已发布的有效截断�
 
 `data.h5` 的 `meta` 顶层属性保存该段的相机内参、畸变、深度单位和已有外参。`effective_parameters` 是 JSON，保存实际使用的硬件和控制参数，包括 `camera_config`、适用的 VR 标定、五指 SDK `tactile_reset` 回执和 `tactile_calibration`。校准元数据包含本次状态、最后一次有效 Bias、该 Bias 的 Unix 时间（纳秒）和应用状态。
 
+VR 录制的 `effective_parameters` 还保存 `hand_retargeting` 的实际求解参数、`hand_retargeting_calibration` 的手部骨长与掌宽，以及已安装的 `dex_retargeting_version`。 [手部重定向](hand_retargeting.md)
+
 `meta.xhand_crc_counts_json` 记录录制窗口内的读写 CRC 回复数、读写恢复次数和因 CRC 未确认送达的写入次数（`unconfirmed_writes`）。
 
 Raw 按字段使用固定类型。关节、绝对关节目标、VR 腕部位姿和手部关键点使用 `float64`，触觉与 HOI 点云使用 `float32`，深度使用 `uint16`，VR 接收时间和序列号使用 `uint64`。`timing/segment_starts` 使用 `int64`，`timing/rows` 使用 `TIMING_ROW_DTYPE`。

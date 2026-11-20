@@ -66,14 +66,20 @@ def run_hoi_worker(
         frame = RGBDFrame.from_camera(camera, data, source_sequence=sequence)
         result = track_hoi_frame(tracker, frame, template, prompts, initialize=initialize)
         valid = result.valid
-        initialize = initialize and not valid
-        points = (
-            transform_task_points(
-                template, result.object_pose_camera, camera.T_xarm_base_from_color
+        if valid:
+            initialize = False
+            points = transform_task_points(
+                template, result.object_pose_camera, camera.T_xarm_base_from_color,
             )
-            if valid
-            else invalid_points
-        )
+        else:
+            logger.warning(
+                "HOI Episode %d 当前帧无效：%s；继续处理后续帧。",
+                command["episode_id"], result.failures,
+            )
+            # 保留同一请求的有效发布，由读取端按其原始时间戳判断时效。
+            if not initialize:
+                continue
+            points = invalid_points
         # 将请求序列检查和结果发布放在同一临界区。
         with shared.hoi_request_lock:
             if shared.hoi_request.latest_sequence != request_sequence:
@@ -85,9 +91,4 @@ def run_hoi_worker(
                 valid=valid,
                 object_pointcloud=points,
                 **({"rgb": data["rgb"]} if publish_rgb else {}),
-            )
-        if not valid:
-            logger.warning(
-                "HOI Episode %d 当前帧无效：%s；继续处理后续帧。",
-                command["episode_id"], result.failures,
             )

@@ -11,7 +11,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "third_party/cordvip_geometry/src"), str(ROOT)]
 
-from cordvip_geometry.mesh import load_mesh, simplify_mesh
+from cordvip_geometry.mesh import load_mesh
 
 from dexmani_real.config.perception import (
     HOI_MAX_OBJECTS,
@@ -29,13 +29,9 @@ from dexmani_real.utils.io import publish
 
 
 def allocate_counts(areas):
+    """按已通过对象数量校验的网格表面积分配点数。"""
     areas = np.asarray(areas, dtype=np.float64)
     remaining = HOI_NUM_POINTS - HOI_MIN_POINTS_PER_OBJECT * len(areas)
-    if remaining < 0:
-        raise ValueError(
-            f"{HOI_NUM_POINTS} 点、每物体至少 {HOI_MIN_POINTS_PER_OBJECT} 点，"
-            f"最多支持 {HOI_MAX_OBJECTS} 个物体"
-        )
     quota = remaining * (areas / areas.sum())
     counts = np.floor(quota).astype(int)
     order = np.argsort(-(quota - counts), kind="stable")
@@ -48,18 +44,31 @@ def sample_template(task, *, overwrite=False):
     task = Path(task).expanduser().resolve()
     output = task / "hoi"
     path = output / "template.npz"
-    if path.exists() and not overwrite:
-        load_hoi_task(task)
+    reuse = path.exists() and not overwrite
+    if reuse:
+        _, mesh_paths, _ = load_hoi_task(task)
+    else:
+        names = [obj["name"] for obj in task_objects(task)]
+        if len(names) > HOI_MAX_OBJECTS:
+            raise ValueError(
+                f"{HOI_NUM_POINTS} 点、每物体至少 {HOI_MIN_POINTS_PER_OBJECT} 点，"
+                f"最多支持 {HOI_MAX_OBJECTS} 个物体"
+            )
+        mesh_paths = {name: task / name / TASK_MESH_PATH for name in names}
+    for mesh_path in mesh_paths.values():
+        if not mesh_path.is_file():
+            raise FileNotFoundError(f"对象网格缺失或不是文件：{mesh_path}")
+    if reuse:
         return output
-    names = [obj["name"] for obj in task_objects(task)]
-    meshes = [simplify_mesh(load_mesh(task / name / TASK_MESH_PATH)) for name in names]
+
+    meshes = [load_mesh(mesh_path, simplify=True) for mesh_path in mesh_paths.values()]
     counts = allocate_counts([mesh.area for mesh in meshes])
     points = [
         sample_surface_points(mesh, int(count), seed=0) for mesh, count in zip(meshes, counts)
     ]
     template = {
         "points_local": np.concatenate(points),
-        "object_names": np.asarray(names),
+        "object_names": np.asarray(tuple(mesh_paths)),
         "offsets": np.r_[0, np.cumsum(counts)].astype(np.int64),
     }
     validate_task_template(template)
